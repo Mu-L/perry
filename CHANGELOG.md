@@ -1,4 +1,4 @@
-## v0.5.1154 — feat(ui-windows-winui): real Windows App SDK bootstrap probe (#4680 step 2)
+## v0.5.1154 — feat(ui-windows-winui): real Windows App SDK bootstrap probe + render-backend dispatch seam (#4680 steps 2–3)
 
 **WinUI 3 backend, step 2 of 6.** `--target windows-winui` already builds, links,
 and runs (the `perry-ui-windows-winui` crate re-exports the Win32 backend and
@@ -38,9 +38,24 @@ Details:
   covered on a host without the SDK; the success path runs only where the runtime
   is installed.
 
-Step 3 (the XAML widget mapping) consults this probe before constructing any
-`Microsoft.UI.Xaml` object; that work is still ahead. Win32 (`--target windows`)
-remains the default and is unaffected.
+**Step-3 dispatch seam.** Added `winui::backend` so the per-widget XAML mapping
+has a single decision point: `backend::active()` returns `RenderBackend::Fluent`
+when the bootstrap probe is `Ready`, else `RenderBackend::Win32`. A CRT static
+initializer (`.CRT$XCU`, `#[used]`) registered in the crate runs the probe at
+process start for *any* binary that links this staticlib — i.e. exactly the
+`--target windows-winui` builds, never the default `--target windows` builds
+(which don't link the crate) — so the first widget construction reads an
+already-resolved answer. Setting `PERRY_WINUI_DIAG` prints the chosen backend
+(`[perry-winui] render backend: win32|fluent`) at launch. Verified: the
+initializer fires in a linked binary (diagnostic observed) and the `.CRT$XCU`
+section is present in the WHOLEARCHIVE'd staticlib; `active()` mirrors the
+bootstrap verdict and is stable. Each XAML widget (step 3 proper) lands behind
+this check; today it always resolves to `Win32` until the first control is
+wired in.
+
+Step 3's actual `Microsoft.UI.Xaml` controls are still ahead (they need the
+WinAppSDK winmd projections + runtime). Win32 (`--target windows`) remains the
+default and is unaffected.
 
 ## v0.5.1153 — fix: keep `js_promise_report_unhandled_rejections` alive through auto-optimize LTO (#4876)
 
