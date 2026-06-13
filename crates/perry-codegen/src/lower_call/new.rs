@@ -572,6 +572,27 @@ pub(crate) fn lower_new(ctx: &mut FnCtx<'_>, class_name: &str, args: &[Expr]) ->
                     &[(DOUBLE, &func_double), (PTR, &args_ptr), (I64, &args_len)],
                 ));
             }
+            // `new Function(p1, …, body)` with a RUNTIME-constructed body (the
+            // const-foldable / static-literal case was handled in HIR lowering;
+            // only dynamic bodies reach here). Perry is AOT-compiled and can't
+            // compile an arbitrary runtime string, so historically this produced
+            // a non-callable placeholder object. Route it through a runtime
+            // helper that recognizes the small set of well-known codegen-library
+            // templates (currently `depd`'s deprecation-wrapper, used eagerly by
+            // `send` → Next.js) and returns a working native function; anything
+            // else still gets the placeholder. NO general JS interpreter.
+            if class_name == "Function" {
+                let mut lowered_args: Vec<String> = Vec::with_capacity(args.len());
+                for a in args {
+                    lowered_args.push(lower_expr(ctx, a)?);
+                }
+                let (args_ptr, args_len) = lower_js_args_array(ctx, &lowered_args);
+                return Ok(ctx.block().call(
+                    DOUBLE,
+                    "js_function_ctor_from_strings",
+                    &[(PTR, &args_ptr), (I64, &args_len)],
+                ));
+            }
             // Built-in / native class (Promise, Error, Date, etc.) with
             // no dedicated lower_builtin_new handler — lower args for
             // side effects (closures, string literal interning) and

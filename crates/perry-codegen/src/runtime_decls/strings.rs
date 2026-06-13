@@ -314,7 +314,11 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // Args: (msg_ptr, msg_len, code_ptr, code_len, kind). Used by the
     // WorkerNew unresolved-path fallback. Helper diverges (`-> !`); declared
     // as void-return for LLVM purposes.
-    module.declare_function("js_throw_error_with_code", VOID, &[PTR, I64, PTR, I64, I32]);
+    module.declare_function(
+        "js_throw_error_with_code",
+        VOID,
+        &[PTR, I64, PTR, I64, I32],
+    );
     module.declare_function("js_map_set", I64, &[I64, DOUBLE, DOUBLE]);
     module.declare_function("js_map_get", DOUBLE, &[I64, DOUBLE]);
     module.declare_function("js_map_has", I32, &[I64, DOUBLE]);
@@ -1169,6 +1173,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     // invokes the constructor with IMPLICIT_THIS bound to the new
     // instance. Returns the NaN-boxed new instance pointer.
     module.declare_function("js_new_function_construct", DOUBLE, &[DOUBLE, PTR, I64]);
+    module.declare_function("js_function_ctor_from_strings", DOUBLE, &[PTR, I64]);
     // `new <callee>(...spread)` — codegen folds every argument (regular +
     // spread-expanded) into one JS array and hands it here; the runtime
     // materialises a flat buffer and forwards to `js_new_function_construct`.

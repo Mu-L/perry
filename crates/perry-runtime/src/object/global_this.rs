@@ -1246,6 +1246,68 @@ extern "C" fn global_this_error_is_error_thunk(
     crate::error::js_error_is_error(value)
 }
 
+/// `new Function(...)` with a RUNTIME-constructed body. Static/const bodies are
+/// AOT-compiled in HIR; only dynamic ones reach here. Perry has no JS
+/// interpreter, but it CAN recognize the fixed templates a few popular codegen
+/// libraries emit and return a real native function. Currently: `depd`'s
+/// deprecation wrapper (used eagerly by `send` → Next.js). depd's wrapper just
+/// logs a deprecation then forwards to the wrapped fn, so the "wrapper" can
+/// simply BE that fn — `new Function(...)(fn,log,deprecate,msg,site)` returns
+/// `fn`. Unrecognized templates fall back to a non-callable placeholder object
+/// (prior behavior); there is no general eval.
+#[no_mangle]
+pub extern "C" fn js_function_ctor_from_strings(args_ptr: *const f64, args_len: usize) -> f64 {
+    let body = if args_len >= 1 && !args_ptr.is_null() {
+        let v = unsafe { *args_ptr.add(args_len - 1) };
+        let mut scratch = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+        match crate::string::str_bytes_from_jsvalue(v, &mut scratch) {
+            Some((p, n)) if !p.is_null() => {
+                let bytes = unsafe { std::slice::from_raw_parts(p, n as usize) };
+                std::str::from_utf8(bytes).unwrap_or("").to_string()
+            }
+            _ => String::new(),
+        }
+    } else {
+        String::new()
+    };
+    // depd `wrapfunction`: `new Function("fn","log","deprecate","message",
+    // "site", '…return function (…) { log.call(deprecate, message, site)\n
+    // return fn.apply(this, arguments)\n}')`. The outer, called with
+    // (fn,log,deprecate,message,site), returns that wrapper.
+    if body.contains("return function (")
+        && body.contains("log.call(deprecate, message, site)")
+        && body.contains("return fn.apply(this, arguments)")
+    {
+        let fp = depd_wrapfunction_outer_thunk as *const u8;
+        crate::closure::js_register_closure_arity(fp, 5);
+        let closure = crate::closure::js_closure_alloc_singleton(fp);
+        if !closure.is_null() {
+            return crate::value::js_nanbox_pointer(closure as i64);
+        }
+    }
+    let obj = crate::object::js_object_alloc(0, 0);
+    crate::value::js_nanbox_pointer(obj as i64)
+}
+
+/// depd `wrapfunction` outer `(fn, log, deprecate, message, site) => wrapper`.
+/// The wrapper forwards to `fn` (deprecation logging dropped — a non-essential
+/// warning), so return `fn` itself: calling the "deprecated" function calls the
+/// real one with identical `this`/arguments.
+extern "C" fn depd_wrapfunction_outer_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    fn_v: f64,
+    _log: f64,
+    _deprecate: f64,
+    _message: f64,
+    _site: f64,
+) -> f64 {
+    fn_v
+}
+
+#[used]
+static KEEP_JS_FUNCTION_CTOR_FROM_STRINGS: extern "C" fn(*const f64, usize) -> f64 =
+    js_function_ctor_from_strings;
+
 /// #2904: `Error.prepareStackTrace` default — Node leaves a hook here that
 /// formats the stack from structured frames. Perry's stack strings are
 /// coarse; the installed default returns the existing `error.stack` string
@@ -4945,10 +5007,23 @@ fn alias_number_static_to_global_function(singleton: *mut ObjectHeader, name: &s
     );
 }
 
+/// Raw address of the global `Error` constructor closure, captured at install.
+/// Read by `error::error_prepare_stack_trace_override` so `captureStackTrace` /
+/// `error.stack` can honor a user-set `Error.prepareStackTrace`.
+pub(crate) static ERROR_CONSTRUCTOR_PTR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The default `Error.prepareStackTrace` thunk's address — used to tell a
+/// user override apart from Perry's built-in default.
+pub(crate) fn default_prepare_stack_trace_func_ptr() -> usize {
+    global_this_error_prepare_stack_trace_thunk as *const u8 as usize
+}
+
 fn install_error_static_methods(ctor: *mut crate::closure::ClosureHeader) {
     if ctor.is_null() {
         return;
     }
+    ERROR_CONSTRUCTOR_PTR.store(ctor as usize, std::sync::atomic::Ordering::Relaxed);
     let func_ptr = global_this_error_capture_stack_trace_thunk as *const u8;
     let closure = crate::closure::js_closure_alloc(func_ptr, 0);
     if closure.is_null() {
