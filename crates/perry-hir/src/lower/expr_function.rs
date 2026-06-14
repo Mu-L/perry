@@ -809,6 +809,26 @@ pub(crate) fn lower_fn_expr(ctx: &mut LoweringContext, fn_expr: &ast::FnExpr) ->
     // threw `TypeError: value is not a function`. Function declarations
     // must run before any var-init in the body, then var-inits and other
     // executable statements run in source order.
+    // Pre-register sibling class DECLARATION names so forward references in
+    // earlier statements (and nested closures lowered before the class) resolve
+    // to `ClassRef` rather than the unknown-global sentinel — the same Phase 1.5
+    // that `lower_fn_body_block_stmt` (arrow / fn-decl bodies) performs. Plain
+    // function expressions previously skipped it: the cjs_wrap IIFE is exactly
+    // such an expression, and a class it can't hoist out (one whose body
+    // references an IIFE-local, e.g. `class X extends imp.Base { constructor(){
+    // super(imp2.CONST) } }`) stays inside the IIFE with its export getter
+    // `() => X` lowered ABOVE it — that forward read fell through to
+    // `js_global_get_or_throw_unresolved("X")` → `ReferenceError: X is not
+    // defined` (Next.js RSCPathnameNormalizer). Scoped: restored after the body.
+    let saved_forward_class_names = ctx.forward_class_names.clone();
+    if let Some(ref block) = fn_expr.function.body {
+        for stmt in &block.stmts {
+            if let ast::Stmt::Decl(ast::Decl::Class(class_decl)) = stmt {
+                ctx.forward_class_names
+                    .insert(class_decl.ident.sym.to_string());
+            }
+        }
+    }
     let mut body = if let Some(ref block) = fn_expr.function.body {
         // #4795: a `using` / `await using` declaration in a function-expression
         // body must be desugared (scope-exit disposal + declaration-time
@@ -861,6 +881,7 @@ pub(crate) fn lower_fn_expr(ctx: &mut LoweringContext, fn_expr: &ast::FnExpr) ->
         Vec::new()
     };
     ctx.current_strict = outer_strict;
+    ctx.forward_class_names = saved_forward_class_names;
 
     // Prepend destructuring statements to body
     if !destructuring_stmts.is_empty() {
