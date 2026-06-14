@@ -600,6 +600,17 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                                     (DOUBLE, &name_val_box),
                                 ],
                             );
+                            // #5127: `super(message, options)` must forward the
+                            // ES2022 `cause` option. The instance is a generic
+                            // object, so install a non-enumerable `cause`
+                            // property from args[1] when present.
+                            if let Some(opts_val) = lowered_args.get(1) {
+                                let blk = ctx.block();
+                                blk.call_void(
+                                    "js_error_apply_cause_to_object",
+                                    &[(I64, &this_handle), (DOUBLE, opts_val)],
+                                );
+                            }
                         }
                     }
                     return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
