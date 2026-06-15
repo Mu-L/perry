@@ -799,6 +799,16 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                             (DOUBLE, &name_val_box),
                         ],
                     );
+                    // #5127: forward the ES2022 `cause` option through a
+                    // multi-hop chain too (`class Leaf extends Mid extends
+                    // Error`). Mirrors the direct Error-like branch above.
+                    if let Some(opts_val) = lowered_args.get(1) {
+                        let blk = ctx.block();
+                        blk.call_void(
+                            "js_error_apply_cause_to_object",
+                            &[(I64, &this_handle), (DOUBLE, opts_val)],
+                        );
+                    }
                 }
             } else if let Some(ctor) = ctx
                 .imported_class_ctors

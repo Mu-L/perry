@@ -1490,6 +1490,10 @@ static KEEP_AGGREGATEERROR_NEW_FULL: extern "C" fn(
 #[used]
 static KEEP_ERROR_IS_ERROR: extern "C" fn(f64) -> f64 = js_error_is_error;
 
+#[used]
+static KEEP_ERROR_APPLY_CAUSE_TO_OBJECT: extern "C" fn(*mut crate::object::ObjectHeader, f64) =
+    js_error_apply_cause_to_object;
+
 #[cfg(test)]
 mod tostring_tests {
     use super::*;

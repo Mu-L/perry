@@ -80,3 +80,33 @@ console.log(new B("x").cause);
         "high-level low-level\nAppError true\nfalse true\n42\nundefined\n"
     );
 }
+
+/// Multi-hop chain (`Leaf extends Mid extends Error`) is lowered through the
+/// fallback Error-chain `super(...)` arm (the immediate parent `Mid` has no
+/// own ctor), which is a distinct code path from the direct `extends Error`
+/// case above. Guard that `cause` forwards through it too.
+#[test]
+fn error_subclass_forwards_cause_through_multi_hop_super() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let stdout = compile_and_run(
+        dir.path(),
+        r#"
+class Mid extends Error {}
+class Leaf extends Mid {
+  constructor(msg: string, opts?: ErrorOptions) { super(msg, opts); this.name = "Leaf"; }
+}
+const e = new Leaf("high-level", { cause: new TypeError("low-level") });
+console.log(e.message, (e.cause as Error)?.message);
+console.log(e.name, e instanceof Error, e instanceof Mid);
+console.log(Object.keys(e).includes("cause"), Object.prototype.hasOwnProperty.call(e, "cause"));
+
+// No options forwarded through the multi-hop chain => no cause.
+class Leaf2 extends Mid { constructor(m: string){ super(m); } }
+console.log(new Leaf2("x").cause);
+"#,
+    );
+    assert_eq!(
+        stdout,
+        "high-level low-level\nLeaf true true\nfalse true\nundefined\n"
+    );
+}
