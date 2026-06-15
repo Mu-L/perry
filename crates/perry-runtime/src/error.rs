@@ -515,7 +515,10 @@ unsafe fn apply_cause_from_options(error: *mut ErrorHeader, options: f64) {
 /// reads `options.cause` via the generic getter (works for object literals
 /// and runtime-held options alike) and is a no-op for non-object options.
 #[no_mangle]
-pub extern "C" fn js_error_apply_cause_to_object(obj: *mut crate::object::ObjectHeader, options: f64) {
+pub extern "C" fn js_error_apply_cause_to_object(
+    obj: *mut crate::object::ObjectHeader,
+    options: f64,
+) {
     let opts = crate::value::JSValue::from_bits(options.to_bits());
     if !opts.is_pointer() {
         return;
