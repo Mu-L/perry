@@ -624,6 +624,27 @@ mod tests {
     }
 
     #[test]
+    fn typed_parse_layout_only_object_field_writes_preserve_layout() {
+        let input = br#"[{"id":1,"name":"item_1","nested":{"x":1,"y":2}},{"id":2,"name":"item_2","nested":{"x":2,"y":4}}]"#;
+        let packed_keys = b"id\0name\0nested\0";
+        let text = js_string_from_bytes(input.as_ptr(), input.len() as u32);
+        let value = unsafe {
+            js_json_parse_typed_array(text, packed_keys.as_ptr(), packed_keys.len() as u32, 3)
+        };
+        let arr = (value.bits() & POINTER_MASK) as *const crate::ArrayHeader;
+        let first_bits = crate::array::js_array_get_f64(arr, 0).to_bits();
+        let first = (first_bits & POINTER_MASK) as usize;
+
+        assert_eq!(crate::gc::test_layout_pointer_slot_count(first, 3), Some(2));
+
+        let output = unsafe { js_json_stringify(f64::from_bits(value.bits()), TYPE_UNKNOWN) };
+        assert_eq!(
+            unsafe { str_from_header(output).unwrap() },
+            std::str::from_utf8(input).unwrap()
+        );
+    }
+
+    #[test]
     fn direct_parse_array_numeric_layout_preserves_and_downgrades() {
         let numeric_input = br#"[1,2,3]"#;
         let numeric_text = js_string_from_bytes(numeric_input.as_ptr(), numeric_input.len() as u32);

@@ -1936,6 +1936,18 @@ pub(crate) unsafe fn store_object_field_slot(
 }
 
 #[inline]
+pub(crate) unsafe fn store_object_field_slot_layout_only(
+    obj: *mut ObjectHeader,
+    field_index: usize,
+    value_bits: u64,
+) {
+    let fields_ptr = (obj as *mut u8).add(std::mem::size_of::<ObjectHeader>()) as *mut u64;
+    // GC_STORE_AUDIT(INIT): layout-only helper is restricted to fresh/suppressed caller sites.
+    std::ptr::write(fields_ptr.add(field_index), value_bits);
+    crate::gc::layout_note_slot(obj as usize, field_index, value_bits);
+}
+
+#[inline]
 pub(super) unsafe fn mark_object_dynamic_shape_unknown(obj: *mut ObjectHeader) {
     if obj.is_null() || (obj as usize) < crate::gc::GC_HEADER_SIZE + 0x1000 {
         return;
