@@ -7,6 +7,9 @@
 use super::*;
 use crate::{js_string_from_bytes, JSValue, StringHeader};
 
+const LAZY_MIN_BLOB_BYTES: usize = 1024;
+const LAZY_MAX_BLOB_BYTES: usize = 16 * 1024 * 1024;
+
 // ─── JSON.parse ───────────────────────────────────────────────────────────────
 
 /// JSON.parse(text) shim that returns `null` for a null input instead
@@ -176,27 +179,7 @@ pub unsafe extern "C" fn js_json_parse(text_ptr: *const StringHeader) -> JSValue
     // Escape hatch via PERRY_JSON_TAPE=1 (force lazy regardless
     // of size, useful for testing) / =0 (force direct, useful as
     // a correctness fallback).
-    const LAZY_MIN_BLOB_BYTES: usize = 1024;
-    const LAZY_MAX_BLOB_BYTES: usize = 16 * 1024 * 1024;
-    let tape_mode = tape_mode_from_env();
-    let use_tape = match tape_mode {
-        TapeMode::ForceOn => true,
-        TapeMode::ForceOff => false,
-        TapeMode::Auto => {
-            // Tape laziness currently pays off only for top-level arrays:
-            // object/scalar roots materialize eagerly after building the tape,
-            // so they do two parses' worth of work. Peek the first meaningful
-            // byte and keep object-root API payloads on the direct parser.
-            len >= LAZY_MIN_BLOB_BYTES
-                && len <= LAZY_MAX_BLOB_BYTES
-                && bytes
-                    .iter()
-                    .copied()
-                    .find(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
-                    == Some(b'[')
-        }
-    };
-    if use_tape {
+    if should_use_tape_parse(len, bytes) {
         if let Some(result) = try_parse_via_tape(text_ptr, bytes) {
             return result;
         }
@@ -314,6 +297,27 @@ pub(crate) fn tape_mode_from_env() -> TapeMode {
     })
 }
 
+#[inline]
+fn should_use_tape_parse(len: usize, bytes: &[u8]) -> bool {
+    match tape_mode_from_env() {
+        TapeMode::ForceOn => true,
+        TapeMode::ForceOff => false,
+        TapeMode::Auto => {
+            // Tape laziness currently pays off only for top-level arrays:
+            // object/scalar roots materialize eagerly after building the tape,
+            // so they do two parses' worth of work. Peek the first meaningful
+            // byte and keep object-root API payloads on the direct parser.
+            len >= LAZY_MIN_BLOB_BYTES
+                && len <= LAZY_MAX_BLOB_BYTES
+                && bytes
+                    .iter()
+                    .copied()
+                    .find(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+                    == Some(b'[')
+        }
+    }
+}
+
 /// Issue #179 Step 2 Phase 1: tape-path entry. Builds a tape from
 /// the input bytes, then materializes the full JSValue tree via
 /// `json_tape::materialize`. Returns `None` on malformed input so
@@ -411,6 +415,17 @@ pub unsafe extern "C" fn js_json_parse_typed_array(
     }
     let data_ptr = (text_ptr as *const u8).add(std::mem::size_of::<StringHeader>());
     let bytes = std::slice::from_raw_parts(data_ptr, len);
+
+    // `JSON.parse<T[]>` is a performance specialization, not a different
+    // semantic mode. For large top-level arrays, reuse the ordinary lazy tape
+    // path so length reads and untouched stringify keep the same O(1)/memcpy
+    // behavior as untyped JSON.parse. Indexed or mutating access still
+    // materializes a normal JS tree through the existing lazy-array contract.
+    if should_use_tape_parse(len, bytes) {
+        if let Some(result) = try_parse_via_tape(text_ptr, bytes) {
+            return result;
+        }
+    }
 
     // Build the shape hint once. The keys_array + pre-interned key
     // pointers are owned by longlived arena + shape-cache structures,

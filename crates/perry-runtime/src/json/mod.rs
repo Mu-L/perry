@@ -648,6 +648,51 @@ mod tests {
     }
 
     #[test]
+    fn typed_parse_large_array_reuses_lazy_tape_and_materializes_on_access() {
+        let mut input = String::from("[");
+        for i in 0..96 {
+            if i > 0 {
+                input.push(',');
+            }
+            input.push_str(&format!(
+                r#"{{"id":{},"name":"item_{}","nested":{{"x":{},"y":{}}}}}"#,
+                i,
+                i,
+                i,
+                i * 2
+            ));
+        }
+        input.push(']');
+        assert!(input.len() > 1024);
+
+        let packed_keys = b"id\0name\0nested\0";
+        let text = js_string_from_bytes(input.as_ptr(), input.len() as u32);
+        let value = unsafe {
+            js_json_parse_typed_array(text, packed_keys.as_ptr(), packed_keys.len() as u32, 3)
+        };
+        let arr_ptr = (value.bits() & POINTER_MASK) as *const crate::ArrayHeader;
+
+        unsafe {
+            let gc_header =
+                (arr_ptr as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+            assert_eq!((*gc_header).obj_type, crate::gc::GC_TYPE_LAZY_ARRAY);
+        }
+        assert_eq!(crate::array::js_array_length(arr_ptr), 96);
+
+        let output = unsafe { js_json_stringify(f64::from_bits(value.bits()), TYPE_UNKNOWN) };
+        assert_eq!(unsafe { str_from_header(output).unwrap() }, input);
+
+        let record_bits = crate::array::js_array_get_f64(arr_ptr, 17).to_bits();
+        let record = (record_bits & POINTER_MASK) as *const crate::ObjectHeader;
+        let id_key = js_string_from_bytes(b"id".as_ptr(), 2);
+        let nested_key = js_string_from_bytes(b"nested".as_ptr(), 6);
+        let id = crate::object::js_object_get_field_by_name(record, id_key);
+        assert_eq!(f64::from_bits(id.bits()), 17.0);
+        let nested = crate::object::js_object_get_field_by_name(record, nested_key);
+        assert!(nested.is_pointer());
+    }
+
+    #[test]
     fn direct_parse_array_growth_keeps_root_current() {
         let mut input = String::from("[");
         for i in 0..40 {
