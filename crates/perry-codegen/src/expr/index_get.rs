@@ -68,13 +68,14 @@ fn is_width_tracked_typed_array_receiver(ctx: &FnCtx<'_>, object: &Expr) -> bool
     )
 }
 
-fn lower_guarded_array_index_get(
+pub(crate) fn lower_guarded_array_index_get(
     ctx: &mut FnCtx<'_>,
     arr_box: &str,
     idx_box: &str,
     idx_i32: &str,
     block_prefix: &str,
     require_numeric_layout: bool,
+    skipped_fast_pass_count: Option<&str>,
 ) -> Result<String> {
     let contract = if require_numeric_layout {
         TypedFeedbackContract::numeric_array_get_index()
@@ -169,6 +170,12 @@ fn lower_guarded_array_index_get(
 
     ctx.current_block = fast_idx;
     let fast_blk = ctx.block();
+    if let Some(count) = skipped_fast_pass_count {
+        fast_blk.call_void(
+            "js_typed_feedback_record_array_guard_fast_passes",
+            &[(I64, &feedback_site_id), (I64, count)],
+        );
+    }
     let arr_bits = fast_blk.bitcast_double_to_i64(arr_box);
     let arr_handle = fast_blk.and(I64, &arr_bits, POINTER_MASK_I64);
     let idx_i64 = fast_blk.zext(I32, idx_i32, I64);
@@ -601,6 +608,17 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 }
                 let require_numeric_layout =
                     expr_has_numeric_pointer_free_array_layout(ctx, object);
+                if let (Expr::LocalGet(arr_id), Expr::LocalGet(idx_id)) =
+                    (object.as_ref(), index.as_ref())
+                {
+                    if let Some(slot) = ctx
+                        .hoisted_array_index_gets
+                        .get(&(*arr_id, *idx_id))
+                        .cloned()
+                    {
+                        return Ok(ctx.block().load(DOUBLE, &slot));
+                    }
+                }
                 // Bounded-index fast path (mirrors the IndexSet
                 // optimization in the same file): if the surrounding
                 // for-loop registered `(counter_id, arr_id)` as
@@ -632,6 +650,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                                 &idx_i32,
                                 "bidx.num",
                                 true,
+                                None,
                             );
                         }
                         return lower_bounded_array_index_get(ctx, &arr_box, &idx_i32);
@@ -675,6 +694,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     &idx_i32,
                     "arr",
                     require_numeric_layout,
+                    None,
                 );
             }
             // Generic dynamic object access: stringify the index (no-op
