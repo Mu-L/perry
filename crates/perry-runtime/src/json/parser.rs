@@ -349,7 +349,7 @@ impl<'a> DirectParser<'a> {
         // Pre-allocate with the known keys_array + field count. No
         // shape cache lookup — the shape is already in the cache from
         // the one-time build at parse entry.
-        let mut js_obj = crate::object::js_object_alloc_class_inline_keys(
+        let js_obj = crate::object::js_object_alloc_class_inline_keys(
             0, // class_id 0 = plain object (not a class instance)
             0, // parent_class_id
             shape.field_count,
@@ -365,7 +365,7 @@ impl<'a> DirectParser<'a> {
             // GC_STORE_AUDIT(INIT): shaped JSON object fields are initialized before parse publication.
             std::ptr::write(fields_ptr.add(i), JSValue::undefined());
         }
-        let obj_slot = parse_root_push(JSValue::object_ptr(js_obj as *mut u8));
+        parse_root_push(JSValue::object_ptr(js_obj as *mut u8));
 
         // Fast path: track the expected next-field index. Each
         // iteration: if the incoming key matches `expected_keys[idx]`,
@@ -394,10 +394,11 @@ impl<'a> DirectParser<'a> {
             // shaped record are NOT themselves expected to match the
             // shape (shape is one-level deep by design in Step 1b).
             let value = self.parse_value_generic();
-            // JSON.parse suppresses GC for the whole parse, so there is
-            // no collection point between `parse_value_generic` and the
-            // direct/slow-path field write below.
-            js_obj = parse_root_object_ptr(obj_slot);
+            // JSON.parse suppresses GC for the whole parse, and `js_obj`
+            // remains in PARSE_ROOTS until this object returns. The object
+            // pointer is stable while nested values are parsed, so the hot
+            // field path does not need to reload it from TLS after every
+            // field.
 
             let key_bytes = key.as_bytes();
 
@@ -445,7 +446,6 @@ impl<'a> DirectParser<'a> {
                 // Key interning: check PARSE_KEY_CACHE first (same
                 // path as generic parse_object).
                 let key_ptr = cached_parse_key_ptr(key_bytes);
-                js_obj = parse_root_object_ptr(obj_slot);
                 crate::object::js_object_set_field_by_name(
                     js_obj,
                     key_ptr as *mut StringHeader,
@@ -463,7 +463,6 @@ impl<'a> DirectParser<'a> {
             }
         }
         self.expect(b'}');
-        js_obj = parse_root_object_ptr(obj_slot);
         parse_root_restore(saved_roots);
         JSValue::object_ptr(js_obj as *mut u8)
     }

@@ -234,11 +234,6 @@ pub(crate) fn parse_root_get(idx: usize) -> JSValue {
 }
 
 #[inline]
-pub(crate) fn parse_root_object_ptr(idx: usize) -> *mut crate::ObjectHeader {
-    (parse_root_get(idx).bits() & POINTER_MASK) as *mut crate::ObjectHeader
-}
-
-#[inline]
 pub(crate) fn parse_root_array_ptr(idx: usize) -> *mut crate::ArrayHeader {
     (parse_root_get(idx).bits() & POINTER_MASK) as *mut crate::ArrayHeader
 }
@@ -636,6 +631,29 @@ mod tests {
         let first = (first_bits & POINTER_MASK) as usize;
 
         assert_eq!(crate::gc::test_layout_pointer_slot_count(first, 3), Some(2));
+
+        let output = unsafe { js_json_stringify(f64::from_bits(value.bits()), TYPE_UNKNOWN) };
+        assert_eq!(
+            unsafe { str_from_header(output).unwrap() },
+            std::str::from_utf8(input).unwrap()
+        );
+    }
+
+    #[test]
+    fn typed_parse_shaped_object_keeps_pointer_across_nested_values() {
+        let input = br#"[{"id":1,"name":"item_1","nested":{"x":1,"y":[2,3]},"extra":{"k":[4,5]}}]"#;
+        let packed_keys = b"id\0name\0nested\0";
+        let text = js_string_from_bytes(input.as_ptr(), input.len() as u32);
+        let value = unsafe {
+            js_json_parse_typed_array(text, packed_keys.as_ptr(), packed_keys.len() as u32, 3)
+        };
+        let arr = (value.bits() & POINTER_MASK) as *const crate::ArrayHeader;
+        let first_bits = crate::array::js_array_get_f64(arr, 0).to_bits();
+        let first = (first_bits & POINTER_MASK) as *const crate::ObjectHeader;
+        let key_extra = js_string_from_bytes(b"extra".as_ptr(), 5);
+        let extra = crate::object::js_object_get_field_by_name(first, key_extra);
+
+        assert!(extra.is_pointer());
 
         let output = unsafe { js_json_stringify(f64::from_bits(value.bits()), TYPE_UNKNOWN) };
         assert_eq!(
