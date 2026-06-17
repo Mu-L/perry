@@ -171,18 +171,17 @@ fn lower_guarded_array_index_get(
     let fast_blk = ctx.block();
     let arr_bits = fast_blk.bitcast_double_to_i64(arr_box);
     let arr_handle = fast_blk.and(I64, &arr_bits, POINTER_MASK_I64);
+    let idx_i64 = fast_blk.zext(I32, idx_i32, I64);
+    let byte_offset = fast_blk.shl(I64, &idx_i64, "3");
+    let with_header = fast_blk.add(I64, &byte_offset, "8");
+    let element_addr = fast_blk.add(I64, &arr_handle, &with_header);
+    let element_ptr = fast_blk.inttoptr(I64, &element_addr);
     let fast_val = if require_numeric_layout {
-        fast_blk.call(
-            DOUBLE,
-            "js_array_numeric_get_f64_unboxed",
-            &[(I64, &arr_handle), (I32, idx_i32)],
-        )
+        // The numeric-array guard proves a live, non-forwarded ArrayHeader,
+        // in-bounds index, and raw-f64 numeric layout. That makes the runtime
+        // helper's fast path equivalent to a direct payload load here.
+        fast_blk.load(DOUBLE, &element_ptr)
     } else {
-        let idx_i64 = fast_blk.zext(I32, idx_i32, I64);
-        let byte_offset = fast_blk.shl(I64, &idx_i64, "3");
-        let with_header = fast_blk.add(I64, &byte_offset, "8");
-        let element_addr = fast_blk.add(I64, &arr_handle, &with_header);
-        let element_ptr = fast_blk.inttoptr(I64, &element_addr);
         let fast_raw = fast_blk.load(DOUBLE, &element_ptr);
         // `new Array(n)` slots are TAG_HOLE internally; JavaScript reads expose
         // `undefined`.
@@ -203,7 +202,7 @@ fn lower_guarded_array_index_get(
         ctx.record_lowered_value_with_access_mode_and_facts(
             "NumericArrayIndexGet",
             None,
-            "js_array_numeric_get_f64_unboxed",
+            "numeric_array_index_get.raw_f64_load",
             &fast,
             Some(BoundsState::Guarded {
                 guard_id: "numeric_array_index_get_guard".to_string(),
