@@ -1075,7 +1075,19 @@ fn emit_range_plain_array_index_set_preguard(
     let guard_ok_slot = ctx.func.alloca_entry(I32);
     ctx.block().store(I32, &guard_result, &guard_ok_slot);
 
-    Ok(PreguardedPlainArrayIndexSet { guard_ok_slot })
+    let pointer_free_result = ctx.block().call(
+        I32,
+        "js_plain_array_inbounds_pointer_free_range_guard",
+        &[(DOUBLE, &arr_box), (I32, &counter_i32), (I32, &max_i32)],
+    );
+    let pointer_free_range_slot = ctx.func.alloca_entry(I32);
+    ctx.block()
+        .store(I32, &pointer_free_result, &pointer_free_range_slot);
+
+    Ok(PreguardedPlainArrayIndexSet {
+        guard_ok_slot,
+        pointer_free_range_slot: Some(pointer_free_range_slot),
+    })
 }
 
 fn emit_affine_numeric_array_index_get_preguard(

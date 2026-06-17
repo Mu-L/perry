@@ -1200,6 +1200,28 @@ pub extern "C" fn js_plain_array_inbounds_range_guard(
     }
 }
 
+#[no_mangle]
+pub extern "C" fn js_plain_array_inbounds_pointer_free_range_guard(
+    receiver: f64,
+    first_index: i32,
+    last_index: i32,
+) -> i32 {
+    if first_index < 0 || last_index < first_index {
+        return 0;
+    }
+    let raw_addr = normalize_raw_object_addr(receiver.to_bits());
+    if !plain_array_index_guard(raw_addr as *const ArrayHeader, last_index as u32, true) {
+        return 0;
+    }
+    let first = first_index as usize;
+    let last = last_index as usize;
+    let slot_count = last.saturating_add(1);
+    match crate::gc::layout_range_has_pointer_slots_for_user(raw_addr, first, last, slot_count) {
+        Some(false) => 1,
+        _ => 0,
+    }
+}
+
 fn numeric_array_index_guard(arr: *const ArrayHeader, index: u32, require_in_bounds: bool) -> bool {
     plain_array_index_guard(arr, index, require_in_bounds)
         && crate::array::js_array_is_numeric_f64_layout(arr) != 0

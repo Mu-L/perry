@@ -1042,6 +1042,7 @@ pub(crate) struct PreguardedNumericArrayIndexSet {
 #[derive(Debug, Clone)]
 pub(crate) struct PreguardedPlainArrayIndexSet {
     pub guard_ok_slot: String,
+    pub pointer_free_range_slot: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
