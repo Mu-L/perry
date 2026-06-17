@@ -494,13 +494,23 @@ fn typed_feedback_preguards_plain_array_writes_with_length_bound() {
         ir.contains("call i32 @js_plain_array_f64_number_range_guard"),
         "{ir}"
     );
-    assert!(ir.contains("plain_f64_add.fast"), "{ir}");
-    assert!(ir.contains("plain_f64_add.fallback"), "{ir}");
-    assert!(ir.contains("idxset.preguarded_plain_fast"), "{ir}");
-    assert!(ir.contains("idxset.preguarded_plain_fallback"), "{ir}");
-    assert!(ir.contains("idxset.preguarded_plain_layout_note"), "{ir}");
-    assert!(ir.contains("idxset.preguarded_plain_layout_skip"), "{ir}");
-    assert!(ir.contains("call void @js_gc_note_slot_layout"), "{ir}");
+    assert!(ir.contains("idxset.plain_f64_self_add.fast"), "{ir}");
+    assert!(ir.contains("idxset.plain_f64_self_add.fallback"), "{ir}");
+    assert!(
+        ir.contains("call double @js_typed_feedback_array_index_get_fallback_boxed"),
+        "{ir}"
+    );
+    assert!(
+        ir.contains("call double @js_dynamic_string_or_number_add"),
+        "{ir}"
+    );
+    assert!(!ir.contains("idxset.preguarded_plain_layout_note"), "{ir}");
+    assert!(!ir.contains("call void @js_gc_note_slot_layout"), "{ir}");
+    assert!(!ir.contains("call void @js_write_barrier_slot"), "{ir}");
+    assert!(
+        !ir.contains("call void @js_array_note_numeric_write"),
+        "{ir}"
+    );
     assert_eq!(
         ir.matches("call i32 @js_typed_feedback_plain_array_index_set_guard")
             .count(),
@@ -567,12 +577,23 @@ fn typed_feedback_preguards_plain_array_writes_with_local_bound() {
         ir.contains("call i32 @js_plain_array_f64_number_range_guard"),
         "{ir}"
     );
-    assert!(ir.contains("plain_f64_add.fast"), "{ir}");
-    assert!(ir.contains("plain_f64_add.fallback"), "{ir}");
-    assert!(ir.contains("idxset.preguarded_plain_fast"), "{ir}");
-    assert!(ir.contains("idxset.preguarded_plain_fallback"), "{ir}");
-    assert!(ir.contains("idxset.preguarded_plain_layout_note"), "{ir}");
-    assert!(ir.contains("idxset.preguarded_plain_layout_skip"), "{ir}");
+    assert!(ir.contains("idxset.plain_f64_self_add.fast"), "{ir}");
+    assert!(ir.contains("idxset.plain_f64_self_add.fallback"), "{ir}");
+    assert!(
+        ir.contains("call double @js_typed_feedback_array_index_get_fallback_boxed"),
+        "{ir}"
+    );
+    assert!(
+        ir.contains("call double @js_dynamic_string_or_number_add"),
+        "{ir}"
+    );
+    assert!(!ir.contains("idxset.preguarded_plain_layout_note"), "{ir}");
+    assert!(!ir.contains("call void @js_gc_note_slot_layout"), "{ir}");
+    assert!(!ir.contains("call void @js_write_barrier_slot"), "{ir}");
+    assert!(
+        !ir.contains("call void @js_array_note_numeric_write"),
+        "{ir}"
+    );
     assert_eq!(
         ir.matches("call i32 @js_typed_feedback_plain_array_index_set_guard")
             .count(),

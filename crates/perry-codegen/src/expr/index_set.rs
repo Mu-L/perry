@@ -201,6 +201,159 @@ fn lower_preguarded_numeric_array_index_set(
     Ok(())
 }
 
+#[derive(Clone)]
+struct PreguardedPlainArrayF64SelfAdd {
+    guard_ok_slot: String,
+    f64_numeric_range_slot: String,
+    other_expr: Expr,
+    array_is_left: bool,
+}
+
+fn is_same_local_index_get(expr: &Expr, arr_id: u32, idx_id: u32) -> bool {
+    let Expr::IndexGet { object, index } = expr else {
+        return false;
+    };
+    matches!(
+        (object.as_ref(), index.as_ref()),
+        (Expr::LocalGet(obj_id), Expr::LocalGet(index_id))
+            if *obj_id == arr_id && *index_id == idx_id
+    )
+}
+
+fn is_numeric_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Integer(_) | Expr::Number(_))
+}
+
+fn match_preguarded_plain_array_f64_self_add(
+    ctx: &FnCtx<'_>,
+    arr_id: u32,
+    idx_id: u32,
+    value: &Expr,
+) -> Option<PreguardedPlainArrayF64SelfAdd> {
+    let Expr::Binary {
+        op: BinaryOp::Add,
+        left,
+        right,
+    } = value
+    else {
+        return None;
+    };
+
+    let (array_is_left, other_expr) =
+        if is_same_local_index_get(left, arr_id, idx_id) && is_numeric_literal(right) {
+            (true, right.as_ref().clone())
+        } else if is_same_local_index_get(right, arr_id, idx_id) && is_numeric_literal(left) {
+            (false, left.as_ref().clone())
+        } else {
+            return None;
+        };
+
+    let preguard = ctx
+        .preguarded_plain_array_index_sets
+        .get(&(arr_id, idx_id))?;
+    Some(PreguardedPlainArrayF64SelfAdd {
+        guard_ok_slot: preguard.guard_ok_slot.clone(),
+        f64_numeric_range_slot: preguard.f64_numeric_range_slot.clone()?,
+        other_expr,
+        array_is_left,
+    })
+}
+
+fn lower_preguarded_plain_array_f64_self_add_index_set(
+    ctx: &mut FnCtx<'_>,
+    arr_box: &str,
+    idx_i32: &str,
+    arr_id: u32,
+    site_id: &str,
+    self_add: &PreguardedPlainArrayF64SelfAdd,
+) -> Result<String> {
+    let slot = ctx
+        .locals
+        .get(&arr_id)
+        .ok_or_else(|| anyhow!("IndexSet: local {} not in scope", arr_id))?
+        .clone();
+
+    let other_val = lower_expr(ctx, &self_add.other_expr)?;
+    let fast_idx = ctx.new_block("idxset.plain_f64_self_add.fast");
+    let fallback_idx = ctx.new_block("idxset.plain_f64_self_add.fallback");
+    let merge_idx = ctx.new_block("idxset.plain_f64_self_add.merge");
+    let fast_label = ctx.block_label(fast_idx);
+    let fallback_label = ctx.block_label(fallback_idx);
+    let merge_label = ctx.block_label(merge_idx);
+
+    let inbounds_i32 = ctx.block().load(I32, &self_add.guard_ok_slot);
+    let inbounds_ok = ctx.block().icmp_ne(I32, &inbounds_i32, "0");
+    let numeric_i32 = ctx.block().load(I32, &self_add.f64_numeric_range_slot);
+    let numeric_ok = ctx.block().icmp_ne(I32, &numeric_i32, "0");
+    let fast_ok = ctx.block().and(I1, &inbounds_ok, &numeric_ok);
+    ctx.block().cond_br(&fast_ok, &fast_label, &fallback_label);
+
+    ctx.current_block = fallback_idx;
+    let fallback_val = {
+        let idx_double = ctx.block().sitofp(I32, idx_i32, DOUBLE);
+        let array_value = ctx.block().call(
+            DOUBLE,
+            "js_typed_feedback_array_index_get_fallback_boxed",
+            &[(I64, "0"), (DOUBLE, arr_box), (DOUBLE, &idx_double)],
+        );
+        let (left, right) = if self_add.array_is_left {
+            (&array_value, &other_val)
+        } else {
+            (&other_val, &array_value)
+        };
+        let fallback_val = ctx.block().call(
+            DOUBLE,
+            "js_dynamic_string_or_number_add",
+            &[(DOUBLE, left), (DOUBLE, right)],
+        );
+        let fallback_box = ctx.block().call(
+            DOUBLE,
+            "js_typed_feedback_array_index_set_fallback_boxed",
+            &[
+                (I64, site_id),
+                (DOUBLE, arr_box),
+                (I32, idx_i32),
+                (DOUBLE, &fallback_val),
+            ],
+        );
+        ctx.block().store(DOUBLE, &fallback_box, &slot);
+        fallback_val
+    };
+    let fallback_end_label = ctx.block().label.clone();
+    ctx.block().br(&merge_label);
+
+    ctx.current_block = fast_idx;
+    let fast_val = {
+        let blk = ctx.block();
+        let arr_bits = blk.bitcast_double_to_i64(arr_box);
+        let arr_handle = blk.and(I64, &arr_bits, POINTER_MASK_I64);
+        let idx_i64 = blk.zext(I32, idx_i32, I64);
+        let byte_offset = blk.shl(I64, &idx_i64, "3");
+        let with_header = blk.add(I64, &byte_offset, "8");
+        let element_addr = blk.add(I64, &arr_handle, &with_header);
+        let element_ptr = blk.inttoptr(I64, &element_addr);
+        let array_value = blk.load(DOUBLE, &element_ptr);
+        let fast_val = if self_add.array_is_left {
+            blk.fadd(&array_value, &other_val)
+        } else {
+            blk.fadd(&other_val, &array_value)
+        };
+        blk.store(DOUBLE, &fast_val, &element_ptr);
+        fast_val
+    };
+    let fast_end_label = ctx.block().label.clone();
+    ctx.block().br(&merge_label);
+
+    ctx.current_block = merge_idx;
+    Ok(ctx.block().phi(
+        DOUBLE,
+        &[
+            (&fallback_val, &fallback_end_label),
+            (&fast_val, &fast_end_label),
+        ],
+    ))
+}
+
 fn lower_preguarded_plain_array_index_set(
     ctx: &mut FnCtx<'_>,
     arr_box: &str,
@@ -813,7 +966,6 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     let idx_double = lower_expr(ctx, index)?;
                     ctx.block().fptosi(DOUBLE, &idx_double, I32)
                 };
-                let val_double = lower_expr(ctx, value)?;
                 let local_id = if let Expr::LocalGet(id) = object.as_ref() {
                     Some(*id)
                 } else {
@@ -829,6 +981,25 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         TypedFeedbackContract::array_set_index()
                     },
                 );
+                if let Some(id) = local_id {
+                    if !require_numeric_layout && ctx.locals.contains_key(&id) {
+                        if let Expr::LocalGet(idx_id) = index.as_ref() {
+                            if let Some(self_add) =
+                                match_preguarded_plain_array_f64_self_add(ctx, id, *idx_id, value)
+                            {
+                                return lower_preguarded_plain_array_f64_self_add_index_set(
+                                    ctx,
+                                    &arr_box,
+                                    &idx_i32,
+                                    id,
+                                    &feedback_site_id,
+                                    &self_add,
+                                );
+                            }
+                        }
+                    }
+                }
+                let val_double = lower_expr(ctx, value)?;
                 // Use the fast inlined IndexSet path only when the
                 // receiver is a local that's actually in ctx.locals
                 // (stack slot). Module-level arrays accessed from inside
