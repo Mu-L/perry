@@ -7,8 +7,8 @@ use crate::destructuring::*;
 use crate::ir::*;
 use crate::lower::{
     collect_for_of_pattern_leaves, emit_for_of_pattern_binding, insert_iterator_close_on_abrupt,
-    lazy_iter_for_stmt, lazy_or_index_elem, lower_expr, wrap_lazy_for_of_body_close_on_throw,
-    LoweringContext,
+    labeled_body_targets_loop, lazy_iter_for_stmt, lazy_or_index_elem, lower_expr,
+    wrap_lazy_for_of_body_close_on_throw, LoweringContext,
 };
 use crate::lower_patterns::*;
 use crate::lower_types::*;
@@ -461,14 +461,12 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
             // `continue a` against a non-loop label is a JS early SyntaxError, so it
             // never reaches here. Labeled LOOPS skip this and keep the label bound
             // to the loop itself, so `continue a` targets the loop.
-            let body_is_loop = matches!(
-                &*labeled_stmt.body,
-                ast::Stmt::For(_)
-                    | ast::Stmt::While(_)
-                    | ast::Stmt::DoWhile(_)
-                    | ast::Stmt::ForIn(_)
-                    | ast::Stmt::ForOf(_)
-            );
+            //
+            // #5247: a label chain ending in a loop (`outer: inner: for (...)`) is
+            // a loop label too — unwrap nested `Labeled` bodies so the outer label
+            // binds to the real loop and `continue outer` targets it, rather than
+            // desugaring `outer` to a run-once do-while.
+            let body_is_loop = labeled_body_targets_loop(&labeled_stmt.body);
             if !body_is_loop {
                 let body = if let ast::Stmt::Block(block) = &*labeled_stmt.body {
                     lower_block_stmt_scoped(ctx, block)?
