@@ -45,6 +45,11 @@ pub(crate) fn lower_let(
             if let Some(props) = crate::lower_call::extract_options_fields(ctx, init_expr) {
                 ctx.option_object_locals.insert(id, props);
             }
+            if let perry_hir::Expr::New { class_name, .. } = init_expr {
+                if ctx.classes.contains_key(class_name) {
+                    ctx.const_new_class_locals.insert(id, class_name.clone());
+                }
+            }
         }
     }
     if let Some(init_expr) = init {
