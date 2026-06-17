@@ -50,8 +50,8 @@ use super::{
     nanbox_pointer_inline, nanbox_pointer_inline_pub, nanbox_string_inline, proxy_build_args_array,
     raw_f64_layout_fact, try_flat_const_2d_int, try_lower_flat_const_index_get,
     try_match_channel_reduction, try_static_class_name, unbox_str_handle, unbox_to_i64,
-    variant_name, ChannelReduction, FlatConstInfo, FnCtx, I18nLowerCtx, TypedFeedbackContract,
-    TypedFeedbackKind,
+    variant_name, ChannelReduction, FlatConstInfo, FnCtx, I18nLowerCtx, PreguardedAffineIndexExpr,
+    TypedFeedbackContract, TypedFeedbackKind,
 };
 
 fn is_width_tracked_typed_array_receiver(ctx: &FnCtx<'_>, object: &Expr) -> bool {
@@ -195,6 +195,67 @@ fn lower_preguarded_numeric_array_index_set(
 
     ctx.current_block = merge_idx;
     Ok(())
+}
+
+fn affine_index_expr_matches(expr: &Expr, pattern: &PreguardedAffineIndexExpr) -> bool {
+    fn local(expr: &Expr) -> Option<u32> {
+        match expr {
+            Expr::LocalGet(id) => Some(*id),
+            _ => None,
+        }
+    }
+
+    fn mul_pair(expr: &Expr) -> Option<(u32, u32)> {
+        match expr {
+            Expr::Binary {
+                op: BinaryOp::Mul,
+                left,
+                right,
+            } => Some((local(left.as_ref())?, local(right.as_ref())?)),
+            _ => None,
+        }
+    }
+
+    fn mul_matches(pair: (u32, u32), a: u32, b: u32) -> bool {
+        (pair.0 == a && pair.1 == b) || (pair.0 == b && pair.1 == a)
+    }
+
+    let Expr::Binary {
+        op: BinaryOp::Add,
+        left,
+        right,
+    } = expr
+    else {
+        return false;
+    };
+
+    let candidates = [
+        (mul_pair(left.as_ref()), local(right.as_ref())),
+        (mul_pair(right.as_ref()), local(left.as_ref())),
+    ];
+    candidates
+        .into_iter()
+        .any(|(mul, add)| match (mul, add, pattern) {
+            (
+                Some(pair),
+                Some(add_id),
+                PreguardedAffineIndexExpr::MulLocalBoundPlusCounter {
+                    mul_local_id,
+                    bound_local_id,
+                    counter_local_id,
+                },
+            ) => add_id == *counter_local_id && mul_matches(pair, *mul_local_id, *bound_local_id),
+            (
+                Some(pair),
+                Some(add_id),
+                PreguardedAffineIndexExpr::CounterTimesBoundPlusLocal {
+                    counter_local_id,
+                    bound_local_id,
+                    add_local_id,
+                },
+            ) => add_id == *add_local_id && mul_matches(pair, *counter_local_id, *bound_local_id),
+            _ => false,
+        })
 }
 
 pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
@@ -580,7 +641,27 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 let require_numeric_layout =
                     value_is_numeric && expr_has_numeric_pointer_free_array_layout(ctx, object);
                 let arr_box = lower_expr(ctx, object)?;
-                let idx_double = lower_expr(ctx, index)?;
+                let i32_slots = ctx.i32_counter_slots.clone();
+                let flat_const_arrays = ctx.flat_const_arrays.clone();
+                let array_row_aliases = ctx.array_row_aliases.clone();
+                let integer_locals = ctx.integer_locals.clone();
+                let use_i32_index = can_lower_expr_as_i32(
+                    index,
+                    &i32_slots,
+                    &flat_const_arrays,
+                    &array_row_aliases,
+                    &integer_locals,
+                    ctx.clamp3_functions,
+                    ctx.clamp_u8_functions,
+                    ctx.integer_returning_functions,
+                    ctx.i32_identity_functions,
+                );
+                let idx_i32 = if use_i32_index {
+                    lower_expr_as_i32(ctx, index)?
+                } else {
+                    let idx_double = lower_expr(ctx, index)?;
+                    ctx.block().fptosi(DOUBLE, &idx_double, I32)
+                };
                 let val_double = lower_expr(ctx, value)?;
                 let local_id = if let Expr::LocalGet(id) = object.as_ref() {
                     Some(*id)
@@ -611,10 +692,32 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 // and the implicit length update vanishing.
                 if let Some(id) = local_id {
                     if ctx.locals.contains_key(&id) {
+                        if require_numeric_layout {
+                            if let Some(preguard) = ctx
+                                .preguarded_numeric_array_affine_index_sets
+                                .iter()
+                                .find(|preguard| {
+                                    preguard.array_local_id == id
+                                        && affine_index_expr_matches(index, &preguard.index)
+                                })
+                                .cloned()
+                            {
+                                lower_preguarded_numeric_array_index_set(
+                                    ctx,
+                                    &arr_box,
+                                    &idx_i32,
+                                    &val_double,
+                                    id,
+                                    &preguard.site_id,
+                                    &preguard.guard_ok_slot,
+                                )?;
+                                return Ok(val_double);
+                            }
+                        }
                         lower_index_set_fast(
                             ctx,
                             &arr_box,
-                            &idx_double,
+                            &idx_i32,
                             &val_double,
                             id,
                             layout_note_needed,
@@ -627,7 +730,6 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         let blk = ctx.block();
                         let arr_bits = blk.bitcast_double_to_i64(&arr_box);
                         let arr_handle = blk.and(I64, &arr_bits, POINTER_MASK_I64);
-                        let idx_i32 = blk.fptosi(DOUBLE, &idx_double, I32);
                         let new_handle = blk.call(
                             I64,
                             "js_typed_feedback_array_set_f64_extend",
@@ -666,7 +768,6 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         let blk = ctx.block();
                         let arr_bits = blk.bitcast_double_to_i64(&arr_box);
                         let arr_handle = blk.and(I64, &arr_bits, POINTER_MASK_I64);
-                        let idx_i32 = blk.fptosi(DOUBLE, &idx_double, I32);
                         blk.call(
                             I64,
                             "js_typed_feedback_array_set_f64_extend",
@@ -687,7 +788,6 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     let blk = ctx.block();
                     let arr_bits = blk.bitcast_double_to_i64(&arr_box);
                     let arr_handle = blk.and(I64, &arr_bits, POINTER_MASK_I64);
-                    let idx_i32 = blk.fptosi(DOUBLE, &idx_double, I32);
                     // Issue #637 followup / hono r2: use the extend variant
                     // so `arr[i] = X` for i >= length grows the array per
                     // JS spec, instead of silently no-op'ing (which the

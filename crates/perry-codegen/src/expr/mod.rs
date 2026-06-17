@@ -570,6 +570,11 @@ pub(crate) struct FnCtx<'a> {
     /// Active only while lowering that loop body.
     pub preguarded_numeric_array_affine_index_gets: Vec<PreguardedNumericArrayAffineIndexGet>,
 
+    /// Loop-local guards for numeric array writes with affine computed indices
+    /// where a local-bound loop prebody guarded the maximum visited index.
+    /// Active only while lowering that loop body.
+    pub preguarded_numeric_array_affine_index_sets: Vec<PreguardedNumericArrayAffineIndexSet>,
+
     /// `(counter_local_id, array_local_id)` pairs that are guaranteed
     /// inbounds inside the current loop nest — populated by
     /// `lower_for` when it detects the same `for (...; i < arr.length;
@@ -1039,6 +1044,14 @@ pub(crate) enum PreguardedAffineIndexExpr {
 
 #[derive(Debug, Clone)]
 pub(crate) struct PreguardedNumericArrayAffineIndexGet {
+    pub array_local_id: u32,
+    pub index: PreguardedAffineIndexExpr,
+    pub site_id: String,
+    pub guard_ok_slot: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreguardedNumericArrayAffineIndexSet {
     pub array_local_id: u32,
     pub index: PreguardedAffineIndexExpr,
     pub site_id: String,

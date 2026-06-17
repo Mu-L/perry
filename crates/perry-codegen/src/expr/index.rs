@@ -70,7 +70,7 @@ use crate::types::{DOUBLE, I1, I32, I64};
 pub(crate) fn lower_index_set_fast(
     ctx: &mut FnCtx<'_>,
     arr_box: &str,
-    idx_double: &str,
+    idx_i32: &str,
     val_double: &str,
     local_id: u32,
     layout_note_needed: bool,
@@ -90,7 +90,6 @@ pub(crate) fn lower_index_set_fast(
     let blk = ctx.block();
     let arr_bits = blk.bitcast_double_to_i64(arr_box);
     let arr_handle = blk.and(I64, &arr_bits, POINTER_MASK_I64);
-    let idx_i32 = blk.fptosi(DOUBLE, idx_double, I32);
 
     let guarded_idx = ctx.new_block("idxset.guarded");
     let guard_fallback_idx = ctx.new_block("idxset.guard_fallback");

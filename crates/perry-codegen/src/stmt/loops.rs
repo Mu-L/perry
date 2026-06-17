@@ -6,8 +6,8 @@ use crate::expr::{
     emit_typed_feedback_register_site, expr_has_numeric_pointer_free_array_layout,
     lower_guarded_array_index_get_trusted_i32, BoundedIndexPair, IntRangeFact,
     PreguardedAffineIndexExpr, PreguardedNumericArrayAffineIndexGet,
-    PreguardedNumericArrayIndexGet, PreguardedNumericArrayIndexSet, TypedFeedbackContract,
-    TypedFeedbackKind,
+    PreguardedNumericArrayAffineIndexSet, PreguardedNumericArrayIndexGet,
+    PreguardedNumericArrayIndexSet, TypedFeedbackContract, TypedFeedbackKind,
 };
 use crate::loop_purity::body_needs_asm_barrier;
 use crate::lower_conditional::lower_truthy;
@@ -36,6 +36,12 @@ struct RangeNumericArrayIndexSetPreguard {
 
 #[derive(Clone, Debug)]
 struct AffineNumericArrayIndexGetPreguard {
+    array_local_id: u32,
+    index: PreguardedAffineIndexExpr,
+}
+
+#[derive(Clone, Debug)]
+struct AffineNumericArrayIndexSetPreguard {
     array_local_id: u32,
     index: PreguardedAffineIndexExpr,
 }
@@ -381,10 +387,29 @@ pub(crate) fn lower_for(
         } else {
             Vec::new()
         };
+    let affine_array_set_preguards: Vec<AffineNumericArrayIndexSetPreguard> =
+        if let (Some((counter_id, bound_id, op)), Some(_)) =
+            (local_bound_classification, i32_local_bound_slot.as_ref())
+        {
+            if matches!(op, perry_hir::CompareOp::Lt)
+                && local_bound_index_bounds_are_safe
+                && ctx.i32_counter_slots.contains_key(&counter_id)
+                && ctx.i32_counter_slots.contains_key(&bound_id)
+            {
+                classify_affine_numeric_array_index_set_preguards(
+                    ctx, counter_id, bound_id, update, body,
+                )
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
     let has_loop_prebody = invariant_array_get_hoist.is_some()
         || range_array_get_preguard.is_some()
         || range_array_set_preguard.is_some()
-        || !affine_array_get_preguards.is_empty();
+        || !affine_array_get_preguards.is_empty()
+        || !affine_array_set_preguards.is_empty();
 
     let cond_idx = ctx.new_block("for.cond");
     let prebody_idx = if has_loop_prebody {
@@ -481,6 +506,7 @@ pub(crate) fn lower_for(
     let mut range_preguard_runtime: Option<((u32, u32), PreguardedNumericArrayIndexGet)> = None;
     let mut range_set_preguard_runtime: Option<((u32, u32), PreguardedNumericArrayIndexSet)> = None;
     let mut affine_preguard_runtime: Vec<PreguardedNumericArrayAffineIndexGet> = Vec::new();
+    let mut affine_set_preguard_runtime: Vec<PreguardedNumericArrayAffineIndexSet> = Vec::new();
     if let Some(pre_idx) = prebody_idx {
         ctx.current_block = pre_idx;
         if let (Some(hoist), Some(slot)) =
@@ -531,6 +557,20 @@ pub(crate) fn lower_for(
                 affine_preguard_runtime.push(info);
             }
         }
+        if !affine_array_set_preguards.is_empty() {
+            let bound_slot = i32_local_bound_slot
+                .as_ref()
+                .expect("affine array set preguard requires an i32 bound slot");
+            let counter_id = local_bound_classification
+                .map(|(counter_id, _, _)| counter_id)
+                .expect("affine set preguard requires local-bound counter");
+            for preguard in affine_array_set_preguards.iter().cloned() {
+                let info = emit_affine_numeric_array_index_set_preguard(
+                    ctx, preguard, counter_id, bound_slot,
+                )?;
+                affine_set_preguard_runtime.push(info);
+            }
+        }
         if !ctx.block().is_terminated() {
             ctx.block().br(&body_label);
         }
@@ -578,7 +618,12 @@ pub(crate) fn lower_for(
     let affine_preguard_base_len = ctx.preguarded_numeric_array_affine_index_gets.len();
     ctx.preguarded_numeric_array_affine_index_gets
         .extend(affine_preguard_runtime.iter().cloned());
+    let affine_set_preguard_base_len = ctx.preguarded_numeric_array_affine_index_sets.len();
+    ctx.preguarded_numeric_array_affine_index_sets
+        .extend(affine_set_preguard_runtime.iter().cloned());
     let lower_result = lower_stmts(ctx, body);
+    ctx.preguarded_numeric_array_affine_index_sets
+        .truncate(affine_set_preguard_base_len);
     ctx.preguarded_numeric_array_affine_index_gets
         .truncate(affine_preguard_base_len);
     if let Some((key, previous)) = range_set_preguard_replacement {
@@ -980,6 +1025,113 @@ fn emit_affine_numeric_array_index_get_preguard(
     })
 }
 
+fn emit_affine_numeric_array_index_set_preguard(
+    ctx: &mut FnCtx<'_>,
+    preguard: AffineNumericArrayIndexSetPreguard,
+    counter_id: u32,
+    bound_i32_slot: &str,
+) -> Result<PreguardedNumericArrayAffineIndexSet> {
+    let arr_expr = perry_hir::Expr::LocalGet(preguard.array_local_id);
+    let arr_box = lower_expr(ctx, &arr_expr)?;
+    let counter_slot = ctx
+        .i32_counter_slots
+        .get(&counter_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("affine array set preguard missing i32 counter"))?;
+    let bound_i32 = ctx.block().load(I32, bound_i32_slot);
+    let counter_i32 = ctx.block().load(I32, &counter_slot);
+    let remaining_i32 = ctx.block().sub(I32, &bound_i32, &counter_i32);
+    let skipped_i32 = ctx.block().sub(I32, &remaining_i32, "1");
+    let skipped_i64 = ctx.block().zext(I32, &skipped_i32, I64);
+    let last_counter_i32 = ctx.block().sub(I32, &bound_i32, "1");
+
+    let max_i32 = match &preguard.index {
+        PreguardedAffineIndexExpr::MulLocalBoundPlusCounter {
+            mul_local_id,
+            bound_local_id,
+            ..
+        } => {
+            let mul_slot = ctx
+                .i32_counter_slots
+                .get(mul_local_id)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("affine array set preguard missing i32 multiplier")
+                })?;
+            let bound_slot = ctx
+                .i32_counter_slots
+                .get(bound_local_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("affine array set preguard missing i32 bound"))?;
+            let mul = ctx.block().load(I32, &mul_slot);
+            let bound = ctx.block().load(I32, &bound_slot);
+            let base = ctx.block().mul(I32, &mul, &bound);
+            ctx.block().add(I32, &base, &last_counter_i32)
+        }
+        PreguardedAffineIndexExpr::CounterTimesBoundPlusLocal {
+            bound_local_id,
+            add_local_id,
+            ..
+        } => {
+            let bound_slot = ctx
+                .i32_counter_slots
+                .get(bound_local_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("affine array set preguard missing i32 bound"))?;
+            let add_slot = ctx
+                .i32_counter_slots
+                .get(add_local_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("affine array set preguard missing i32 addend"))?;
+            let bound = ctx.block().load(I32, &bound_slot);
+            let add = ctx.block().load(I32, &add_slot);
+            let base = ctx.block().mul(I32, &last_counter_i32, &bound);
+            ctx.block().add(I32, &base, &add)
+        }
+    };
+    let site_id = emit_typed_feedback_register_site(
+        ctx,
+        TypedFeedbackKind::ArrayElement,
+        "array[index]=",
+        TypedFeedbackContract::numeric_array_set_index(),
+    );
+    let guard_result = ctx.block().call(
+        I32,
+        "js_typed_feedback_numeric_array_index_set_guard",
+        &[
+            (I64, &site_id),
+            (DOUBLE, &arr_box),
+            (I32, &max_i32),
+            (DOUBLE, "0.0"),
+            (I32, "1"),
+        ],
+    );
+    let guard_ok_slot = ctx.func.alloca_entry(I32);
+    ctx.block().store(I32, &guard_result, &guard_ok_slot);
+    let guard_ok = ctx.block().icmp_ne(I32, &guard_result, "0");
+
+    let fast_idx = ctx.new_block("affine_set_preguard.fast");
+    let done_idx = ctx.new_block("affine_set_preguard.done");
+    let fast_label = ctx.block_label(fast_idx);
+    let done_label = ctx.block_label(done_idx);
+    ctx.block().cond_br(&guard_ok, &fast_label, &done_label);
+
+    ctx.current_block = fast_idx;
+    ctx.block().call_void(
+        "js_typed_feedback_record_array_guard_fast_passes",
+        &[(I64, &site_id), (I64, &skipped_i64)],
+    );
+    ctx.block().br(&done_label);
+
+    ctx.current_block = done_idx;
+    Ok(PreguardedNumericArrayAffineIndexSet {
+        array_local_id: preguard.array_local_id,
+        index: preguard.index,
+        site_id,
+        guard_ok_slot,
+    })
+}
+
 fn emit_i32_length_loop_condition(
     ctx: &mut FnCtx<'_>,
     counter_id: u32,
@@ -1156,7 +1308,83 @@ fn classify_affine_numeric_array_index_get_preguards(
     candidates
 }
 
+fn classify_affine_numeric_array_index_set_preguards(
+    ctx: &crate::expr::FnCtx<'_>,
+    counter_id: u32,
+    bound_id: u32,
+    update: Option<&perry_hir::Expr>,
+    body: &[perry_hir::Stmt],
+) -> Vec<AffineNumericArrayIndexSetPreguard> {
+    let Some(mut candidates) =
+        collect_affine_numeric_array_index_sets(ctx, body, counter_id, bound_id)
+    else {
+        return Vec::new();
+    };
+    if candidates.is_empty() || candidates.len() > 2 {
+        return Vec::new();
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|candidate| seen.insert((candidate.array_local_id, candidate.index.clone())));
+
+    for candidate in &candidates {
+        if !expr_has_numeric_pointer_free_array_layout(
+            ctx,
+            &perry_hir::Expr::LocalGet(candidate.array_local_id),
+        ) {
+            return Vec::new();
+        }
+
+        let protected = affine_set_index_protected_locals(candidate);
+        if protected.iter().any(|id| stmts_mutate_local(body, *id)) {
+            return Vec::new();
+        }
+        if update.is_some_and(|expr| {
+            protected
+                .iter()
+                .any(|id| *id != counter_id && expr_mutates_local(expr, *id))
+        }) {
+            return Vec::new();
+        }
+        if !affine_index_i32_slots_are_available(ctx, &candidate.index) {
+            return Vec::new();
+        }
+        if !affine_index_nonnegative_inputs_are_safe(ctx, &candidate.index) {
+            return Vec::new();
+        }
+    }
+
+    candidates
+}
+
 fn affine_index_protected_locals(candidate: &AffineNumericArrayIndexGetPreguard) -> Vec<u32> {
+    let mut locals = vec![candidate.array_local_id];
+    match &candidate.index {
+        PreguardedAffineIndexExpr::MulLocalBoundPlusCounter {
+            mul_local_id,
+            bound_local_id,
+            counter_local_id,
+        } => {
+            locals.push(*mul_local_id);
+            locals.push(*bound_local_id);
+            locals.push(*counter_local_id);
+        }
+        PreguardedAffineIndexExpr::CounterTimesBoundPlusLocal {
+            counter_local_id,
+            bound_local_id,
+            add_local_id,
+        } => {
+            locals.push(*counter_local_id);
+            locals.push(*bound_local_id);
+            locals.push(*add_local_id);
+        }
+    }
+    locals.sort_unstable();
+    locals.dedup();
+    locals
+}
+
+fn affine_set_index_protected_locals(candidate: &AffineNumericArrayIndexSetPreguard) -> Vec<u32> {
     let mut locals = vec![candidate.array_local_id];
     match &candidate.index {
         PreguardedAffineIndexExpr::MulLocalBoundPlusCounter {
@@ -1307,6 +1535,192 @@ fn collect_affine_numeric_array_index_gets(
         // HIR variants whose evaluation order/mutation behavior is not
         // modeled by this narrow classifier.
         _ => None,
+    }
+}
+
+fn collect_affine_numeric_array_index_sets(
+    ctx: &crate::expr::FnCtx<'_>,
+    body: &[perry_hir::Stmt],
+    counter_id: u32,
+    bound_id: u32,
+) -> Option<Vec<AffineNumericArrayIndexSetPreguard>> {
+    use perry_hir::{Expr, Stmt};
+
+    let mut out = Vec::new();
+    let mut body_numeric_locals = std::collections::HashSet::new();
+    for stmt in body {
+        match stmt {
+            Stmt::Expr(Expr::IndexSet {
+                object,
+                index,
+                value,
+            }) => {
+                let Expr::LocalGet(array_local_id) = object.as_ref() else {
+                    return None;
+                };
+                if !affine_set_value_is_numeric(ctx, value, &body_numeric_locals)
+                    || !affine_set_preguard_transparent_expr(value.as_ref())
+                {
+                    return None;
+                }
+                let index = classify_affine_index_expr(index.as_ref(), counter_id, bound_id)?;
+                out.push(AffineNumericArrayIndexSetPreguard {
+                    array_local_id: *array_local_id,
+                    index,
+                });
+            }
+            Stmt::Expr(expr) => {
+                if !affine_set_preguard_transparent_expr(expr) {
+                    return None;
+                }
+            }
+            Stmt::Let { id, ty, init, .. } => {
+                if let Some(init) = init {
+                    if !affine_set_preguard_transparent_expr(init) {
+                        return None;
+                    }
+                    if matches!(ty, perry_types::Type::Number | perry_types::Type::Int32)
+                        && affine_set_value_is_numeric(ctx, init, &body_numeric_locals)
+                    {
+                        body_numeric_locals.insert(*id);
+                    } else {
+                        body_numeric_locals.remove(id);
+                    }
+                }
+            }
+            Stmt::For {
+                init,
+                condition,
+                update,
+                body,
+            } => {
+                if init
+                    .as_ref()
+                    .is_some_and(|stmt| !affine_set_preguard_transparent_stmt(stmt.as_ref()))
+                    || condition
+                        .as_ref()
+                        .is_some_and(|expr| !affine_set_preguard_transparent_expr(expr))
+                    || update
+                        .as_ref()
+                        .is_some_and(|expr| !affine_set_preguard_transparent_expr(expr))
+                    || body
+                        .iter()
+                        .any(|stmt| !affine_set_preguard_transparent_stmt(stmt))
+                {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+fn affine_set_value_is_numeric(
+    ctx: &crate::expr::FnCtx<'_>,
+    expr: &perry_hir::Expr,
+    body_numeric_locals: &std::collections::HashSet<u32>,
+) -> bool {
+    use perry_hir::{BinaryOp, Expr};
+
+    if is_numeric_expr(ctx, expr) {
+        return true;
+    }
+    match expr {
+        Expr::LocalGet(id) => body_numeric_locals.contains(id),
+        Expr::Binary {
+            op: BinaryOp::Add,
+            left,
+            right,
+        } => {
+            affine_set_value_is_numeric(ctx, left, body_numeric_locals)
+                && affine_set_value_is_numeric(ctx, right, body_numeric_locals)
+        }
+        Expr::Binary { .. } | Expr::Update { .. } => true,
+        _ => false,
+    }
+}
+
+fn affine_set_preguard_transparent_stmt(stmt: &perry_hir::Stmt) -> bool {
+    use perry_hir::Stmt;
+    match stmt {
+        Stmt::Let { init, .. } => init
+            .as_ref()
+            .is_none_or(|expr| affine_set_preguard_transparent_expr(expr)),
+        Stmt::Expr(expr) => affine_set_preguard_transparent_expr(expr),
+        Stmt::For {
+            init,
+            condition,
+            update,
+            body,
+        } => {
+            init.as_ref()
+                .is_none_or(|stmt| affine_set_preguard_transparent_stmt(stmt.as_ref()))
+                && condition
+                    .as_ref()
+                    .is_none_or(|expr| affine_set_preguard_transparent_expr(expr))
+                && update
+                    .as_ref()
+                    .is_none_or(|expr| affine_set_preguard_transparent_expr(expr))
+                && body
+                    .iter()
+                    .all(|stmt| affine_set_preguard_transparent_stmt(stmt))
+        }
+        _ => false,
+    }
+}
+
+fn affine_set_preguard_transparent_expr(expr: &perry_hir::Expr) -> bool {
+    use perry_hir::{ArrayElement, Expr};
+    match expr {
+        Expr::LocalSet(_, value)
+        | Expr::Unary { operand: value, .. }
+        | Expr::Void(value)
+        | Expr::TypeOf(value)
+        | Expr::StringCoerce(value)
+        | Expr::ObjectCoerce(value)
+        | Expr::BooleanCoerce(value)
+        | Expr::NumberCoerce(value)
+        | Expr::MathAbs(value)
+        | Expr::MathSqrt(value)
+        | Expr::MathFloor(value)
+        | Expr::MathCeil(value)
+        | Expr::MathRound(value)
+        | Expr::MathF16round(value) => affine_set_preguard_transparent_expr(value),
+        Expr::Update { .. } => true,
+        Expr::IndexGet { object, index } => {
+            affine_set_preguard_transparent_expr(object)
+                && affine_set_preguard_transparent_expr(index)
+        }
+        Expr::Binary { left, right, .. }
+        | Expr::Compare { left, right, .. }
+        | Expr::MathImul(left, right)
+        | Expr::MathPow(left, right) => {
+            affine_set_preguard_transparent_expr(left)
+                && affine_set_preguard_transparent_expr(right)
+        }
+        Expr::Array(elements) => elements
+            .iter()
+            .all(|expr| affine_set_preguard_transparent_expr(expr)),
+        Expr::ArraySpread(elements) => elements.iter().all(|element| match element {
+            ArrayElement::Expr(expr) | ArrayElement::Spread(expr) => {
+                affine_set_preguard_transparent_expr(expr)
+            }
+        }),
+        Expr::MathMin(elements) | Expr::MathMax(elements) => elements
+            .iter()
+            .all(|expr| affine_set_preguard_transparent_expr(expr)),
+        Expr::LocalGet(_)
+        | Expr::GlobalGet(_)
+        | Expr::FuncRef(_)
+        | Expr::Number(_)
+        | Expr::Integer(_)
+        | Expr::Bool(_)
+        | Expr::Null
+        | Expr::Undefined
+        | Expr::String(_)
+        | Expr::WtfString(_) => true,
+        _ => false,
     }
 }
 
