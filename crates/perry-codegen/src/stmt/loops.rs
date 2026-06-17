@@ -3,8 +3,8 @@
 use super::*;
 
 use crate::expr::{
-    expr_has_numeric_pointer_free_array_layout, lower_guarded_array_index_get, BoundedIndexPair,
-    IntRangeFact,
+    expr_has_numeric_pointer_free_array_layout, lower_guarded_array_index_get_trusted_i32,
+    BoundedIndexPair, IntRangeFact,
 };
 use crate::loop_purity::body_needs_asm_barrier;
 use crate::lower_conditional::lower_truthy;
@@ -559,8 +559,6 @@ fn emit_invariant_numeric_array_index_get_hoist(
             let idx_double = lower_expr(ctx, &idx_expr)?;
             ctx.block().fptosi(DOUBLE, &idx_double, I32)
         };
-    let idx_double = ctx.block().sitofp(I32, &idx_i32, DOUBLE);
-
     let inner_counter_slot = ctx
         .i32_counter_slots
         .get(&hoist.inner_counter_local_id)
@@ -572,13 +570,11 @@ fn emit_invariant_numeric_array_index_get_hoist(
     let skipped_i32 = ctx.block().sub(I32, &remaining_i32, "1");
     let skipped_i64 = ctx.block().zext(I32, &skipped_i32, I64);
 
-    lower_guarded_array_index_get(
+    lower_guarded_array_index_get_trusted_i32(
         ctx,
         &arr_box,
-        &idx_double,
         &idx_i32,
         "hoist.num",
-        true,
         Some(&skipped_i64),
     )
 }

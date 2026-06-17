@@ -377,4 +377,5 @@ mod keep_typed_feedback {
     #[used] static K21: extern "C" fn(u64, *mut ObjectHeader, u32, *const crate::StringHeader, f64) = js_typed_feedback_object_set_unboxed_f64_field;
     #[used] static K22: extern "C" fn(u64, f64) -> f64 = js_typed_feedback_observe_helper_return;
     #[used] static K23: extern "C" fn() = js_typed_feedback_maybe_dump_trace;
+    #[used] static K24: extern "C" fn(u64, f64, i32, i32) -> i32 = js_typed_feedback_numeric_array_index_get_guard_i32;
 }
