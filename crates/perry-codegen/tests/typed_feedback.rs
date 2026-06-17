@@ -434,6 +434,130 @@ fn typed_feedback_preguards_bounded_numeric_array_writes() {
 }
 
 #[test]
+fn typed_feedback_preguards_plain_array_writes_with_length_bound() {
+    let array_ty = Type::Array(Box::new(Type::Any));
+    let ir = ir_for(module(
+        "typed_feedback_plain_array_length_set_preguard.ts",
+        vec![
+            param(1, "xs", array_ty.clone()),
+            param(2, "start", Type::Number),
+        ],
+        array_ty,
+        vec![
+            Stmt::For {
+                init: Some(Box::new(Stmt::Let {
+                    id: 3,
+                    name: "i".to_string(),
+                    ty: Type::Number,
+                    mutable: true,
+                    init: Some(Expr::LocalGet(2)),
+                })),
+                condition: Some(Expr::Compare {
+                    op: CompareOp::Lt,
+                    left: Box::new(Expr::LocalGet(3)),
+                    right: Box::new(Expr::PropertyGet {
+                        object: Box::new(Expr::LocalGet(1)),
+                        property: "length".to_string(),
+                    }),
+                }),
+                update: Some(Expr::Update {
+                    id: 3,
+                    op: UpdateOp::Increment,
+                    prefix: false,
+                }),
+                body: vec![Stmt::Expr(Expr::IndexSet {
+                    object: Box::new(Expr::LocalGet(1)),
+                    index: Box::new(Expr::LocalGet(3)),
+                    value: Box::new(Expr::Binary {
+                        op: BinaryOp::Add,
+                        left: Box::new(Expr::IndexGet {
+                            object: Box::new(Expr::LocalGet(1)),
+                            index: Box::new(Expr::LocalGet(3)),
+                        }),
+                        right: Box::new(Expr::Integer(1)),
+                    }),
+                })],
+            },
+            Stmt::Return(Some(Expr::LocalGet(1))),
+        ],
+    ));
+
+    assert!(
+        ir.contains("call i32 @js_plain_array_inbounds_range_guard"),
+        "{ir}"
+    );
+    assert!(ir.contains("idxset.preguarded_plain_fast"), "{ir}");
+    assert!(ir.contains("idxset.preguarded_plain_fallback"), "{ir}");
+    assert!(ir.contains("call void @js_gc_note_slot_layout"), "{ir}");
+    assert_eq!(
+        ir.matches("call i32 @js_typed_feedback_plain_array_index_set_guard")
+            .count(),
+        0,
+        "{ir}"
+    );
+}
+
+#[test]
+fn typed_feedback_preguards_plain_array_writes_with_local_bound() {
+    let array_ty = Type::Array(Box::new(Type::Any));
+    let ir = ir_for(module(
+        "typed_feedback_plain_array_local_set_preguard.ts",
+        vec![
+            param(1, "xs", array_ty.clone()),
+            param(2, "limit", Type::Number),
+        ],
+        array_ty,
+        vec![
+            Stmt::For {
+                init: Some(Box::new(Stmt::Let {
+                    id: 3,
+                    name: "i".to_string(),
+                    ty: Type::Number,
+                    mutable: true,
+                    init: Some(Expr::Integer(0)),
+                })),
+                condition: Some(Expr::Compare {
+                    op: CompareOp::Lt,
+                    left: Box::new(Expr::LocalGet(3)),
+                    right: Box::new(Expr::LocalGet(2)),
+                }),
+                update: Some(Expr::Update {
+                    id: 3,
+                    op: UpdateOp::Increment,
+                    prefix: false,
+                }),
+                body: vec![Stmt::Expr(Expr::IndexSet {
+                    object: Box::new(Expr::LocalGet(1)),
+                    index: Box::new(Expr::LocalGet(3)),
+                    value: Box::new(Expr::Binary {
+                        op: BinaryOp::Add,
+                        left: Box::new(Expr::IndexGet {
+                            object: Box::new(Expr::LocalGet(1)),
+                            index: Box::new(Expr::LocalGet(3)),
+                        }),
+                        right: Box::new(Expr::Integer(1)),
+                    }),
+                })],
+            },
+            Stmt::Return(Some(Expr::LocalGet(1))),
+        ],
+    ));
+
+    assert!(
+        ir.contains("call i32 @js_plain_array_inbounds_range_guard"),
+        "{ir}"
+    );
+    assert!(ir.contains("idxset.preguarded_plain_fast"), "{ir}");
+    assert!(ir.contains("idxset.preguarded_plain_fallback"), "{ir}");
+    assert_eq!(
+        ir.matches("call i32 @js_typed_feedback_plain_array_index_set_guard")
+            .count(),
+        0,
+        "{ir}"
+    );
+}
+
+#[test]
 fn typed_feedback_guards_numeric_array_push_specialization() {
     let array_ty = Type::Array(Box::new(Type::Number));
     let ir = ir_for(module(

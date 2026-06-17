@@ -197,6 +197,82 @@ fn lower_preguarded_numeric_array_index_set(
     Ok(())
 }
 
+fn lower_preguarded_plain_array_index_set(
+    ctx: &mut FnCtx<'_>,
+    arr_box: &str,
+    idx_i32: &str,
+    val_double: &str,
+    arr_id: u32,
+    guard_ok_slot: &str,
+    layout_note_needed: bool,
+    write_barrier_needed: bool,
+    value_is_numeric: bool,
+) -> Result<()> {
+    let slot = ctx
+        .locals
+        .get(&arr_id)
+        .ok_or_else(|| anyhow!("IndexSet: local {} not in scope", arr_id))?
+        .clone();
+
+    let fast_idx = ctx.new_block("idxset.preguarded_plain_fast");
+    let fallback_idx = ctx.new_block("idxset.preguarded_plain_fallback");
+    let merge_idx = ctx.new_block("idxset.preguarded_plain_merge");
+    let fast_label = ctx.block_label(fast_idx);
+    let fallback_label = ctx.block_label(fallback_idx);
+    let merge_label = ctx.block_label(merge_idx);
+
+    let guard_ok_i32 = ctx.block().load(I32, guard_ok_slot);
+    let guard_ok = ctx.block().icmp_ne(I32, &guard_ok_i32, "0");
+    ctx.block().cond_br(&guard_ok, &fast_label, &fallback_label);
+
+    ctx.current_block = fallback_idx;
+    {
+        let fallback_box = ctx.block().call(
+            DOUBLE,
+            "js_typed_feedback_array_index_set_fallback_boxed",
+            &[
+                (I64, "0"),
+                (DOUBLE, arr_box),
+                (I32, idx_i32),
+                (DOUBLE, val_double),
+            ],
+        );
+        ctx.block().store(DOUBLE, &fallback_box, &slot);
+        ctx.block().br(&merge_label);
+    }
+
+    ctx.current_block = fast_idx;
+    {
+        let blk = ctx.block();
+        let arr_bits = blk.bitcast_double_to_i64(arr_box);
+        let arr_handle = blk.and(I64, &arr_bits, POINTER_MASK_I64);
+        let idx_i64 = blk.zext(I32, idx_i32, I64);
+        let byte_offset = blk.shl(I64, &idx_i64, "3");
+        let with_header = blk.add(I64, &byte_offset, "8");
+        let element_addr = blk.add(I64, &arr_handle, &with_header);
+        let element_ptr = blk.inttoptr(I64, &element_addr);
+        let value_bits = emit_jsvalue_slot_store_on_block(
+            blk,
+            &element_ptr,
+            val_double,
+            &arr_handle,
+            idx_i32,
+            layout_note_needed,
+            &arr_handle,
+            &element_addr,
+            write_barrier_needed,
+        )
+        .unwrap_or_else(|| blk.bitcast_double_to_i64(val_double));
+        if !value_is_numeric {
+            emit_array_numeric_write_note_on_block(blk, &arr_handle, &value_bits);
+        }
+        blk.br(&merge_label);
+    }
+
+    ctx.current_block = merge_idx;
+    Ok(())
+}
+
 fn affine_index_expr_matches(expr: &Expr, pattern: &PreguardedAffineIndexExpr) -> bool {
     fn local(expr: &Expr) -> Option<u32> {
         match expr {
@@ -692,6 +768,28 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 // and the implicit length update vanishing.
                 if let Some(id) = local_id {
                     if ctx.locals.contains_key(&id) {
+                        if !require_numeric_layout {
+                            if let Expr::LocalGet(idx_id) = index.as_ref() {
+                                if let Some(preguard) = ctx
+                                    .preguarded_plain_array_index_sets
+                                    .get(&(id, *idx_id))
+                                    .cloned()
+                                {
+                                    lower_preguarded_plain_array_index_set(
+                                        ctx,
+                                        &arr_box,
+                                        &idx_i32,
+                                        &val_double,
+                                        id,
+                                        &preguard.guard_ok_slot,
+                                        layout_note_needed,
+                                        write_barrier_needed,
+                                        value_is_numeric,
+                                    )?;
+                                    return Ok(val_double);
+                                }
+                            }
+                        }
                         if require_numeric_layout {
                             if let Some(preguard) = ctx
                                 .preguarded_numeric_array_affine_index_sets

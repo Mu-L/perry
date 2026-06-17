@@ -293,6 +293,7 @@ pub(super) fn compile_closure(
         hoisted_array_index_gets: HashMap::new(),
         preguarded_numeric_array_index_gets: HashMap::new(),
         preguarded_numeric_array_index_sets: HashMap::new(),
+        preguarded_plain_array_index_sets: HashMap::new(),
         preguarded_numeric_array_affine_index_gets: Vec::new(),
         preguarded_numeric_array_modulo_index_gets: Vec::new(),
         preguarded_numeric_array_affine_index_sets: Vec::new(),
