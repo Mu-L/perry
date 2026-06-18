@@ -1112,6 +1112,24 @@ fn nonnegative_i64_addend_max(
             let divisor = exact_nonnegative_integer_const(right.as_ref())?;
             (divisor > 0).then_some(divisor - 1)
         }
+        perry_hir::Expr::Binary {
+            op: perry_hir::BinaryOp::Add,
+            left,
+            right,
+        } => {
+            let left = nonnegative_i64_addend_max(ctx, counter_id, left)?;
+            let right = nonnegative_i64_addend_max(ctx, counter_id, right)?;
+            left.checked_add(right)
+        }
+        perry_hir::Expr::Binary {
+            op: perry_hir::BinaryOp::Mul,
+            left,
+            right,
+        } => {
+            let left = nonnegative_i64_addend_max(ctx, counter_id, left)?;
+            let right = nonnegative_i64_addend_max(ctx, counter_id, right)?;
+            left.checked_mul(right)
+        }
         perry_hir::Expr::Uint8ArrayGet { array, index } => {
             bounded_byte_get_addend_max(ctx, counter_id, array, index)
         }

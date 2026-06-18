@@ -1353,6 +1353,85 @@ fn i64_loop_accumulator_uses_uint8array_byte_addend() {
 }
 
 #[test]
+fn i64_loop_accumulator_uses_affine_counter_addend() {
+    let affine = Expr::Binary {
+        op: BinaryOp::Add,
+        left: Box::new(Expr::Binary {
+            op: BinaryOp::Mul,
+            left: Box::new(Expr::LocalGet(3)),
+            right: Box::new(Expr::Integer(2)),
+        }),
+        right: Box::new(Expr::Integer(1)),
+    };
+    let ir = ir_for(module(
+        "i64_loop_accumulator_affine_addend.ts",
+        Vec::new(),
+        Type::Number,
+        vec![
+            Stmt::Let {
+                id: 1,
+                name: "limit".to_string(),
+                ty: Type::Number,
+                mutable: false,
+                init: Some(Expr::Integer(100)),
+            },
+            Stmt::Let {
+                id: 2,
+                name: "sum".to_string(),
+                ty: Type::Number,
+                mutable: true,
+                init: Some(Expr::Integer(0)),
+            },
+            Stmt::For {
+                init: Some(Box::new(Stmt::Let {
+                    id: 3,
+                    name: "i".to_string(),
+                    ty: Type::Number,
+                    mutable: true,
+                    init: Some(Expr::Integer(0)),
+                })),
+                condition: Some(Expr::Compare {
+                    op: CompareOp::Lt,
+                    left: Box::new(Expr::LocalGet(3)),
+                    right: Box::new(Expr::LocalGet(1)),
+                }),
+                update: Some(Expr::Update {
+                    id: 3,
+                    op: UpdateOp::Increment,
+                    prefix: false,
+                }),
+                body: vec![Stmt::Expr(Expr::LocalSet(
+                    2,
+                    Box::new(Expr::Binary {
+                        op: BinaryOp::Add,
+                        left: Box::new(Expr::LocalGet(2)),
+                        right: Box::new(affine),
+                    }),
+                ))],
+            },
+            Stmt::Return(Some(Expr::LocalGet(2))),
+        ],
+    ));
+    let body_start = ir.find("\nfor.body.").expect("for body block");
+    let body_end = ir[body_start..]
+        .find("\nfor.update.")
+        .map(|offset| body_start + offset)
+        .expect("for update block");
+    let exit_start = ir.find("\nfor.exit.").expect("for exit block");
+    let body_ir = &ir[body_start..body_end];
+    let exit_ir = &ir[exit_start..];
+
+    assert!(body_ir.contains("mul i64"), "{body_ir}");
+    assert!(body_ir.contains("add i64"), "{body_ir}");
+    assert!(body_ir.contains("store i64"), "{body_ir}");
+    assert!(!body_ir.contains("fmul double"), "{body_ir}");
+    assert!(!body_ir.contains("fadd double"), "{body_ir}");
+    assert!(!body_ir.contains("store double"), "{body_ir}");
+    assert!(exit_ir.contains("sitofp i64"), "{exit_ir}");
+    assert!(exit_ir.contains("store double"), "{exit_ir}");
+}
+
+#[test]
 fn i64_loop_accumulator_rejects_negative_zero_initial_value() {
     let ir = ir_for(module(
         "i64_loop_accumulator_negative_zero.ts",
