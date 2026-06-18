@@ -142,6 +142,7 @@ pub(super) fn compile_method(
             class.name, method.name
         )),
         active_region_id: None,
+        native_facts: &native_facts,
         locals,
         local_types,
         current_block: 0,
@@ -444,12 +445,13 @@ pub(super) fn compile_method(
                         for la in &forwarded {
                             ctor_args.push((DOUBLE, la.as_str()));
                         }
-                        ctx.pending_declares.push((
-                            ctor_sym.clone(),
-                            crate::types::VOID,
-                            ctor_param_types,
-                        ));
-                        ctx.block().call_void(&ctor_sym, &ctor_args);
+                        // Synthesized default-ctor forwarding to an imported parent
+                        // ctor: discard the return (parent override does not
+                        // replace `this`). Declared DOUBLE to match the symbol's
+                        // real signature (see codegen/mod.rs).
+                        ctx.pending_declares
+                            .push((ctor_sym.clone(), DOUBLE, ctor_param_types));
+                        let _ = ctx.block().call(DOUBLE, &ctor_sym, &ctor_args);
                     }
                 }
             }
@@ -674,6 +676,7 @@ pub(super) fn compile_static_method(
             class.name, f.name
         )),
         active_region_id: None,
+        native_facts: &native_facts,
         locals,
         local_types,
         current_block: 0,
