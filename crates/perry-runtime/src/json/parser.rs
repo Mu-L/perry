@@ -418,8 +418,12 @@ impl<'a> DirectParser<'a> {
                             if fast_idx < alloc_limit {
                                 let slot_idx = fast_idx;
                                 let value_bits = value.bits();
-                                // GC_STORE_AUDIT(BARRIERED): shaped JSON field write uses the shared object slot-store helper.
-                                crate::object::store_object_field_slot(
+                                // JSON.parse suppresses GC and writes only into
+                                // objects allocated by the same parse, so a
+                                // generational write barrier is redundant.
+                                // Keep the layout note so tracing still sees
+                                // the field slot.
+                                crate::object::store_object_field_slot_layout_only(
                                     js_obj, slot_idx, value_bits,
                                 );
                                 fast_idx += 1;
@@ -656,8 +660,7 @@ impl<'a> DirectParser<'a> {
         let write_field = |i: usize, value: JSValue| {
             let value_bits = value.bits();
             unsafe {
-                // GC_STORE_AUDIT(BARRIERED): JSON object field write uses the shared object slot-store helper.
-                crate::object::store_object_field_slot(js_obj, i, value_bits);
+                crate::object::store_object_field_slot_layout_only(js_obj, i, value_bits);
             }
         };
         if let Some((_, values)) = heap_fields.as_ref() {
