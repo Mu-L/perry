@@ -10,6 +10,7 @@ use perry_hir::{BinaryOp, CompareOp, Expr, UnaryOp, UpdateOp};
 #[allow(unused_imports)]
 use perry_types::Type as HirType;
 
+use crate::block::LlBlock;
 #[allow(unused_imports)]
 use crate::lower_call::{lower_call, lower_native_method_call, lower_new};
 #[allow(unused_imports)]
@@ -20,7 +21,10 @@ use crate::lower_string_method::{
     lower_string_concat_chain, lower_string_self_append,
 };
 #[allow(unused_imports)]
-use crate::nanbox::{double_literal, POINTER_MASK_I64};
+use crate::nanbox::{
+    double_literal, i64_literal, BIGINT_TAG_I64, POINTER_MASK, POINTER_MASK_I64, POINTER_TAG_I64,
+    STRING_TAG_I64, TAG_MASK,
+};
 use crate::native_value::{
     BoundsState, BufferAccessMode, LoweredValue, MaterializationReason, NativeRep, SemanticKind,
 };
@@ -204,6 +208,7 @@ fn lower_preguarded_plain_array_index_set(
     val_double: &str,
     arr_id: u32,
     guard_ok_slot: &str,
+    pointer_free_range_slot: Option<&str>,
     layout_note_needed: bool,
     write_barrier_needed: bool,
     value_is_numeric: bool,
@@ -217,9 +222,25 @@ fn lower_preguarded_plain_array_index_set(
     let fast_idx = ctx.new_block("idxset.preguarded_plain_fast");
     let fallback_idx = ctx.new_block("idxset.preguarded_plain_fallback");
     let merge_idx = ctx.new_block("idxset.preguarded_plain_merge");
+    let layout_branch = pointer_free_range_slot
+        .filter(|_| layout_note_needed)
+        .map(|_| {
+            (
+                ctx.new_block("idxset.preguarded_plain_layout_note"),
+                ctx.new_block("idxset.preguarded_plain_layout_skip"),
+            )
+        });
     let fast_label = ctx.block_label(fast_idx);
     let fallback_label = ctx.block_label(fallback_idx);
     let merge_label = ctx.block_label(merge_idx);
+    let layout_branch_labels = layout_branch.map(|(note_idx, skip_idx)| {
+        (
+            note_idx,
+            skip_idx,
+            ctx.block_label(note_idx),
+            ctx.block_label(skip_idx),
+        )
+    });
 
     let guard_ok_i32 = ctx.block().load(I32, guard_ok_slot);
     let guard_ok = ctx.block().icmp_ne(I32, &guard_ok_i32, "0");
@@ -251,26 +272,80 @@ fn lower_preguarded_plain_array_index_set(
         let with_header = blk.add(I64, &byte_offset, "8");
         let element_addr = blk.add(I64, &arr_handle, &with_header);
         let element_ptr = blk.inttoptr(I64, &element_addr);
-        let value_bits = emit_jsvalue_slot_store_on_block(
-            blk,
-            &element_ptr,
-            val_double,
-            &arr_handle,
-            idx_i32,
-            layout_note_needed,
-            &arr_handle,
-            &element_addr,
-            write_barrier_needed,
-        )
-        .unwrap_or_else(|| blk.bitcast_double_to_i64(val_double));
-        if !value_is_numeric {
-            emit_array_numeric_write_note_on_block(blk, &arr_handle, &value_bits);
+        blk.store(DOUBLE, val_double, &element_ptr);
+        let value_bits = blk.bitcast_double_to_i64(val_double);
+        if let (Some(pointer_free_range_slot), Some((note_idx, skip_idx, note_label, skip_label))) =
+            (pointer_free_range_slot, layout_branch_labels.as_ref())
+        {
+            let range_free_i32 = blk.load(I32, pointer_free_range_slot);
+            let range_free = blk.icmp_ne(I32, &range_free_i32, "0");
+            let value_has_pointer = emit_layout_pointer_bearing_bits_check(blk, &value_bits);
+            let value_non_pointer = blk.xor(I1, &value_has_pointer, "true");
+            let skip_layout_note = blk.and(I1, &range_free, &value_non_pointer);
+            blk.cond_br(&skip_layout_note, skip_label, note_label);
+
+            ctx.current_block = *note_idx;
+            {
+                let blk = ctx.block();
+                emit_layout_note_slot_on_block(blk, &arr_handle, idx_i32, &value_bits);
+                blk.br(skip_label);
+            }
+
+            ctx.current_block = *skip_idx;
+            {
+                let blk = ctx.block();
+                if write_barrier_needed {
+                    emit_write_barrier_slot_on_block(blk, &arr_handle, &element_addr, &value_bits);
+                }
+                if !value_is_numeric {
+                    emit_array_numeric_write_note_on_block(blk, &arr_handle, &value_bits);
+                }
+                blk.br(&merge_label);
+            }
+        } else {
+            if layout_note_needed {
+                emit_layout_note_slot_on_block(blk, &arr_handle, idx_i32, &value_bits);
+            }
+            if write_barrier_needed {
+                emit_write_barrier_slot_on_block(blk, &arr_handle, &element_addr, &value_bits);
+            }
+            if !value_is_numeric {
+                emit_array_numeric_write_note_on_block(blk, &arr_handle, &value_bits);
+            }
+            blk.br(&merge_label);
         }
-        blk.br(&merge_label);
     }
 
     ctx.current_block = merge_idx;
     Ok(())
+}
+
+fn emit_layout_pointer_bearing_bits_check(blk: &mut LlBlock, value_bits: &str) -> String {
+    let tag_mask = i64_literal(TAG_MASK);
+    let nanbox_min = i64_literal(0x7FF8_0000_0000_0000);
+    let pointer_mask = i64_literal(POINTER_MASK);
+
+    let tag = blk.and(I64, value_bits, &tag_mask);
+    let payload = blk.and(I64, value_bits, POINTER_MASK_I64);
+    let payload_nonzero = blk.icmp_ne(I64, &payload, "0");
+    let is_pointer_tag = blk.icmp_eq(I64, &tag, POINTER_TAG_I64);
+    let is_string_tag = blk.icmp_eq(I64, &tag, STRING_TAG_I64);
+    let is_bigint_tag = blk.icmp_eq(I64, &tag, BIGINT_TAG_I64);
+    let is_ref_tag = blk.or(I1, &is_pointer_tag, &is_string_tag);
+    let is_ref_tag = blk.or(I1, &is_ref_tag, &is_bigint_tag);
+    let tagged_pointer = blk.and(I1, &is_ref_tag, &payload_nonzero);
+
+    let nanbox_high = blk.icmp_sge(I64, &tag, &nanbox_min);
+    let not_nanbox_high = blk.xor(I1, &nanbox_high, "true");
+    let raw_ge_min = blk.icmp_sge(I64, value_bits, "4096");
+    let raw_le_mask = blk.icmp_sle(I64, value_bits, &pointer_mask);
+    let raw_in_range = blk.and(I1, &raw_ge_min, &raw_le_mask);
+    let aligned_bits = blk.and(I64, value_bits, "7");
+    let raw_aligned = blk.icmp_eq(I64, &aligned_bits, "0");
+    let raw_pointer = blk.and(I1, &not_nanbox_high, &raw_in_range);
+    let raw_pointer = blk.and(I1, &raw_pointer, &raw_aligned);
+
+    blk.or(I1, &tagged_pointer, &raw_pointer)
 }
 
 fn affine_index_expr_matches(expr: &Expr, pattern: &PreguardedAffineIndexExpr) -> bool {
@@ -782,6 +857,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                                         &val_double,
                                         id,
                                         &preguard.guard_ok_slot,
+                                        preguard.pointer_free_range_slot.as_deref(),
                                         layout_note_needed,
                                         write_barrier_needed,
                                         value_is_numeric,

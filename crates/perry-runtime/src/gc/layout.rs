@@ -866,6 +866,35 @@ pub(crate) fn layout_pointer_slot_summary_for_user(
     }
 }
 
+pub(crate) fn layout_range_has_pointer_slots_for_user(
+    user_ptr: usize,
+    first_slot: usize,
+    last_slot: usize,
+    slot_count: usize,
+) -> Option<bool> {
+    if first_slot > last_slot || last_slot >= slot_count {
+        return None;
+    }
+    unsafe {
+        let header = layout_header_for_user(user_ptr)?;
+        match (*header)._reserved & GC_LAYOUT_STATE_MASK {
+            GC_LAYOUT_POINTER_FREE => Some(false),
+            GC_LAYOUT_SIDE_MASK => {
+                let mask = LAYOUT_SLOT_MASKS.with(|m| m.borrow().get(&user_ptr).cloned());
+                let Some(mask) = mask else {
+                    set_layout_state(header, GC_LAYOUT_UNKNOWN);
+                    return None;
+                };
+                Some(
+                    mask.next_slot_at_or_after(first_slot, slot_count)
+                        .is_some_and(|slot| slot <= last_slot),
+                )
+            }
+            _ => None,
+        }
+    }
+}
+
 pub(crate) fn layout_typed_raw_f64_slot_for_user(user_ptr: usize, slot_index: usize) -> bool {
     TYPED_LAYOUTS.with(|m| {
         m.borrow()

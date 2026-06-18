@@ -674,6 +674,58 @@ fn typed_feedback_plain_array_inbounds_range_guard_checks_current_and_last_index
 }
 
 #[test]
+fn typed_feedback_plain_array_pointer_free_range_guard_tracks_current_layout() {
+    let values = [1.0, 2.0, 3.0];
+    let arr = crate::array::js_array_from_f64(values.as_ptr(), values.len() as u32);
+    let arr_box = crate::value::js_nanbox_pointer(arr as i64);
+
+    assert_eq!(
+        js_plain_array_inbounds_pointer_free_range_guard(arr_box, 0, 2),
+        1
+    );
+    assert_eq!(
+        js_plain_array_inbounds_pointer_free_range_guard(arr_box, 1, 1),
+        1
+    );
+
+    let payload = crate::string::js_string_from_bytes(b"downgraded".as_ptr(), 10);
+    let payload_value = crate::value::js_nanbox_string(payload as i64);
+    crate::array::js_array_set_f64(arr, 1, payload_value);
+
+    assert_eq!(
+        js_plain_array_inbounds_pointer_free_range_guard(arr_box, 0, 0),
+        1
+    );
+    assert_eq!(
+        js_plain_array_inbounds_pointer_free_range_guard(arr_box, 0, 2),
+        0
+    );
+    assert_eq!(
+        js_plain_array_inbounds_pointer_free_range_guard(arr_box, 2, 2),
+        1
+    );
+    assert_eq!(
+        js_plain_array_inbounds_pointer_free_range_guard(arr_box, -1, 2),
+        0
+    );
+    assert_eq!(
+        js_plain_array_inbounds_pointer_free_range_guard(arr_box, 2, 1),
+        0
+    );
+    assert_eq!(
+        js_plain_array_inbounds_pointer_free_range_guard(arr_box, 0, 3),
+        0
+    );
+
+    let obj = crate::object::js_object_alloc(0, 0);
+    let obj_box = crate::value::js_nanbox_pointer(obj as i64);
+    assert_eq!(
+        js_plain_array_inbounds_pointer_free_range_guard(obj_box, 0, 0),
+        0
+    );
+}
+
+#[test]
 fn typed_feedback_numeric_array_guard_fast_path_respects_megamorphic_state() {
     let _guard = TYPED_FEEDBACK_TEST_LOCK.lock().unwrap();
     reset_typed_feedback_for_tests();

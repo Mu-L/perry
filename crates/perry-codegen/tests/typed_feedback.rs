@@ -486,8 +486,14 @@ fn typed_feedback_preguards_plain_array_writes_with_length_bound() {
         ir.contains("call i32 @js_plain_array_inbounds_range_guard"),
         "{ir}"
     );
+    assert!(
+        ir.contains("call i32 @js_plain_array_inbounds_pointer_free_range_guard"),
+        "{ir}"
+    );
     assert!(ir.contains("idxset.preguarded_plain_fast"), "{ir}");
     assert!(ir.contains("idxset.preguarded_plain_fallback"), "{ir}");
+    assert!(ir.contains("idxset.preguarded_plain_layout_note"), "{ir}");
+    assert!(ir.contains("idxset.preguarded_plain_layout_skip"), "{ir}");
     assert!(ir.contains("call void @js_gc_note_slot_layout"), "{ir}");
     assert_eq!(
         ir.matches("call i32 @js_typed_feedback_plain_array_index_set_guard")
@@ -547,8 +553,14 @@ fn typed_feedback_preguards_plain_array_writes_with_local_bound() {
         ir.contains("call i32 @js_plain_array_inbounds_range_guard"),
         "{ir}"
     );
+    assert!(
+        ir.contains("call i32 @js_plain_array_inbounds_pointer_free_range_guard"),
+        "{ir}"
+    );
     assert!(ir.contains("idxset.preguarded_plain_fast"), "{ir}");
     assert!(ir.contains("idxset.preguarded_plain_fallback"), "{ir}");
+    assert!(ir.contains("idxset.preguarded_plain_layout_note"), "{ir}");
+    assert!(ir.contains("idxset.preguarded_plain_layout_skip"), "{ir}");
     assert_eq!(
         ir.matches("call i32 @js_typed_feedback_plain_array_index_set_guard")
             .count(),

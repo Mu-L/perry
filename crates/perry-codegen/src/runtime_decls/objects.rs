@@ -208,6 +208,11 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
         &[DOUBLE, I32, I32],
     );
     module.declare_function(
+        "js_plain_array_inbounds_pointer_free_range_guard",
+        I32,
+        &[DOUBLE, I32, I32],
+    );
+    module.declare_function(
         "js_typed_feedback_plain_array_index_set_guard",
         I32,
         &[I64, DOUBLE, I32, DOUBLE, I32],
