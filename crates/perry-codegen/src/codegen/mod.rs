@@ -2529,13 +2529,20 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     // #5391 codegen units: large modules split their object compilation into N
     // independently-compiled units so clang's peak RSS stays ~whole/N instead of
     // OOMing on one giant TU. Gated to large modules (default 1 unit = unchanged
-    // behavior). `emit_ir_only` and `PERRY_SAVE_LL` want the whole-module text,
-    // so they take the single-text path; the split path avoids materializing the
-    // full ~1GB IR string at all (which would defeat the memory win).
-    let n_units = if opts.emit_ir_only {
-        1
-    } else {
+    // behavior). The split path is disabled when:
+    //   * `emit_ir_only` — the caller wants the single whole-module IR text;
+    //   * `PERRY_SAVE_LL` is set — it dumps the whole-module text for debugging,
+    //     which the split path never materializes;
+    //   * an explicit cross-`target` is requested — units are merged with the
+    //     host `ld -r`, which only handles the host object format (a Linux host
+    //     can't `ld -r` Windows/COFF unit objects). Fall back to a single TU.
+    // (CodeRabbit, #5407.)
+    let can_split =
+        !opts.emit_ir_only && opts.target.is_none() && std::env::var_os("PERRY_SAVE_LL").is_none();
+    let n_units = if can_split {
         decide_codegen_units(module_callable_count(hir))
+    } else {
+        1
     };
     if n_units > 1 {
         let units = llmod.render_codegen_units(n_units);

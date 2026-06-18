@@ -297,8 +297,45 @@ pub fn compile_units_to_object(units: &[String], target_triple: Option<&str>) ->
     let tmp_dir = env::temp_dir();
     let pid = std::process::id();
     let nonce = TEMP_NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let combined = tmp_dir.join(format!("perry_cgu_{}_{}_combined.o", pid, nonce));
 
+    // Track every temp object we write so cleanup runs on EVERY exit path,
+    // including a `?` early return from a mid-sequence unit-compile/write
+    // failure or a missing linker (which would otherwise leak earlier
+    // `perry_cgu_*.o` files in /tmp — CodeRabbit, #5407).
     let mut obj_paths: Vec<PathBuf> = Vec::with_capacity(units.len());
+    let result = compile_and_merge_units(
+        units,
+        target_triple,
+        &tmp_dir,
+        pid,
+        nonce,
+        &combined,
+        &mut obj_paths,
+    );
+
+    if env::var_os("PERRY_LLVM_KEEP_IR").is_none() {
+        for p in &obj_paths {
+            let _ = fs::remove_file(p);
+        }
+        let _ = fs::remove_file(&combined);
+    }
+    result
+}
+
+/// Inner worker for [`compile_units_to_object`]: compile each unit to its own
+/// `.o` (pushing the path into `obj_paths` as it goes, so the caller can clean
+/// up on any error), then `ld -r` them into `combined` and read it back.
+#[allow(clippy::too_many_arguments)]
+fn compile_and_merge_units(
+    units: &[String],
+    target_triple: Option<&str>,
+    tmp_dir: &Path,
+    pid: u32,
+    nonce: u64,
+    combined: &Path,
+    obj_paths: &mut Vec<PathBuf>,
+) -> Result<Vec<u8>> {
     for (i, unit) in units.iter().enumerate() {
         let bytes = compile_ll_to_object(unit, target_triple)
             .with_context(|| format!("codegen unit {}/{} failed to compile", i + 1, units.len()))?;
@@ -308,18 +345,17 @@ pub fn compile_units_to_object(units: &[String], target_triple: Option<&str>) ->
         obj_paths.push(p);
     }
 
-    let combined = tmp_dir.join(format!("perry_cgu_{}_{}_combined.o", pid, nonce));
     let ld = env::var("PERRY_LD").unwrap_or_else(|_| "ld".to_string());
     let mut cmd = Command::new(&ld);
-    cmd.arg("-r").arg("-o").arg(&combined);
-    for p in &obj_paths {
+    cmd.arg("-r").arg("-o").arg(combined);
+    for p in obj_paths.iter() {
         cmd.arg(p);
     }
     let out = cmd
         .output()
         .with_context(|| format!("failed to invoke partial linker `{} -r`", ld))?;
-    let result = if out.status.success() {
-        fs::read(&combined)
+    if out.status.success() {
+        fs::read(combined)
             .with_context(|| format!("failed to read merged object {}", combined.display()))
     } else {
         Err(anyhow!(
@@ -329,15 +365,7 @@ pub fn compile_units_to_object(units: &[String], target_triple: Option<&str>) ->
             out.status,
             String::from_utf8_lossy(&out.stderr)
         ))
-    };
-
-    if env::var_os("PERRY_LLVM_KEEP_IR").is_none() {
-        for p in &obj_paths {
-            let _ = fs::remove_file(p);
-        }
-        let _ = fs::remove_file(&combined);
     }
-    result
 }
 
 fn json_string(value: &str) -> String {
