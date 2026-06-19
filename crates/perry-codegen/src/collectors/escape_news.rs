@@ -412,6 +412,16 @@ fn collect_used_new_fields_in_expr(
                 collect_used_new_fields_in_expr(arg, non_escaping_news, used);
             }
         }
+        Expr::NewDynamicSpread { callee, args } => {
+            collect_used_new_fields_in_expr(callee, non_escaping_news, used);
+            for arg in args {
+                match arg {
+                    CallArg::Expr(e) | CallArg::Spread(e) => {
+                        collect_used_new_fields_in_expr(e, non_escaping_news, used);
+                    }
+                }
+            }
+        }
         Expr::LocalSet(_, value) => collect_used_new_fields_in_expr(value, non_escaping_news, used),
         Expr::Sequence(values) => {
             for value in values {

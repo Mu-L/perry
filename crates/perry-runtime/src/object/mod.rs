@@ -486,6 +486,16 @@ pub extern "C" fn js_implicit_this_set(value: f64) -> f64 {
     IMPLICIT_THIS.with(|c| f64::from_bits(c.replace(value.to_bits())))
 }
 
+#[inline]
+pub fn js_implicit_this_push(value: f64) -> f64 {
+    js_implicit_this_set(value)
+}
+
+#[inline]
+pub fn js_implicit_this_restore(previous: f64) {
+    js_implicit_this_set(previous);
+}
+
 /// Read the current `new.target` value for ordinary function bodies.
 #[no_mangle]
 pub extern "C" fn js_new_target_get() -> f64 {

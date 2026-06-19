@@ -332,6 +332,79 @@ fn test_runtime_root_visitor_marks_and_rewrites_nanbox_slot() {
 }
 
 #[test]
+fn test_proxy_root_scanner_marks_and_rewrites_registry_and_metadata() {
+    clear_marks();
+    crate::proxy::test_clear_proxy_roots();
+
+    let target_user = crate::arena::arena_alloc_gc(64, 8, GC_TYPE_OBJECT);
+    let handler_user = crate::arena::arena_alloc_gc(64, 8, GC_TYPE_OBJECT);
+    let metadata_user = crate::arena::arena_alloc_gc(64, 8, GC_TYPE_OBJECT);
+    let target_bits = ptr_bits(target_user as usize);
+    let handler_bits = ptr_bits(handler_user as usize);
+    let metadata_bits = ptr_bits(metadata_user as usize);
+
+    let proxy =
+        crate::proxy::js_proxy_new(f64::from_bits(target_bits), f64::from_bits(handler_bits));
+    let key_ptr = crate::string::js_string_from_bytes(b"gc-meta".as_ptr(), 7);
+    let key = f64::from_bits(string_bits(key_ptr as usize));
+    let undefined = f64::from_bits(crate::value::TAG_UNDEFINED);
+    crate::proxy::js_reflect_define_metadata(
+        key,
+        f64::from_bits(metadata_bits),
+        f64::from_bits(target_bits),
+        undefined,
+    );
+
+    let valid_ptrs = build_valid_pointer_set();
+    crate::proxy::scan_proxy_roots_mut(&mut RuntimeRootVisitor::for_mark(&valid_ptrs));
+    assert_marked_user_ptr(target_user as usize, "proxy target");
+    assert_marked_user_ptr(handler_user as usize, "proxy handler");
+    assert_marked_user_ptr(metadata_user as usize, "proxy metadata value");
+
+    let moved_target = crate::arena::arena_alloc_gc_old(64, 8, GC_TYPE_OBJECT);
+    let moved_handler = crate::arena::arena_alloc_gc_old(64, 8, GC_TYPE_OBJECT);
+    let moved_metadata = crate::arena::arena_alloc_gc_old(64, 8, GC_TYPE_OBJECT);
+    let moved_target_bits = ptr_bits(moved_target as usize);
+    let moved_handler_bits = ptr_bits(moved_handler as usize);
+    let moved_metadata_bits = ptr_bits(moved_metadata as usize);
+    unsafe {
+        set_forwarding_address(
+            header_from_user_ptr(target_user) as *mut GcHeader,
+            moved_target,
+        );
+        set_forwarding_address(
+            header_from_user_ptr(handler_user) as *mut GcHeader,
+            moved_handler,
+        );
+        set_forwarding_address(
+            header_from_user_ptr(metadata_user) as *mut GcHeader,
+            moved_metadata,
+        );
+    }
+
+    crate::proxy::scan_proxy_roots_mut(&mut RuntimeRootVisitor::for_rewrite(&valid_ptrs));
+
+    assert_eq!(
+        crate::proxy::js_proxy_target(proxy).to_bits(),
+        moved_target_bits
+    );
+    assert_eq!(
+        crate::proxy::js_proxy_handler(proxy).to_bits(),
+        moved_handler_bits
+    );
+    assert_eq!(
+        crate::proxy::js_reflect_get_own_metadata(
+            key,
+            f64::from_bits(moved_target_bits),
+            undefined,
+        )
+        .to_bits(),
+        moved_metadata_bits,
+        "metadata target key and value should be rewritten after moving GC"
+    );
+}
+
+#[test]
 fn test_implicit_this_root_scanner_marks_and_rewrites() {
     // Regression for #1813. The implicit-`this` cell holds the NaN-boxed
     // receiver across a dynamically-dispatched non-arrow method body. Under a
@@ -382,7 +455,222 @@ fn test_implicit_this_root_scanner_marks_and_rewrites() {
         "scanning the idle implicit-`this` cell must leave TAG_UNDEFINED untouched"
     );
 
-    crate::object::js_implicit_this_set(prev_this);
+    crate::object::js_implicit_this_restore(prev_this);
+    clear_marks();
+    clear_mark_seeds();
+}
+
+#[test]
+fn test_implicit_this_saved_stack_rewrites_before_restore() {
+    clear_marks();
+    clear_mark_seeds();
+
+    let original_this = crate::object::js_implicit_this_get();
+    let saved_user = crate::arena::arena_alloc_gc(64, 8, GC_TYPE_OBJECT);
+    let active_user = crate::arena::arena_alloc_gc(64, 8, GC_TYPE_OBJECT);
+    let moved_saved_user = crate::arena::arena_alloc_gc_old(64, 8, GC_TYPE_OBJECT);
+    let saved_hdr = unsafe { header_from_user_ptr(saved_user) as *mut GcHeader };
+
+    crate::object::js_implicit_this_set(f64::from_bits(ptr_bits(saved_user as usize)));
+    let previous =
+        crate::object::js_implicit_this_push(f64::from_bits(ptr_bits(active_user as usize)));
+    assert_eq!(previous.to_bits(), ptr_bits(saved_user as usize));
+
+    let valid_ptrs = build_valid_pointer_set();
+    crate::object::scan_implicit_this_roots_mut(&mut RuntimeRootVisitor::for_mark(&valid_ptrs));
+    unsafe {
+        assert_ne!(
+            (*saved_hdr).gc_flags & GC_FLAG_MARKED,
+            0,
+            "saved previous IMPLICIT_THIS values must remain roots while nested callbacks run"
+        );
+        set_forwarding_address(saved_hdr, moved_saved_user);
+    }
+
+    crate::object::scan_implicit_this_roots_mut(&mut RuntimeRootVisitor::for_rewrite(&valid_ptrs));
+    crate::object::js_implicit_this_restore(previous);
+    assert_eq!(
+        crate::object::js_implicit_this_get().to_bits(),
+        ptr_bits(moved_saved_user as usize),
+        "restore must use the GC-rewritten saved previous value, not the stale raw f64"
+    );
+
+    crate::object::js_implicit_this_set(original_this);
+    clear_marks();
+    clear_mark_seeds();
+}
+
+#[test]
+fn test_json_stringify_root_scanner_marks_and_rewrites_stack_and_shape_cache() {
+    clear_marks();
+    clear_mark_seeds();
+    crate::json::test_clear_stringify_roots();
+
+    let stack_user = crate::arena::arena_alloc_gc(64, 8, GC_TYPE_OBJECT);
+    let keys_payload = std::mem::size_of::<crate::ArrayHeader>();
+    let keys_arr =
+        crate::arena::arena_alloc_gc(keys_payload, 8, GC_TYPE_ARRAY) as *mut crate::ArrayHeader;
+    unsafe {
+        (*keys_arr).length = 0;
+        (*keys_arr).capacity = 0;
+    }
+    crate::json::test_seed_stringify_roots(stack_user as usize, keys_arr);
+
+    let valid_ptrs = build_valid_pointer_set();
+    let stack_old = crate::arena::arena_alloc_gc_old(64, 8, GC_TYPE_OBJECT);
+    let (keys_old, _) = unsafe { alloc_old_test_array(0) };
+    let stack_hdr = unsafe { header_from_user_ptr(stack_user) as *mut GcHeader };
+    let keys_hdr = unsafe { header_from_user_ptr(keys_arr as *const u8) as *mut GcHeader };
+
+    crate::json::scan_stringify_roots_mut(&mut RuntimeRootVisitor::for_mark(&valid_ptrs));
+    unsafe {
+        assert_ne!(
+            (*stack_hdr).gc_flags & GC_FLAG_MARKED,
+            0,
+            "STRINGIFY_STACK entries must be marked while circular detection owns them"
+        );
+        assert_ne!(
+            (*keys_hdr).gc_flags & GC_FLAG_MARKED,
+            0,
+            "JSON stringify shape-cache key arrays must be marked while cached"
+        );
+        set_forwarding_address(stack_hdr, stack_old);
+        set_forwarding_address(keys_hdr, keys_old as *mut u8);
+    }
+
+    crate::json::scan_stringify_roots_mut(&mut RuntimeRootVisitor::for_rewrite(&valid_ptrs));
+    let (stack_after, cache_keys_after, template_keys_after) =
+        crate::json::test_stringify_roots_snapshot();
+    assert_eq!(stack_after, stack_old as usize);
+    assert_eq!(cache_keys_after, keys_old as usize);
+    assert_eq!(template_keys_after, keys_old as usize);
+
+    crate::json::test_clear_stringify_roots();
+    clear_marks();
+    clear_mark_seeds();
+}
+
+#[test]
+fn test_json_stringify_root_scanner_marks_and_rewrites_saved_shape_cache() {
+    clear_marks();
+    clear_mark_seeds();
+    crate::json::test_clear_stringify_roots();
+
+    let keys_payload = std::mem::size_of::<crate::ArrayHeader>();
+    let keys_arr =
+        crate::arena::arena_alloc_gc(keys_payload, 8, GC_TYPE_ARRAY) as *mut crate::ArrayHeader;
+    unsafe {
+        (*keys_arr).length = 0;
+        (*keys_arr).capacity = 0;
+    }
+    crate::json::test_seed_saved_stringify_shape_cache(keys_arr);
+
+    let valid_ptrs = build_valid_pointer_set();
+    let (keys_old, _) = unsafe { alloc_old_test_array(0) };
+    let keys_hdr = unsafe { header_from_user_ptr(keys_arr as *const u8) as *mut GcHeader };
+
+    crate::json::scan_stringify_roots_mut(&mut RuntimeRootVisitor::for_mark(&valid_ptrs));
+    unsafe {
+        assert_ne!(
+            (*keys_hdr).gc_flags & GC_FLAG_MARKED,
+            0,
+            "saved JSON stringify shape-cache key arrays must be marked during reentrant calls"
+        );
+        set_forwarding_address(keys_hdr, keys_old as *mut u8);
+    }
+
+    crate::json::scan_stringify_roots_mut(&mut RuntimeRootVisitor::for_rewrite(&valid_ptrs));
+    let (cache_keys_after, template_keys_after) =
+        crate::json::test_saved_stringify_shape_cache_snapshot();
+    assert_eq!(cache_keys_after, keys_old as usize);
+    assert_eq!(template_keys_after, keys_old as usize);
+
+    crate::json::test_clear_stringify_roots();
+    clear_marks();
+    clear_mark_seeds();
+}
+
+#[test]
+fn test_descriptor_side_table_scanner_marks_accessors_and_rewrites_owner_keys() {
+    let _guard = GcTestIsolationGuard::new();
+    clear_marks();
+    clear_mark_seeds();
+    crate::object::test_clear_descriptor_roots();
+
+    let owner = crate::object::js_object_alloc(0, 0) as usize;
+    let getter =
+        crate::closure::js_closure_alloc(test_no_capture_singleton_func as *const u8, 0) as usize;
+    let setter =
+        crate::closure::js_closure_alloc(test_no_capture_singleton_func as *const u8, 0) as usize;
+    crate::object::set_property_attrs(
+        owner,
+        "x".to_string(),
+        crate::object::PropertyAttrs::new(false, true, false),
+    );
+    crate::object::set_accessor_descriptor(
+        owner,
+        "x".to_string(),
+        crate::object::AccessorDescriptor {
+            get: ptr_bits(getter),
+            set: ptr_bits(setter),
+        },
+    );
+
+    let valid_ptrs = build_valid_pointer_set();
+    crate::object::scan_descriptor_roots_mut(&mut RuntimeRootVisitor::for_mark(&valid_ptrs));
+    assert_unmarked_user_ptr(owner, "descriptor owner metadata key");
+    assert_marked_user_ptr(getter, "descriptor getter closure");
+    assert_marked_user_ptr(setter, "descriptor setter closure");
+
+    let moved_owner = crate::arena::arena_alloc_gc_old(64, 8, GC_TYPE_OBJECT) as usize;
+    let moved_getter = crate::arena::arena_alloc_gc_old(
+        std::mem::size_of::<crate::closure::ClosureHeader>(),
+        std::mem::align_of::<crate::closure::ClosureHeader>(),
+        GC_TYPE_CLOSURE,
+    ) as usize;
+    let moved_setter = crate::arena::arena_alloc_gc_old(
+        std::mem::size_of::<crate::closure::ClosureHeader>(),
+        std::mem::align_of::<crate::closure::ClosureHeader>(),
+        GC_TYPE_CLOSURE,
+    ) as usize;
+    unsafe {
+        init_test_closure(moved_getter as *mut u8);
+        init_test_closure(moved_setter as *mut u8);
+        set_forwarding_address(
+            header_from_user_ptr(owner as *const u8) as *mut GcHeader,
+            moved_owner as *mut u8,
+        );
+        set_forwarding_address(
+            header_from_user_ptr(getter as *const u8) as *mut GcHeader,
+            moved_getter as *mut u8,
+        );
+        set_forwarding_address(
+            header_from_user_ptr(setter as *const u8) as *mut GcHeader,
+            moved_setter as *mut u8,
+        );
+    }
+
+    crate::object::scan_descriptor_roots_mut(&mut RuntimeRootVisitor::for_rewrite(&valid_ptrs));
+
+    assert!(
+        crate::object::get_property_attrs(owner, "x").is_none(),
+        "descriptor scanner should remove stale owner keys"
+    );
+    let attrs = crate::object::get_property_attrs(moved_owner, "x")
+        .expect("descriptor attrs should be rekeyed to moved owner");
+    assert!(!attrs.writable());
+    assert!(attrs.enumerable());
+    assert!(!attrs.configurable());
+    let acc = crate::object::get_accessor_descriptor(moved_owner, "x")
+        .expect("accessor descriptor should be rekeyed to moved owner");
+    assert_eq!(acc.get, ptr_bits(moved_getter));
+    assert_eq!(acc.set, ptr_bits(moved_setter));
+    assert!(
+        crate::object::get_accessor_descriptor(owner, "x").is_none(),
+        "accessor scanner should remove stale owner keys"
+    );
+
+    crate::object::test_clear_descriptor_roots();
     clear_marks();
     clear_mark_seeds();
 }
@@ -954,6 +1242,36 @@ fn test_transient_runtime_handle_scope_drop_removes_roots() {
 }
 
 #[test]
+fn test_dgram_bound_registry_scanner_marks_and_rewrites_socket() {
+    clear_marks();
+    clear_mark_seeds();
+    let _registry_guard = crate::dgram::DgramRegistryTestGuard::new();
+
+    let (socket, _) = unsafe { alloc_nursery_test_object(0) };
+    let (moved_socket, _) = unsafe { alloc_old_test_object(0) };
+    let socket_bits = ptr_bits(socket as usize);
+    crate::dgram::test_insert_bound_socket_for_gc("127.0.0.1", 41_001, f64::from_bits(socket_bits));
+
+    let valid_ptrs = build_valid_pointer_set();
+    let mut marker = RuntimeRootVisitor::for_mark(&valid_ptrs);
+    crate::dgram::scan_dgram_roots_mut(&mut marker);
+    assert_marked_user_ptr(socket as usize, "dgram bound socket registry entry");
+
+    unsafe {
+        set_forwarding_address(
+            header_from_user_ptr(socket as *const u8) as *mut GcHeader,
+            moved_socket as *mut u8,
+        );
+    }
+    let mut rewriter = RuntimeRootVisitor::for_rewrite(&valid_ptrs);
+    crate::dgram::scan_dgram_roots_mut(&mut rewriter);
+
+    let rewritten = crate::dgram::test_lookup_bound_socket_for_gc("127.0.0.1", 41_001)
+        .expect("dgram bound socket should remain registered");
+    assert_eq!(rewritten.to_bits(), ptr_bits(moved_socket as usize));
+}
+
+#[test]
 fn test_set_gc_field_rewrite_reindexes_elements() {
     clear_marks();
     clear_mark_seeds();
@@ -1310,6 +1628,9 @@ fn test_transient_runtime_handle_closure_captures_gc() {
     let _guard = CopyingNurseryTestGuard::new(0);
     let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     register_runtime_handle_root_scanner_for_tests();
+    gc_register_budgeted_once_mutable_root_scanner(
+        crate::closure::scan_singleton_closure_roots_mut,
+    );
     crate::closure::test_clear_singleton_closure_caches();
 
     let captured = crate::string::js_string_from_bytes(b"closure-payload".as_ptr(), 15);
@@ -1333,8 +1654,8 @@ fn test_transient_runtime_handle_closure_captures_gc() {
             .add(std::mem::size_of::<crate::closure::ClosureHeader>())
             as *const u64;
         let stored = *capture_slot;
-        assert_eq!(stored & TAG_MASK, STRING_TAG);
         let stored_ptr = (stored & POINTER_MASK) as *const crate::StringHeader;
+        assert_eq!(stored & TAG_MASK, STRING_TAG);
         assert_string_bytes(stored_ptr, b"closure-payload");
     }
 
@@ -1407,6 +1728,23 @@ extern "C" fn test_array_identity_force_minor_gc(
     let value_handle = scope.root_nanbox_f64(value);
     let _ = crate::gc::gc_collect_minor();
     value_handle.get_nanbox_f64()
+}
+
+thread_local! {
+    static TEST_EVENT_TARGET_DISPATCH_EVENT_BITS: Cell<u64> = const { Cell::new(0) };
+}
+
+extern "C" fn test_event_target_listener_force_minor_gc(
+    _closure: *const crate::closure::ClosureHeader,
+    event: f64,
+) -> f64 {
+    let scope = RuntimeHandleScope::new();
+    let event_handle = scope.root_nanbox_f64(event);
+    let _ = crate::gc::gc_collect_minor();
+    TEST_EVENT_TARGET_DISPATCH_EVENT_BITS.with(|bits| {
+        bits.set(event_handle.get_nanbox_f64().to_bits());
+    });
+    f64::from_bits(crate::value::TAG_UNDEFINED)
 }
 
 thread_local! {
@@ -1593,7 +1931,11 @@ fn test_async_hook_option_lookup_roots_callbacks_across_copied_minor_gc() {
     drain_scheduled_minor_gc(before, "async hook option key lookup");
 
     let (callback, _resource_bits) = crate::async_hooks::test_async_hooks_scanner_snapshot();
-    assert_eq!(assert_callable_closure(ptr_bits(callback)), original);
+    let rewritten = assert_callable_closure(ptr_bits(callback));
+    assert_ne!(
+        rewritten, original,
+        "async hook option callback root should be rewritten after copied-minor GC"
+    );
 }
 
 #[test]
@@ -1616,6 +1958,80 @@ fn test_closure_rest_dispatch_roots_args_during_rest_array_alloc_gc() {
     let result_root = result_scope.root_nanbox_f64(result);
     drain_scheduled_minor_gc(before, "rest-array creation");
     assert_string_value(result_root.get_nanbox_f64(), b"rest-dispatch");
+}
+
+#[test]
+fn test_event_target_dispatch_roots_target_event_and_callbacks_across_copied_minor_gc() {
+    let _guard = CopyingNurseryTestGuard::new(0);
+    let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    register_runtime_handle_root_scanner_for_tests();
+    TEST_EVENT_TARGET_DISPATCH_EVENT_BITS.with(|bits| bits.set(0));
+
+    let event_type = crate::string::js_string_from_bytes(b"tick".as_ptr(), 4);
+    let target = crate::event_target::js_event_target_new();
+    let event = crate::event_target::js_event_new(
+        f64::from_bits(string_bits(event_type as usize)),
+        f64::from_bits(crate::value::TAG_UNDEFINED),
+        1,
+    );
+    let target_original = target as usize;
+    let event_original = event as usize;
+
+    let scope = RuntimeHandleScope::new();
+    let target_root = scope.root_raw_mut_ptr(target);
+    let event_root = scope.root_raw_mut_ptr(event);
+    let event_value_root = scope.root_nanbox_f64(f64::from_bits(ptr_bits(event as usize)));
+
+    let listener_func = test_event_target_listener_force_minor_gc as *const u8;
+    crate::closure::js_register_closure_arity(listener_func, 1);
+    let listener = crate::closure::js_closure_alloc(listener_func, 0);
+    unsafe {
+        crate::event_target::js_event_target_add_event_listener(
+            target_root.get_raw_mut_ptr(),
+            event_type,
+            listener as i64,
+        );
+    }
+
+    let result = unsafe {
+        crate::event_target::js_event_target_dispatch_event(
+            target_root.get_raw_mut_ptr(),
+            event_value_root.get_nanbox_f64(),
+        )
+    };
+    assert_ne!(crate::value::js_is_truthy(result), 0);
+
+    let target_after = target_root.get_raw_mut_ptr::<crate::object::ObjectHeader>();
+    let event_after = event_root.get_raw_mut_ptr::<crate::object::ObjectHeader>();
+    assert_ne!(
+        target_after as usize, target_original,
+        "dispatch target should be rewritten after listener-forced copied minor"
+    );
+    assert_ne!(
+        event_after as usize, event_original,
+        "dispatch event should be rewritten after listener-forced copied minor"
+    );
+    assert_eq!(
+        event_value_root.get_nanbox_f64().to_bits(),
+        ptr_bits(event_after as usize)
+    );
+    TEST_EVENT_TARGET_DISPATCH_EVENT_BITS.with(|bits| {
+        assert_eq!(bits.get(), ptr_bits(event_after as usize));
+    });
+
+    let current_target_key = crate::string::js_string_from_bytes(b"currentTarget".as_ptr(), 13);
+    let event_phase_key = crate::string::js_string_from_bytes(b"eventPhase".as_ptr(), 10);
+    let event_after = event_root.get_raw_mut_ptr::<crate::object::ObjectHeader>();
+    assert_eq!(
+        crate::object::js_object_get_field_by_name_f64(event_after, current_target_key).to_bits(),
+        crate::value::TAG_NULL,
+        "dispatch must reset currentTarget on the moved event, not stale from-space"
+    );
+    assert_eq!(
+        crate::object::js_object_get_field_by_name_f64(event_after, event_phase_key),
+        0.0,
+        "dispatch must reset eventPhase on the moved event, not stale from-space"
+    );
 }
 
 #[test]

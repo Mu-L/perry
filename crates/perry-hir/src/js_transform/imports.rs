@@ -1,4 +1,4 @@
-use crate::ir::{Expr, Module, ModuleKind, Stmt};
+use crate::ir::{CallArg, Expr, Module, ModuleKind, Stmt};
 use perry_types::LocalId;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -725,6 +725,20 @@ pub fn transform_expr(
                     constructor: Box::new(constructor_expr),
                     args: args_owned,
                 };
+            }
+        }
+
+        // Dynamic-spread constructor calls cannot be rewritten to JsNewFromHandle
+        // without preserving spread semantics, but their children still need JS
+        // interop transformation.
+        Expr::NewDynamicSpread { callee, args } => {
+            transform_expr(callee, js_imports, extern_func_to_js, local_name_to_js, tracker);
+            for arg in args.iter_mut() {
+                match arg {
+                    CallArg::Expr(e) | CallArg::Spread(e) => {
+                        transform_expr(e, js_imports, extern_func_to_js, local_name_to_js, tracker);
+                    }
+                }
             }
         }
 

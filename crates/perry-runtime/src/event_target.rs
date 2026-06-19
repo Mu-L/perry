@@ -759,7 +759,11 @@ pub unsafe extern "C" fn js_event_target_dispatch_event(
     if !is_event_target(target) {
         return bool_value(true);
     }
-    let Some(event_ptr) = value_as_ptr::<ObjectHeader>(event) else {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let target_root = scope.root_raw_mut_ptr(target);
+    let event_root = scope.root_nanbox_f64(event);
+
+    let Some(mut event_ptr) = value_as_ptr::<ObjectHeader>(event_root.get_nanbox_f64()) else {
         if is_undefined(event) {
             throw_missing_arg("event");
         }
@@ -768,10 +772,15 @@ pub unsafe extern "C" fn js_event_target_dispatch_event(
     if !is_event_instance(event_ptr) {
         throw_invalid_event(event);
     }
-    let Some(event_name_ptr) = event_type_ptr(event) else {
+    let Some(event_name_ptr) = event_type_ptr(event_root.get_nanbox_f64()) else {
         return bool_value(true);
     };
-    let target_value = boxed_ptr(target);
+    let event_name_root = scope.root_string_ptr(event_name_ptr);
+    let mut target = target_root.get_raw_mut_ptr::<ObjectHeader>();
+    event_ptr = value_as_ptr::<ObjectHeader>(event_root.get_nanbox_f64())
+        .expect("validated Event handle should remain an object");
+    let mut event_name_ptr = event_name_root.get_raw_const_ptr::<StringHeader>();
+    let mut target_value = boxed_ptr(target);
     set_event_field(event_ptr, b"target", target_value);
     set_event_field(event_ptr, b"currentTarget", target_value);
     set_event_field(event_ptr, b"eventPhase", number_value(2.0));
@@ -792,23 +801,37 @@ pub unsafe extern "C" fn js_event_target_dispatch_event(
             callbacks
         })
         .unwrap_or_default();
+    let callback_roots: Vec<_> = callbacks
+        .iter()
+        .map(|(callback, _, _)| scope.root_nanbox_f64(*callback))
+        .collect();
 
-    let args = [event];
-    for (callback, capture, once) in callbacks {
+    for (index, (_callback, capture, once)) in callbacks.into_iter().enumerate() {
+        let callback = callback_roots[index].get_nanbox_f64();
         let Some(callable) = closure_value_from_listener(callback) else {
             continue;
         };
         if once {
             remove_event_listener_value_with_capture(target, event_name_ptr, callback, capture);
+            target = target_root.get_raw_mut_ptr::<ObjectHeader>();
+            target_value = boxed_ptr(target);
         }
-        let prev_this = crate::object::js_implicit_this_set(target_value);
+        let prev_this = crate::object::js_implicit_this_push(target_value);
+        let args = [event_root.get_nanbox_f64()];
         let _ = crate::closure::js_native_call_value(callable, args.as_ptr(), args.len());
-        crate::object::js_implicit_this_set(prev_this);
+        crate::object::js_implicit_this_restore(prev_this);
+        target = target_root.get_raw_mut_ptr::<ObjectHeader>();
+        event_ptr = value_as_ptr::<ObjectHeader>(event_root.get_nanbox_f64())
+            .expect("validated Event handle should remain an object");
+        event_name_ptr = event_name_root.get_raw_const_ptr::<StringHeader>();
+        target_value = boxed_ptr(target);
         if event_bool_field(event_ptr, b"_immediateStopped") {
             break;
         }
     }
 
+    event_ptr = value_as_ptr::<ObjectHeader>(event_root.get_nanbox_f64())
+        .expect("validated Event handle should remain an object");
     set_event_field(event_ptr, b"currentTarget", null_value());
     set_event_field(event_ptr, b"eventPhase", number_value(0.0));
     let canceled = event_bool_field(event_ptr, b"cancelable")

@@ -560,6 +560,7 @@ pub fn construction_expr_can_affect_method_lookup(
         | Expr::SuperMethodCall { .. }
         | Expr::New { .. }
         | Expr::NewDynamic { .. }
+        | Expr::NewDynamicSpread { .. }
         | Expr::ObjectAssign { .. }
         | Expr::PropertySet { .. }
         | Expr::PropertyUpdate { .. }

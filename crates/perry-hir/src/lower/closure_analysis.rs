@@ -252,6 +252,16 @@ fn widen_mutable_captures_expr(
                 widen_mutable_captures_expr(arg, scope_mutable);
             }
         }
+        Expr::NewDynamicSpread { callee, args } => {
+            widen_mutable_captures_expr(callee, scope_mutable);
+            for arg in args {
+                match arg {
+                    CallArg::Expr(e) | CallArg::Spread(e) => {
+                        widen_mutable_captures_expr(e, scope_mutable)
+                    }
+                }
+            }
+        }
         Expr::LocalSet(_, value) | Expr::GlobalSet(_, value) => {
             widen_mutable_captures_expr(value, scope_mutable);
         }
@@ -560,6 +570,14 @@ fn collect_closure_assigned_expr(expr: &Expr, out: &mut std::collections::HashSe
                 collect_closure_assigned_expr(arg, out);
             }
         }
+        Expr::NewDynamicSpread { callee, args } => {
+            collect_closure_assigned_expr(callee, out);
+            for arg in args {
+                match arg {
+                    CallArg::Expr(e) | CallArg::Spread(e) => collect_closure_assigned_expr(e, out),
+                }
+            }
+        }
         Expr::LocalSet(_, value) | Expr::GlobalSet(_, value) => {
             collect_closure_assigned_expr(value, out);
         }
@@ -850,9 +868,23 @@ fn collect_closure_captures_expr(expr: &Expr, out: &mut std::collections::HashSe
             collect_closure_captures_expr(index, out);
             collect_closure_captures_expr(value, out);
         }
-        Expr::New { args, .. } | Expr::NewDynamic { args, .. } => {
+        Expr::New { args, .. } => {
             for arg in args {
                 collect_closure_captures_expr(arg, out);
+            }
+        }
+        Expr::NewDynamic { callee, args } => {
+            collect_closure_captures_expr(callee, out);
+            for arg in args {
+                collect_closure_captures_expr(arg, out);
+            }
+        }
+        Expr::NewDynamicSpread { callee, args } => {
+            collect_closure_captures_expr(callee, out);
+            for arg in args {
+                match arg {
+                    CallArg::Expr(e) | CallArg::Spread(e) => collect_closure_captures_expr(e, out),
+                }
             }
         }
         Expr::ArrayPush { value, .. }
@@ -1285,6 +1317,16 @@ fn collect_closure_assigned_in_body_expr(
             collect_closure_assigned_in_body_expr(callee, out);
             for arg in args {
                 collect_closure_assigned_in_body_expr(arg, out);
+            }
+        }
+        Expr::NewDynamicSpread { callee, args } => {
+            collect_closure_assigned_in_body_expr(callee, out);
+            for arg in args {
+                match arg {
+                    CallArg::Expr(e) | CallArg::Spread(e) => {
+                        collect_closure_assigned_in_body_expr(e, out)
+                    }
+                }
             }
         }
         Expr::GlobalSet(_, value) => collect_closure_assigned_in_body_expr(value, out),

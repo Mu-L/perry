@@ -787,9 +787,9 @@ pub(crate) fn suppress_uncaught_drain<F: FnOnce() -> f64>(f: F) -> f64 {
 }
 
 pub(crate) fn with_implicit_this<F: FnOnce() -> f64>(this_arg: f64, f: F) -> f64 {
-    let prev = crate::object::js_implicit_this_set(this_arg);
+    let prev = crate::object::js_implicit_this_push(this_arg);
     let result = f();
-    crate::object::js_implicit_this_set(prev);
+    crate::object::js_implicit_this_restore(prev);
     result
 }
 

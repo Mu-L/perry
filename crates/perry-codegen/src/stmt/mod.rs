@@ -145,8 +145,9 @@ fn lower_stmts_inner(ctx: &mut FnCtx<'_>, stmts: &[Stmt], emit_shadow_clears: bo
             if let Some(reduction) =
                 crate::expr::try_match_channel_reduction(stmts, i, ctx.integer_locals)
             {
-                if ctx.buffer_data_slots.contains_key(&reduction.array_id) {
-                    crate::expr::lower_channel_reduction(ctx, &reduction)?;
+                if ctx.buffer_data_slots.contains_key(&reduction.array_id)
+                    && crate::expr::lower_channel_reduction(ctx, &reduction)?
+                {
                     let last_lowered_idx = i + reduction.acc_ids.len() - 1;
                     i += reduction.acc_ids.len();
                     if emit_shadow_clears && !ctx.block().is_terminated() {

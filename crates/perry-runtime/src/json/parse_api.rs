@@ -48,16 +48,15 @@ pub unsafe extern "C" fn js_json_parse_or_null(text_ptr: *const StringHeader) ->
 #[cfg(test)]
 pub(crate) unsafe fn test_json_parse_direct(text_ptr: *const StringHeader) -> JSValue {
     assert!(!text_ptr.is_null());
-    let len = (*text_ptr).byte_len as usize;
-    let data_ptr = (text_ptr as *const u8).add(std::mem::size_of::<StringHeader>());
-    let bytes = std::slice::from_raw_parts(data_ptr, len);
+    let text_root = parse_root_push(JSValue::string_ptr(text_ptr as *mut StringHeader));
+    let (_text_ptr, _len, bytes) = refresh_rooted_json_input(text_root);
 
     crate::gc::gc_suppress();
-    let text_root = parse_root_push(JSValue::string_ptr(text_ptr as *mut StringHeader));
     let mut parser = DirectParser::new(bytes);
     let result = parser.parse_value();
-    parse_root_push(result);
+    let result_root = parse_root_push(result);
     crate::gc::gc_unsuppress();
+    let result = parse_root_get(result_root);
     parse_root_restore(text_root);
     result
 }
@@ -87,6 +86,27 @@ fn is_json_null_literal(bytes: &[u8]) -> bool {
     &bytes[start..end] == b"null"
 }
 
+#[inline]
+unsafe fn parse_root_string_ptr(root_idx: usize) -> *const StringHeader {
+    (parse_root_get(root_idx).bits() & POINTER_MASK) as *const StringHeader
+}
+
+#[inline]
+unsafe fn json_input_bytes<'a>(text_ptr: *const StringHeader) -> (usize, &'a [u8]) {
+    let len = (*text_ptr).byte_len as usize;
+    let data_ptr = (text_ptr as *const u8).add(std::mem::size_of::<StringHeader>());
+    (len, std::slice::from_raw_parts(data_ptr, len))
+}
+
+#[inline]
+unsafe fn refresh_rooted_json_input<'a>(
+    text_root: usize,
+) -> (*const StringHeader, usize, &'a [u8]) {
+    let text_ptr = parse_root_string_ptr(text_root);
+    let (len, bytes) = json_input_bytes(text_ptr);
+    (text_ptr, len, bytes)
+}
+
 /// Non-throwing JSON parse entry for APIs that must reject a Promise rather than
 /// synchronously throwing through `JSON.parse`'s FFI boundary.
 ///
@@ -97,9 +117,7 @@ pub unsafe fn js_json_parse_result(text_ptr: *const StringHeader) -> Result<JSVa
     if text_ptr.is_null() {
         return Err(syntax_error_value("Unexpected end of JSON input"));
     }
-    let len = (*text_ptr).byte_len as usize;
-    let data_ptr = (text_ptr as *const u8).add(std::mem::size_of::<StringHeader>());
-    let bytes = std::slice::from_raw_parts(data_ptr, len);
+    let (len, bytes) = json_input_bytes(text_ptr);
 
     if len == 0 {
         return Err(syntax_error_value("Unexpected end of JSON input"));
@@ -109,17 +127,26 @@ pub unsafe fn js_json_parse_result(text_ptr: *const StringHeader) -> Result<JSVa
         return Err(syntax_error_value(&format!("JSON parse error: {}", err)));
     }
 
+    let text_root = parse_root_push(JSValue::string_ptr(text_ptr as *mut StringHeader));
     crate::gc::gc_collect_pending_suppressed_parse();
     crate::gc::gc_check_trigger();
+    let (_text_ptr, len, bytes) = refresh_rooted_json_input(text_root);
     crate::gc::gc_suppress();
 
-    let text_root = parse_root_push(JSValue::string_ptr(text_ptr as *mut StringHeader));
     let mut parser = DirectParser::new(bytes);
     let result = parser.parse_value();
-    parse_root_push(result);
+    let result_root = parse_root_push(result);
+    let parse_error = if result.is_null() && !is_json_null_literal(bytes) {
+        let preview_len = len.min(50);
+        let preview = std::str::from_utf8(&bytes[..preview_len]).unwrap_or("???");
+        Some(format!("JSON parse error: Unexpected token: {}", preview))
+    } else {
+        None
+    };
     crate::gc::gc_unsuppress();
     crate::gc::gc_bump_malloc_trigger();
     crate::gc::gc_schedule_parse_boundary_collection_if_pressure();
+    let result = parse_root_get(result_root);
     parse_root_restore(text_root);
 
     PARSE_KEY_CACHE.with(|c| {
@@ -131,10 +158,7 @@ pub unsafe fn js_json_parse_result(text_ptr: *const StringHeader) -> Result<JSVa
         }
     });
 
-    if result.is_null() && !is_json_null_literal(bytes) {
-        let preview_len = len.min(50);
-        let preview = std::str::from_utf8(&bytes[..preview_len]).unwrap_or("???");
-        let msg = format!("JSON parse error: Unexpected token: {}", preview);
+    if let Some(msg) = parse_error {
         return Err(syntax_error_value(&msg));
     }
 
@@ -150,9 +174,7 @@ pub unsafe extern "C" fn js_json_parse(text_ptr: *const StringHeader) -> JSValue
     if text_ptr.is_null() {
         throw_syntax_error("Unexpected end of JSON input");
     }
-    let len = (*text_ptr).byte_len as usize;
-    let data_ptr = (text_ptr as *const u8).add(std::mem::size_of::<StringHeader>());
-    let bytes = std::slice::from_raw_parts(data_ptr, len);
+    let (len, bytes) = json_input_bytes(text_ptr);
 
     if len == 0 {
         throw_syntax_error("Unexpected end of JSON input");
@@ -160,8 +182,6 @@ pub unsafe extern "C" fn js_json_parse(text_ptr: *const StringHeader) -> JSValue
     if let Err(err) = serde_json::from_slice::<serde_json::Value>(bytes) {
         throw_syntax_error(&format!("JSON parse error: {}", err));
     }
-
-    crate::gc::gc_collect_pending_suppressed_parse();
 
     // Issue #179 Step 2 Phase 1 → default-on: tape-based lazy parse
     // is now the default for top-level arrays on blobs larger than
@@ -243,7 +263,10 @@ pub unsafe extern "C" fn js_json_parse(text_ptr: *const StringHeader) -> JSValue
     // in `gc_check_trigger` protects adversarial cases (previous stringify
     // result strings sharing blocks with interned keys) from retrigger
     // thrash when block-persistence keeps everything alive.
+    let text_root = parse_root_push(JSValue::string_ptr(text_ptr as *mut StringHeader));
+    crate::gc::gc_collect_pending_suppressed_parse();
     crate::gc::gc_check_trigger();
+    let (_text_ptr, len, bytes) = refresh_rooted_json_input(text_root);
 
     // Suppress GC for the duration of the parse. Parse is synchronous and
     // roots all intermediates in PARSE_ROOTS, so no collection is needed
@@ -251,11 +274,28 @@ pub unsafe extern "C" fn js_json_parse(text_ptr: *const StringHeader) -> JSValue
     // cycles walking an ever-growing live set (issue #59).
     crate::gc::gc_suppress();
 
-    let text_root = parse_root_push(JSValue::string_ptr(text_ptr as *mut StringHeader));
-
     let mut parser = DirectParser::new(bytes);
     let result = parser.parse_value();
-    parse_root_push(result);
+    let result_root = parse_root_push(result);
+
+    // Check trailing-token errors before post-parse trigger work can move the
+    // rooted input string; `parser` borrows the current byte slice.
+    let parse_error = if result.is_null() {
+        let is_literal_null = len >= 4 && bytes.starts_with(b"null");
+        if !is_literal_null {
+            let preview_len = len.min(50);
+            let preview = std::str::from_utf8(&bytes[..preview_len]).unwrap_or("???");
+            Some(format!("JSON parse error: Unexpected token: {}", preview))
+        } else if parser.has_trailing_content() {
+            Some("Unexpected non-whitespace character after JSON".to_string())
+        } else {
+            None
+        }
+    } else if parser.has_trailing_content() {
+        Some("Unexpected non-whitespace character after JSON".to_string())
+    } else {
+        None
+    };
 
     // Re-enable GC and rebaseline triggers while the result is still
     // rooted. Tiny parse-churn pressure may collect here; keeping the
@@ -263,6 +303,7 @@ pub unsafe extern "C" fn js_json_parse(text_ptr: *const StringHeader) -> JSValue
     crate::gc::gc_unsuppress();
     crate::gc::gc_bump_malloc_trigger();
     crate::gc::gc_schedule_parse_boundary_collection_if_pressure();
+    let result = parse_root_get(result_root);
     parse_root_restore(text_root);
 
     // Keep key intern cache across parses — scan_parse_roots marks cached
@@ -278,27 +319,8 @@ pub unsafe extern "C" fn js_json_parse(text_ptr: *const StringHeader) -> JSValue
         }
     });
 
-    // If parser didn't consume meaningful input (result is null and input wasn't "null"),
-    // the input was invalid JSON — throw SyntaxError
-    if result.is_null() {
-        let is_literal_null = len >= 4 && bytes.starts_with(b"null");
-        if !is_literal_null {
-            let preview_len = len.min(50);
-            let preview = std::str::from_utf8(&bytes[..preview_len]).unwrap_or("???");
-            let msg = format!("JSON parse error: Unexpected token: {}", preview);
-            throw_syntax_error(&msg);
-        } else if parser.has_trailing_content() {
-            // Literal `null` followed by trailing tokens (`JSON.parse("null x")`)
-            // — reject like any other trailing-token case.
-            throw_syntax_error("Unexpected non-whitespace character after JSON");
-        }
-    } else if parser.has_trailing_content() {
-        // A valid value was parsed but non-whitespace input remains
-        // (`JSON.parse("{}x")`, `JSON.parse("1 2")`). Node rejects trailing
-        // tokens with a SyntaxError; trailing whitespace is allowed.
-        crate::exception::js_throw(syntax_error_value(
-            "Unexpected non-whitespace character after JSON",
-        ));
+    if let Some(msg) = parse_error {
+        throw_syntax_error(&msg);
     }
 
     result
@@ -353,13 +375,15 @@ pub(crate) fn tape_mode_from_env() -> TapeMode {
 /// it's a drop-in replacement behind the feature flag.
 pub(crate) unsafe fn try_parse_via_tape(
     text_ptr: *const StringHeader,
-    bytes: &[u8],
+    _bytes: &[u8],
 ) -> Option<JSValue> {
-    crate::json_tape::with_built_tape(bytes, |tape_entries| {
-        crate::gc::gc_collect_pending_suppressed_parse();
-        crate::gc::gc_check_trigger();
+    let text_root = parse_root_push(JSValue::string_ptr(text_ptr as *mut StringHeader));
+    crate::gc::gc_collect_pending_suppressed_parse();
+    crate::gc::gc_check_trigger();
+    let (text_ptr, _len, bytes) = refresh_rooted_json_input(text_root);
+
+    let result = crate::json_tape::with_built_tape(bytes, |tape_entries| {
         crate::gc::gc_suppress();
-        let text_root = parse_root_push(JSValue::string_ptr(text_ptr as *mut StringHeader));
 
         // Phase 2: if the top-level value is an array, return a lazy
         // array header instead of materializing the tree. Every other
@@ -377,10 +401,12 @@ pub(crate) unsafe fn try_parse_via_tape(
         } else {
             crate::json_tape::materialize_from_idx(tape_entries, bytes, 0)
         };
-        parse_root_push(result);
+        let result_root = parse_root_push(result);
 
         crate::gc::gc_unsuppress();
         crate::gc::gc_bump_malloc_trigger();
+        crate::gc::gc_schedule_parse_boundary_collection_if_pressure();
+        let result = parse_root_get(result_root);
         parse_root_restore(text_root);
 
         PARSE_KEY_CACHE.with(|c| {
@@ -393,7 +419,11 @@ pub(crate) unsafe fn try_parse_via_tape(
         });
 
         result
-    })
+    });
+    if result.is_none() {
+        parse_root_restore(text_root);
+    }
+    result
 }
 
 // ─── JSON.parse<T[]>: schema-directed typed parse ─────────────────────────────
@@ -433,34 +463,51 @@ pub unsafe extern "C" fn js_json_parse_typed_array(
         // Fall through to generic (which will throw the standard error).
         return js_json_parse(text_ptr);
     }
-    let len = (*text_ptr).byte_len as usize;
+    let (len, _bytes) = json_input_bytes(text_ptr);
     if len == 0 {
         return js_json_parse(text_ptr);
     }
-    let data_ptr = (text_ptr as *const u8).add(std::mem::size_of::<StringHeader>());
-    let bytes = std::slice::from_raw_parts(data_ptr, len);
+    let text_root = parse_root_push(JSValue::string_ptr(text_ptr as *mut StringHeader));
 
     // Build the shape hint once. The keys_array + pre-interned key
     // pointers are owned by longlived arena + shape-cache structures,
     // so they outlive the parse and survive any intervening GC.
     let shape = match build_shape_hint(packed_keys, packed_keys_len, field_count) {
         Some(s) => s,
-        None => return js_json_parse(text_ptr),
+        None => {
+            let text_ptr = parse_root_string_ptr(text_root);
+            parse_root_restore(text_root);
+            return js_json_parse(text_ptr);
+        }
     };
 
     // Same pre-parse cleanup + GC suppression as `js_json_parse` —
     // keeps the typed path on the same GC-safety contract.
     crate::gc::gc_collect_pending_suppressed_parse();
     crate::gc::gc_check_trigger();
+    let (_text_ptr, len, bytes) = refresh_rooted_json_input(text_root);
     crate::gc::gc_suppress();
-    let text_root = parse_root_push(JSValue::string_ptr(text_ptr as *mut StringHeader));
 
     let mut parser = DirectParser::with_shape(bytes, shape);
     let result = parser.parse_array_typed();
-    parse_root_push(result);
+    let result_root = parse_root_push(result);
+    let parse_error = if result.is_null() {
+        let is_literal_null = len >= 4 && bytes.starts_with(b"null");
+        if !is_literal_null {
+            let preview_len = len.min(50);
+            let preview = std::str::from_utf8(&bytes[..preview_len]).unwrap_or("???");
+            Some(format!("JSON parse error: Unexpected token: {}", preview))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     crate::gc::gc_unsuppress();
     crate::gc::gc_bump_malloc_trigger();
+    crate::gc::gc_schedule_parse_boundary_collection_if_pressure();
+    let result = parse_root_get(result_root);
     parse_root_restore(text_root);
 
     PARSE_KEY_CACHE.with(|c| {
@@ -472,16 +519,10 @@ pub unsafe extern "C" fn js_json_parse_typed_array(
         }
     });
 
-    if result.is_null() {
-        let is_literal_null = len >= 4 && bytes.starts_with(b"null");
-        if !is_literal_null {
-            let preview_len = len.min(50);
-            let preview = std::str::from_utf8(&bytes[..preview_len]).unwrap_or("???");
-            let msg = format!("JSON parse error: Unexpected token: {}", preview);
-            // Throw a real `SyntaxError` (not a bare string) to match Node's
-            // error identity for invalid JSON.
-            crate::exception::js_throw(syntax_error_value(&msg));
-        }
+    if let Some(msg) = parse_error {
+        // Throw a real `SyntaxError` (not a bare string) to match Node's
+        // error identity for invalid JSON.
+        crate::exception::js_throw(syntax_error_value(&msg));
     }
 
     result

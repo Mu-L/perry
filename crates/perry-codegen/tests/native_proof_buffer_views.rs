@@ -433,6 +433,14 @@ fn add(left: Expr, right: Expr) -> Expr {
     }
 }
 
+fn mul(left: Expr, right: Expr) -> Expr {
+    Expr::Binary {
+        op: BinaryOp::Mul,
+        left: Box::new(left),
+        right: Box::new(right),
+    }
+}
+
 fn length(local_id: u32) -> Expr {
     Expr::PropertyGet {
         object: Box::new(local(local_id)),
@@ -463,6 +471,23 @@ fn index_get(object_id: u32, index: Expr) -> Expr {
         object: Box::new(local(object_id)),
         index: Box::new(index),
     }
+}
+
+fn uint8_get(array_id: u32, index: Expr) -> Expr {
+    Expr::Uint8ArrayGet {
+        array: Box::new(local(array_id)),
+        index: Box::new(index),
+    }
+}
+
+fn channel_accumulate(acc_id: u32, array_id: u32, index: Expr, k_id: u32) -> Stmt {
+    Stmt::Expr(Expr::LocalSet(
+        acc_id,
+        Box::new(add(
+            local(acc_id),
+            mul(uint8_get(array_id, index), local(k_id)),
+        )),
+    ))
 }
 
 fn call(callee: Expr, args: Vec<Expr>) -> Expr {
@@ -851,6 +876,143 @@ fn explicit_width_guard_proves_wide_buffer_read() {
                 && record["buffer_access"]["bounds_width_units"] == 4
         }),
         "expected i + 4 <= buf.length to prove a 4-byte native read:\n{artifact:#}"
+    );
+}
+
+#[test]
+fn affine_buffer_guard_emits_nonwrapping_widened_assume() {
+    let body = vec![
+        buffer_let(1, "buf", int(16)),
+        Stmt::For {
+            init: Some(Box::new(number_let(2, "i", true, int(0)))),
+            condition: Some(Expr::Compare {
+                op: CompareOp::Le,
+                left: Box::new(add(local(2), int(4))),
+                right: Box::new(length(1)),
+            }),
+            update: Some(increment(2)),
+            body: vec![Stmt::Expr(buffer_read(1, "readUInt32BE", local(2)))],
+        },
+        Stmt::Return(Some(int(0))),
+    ];
+
+    let ir = compile_ir("affine_buffer_guard_widened_assume.ts", body);
+    assert!(
+        ir.contains("call void @llvm.assume")
+            && ir.contains("icmp sge i32")
+            && ir.contains("sext i32")
+            && ir.contains("zext i32")
+            && ir.contains("add i64")
+            && ir.contains("icmp ule i64"),
+        "affine raw buffer proof must be non-negative and use widened end arithmetic:\n{ir}"
+    );
+}
+
+#[test]
+fn typed_array_element_offset_uses_widened_gep_index() {
+    let body = vec![
+        typed_array_let(
+            1,
+            "src",
+            "Int32Array",
+            perry_hir::TYPED_ARRAY_KIND_INT32,
+            int(16),
+        ),
+        for_loop(2, length(1), vec![Stmt::Expr(index_get(1, local(2)))]),
+        Stmt::Return(Some(int(0))),
+    ];
+
+    let ir = compile_ir("typed_array_widened_byte_offset.ts", body);
+    assert!(
+        ir.contains("mul i64")
+            && ir.contains("getelementptr inbounds i8, ptr")
+            && ir.contains(", i64 "),
+        "multi-byte typed-array raw access must widen the byte offset before inbounds GEP:\n{ir}"
+    );
+}
+
+#[test]
+fn channel_reduction_with_proven_span_uses_widened_affine_assume() {
+    let body = vec![
+        typed_array_let(
+            1,
+            "src",
+            "Uint8Array",
+            perry_hir::TYPED_ARRAY_KIND_UINT8,
+            int(16),
+        ),
+        number_let(2, "r", true, bit_or_zero(int(0))),
+        number_let(3, "g", true, bit_or_zero(int(0))),
+        number_let(4, "b", true, bit_or_zero(int(0))),
+        number_let(5, "k", false, int(1)),
+        Stmt::Expr(uint8_get(1, local(2))),
+        Stmt::Expr(uint8_get(1, local(3))),
+        Stmt::Expr(uint8_get(1, local(4))),
+        Stmt::For {
+            init: Some(Box::new(number_let(6, "i", true, int(0)))),
+            condition: Some(Expr::Compare {
+                op: CompareOp::Le,
+                left: Box::new(add(local(6), int(3))),
+                right: Box::new(length(1)),
+            }),
+            update: Some(increment(6)),
+            body: vec![
+                channel_accumulate(2, 1, local(6), 5),
+                channel_accumulate(3, 1, add(local(6), int(1)), 5),
+                channel_accumulate(4, 1, add(local(6), int(2)), 5),
+            ],
+        },
+        Stmt::Return(Some(local(2))),
+    ];
+
+    let ir = compile_ir("channel_reduction_widened_assume.ts", body);
+    assert!(
+        ir.contains("insertelement <4 x i32>")
+            && ir.contains("call void @llvm.assume")
+            && ir.contains("icmp sge i32")
+            && ir.contains("sext i32")
+            && ir.contains("zext i32")
+            && ir.contains("add i64")
+            && ir.contains("getelementptr inbounds i8, ptr")
+            && ir.contains(", i64 ")
+            && ir.contains("icmp ule i64"),
+        "proven channel reduction should keep SIMD while proving the lane span without i32 wrap:\n{ir}"
+    );
+}
+
+#[test]
+fn channel_reduction_without_span_proof_falls_back_to_checked_scalar_gets() {
+    let module = module_with_classes_and_params(
+        "channel_reduction_unproven_span_fallback.ts",
+        Vec::new(),
+        vec![param(9, "idx", Type::Number)],
+        Type::Number,
+        vec![
+            typed_array_let(
+                1,
+                "src",
+                "Uint8Array",
+                perry_hir::TYPED_ARRAY_KIND_UINT8,
+                int(16),
+            ),
+            number_let(2, "r", true, bit_or_zero(int(0))),
+            number_let(3, "g", true, bit_or_zero(int(0))),
+            number_let(4, "b", true, bit_or_zero(int(0))),
+            number_let(5, "k", false, int(1)),
+            channel_accumulate(2, 1, local(9), 5),
+            channel_accumulate(3, 1, add(local(9), int(1)), 5),
+            channel_accumulate(4, 1, add(local(9), int(2)), 5),
+            Stmt::Return(Some(local(2))),
+        ],
+    );
+    let ir = String::from_utf8(compile_module(&module, empty_opts()).unwrap()).unwrap();
+    assert!(
+        !ir.contains("insertelement <4 x i32>"),
+        "unproven channel span must not use raw SIMD reduction:\n{ir}"
+    );
+    assert!(
+        ir.matches("call i32 @js_uint8array_get").count() >= 3,
+        "unproven channel span should lower through checked scalar Uint8Array gets:\n{ir}"
     );
 }
 

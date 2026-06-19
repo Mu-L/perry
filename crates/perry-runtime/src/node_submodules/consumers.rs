@@ -507,9 +507,9 @@ fn call_symbol_async_iterator(stream: f64) -> Option<f64> {
     if !is_callable_value(method) {
         return None;
     }
-    let prev_this = crate::object::js_implicit_this_set(stream);
+    let prev_this = crate::object::js_implicit_this_push(stream);
     let iterator = unsafe { crate::closure::js_native_call_value(method, std::ptr::null(), 0) };
-    crate::object::js_implicit_this_set(prev_this);
+    crate::object::js_implicit_this_restore(prev_this);
     if iterator.to_bits() == crate::value::TAG_UNDEFINED {
         None
     } else {

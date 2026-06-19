@@ -27,6 +27,66 @@ fn test_copying_minor_promotes_survivor_on_fourth_survival() {
 }
 
 #[test]
+fn test_survivor_promotion_handoff_attempts_copied_minor_first() {
+    let payload = LARGE_OBJECT_THRESHOLD_BYTES - GC_HEADER_SIZE - 64;
+    let object_count = (GC_COPY_PROMOTION_HANDOFF_MIN_BYTES / payload) + 64;
+    let _guard = CopyingNurseryTestGuard::new(object_count as u32);
+    let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    GC_LAST_OLD_RECLAIM_IN_USE_BYTES.with(|bytes| bytes.set(0));
+
+    let mut originals = Vec::with_capacity(object_count);
+    for slot in 0..object_count {
+        let child = crate::arena::arena_alloc_gc(payload, 8, GC_TYPE_STRING) as usize;
+        assert!(
+            crate::arena::pointer_in_nursery(child),
+            "test setup must use movable nursery objects"
+        );
+        js_shadow_slot_set(slot as u32, ptr_bits(child));
+        originals.push(child);
+    }
+
+    let first_trace = collect_minor_trace(GcTriggerKind::Direct);
+    assert_copied_minor_trace(&first_trace, true, CopiedMinorFallbackReason::None, false);
+
+    let mut survivor_total = 0usize;
+    for (slot, original) in originals.iter().enumerate() {
+        let survivor = (js_shadow_slot_get(slot as u32) & POINTER_MASK) as usize;
+        assert_ne!(survivor, *original);
+        assert!(crate::arena::pointer_in_nursery(survivor));
+        unsafe {
+            let header = header_from_user_ptr(survivor as *const u8);
+            survivor_total = survivor_total.saturating_add((*header).size as usize);
+            (*header).gc_flags |= GC_FLAG_TENURED;
+        }
+    }
+    assert!(
+        survivor_total >= GC_COPY_PROMOTION_HANDOFF_MIN_BYTES,
+        "test setup must create enough promotable survivor bytes"
+    );
+
+    let _old_pressure =
+        crate::arena::arena_alloc_gc_old(GC_OLD_GEN_RECLAIM_THRESHOLD_BYTES, 8, GC_TYPE_OBJECT);
+    assert!(
+        copied_minor_promotion_handoff_due(GcTriggerKind::ArenaBytes),
+        "test setup must create survivor-promotion handoff pressure"
+    );
+
+    let trace = collect_minor_trace(GcTriggerKind::ArenaBytes);
+
+    assert_eq!(trace.collection_kind.as_str(), "minor");
+    assert_eq!(trace.trigger_kind.as_str(), "arena_bytes");
+    assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
+    for slot in 0..object_count {
+        assert!(
+            crate::arena::pointer_in_old_gen(
+                (js_shadow_slot_get(slot as u32) & POINTER_MASK) as usize
+            ),
+            "tenured survivor should be promoted by the copied-minor attempt"
+        );
+    }
+}
+
+#[test]
 fn test_copying_minor_preserves_old_page_accounting_for_defrag_policy() {
     struct ResetGcTestState {
         pinned_header: *mut GcHeader,
@@ -268,6 +328,7 @@ fn test_copying_minor_sweeps_malloc_when_due_on_arena_trigger() {
 
 #[test]
 fn test_gc_check_trigger_copied_minor_malloc_sweep_rebaselines_trigger() {
+    let _trace_guard = TestGcTraceCaptureGuard::force_enabled();
     let _guard = CopyingNurseryTestGuard::new(1);
     let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     let live_malloc = gc_malloc(
@@ -295,24 +356,12 @@ fn test_gc_check_trigger_copied_minor_malloc_sweep_rebaselines_trigger() {
     let mut step_status = JsGcStepResult::default();
     assert_eq!(
         js_gc_step_status(&mut step_status),
-        JS_GC_STEP_STATUS_ACTIVE,
-        "gc_check_trigger should schedule malloc pressure as bounded assist work"
+        JS_GC_STEP_STATUS_IDLE,
+        "eligible malloc pressure should complete during allocation-side copied-minor assist"
     );
-    assert_eq!(
-        gc_collection_count(),
-        collections_before,
-        "gc_check_trigger must not complete malloc pressure synchronously"
-    );
-    assert_eq!(
-        step_status.trigger_kind,
-        GcTriggerKind::MallocCount.ffi_code()
-    );
-
-    let completed = complete_budgeted_gc_cycle();
-    assert_eq!(completed.status, JS_GC_STEP_STATUS_COMPLETED);
     assert!(
         gc_collection_count() > collections_before,
-        "draining the budgeted malloc-pressure cycle should collect"
+        "gc_check_trigger should collect eligible malloc pressure"
     );
     assert_eq!(
         tracked_malloc_headers_matching(&churn_headers),
@@ -335,10 +384,23 @@ fn test_gc_check_trigger_copied_minor_malloc_sweep_rebaselines_trigger() {
         survivors_after + malloc_step_after,
         "gc_check_trigger should rebaseline the next malloc trigger to survivors + step"
     );
+    let event = take_test_last_gc_trace_json().expect("malloc-pressure copied-minor should trace");
+    assert_eq!(event["collection_kind"].as_str(), Some("minor"));
+    assert_eq!(event["trigger"]["kind"].as_str(), Some("malloc_count"));
+    assert_eq!(event["copying_nursery"]["eligible"].as_bool(), Some(true));
+    assert_eq!(
+        event["copying_nursery"]["fallback_reason"].as_str(),
+        Some("none")
+    );
+    assert_eq!(
+        event["copying_nursery"]["malloc_sweep_due"].as_bool(),
+        Some(true)
+    );
 }
 
 #[test]
 fn test_gc_check_trigger_copied_minor_without_malloc_sweep_preserves_malloc_trigger() {
+    let _trace_guard = TestGcTraceCaptureGuard::force_enabled();
     let _guard = CopyingNurseryTestGuard::new(1);
     let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     deactivate_malloc_registry_for_tests();
@@ -368,24 +430,12 @@ fn test_gc_check_trigger_copied_minor_without_malloc_sweep_preserves_malloc_trig
     let mut step_status = JsGcStepResult::default();
     assert_eq!(
         js_gc_step_status(&mut step_status),
-        JS_GC_STEP_STATUS_ACTIVE,
-        "gc_check_trigger should schedule arena pressure as bounded assist work"
+        JS_GC_STEP_STATUS_IDLE,
+        "eligible arena pressure should complete during allocation-side copied-minor assist"
     );
-    assert_eq!(
-        gc_collection_count(),
-        collections_before,
-        "gc_check_trigger must not complete arena pressure synchronously"
-    );
-    assert_eq!(
-        step_status.trigger_kind,
-        GcTriggerKind::ArenaBytes.ffi_code()
-    );
-
-    let completed = complete_budgeted_gc_cycle();
-    assert_eq!(completed.status, JS_GC_STEP_STATUS_COMPLETED);
     assert!(
         gc_collection_count() > collections_before,
-        "draining the budgeted arena-pressure cycle should collect"
+        "gc_check_trigger should collect eligible arena pressure"
     );
     assert_eq!(
         tracked_malloc_headers_matching(&churn_headers),
@@ -401,6 +451,22 @@ fn test_gc_check_trigger_copied_minor_without_malloc_sweep_preserves_malloc_trig
         GC_NEXT_MALLOC_TRIGGER.with(|trigger| trigger.get()),
         next_malloc_trigger,
         "arena-triggered copied-minor without malloc sweep must preserve the existing malloc trigger"
+    );
+    let live_after = (js_shadow_slot_get(0) & POINTER_MASK) as usize;
+    assert_ne!(live_after, live_young);
+    assert!(crate::arena::pointer_in_nursery(live_after));
+
+    let event = take_test_last_gc_trace_json().expect("arena-pressure copied-minor should trace");
+    assert_eq!(event["collection_kind"].as_str(), Some("minor"));
+    assert_eq!(event["trigger"]["kind"].as_str(), Some("arena_bytes"));
+    assert_eq!(event["copying_nursery"]["eligible"].as_bool(), Some(true));
+    assert_eq!(
+        event["copying_nursery"]["fallback_reason"].as_str(),
+        Some("none")
+    );
+    assert_eq!(
+        event["copying_nursery"]["malloc_sweep_due"].as_bool(),
+        Some(false)
     );
 }
 
@@ -525,7 +591,7 @@ fn test_copied_minor_malloc_scaling_falls_back_when_registry_unavailable() {
 }
 
 #[test]
-fn test_copying_minor_falls_back_for_pinned_young_root() {
+fn test_copying_minor_keeps_pinned_eden_root_eligible() {
     let _guard = CopyingNurseryTestGuard::new(1);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     let child = young_leaf();
@@ -537,20 +603,17 @@ fn test_copying_minor_falls_back_for_pinned_young_root() {
     let trace = collect_minor_trace(GcTriggerKind::Direct);
     let after = (js_shadow_slot_get(0) & POINTER_MASK) as usize;
 
-    assert_copied_minor_trace(
-        &trace,
-        false,
-        CopiedMinorFallbackReason::PinnedYoungRoot,
-        false,
-    );
+    assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
     assert_eq!(after, child);
+    assert!(trace.copying_nursery.pinned_eden_objects >= 1);
+    assert!(trace.copying_nursery.pinned_eden_blocks >= 1);
     unsafe {
         (*header_from_user_ptr(child as *const u8)).gc_flags &= !GC_FLAG_PINNED;
     }
 }
 
 #[test]
-fn test_copying_minor_falls_back_for_pinned_young_dirty_slot() {
+fn test_copying_minor_keeps_pinned_eden_dirty_slot_eligible() {
     let _guard = CopyingNurseryTestGuard::new(0);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     let child = young_leaf();
@@ -564,20 +627,17 @@ fn test_copying_minor_falls_back_for_pinned_young_dirty_slot() {
     let trace = collect_minor_trace(GcTriggerKind::Direct);
     let child_after = unsafe { (*elements & POINTER_MASK) as usize };
 
-    assert_copied_minor_trace(
-        &trace,
-        false,
-        CopiedMinorFallbackReason::PinnedYoungDirtySlot,
-        false,
-    );
+    assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
     assert_eq!(child_after, child);
+    assert!(trace.copying_nursery.pinned_eden_objects >= 1);
+    assert!(trace.copying_nursery.pinned_eden_blocks >= 1);
     unsafe {
         (*header_from_user_ptr(child as *const u8)).gc_flags &= !GC_FLAG_PINNED;
     }
 }
 
 #[test]
-fn test_copying_minor_falls_back_for_transitive_pinned_young_child() {
+fn test_copying_minor_keeps_transitive_pinned_eden_child_eligible() {
     let _guard = CopyingNurseryTestGuard::new(1);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     let arr = crate::array::js_array_alloc(1);
@@ -605,20 +665,17 @@ fn test_copying_minor_falls_back_for_transitive_pinned_young_child() {
     let arr_after = (js_shadow_slot_get(0) & POINTER_MASK) as usize;
     let child_after = unsafe { (*elements & POINTER_MASK) as usize };
 
-    assert_copied_minor_trace(
-        &trace,
-        false,
-        CopiedMinorFallbackReason::PinnedYoungTransitive,
-        false,
-    );
+    assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
     assert_eq!(
         arr_after, arr as usize,
-        "copying nursery must fall back before moving the young parent"
+        "young parent in a retained pinned-Eden block should stay stable"
     );
     assert_eq!(
         child_after, child,
         "pinned transitive young child must keep its raw address"
     );
+    assert!(trace.copying_nursery.pinned_eden_objects >= 1);
+    assert!(trace.copying_nursery.pinned_eden_blocks >= 1);
     unsafe {
         let child_header = header_from_user_ptr(child as *const u8);
         assert_eq!(

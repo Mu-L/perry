@@ -46,23 +46,6 @@ pub enum NumericArrayLayout {
 }
 
 #[inline]
-pub(crate) fn array_object_flags(arr: *const ArrayHeader) -> u16 {
-    let arr = clean_arr_ptr(arr);
-    if arr.is_null() || (arr as usize) < crate::gc::GC_HEADER_SIZE + 0x1000 {
-        return 0;
-    }
-    unsafe {
-        let gc_header =
-            (arr as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-        if (*gc_header).obj_type == crate::gc::GC_TYPE_ARRAY {
-            (*gc_header)._reserved
-        } else {
-            0
-        }
-    }
-}
-
-#[inline]
 pub(crate) fn array_is_frozen(arr: *const ArrayHeader) -> bool {
     array_object_flags(arr) & crate::gc::OBJ_FLAG_FROZEN != 0
 }
@@ -293,13 +276,19 @@ pub(crate) unsafe fn array_named_property_set(
     let Some(name) = string_header_as_str(key) else {
         return;
     };
+    let flags = array_object_flags(arr);
+    if flags & crate::gc::OBJ_FLAG_FROZEN != 0 {
+        return;
+    }
+    let adding_forbidden =
+        flags & (crate::gc::OBJ_FLAG_SEALED | crate::gc::OBJ_FLAG_NO_EXTEND) != 0;
     let owner = arr as usize;
     ARRAY_NAMED_PROPS.with(|m| {
         let mut map = m.borrow_mut();
         let props = map.entry(owner).or_default();
         if let Some(prop) = props.iter_mut().find(|prop| prop.name == name) {
             prop.value = value;
-        } else {
+        } else if !adding_forbidden {
             props.push(ArrayNamedProperty {
                 name: name.to_string(),
                 value,
@@ -700,6 +689,66 @@ pub struct ArrayHeader {
     pub length: u32,
     /// Capacity (allocated space for elements)
     pub capacity: u32,
+}
+
+#[inline]
+pub(crate) fn array_object_flags(arr: *const ArrayHeader) -> u16 {
+    let arr = clean_arr_ptr(arr);
+    if arr.is_null() {
+        return 0;
+    }
+    unsafe {
+        if (arr as usize) < crate::gc::GC_HEADER_SIZE + 0x1000 {
+            return 0;
+        }
+        let gc_header =
+            (arr as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+        if (*gc_header).obj_type == crate::gc::GC_TYPE_ARRAY
+            || (*gc_header).obj_type == crate::gc::GC_TYPE_LAZY_ARRAY
+        {
+            (*gc_header)._reserved
+        } else {
+            0
+        }
+    }
+}
+
+#[inline]
+pub(crate) fn array_can_set_index(arr: *const ArrayHeader, index: u32) -> bool {
+    let arr = clean_arr_ptr(arr);
+    if arr.is_null() {
+        return false;
+    }
+    let flags = array_object_flags(arr);
+    if flags & crate::gc::OBJ_FLAG_FROZEN != 0 {
+        return false;
+    }
+    unsafe {
+        if index >= (*arr).length
+            && flags & (crate::gc::OBJ_FLAG_SEALED | crate::gc::OBJ_FLAG_NO_EXTEND) != 0
+        {
+            return false;
+        }
+    }
+    true
+}
+
+#[inline]
+pub(crate) fn array_can_set_length(arr: *const ArrayHeader, new_length: u32) -> bool {
+    let arr = clean_arr_ptr(arr);
+    if arr.is_null() {
+        return false;
+    }
+    let flags = array_object_flags(arr);
+    if flags & crate::gc::OBJ_FLAG_FROZEN != 0 {
+        return false;
+    }
+    unsafe {
+        if new_length < (*arr).length && flags & crate::gc::OBJ_FLAG_SEALED != 0 {
+            return false;
+        }
+    }
+    true
 }
 
 #[inline]

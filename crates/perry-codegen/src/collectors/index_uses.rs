@@ -497,6 +497,20 @@ pub fn walk_index_uses_in_expr(e: &perry_hir::Expr, out: &mut HashSet<u32>) {
                 walk_index_uses_in_expr(a, out);
             }
         }
+        Expr::NewDynamic { callee, args } => {
+            walk_index_uses_in_expr(callee, out);
+            for a in args {
+                walk_index_uses_in_expr(a, out);
+            }
+        }
+        Expr::NewDynamicSpread { callee, args } => {
+            walk_index_uses_in_expr(callee, out);
+            for a in args {
+                match a {
+                    CallArg::Expr(e) | CallArg::Spread(e) => walk_index_uses_in_expr(e, out),
+                }
+            }
+        }
         // Closure bodies are intentionally NOT walked: a captured local can't
         // use the i32 slot anyway (boxed captures route through
         // `js_box_get`/`js_box_set` and non-boxed ones through

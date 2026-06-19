@@ -68,11 +68,11 @@ pub(super) fn destroy_stream(stream: f64, err: f64) {
                 err
             };
             let args = [destroy_arg, cb_value];
-            let prev_this = crate::object::js_implicit_this_set(stream);
+            let prev_this = crate::object::js_implicit_this_push(stream);
             unsafe {
                 let _ = crate::closure::js_native_call_value(destroy, args.as_ptr(), args.len());
             }
-            crate::object::js_implicit_this_set(prev_this);
+            crate::object::js_implicit_this_restore(prev_this);
             return;
         }
     }

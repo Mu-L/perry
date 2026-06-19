@@ -559,7 +559,7 @@ extern "C" fn callbackify_outer_thunk(closure: *const ClosureHeader, rest_value:
         let on_rejected =
             nanbox_pointer(rejected_handle.get_raw_const_ptr::<ClosureHeader>() as *const u8);
         let args = [on_fulfilled, on_rejected];
-        let prev_this = crate::object::js_implicit_this_set(returned);
+        let prev_this = crate::object::js_implicit_this_push(returned);
         unsafe {
             crate::closure::js_native_call_value(
                 then_handle.get_nanbox_f64(),
@@ -567,7 +567,7 @@ extern "C" fn callbackify_outer_thunk(closure: *const ClosureHeader, rest_value:
                 args.len(),
             );
         }
-        crate::object::js_implicit_this_set(prev_this);
+        crate::object::js_implicit_this_restore(prev_this);
         return TAG_UNDEFINED_F64;
     }
 

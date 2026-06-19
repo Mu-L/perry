@@ -596,6 +596,172 @@ fn test_copied_minor_eligibility_auto_skips_conservative_stack_scan() {
 }
 
 #[test]
+fn test_copied_minor_keeps_pinned_eden_root_eligible_and_stable() {
+    let _guard = CopyingNurseryTestGuard::new(1);
+    let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let child = young_leaf();
+    let header = unsafe { header_from_user_ptr(child as *const u8) };
+    unsafe {
+        (*header).gc_flags |= GC_FLAG_PINNED;
+    }
+    js_shadow_slot_set(0, string_bits(child));
+
+    let trace = collect_minor_trace(GcTriggerKind::Direct);
+    let after = (js_shadow_slot_get(0) & POINTER_MASK) as usize;
+
+    assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
+    assert_eq!(after, child, "pinned Eden root address must remain stable");
+    assert_eq!(
+        unsafe { (*header).gc_flags & GC_FLAG_FORWARDED },
+        0,
+        "pinned Eden root must not be copied behind a forwarding stub"
+    );
+    assert!(trace.copying_nursery.pinned_eden_objects >= 1);
+    assert!(trace.copying_nursery.pinned_eden_bytes > 0);
+    assert!(trace.copying_nursery.pinned_eden_blocks >= 1);
+    assert!(trace.copying_nursery.pinned_eden_retained_bytes > 0);
+    unsafe {
+        (*header).gc_flags &= !GC_FLAG_PINNED;
+    }
+}
+
+#[test]
+fn test_copied_minor_keeps_unrooted_pinned_eden_object_live() {
+    let _guard = CopyingNurseryTestGuard::new(0);
+    let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let child = young_leaf();
+    let header = unsafe { header_from_user_ptr(child as *const u8) };
+    unsafe {
+        (*header).gc_flags |= GC_FLAG_PINNED;
+    }
+
+    let trace = collect_minor_trace(GcTriggerKind::Direct);
+
+    assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
+    assert_eq!(
+        unsafe { (*header).gc_flags & GC_FLAG_FORWARDED },
+        0,
+        "unrooted pinned Eden object must not be copied through a forwarding stub"
+    );
+    assert_ne!(unsafe { (*header).gc_flags & GC_FLAG_PINNED }, 0);
+    assert!(trace.copying_nursery.pinned_eden_objects >= 1);
+    assert!(trace.copying_nursery.pinned_eden_blocks >= 1);
+    assert!(trace.copying_nursery.pinned_eden_retained_bytes > 0);
+    unsafe {
+        (*header).gc_flags &= !GC_FLAG_PINNED;
+    }
+}
+
+#[test]
+fn test_copied_minor_keeps_old_dirty_slot_to_pinned_eden_eligible() {
+    let _guard = CopyingNurseryTestGuard::new(0);
+    let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let (parent, fields) = unsafe { alloc_old_test_object(1) };
+    let child = young_leaf();
+    let child_bits = string_bits(child);
+    let child_header = unsafe { header_from_user_ptr(child as *const u8) };
+    unsafe {
+        (*child_header).gc_flags |= GC_FLAG_PINNED;
+        *fields = child_bits;
+    }
+    runtime_write_barrier_slot(parent as usize, fields as usize, child_bits);
+
+    let trace = collect_minor_trace(GcTriggerKind::Direct);
+    let after = unsafe { (*fields & POINTER_MASK) as usize };
+
+    assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
+    assert_eq!(
+        after, child,
+        "old dirty slot should keep pointing at the stable pinned Eden object"
+    );
+    assert!(trace.copying_nursery.pinned_eden_objects >= 1);
+    assert!(
+        remembered_set_size() > 0,
+        "old-to-pinned-Eden slot must be restored after copied-minor clears remembered state"
+    );
+
+    clear_marks();
+    let valid_ptrs = build_valid_pointer_set();
+    let stats = mark_remembered_set_roots(&valid_ptrs);
+    assert!(
+        stats.valid_roots > 0,
+        "restored dirty card should rescan the old parent even though the pinned child is already live"
+    );
+    assert_ne!(unsafe { (*child_header).gc_flags & GC_FLAG_PINNED }, 0);
+    clear_marks();
+    unsafe {
+        (*child_header).gc_flags &= !GC_FLAG_PINNED;
+    }
+}
+
+#[test]
+fn test_copied_minor_retained_eden_block_follows_forwarded_stub() {
+    let _guard = CopyingNurseryTestGuard::new(1);
+    let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let stale_arr = crate::array::js_array_alloc(0);
+    let mut current_arr = stale_arr;
+
+    for _ in 0..50 {
+        current_arr = crate::array::js_array_push_f64(current_arr, 1.0);
+    }
+    assert_ne!(stale_arr, current_arr);
+
+    let stale_header = unsafe { header_from_user_ptr(stale_arr as *const u8) };
+    unsafe {
+        assert_ne!((*stale_header).gc_flags & GC_FLAG_FORWARDED, 0);
+        (*stale_header).gc_flags |= GC_FLAG_PINNED;
+    }
+    js_shadow_slot_set(0, ptr_bits(stale_arr as usize));
+
+    let trace = collect_minor_trace(GcTriggerKind::Direct);
+    let after = (js_shadow_slot_get(0) & POINTER_MASK) as usize;
+    let after_header = unsafe { header_from_user_ptr(after as *const u8) };
+
+    assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
+    assert_ne!(
+        after, stale_arr as usize,
+        "retained-block marking must follow array-growth forwarding stubs"
+    );
+    assert_eq!(unsafe { (*after_header).obj_type }, GC_TYPE_ARRAY);
+    unsafe {
+        (*stale_header).gc_flags &= !GC_FLAG_PINNED;
+    }
+}
+
+#[test]
+fn test_copied_minor_still_falls_back_for_pinned_active_survivor_root() {
+    let _guard = CopyingNurseryTestGuard::new(1);
+    let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let child = young_leaf();
+    js_shadow_slot_set(0, string_bits(child));
+
+    let first = collect_minor_trace(GcTriggerKind::Direct);
+    let survivor_child = (js_shadow_slot_get(0) & POINTER_MASK) as usize;
+    let survivor_header = unsafe { header_from_user_ptr(survivor_child as *const u8) };
+    assert_copied_minor_trace(&first, true, CopiedMinorFallbackReason::None, false);
+    assert_ne!(survivor_child, child);
+    assert_eq!(
+        crate::arena::classify_heap_space(survivor_child),
+        crate::arena::active_survivor_space()
+    );
+    unsafe {
+        (*survivor_header).gc_flags |= GC_FLAG_PINNED;
+    }
+
+    let second = collect_minor_trace(GcTriggerKind::Direct);
+
+    assert_copied_minor_trace(
+        &second,
+        false,
+        CopiedMinorFallbackReason::PinnedYoungRoot,
+        false,
+    );
+    unsafe {
+        (*survivor_header).gc_flags &= !GC_FLAG_PINNED;
+    }
+}
+
+#[test]
 fn root_source_active_shadow_frame_reports_precise_shadow_roots_only() {
     let _guard = CopyingNurseryTestGuard::new(1);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
@@ -626,19 +792,14 @@ fn root_source_active_shadow_frame_reports_precise_shadow_roots_only() {
 }
 
 #[test]
-fn test_copied_minor_eligibility_empty_rust_copy_only_scanner_falls_back() {
+fn test_copied_minor_eligibility_empty_rust_copy_only_scanner_stays_eligible() {
     let _guard = CopyingNurseryTestGuard::new(0);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     let _copy_only_root_guard = TemporaryCopyOnlyRootScanner::rust_bits(&[]);
 
     let trace = collect_minor_trace(GcTriggerKind::Direct);
 
-    assert_copied_minor_trace(
-        &trace,
-        false,
-        CopiedMinorFallbackReason::CopyOnlyRoots,
-        false,
-    );
+    assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
     assert_eq!(
         trace
             .legacy_copy_only_scanner_pinned
@@ -649,19 +810,14 @@ fn test_copied_minor_eligibility_empty_rust_copy_only_scanner_falls_back() {
 }
 
 #[test]
-fn test_copied_minor_eligibility_empty_ffi_copy_only_scanner_falls_back() {
+fn test_copied_minor_eligibility_empty_ffi_copy_only_scanner_stays_eligible() {
     let _guard = CopyingNurseryTestGuard::new(0);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     let _copy_only_root_guard = TemporaryCopyOnlyRootScanner::ffi_bits(&[]);
 
     let trace = collect_minor_trace(GcTriggerKind::Direct);
 
-    assert_copied_minor_trace(
-        &trace,
-        false,
-        CopiedMinorFallbackReason::CopyOnlyRoots,
-        false,
-    );
+    assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
     assert_eq!(
         trace
             .legacy_copy_only_scanner_pinned
@@ -672,7 +828,7 @@ fn test_copied_minor_eligibility_empty_ffi_copy_only_scanner_falls_back() {
 }
 
 #[test]
-fn test_copied_minor_eligibility_rejects_copy_only_without_scanning_roots() {
+fn test_copied_minor_eligibility_retains_copy_only_eden_roots() {
     let _guard = CopyingNurseryTestGuard::new(0);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     let child = young_leaf();
@@ -680,18 +836,16 @@ fn test_copied_minor_eligibility_rejects_copy_only_without_scanning_roots() {
 
     let eligibility = CopiedMinorEligibility::evaluate(GcTriggerKind::Direct);
 
-    assert!(!eligibility.eligible);
-    assert_eq!(
-        eligibility.fallback_reason,
-        CopiedMinorFallbackReason::CopyOnlyRoots
-    );
+    assert!(eligibility.eligible);
+    assert_eq!(eligibility.fallback_reason, CopiedMinorFallbackReason::None);
+    assert_eq!(eligibility.pinned_eden_blocks.len(), 1);
     assert_eq!(eligibility.legacy_root_stats.registered_rust_scanners, 1);
-    assert_eq!(eligibility.legacy_root_stats.emitted_roots, 0);
-    assert_eq!(eligibility.legacy_root_stats.emitted_young_roots, 0);
+    assert_eq!(eligibility.legacy_root_stats.emitted_roots, 1);
+    assert_eq!(eligibility.legacy_root_stats.emitted_young_roots, 1);
 }
 
 #[test]
-fn test_copied_minor_eligibility_falls_back_for_live_young_rust_copy_only_root() {
+fn test_copied_minor_keeps_live_eden_rust_copy_only_root_eligible_and_stable() {
     let _guard = CopyingNurseryTestGuard::new(0);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     let child = young_leaf();
@@ -699,12 +853,7 @@ fn test_copied_minor_eligibility_falls_back_for_live_young_rust_copy_only_root()
 
     let trace = collect_minor_trace(GcTriggerKind::Direct);
 
-    assert_copied_minor_trace(
-        &trace,
-        false,
-        CopiedMinorFallbackReason::CopyOnlyRoots,
-        false,
-    );
+    assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
     assert_eq!(
         trace
             .legacy_copy_only_scanner_pinned
@@ -713,6 +862,15 @@ fn test_copied_minor_eligibility_falls_back_for_live_young_rust_copy_only_root()
     );
     assert_eq!(trace.legacy_copy_only_scanner_pinned.emitted_roots, 1);
     assert_eq!(trace.legacy_copy_only_scanner_pinned.emitted_young_roots, 1);
+    assert!(trace.copying_nursery.pinned_eden_objects >= 1);
+    assert!(trace.copying_nursery.pinned_eden_blocks >= 1);
+    assert!(trace.copying_nursery.pinned_eden_retained_bytes > 0);
+    unsafe {
+        assert_eq!(
+            (*header_from_user_ptr(child as *const u8)).obj_type,
+            GC_TYPE_STRING
+        );
+    }
     assert_eq!(
         trace.root_sources.native_stack_fallback.decision,
         ConservativeStackScanDecision::SkipDisabled
@@ -727,7 +885,7 @@ fn test_copied_minor_eligibility_falls_back_for_live_young_rust_copy_only_root()
 }
 
 #[test]
-fn test_copied_minor_eligibility_falls_back_for_live_young_ffi_copy_only_root() {
+fn test_copied_minor_keeps_live_eden_ffi_copy_only_root_eligible_and_stable() {
     let _guard = CopyingNurseryTestGuard::new(0);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     let child = young_leaf();
@@ -735,12 +893,7 @@ fn test_copied_minor_eligibility_falls_back_for_live_young_ffi_copy_only_root() 
 
     let trace = collect_minor_trace(GcTriggerKind::Direct);
 
-    assert_copied_minor_trace(
-        &trace,
-        false,
-        CopiedMinorFallbackReason::CopyOnlyRoots,
-        false,
-    );
+    assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
     assert_eq!(
         trace
             .legacy_copy_only_scanner_pinned
@@ -749,6 +902,107 @@ fn test_copied_minor_eligibility_falls_back_for_live_young_ffi_copy_only_root() 
     );
     assert_eq!(trace.legacy_copy_only_scanner_pinned.emitted_roots, 1);
     assert_eq!(trace.legacy_copy_only_scanner_pinned.emitted_young_roots, 1);
+    assert!(trace.copying_nursery.pinned_eden_objects >= 1);
+    assert!(trace.copying_nursery.pinned_eden_blocks >= 1);
+    assert!(trace.copying_nursery.pinned_eden_retained_bytes > 0);
+    unsafe {
+        assert_eq!(
+            (*header_from_user_ptr(child as *const u8)).obj_type,
+            GC_TYPE_STRING
+        );
+    }
+}
+
+#[test]
+fn test_copied_minor_traces_copy_only_eden_root_children() {
+    let _guard = CopyingNurseryTestGuard::new(0);
+    let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let (parent, fields) = unsafe { alloc_nursery_test_object(1) };
+    let child = young_leaf();
+    unsafe {
+        *fields = ptr_bits(child);
+    }
+    let _copy_only_root_guard =
+        TemporaryCopyOnlyRootScanner::rust_bits(&[ptr_bits(parent as usize)]);
+
+    let trace = collect_minor_trace(GcTriggerKind::Direct);
+    let child_after = unsafe { (*fields & POINTER_MASK) as usize };
+
+    assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
+    assert!(trace.copying_nursery.pinned_eden_objects >= 1);
+    assert!(trace.copying_nursery.pinned_eden_blocks >= 1);
+    assert_ne!(child_after, 0);
+    assert!(crate::arena::pointer_in_nursery(child_after));
+    unsafe {
+        assert_eq!(
+            (*header_from_user_ptr(parent as *const u8)).obj_type,
+            GC_TYPE_OBJECT
+        );
+        assert_eq!(
+            (*header_from_user_ptr(child_after as *const u8)).obj_type,
+            GC_TYPE_STRING
+        );
+    }
+}
+
+#[test]
+fn test_copied_minor_falls_back_for_copy_only_forwarded_eden_stub() {
+    let _guard = CopyingNurseryTestGuard::new(0);
+    let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let stale_arr = crate::array::js_array_alloc(0);
+    let mut current_arr = stale_arr;
+
+    for _ in 0..50 {
+        current_arr = crate::array::js_array_push_f64(current_arr, 1.0);
+    }
+    assert_ne!(stale_arr, current_arr);
+    let stale_header = unsafe { header_from_user_ptr(stale_arr as *const u8) };
+    assert_ne!(unsafe { (*stale_header).gc_flags & GC_FLAG_FORWARDED }, 0);
+
+    let _copy_only_root_guard =
+        TemporaryCopyOnlyRootScanner::rust_bits(&[ptr_bits(stale_arr as usize)]);
+    let trace = collect_minor_trace(GcTriggerKind::Direct);
+
+    assert_copied_minor_trace(
+        &trace,
+        false,
+        CopiedMinorFallbackReason::CopyOnlyRoots,
+        false,
+    );
+    assert_eq!(trace.legacy_copy_only_scanner_pinned.emitted_roots, 1);
+    assert_eq!(trace.legacy_copy_only_scanner_pinned.emitted_young_roots, 1);
+}
+
+#[test]
+fn test_copied_minor_still_falls_back_for_copy_only_active_survivor_root() {
+    let _guard = CopyingNurseryTestGuard::new(1);
+    let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let child = young_leaf();
+    js_shadow_slot_set(0, ptr_bits(child));
+
+    let first = collect_minor_trace(GcTriggerKind::Direct);
+    assert_copied_minor_trace(&first, true, CopiedMinorFallbackReason::None, false);
+    let survivor = (js_shadow_slot_get(0) & POINTER_MASK) as usize;
+    assert_ne!(survivor, child);
+    assert_eq!(
+        crate::arena::classify_heap_space(survivor),
+        crate::arena::active_survivor_space()
+    );
+
+    let _copy_only_root_guard = TemporaryCopyOnlyRootScanner::rust_bits(&[ptr_bits(survivor)]);
+    let second = collect_minor_trace(GcTriggerKind::Direct);
+
+    assert_copied_minor_trace(
+        &second,
+        false,
+        CopiedMinorFallbackReason::CopyOnlyRoots,
+        false,
+    );
+    assert_eq!(second.legacy_copy_only_scanner_pinned.emitted_roots, 1);
+    assert_eq!(
+        second.legacy_copy_only_scanner_pinned.emitted_young_roots,
+        1
+    );
 }
 
 #[test]
@@ -971,7 +1225,7 @@ fn test_copied_minor_rewrites_old_error_cause_and_errors_slots() {
 }
 
 #[test]
-fn test_copied_minor_eligibility_old_only_copy_only_root_falls_back() {
+fn test_copied_minor_eligibility_old_only_copy_only_root_stays_eligible() {
     let _guard = CopyingNurseryTestGuard::new(0);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     let old = crate::arena::arena_alloc_gc_old(32, 8, GC_TYPE_OBJECT) as usize;
@@ -979,62 +1233,51 @@ fn test_copied_minor_eligibility_old_only_copy_only_root_falls_back() {
 
     let trace = collect_minor_trace(GcTriggerKind::Direct);
 
-    assert_copied_minor_trace(
-        &trace,
-        false,
-        CopiedMinorFallbackReason::CopyOnlyRoots,
-        false,
-    );
+    assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
     assert_eq!(trace.legacy_copy_only_scanner_pinned.emitted_roots, 1);
     assert_eq!(trace.legacy_copy_only_scanner_pinned.emitted_old_roots, 1);
     assert_eq!(trace.legacy_copy_only_scanner_pinned.emitted_young_roots, 0);
 }
 
 #[test]
-fn test_copied_minor_eligibility_malformed_copy_only_root_falls_back() {
+fn test_copied_minor_eligibility_malformed_copy_only_root_stays_eligible() {
     let _guard = CopyingNurseryTestGuard::new(0);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     let _copy_only_root_guard = TemporaryCopyOnlyRootScanner::rust_bits(&[0x7FFD_0000_0000_1000]);
 
     let trace = collect_minor_trace(GcTriggerKind::Direct);
 
-    assert_copied_minor_trace(
-        &trace,
-        false,
-        CopiedMinorFallbackReason::CopyOnlyRoots,
-        false,
-    );
+    assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
     assert_eq!(trace.legacy_copy_only_scanner_pinned.emitted_roots, 1);
     assert_eq!(trace.legacy_copy_only_scanner_pinned.malformed_roots, 1);
 }
 
 #[test]
-fn test_copied_minor_eligibility_falls_back_for_malloc_copy_only_root() {
+fn test_copied_minor_marks_malloc_copy_only_root_and_rewrites_young_children() {
     let _guard = CopyingNurseryTestGuard::new(0);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let live_child = young_leaf();
     let live_malloc = gc_malloc(
-        std::mem::size_of::<crate::closure::ClosureHeader>(),
+        std::mem::size_of::<crate::closure::ClosureHeader>() + std::mem::size_of::<u64>(),
         GC_TYPE_CLOSURE,
     );
-    unsafe {
-        init_test_closure(live_malloc);
-    }
+    let capture_slot =
+        unsafe { init_test_closure_with_one_capture(live_malloc, ptr_bits(live_child)) };
     let _copy_only_root_guard =
         TemporaryCopyOnlyRootScanner::rust_bits(&[ptr_bits(live_malloc as usize)]);
 
     let trace = collect_minor_trace(GcTriggerKind::Direct);
 
-    assert_copied_minor_trace(
-        &trace,
-        false,
-        CopiedMinorFallbackReason::CopyOnlyRoots,
-        false,
-    );
+    assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
     assert_eq!(trace.legacy_copy_only_scanner_pinned.emitted_roots, 1);
     assert_eq!(
         trace.legacy_copy_only_scanner_pinned.emitted_malloc_roots,
         1
     );
+    assert!(malloc_user_ptr_tracked(live_malloc));
+    let capture_after = unsafe { (*capture_slot & POINTER_MASK) as usize };
+    assert_ne!(capture_after, live_child);
+    assert!(crate::arena::pointer_in_nursery(capture_after));
 }
 
 #[test]
@@ -1449,7 +1692,7 @@ fn test_copied_minor_verify_evacuation_env_remains_eligible() {
 }
 
 #[test]
-fn test_copied_minor_verify_evacuation_copy_only_roots_reject_before_copying() {
+fn test_copied_minor_verify_evacuation_allows_empty_copy_only_scanner() {
     let _guard = CopyingNurseryTestGuard::new(0);
     let _env_guard = EnvVarGuard::set("PERRY_GC_VERIFY_EVACUATION", "1");
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
@@ -1457,12 +1700,7 @@ fn test_copied_minor_verify_evacuation_copy_only_roots_reject_before_copying() {
 
     let trace = collect_minor_trace(GcTriggerKind::Direct);
 
-    assert_copied_minor_trace(
-        &trace,
-        false,
-        CopiedMinorFallbackReason::CopyOnlyRoots,
-        false,
-    );
+    assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
     assert_eq!(trace.copying_nursery.copied_objects, 0);
     assert_eq!(trace.copying_nursery.promoted_objects, 0);
     assert_eq!(trace.legacy_copy_only_scanner_pinned.emitted_roots, 0);

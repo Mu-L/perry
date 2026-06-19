@@ -201,6 +201,69 @@ static DGRAM_REGISTRY: LazyLock<Mutex<DgramRegistry>> = LazyLock::new(|| {
     })
 });
 
+pub fn scan_dgram_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
+    let Ok(mut registry) = DGRAM_REGISTRY.lock() else {
+        return;
+    };
+    for socket in registry.bound.values_mut() {
+        visitor.visit_nanbox_f64_slot(socket);
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct DgramRegistryTestGuard;
+
+#[cfg(test)]
+impl DgramRegistryTestGuard {
+    pub(crate) fn new() -> Self {
+        test_clear_dgram_registry();
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for DgramRegistryTestGuard {
+    fn drop(&mut self) {
+        test_clear_dgram_registry();
+    }
+}
+
+#[cfg(test)]
+fn test_clear_dgram_registry() {
+    if let Ok(mut registry) = DGRAM_REGISTRY.lock() {
+        registry.bound.clear();
+        registry.next_port = 49152;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_insert_bound_socket_for_gc(address: &str, port: u16, socket: f64) {
+    let mut registry = DGRAM_REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry.bound.insert(
+        SocketKey {
+            address: address.to_string(),
+            port,
+        },
+        socket,
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn test_lookup_bound_socket_for_gc(address: &str, port: u16) -> Option<f64> {
+    let registry = DGRAM_REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    registry
+        .bound
+        .get(&SocketKey {
+            address: address.to_string(),
+            port,
+        })
+        .copied()
+}
+
 fn key(name: &str) -> *mut crate::StringHeader {
     crate::string::js_string_from_bytes(name.as_ptr(), name.len() as u32)
 }
@@ -620,10 +683,10 @@ fn call_function(callback: f64, this: f64, args: &[f64]) -> f64 {
     if !is_callable_value(callback) {
         return undefined_value();
     }
-    let prev = crate::object::js_implicit_this_set(this);
+    let prev = crate::object::js_implicit_this_push(this);
     let result =
         unsafe { crate::closure::js_native_call_value(callback, args.as_ptr(), args.len()) };
-    crate::object::js_implicit_this_set(prev);
+    crate::object::js_implicit_this_restore(prev);
     result
 }
 

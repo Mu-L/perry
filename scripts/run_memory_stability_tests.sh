@@ -1265,6 +1265,103 @@ PY
     done
 }
 
+write_copied_minor_scaling_workload() {
+    local out="$1"
+    local name="$2"
+    local factor="$3"
+    local iterations=$((factor * 96))
+
+    cat >"$out" <<EOF
+declare function gc(): void;
+
+let checksum = 0;
+let keep: any[] = [];
+
+for (let cycle = 0; cycle < 12; cycle++) {
+  keep = [];
+  for (let i = 0; i < $iterations; i++) {
+    const value = cycle * 100000 + i;
+    const record: any = {
+      id: value,
+      left: { score: value + 1 },
+      right: { score: value + 2 },
+      label: "$name" + "_" + value,
+    };
+    checksum += record.id + record.left.score + record.right.score + record.label.length;
+    if ((i % $iterations) === 0) {
+      keep.push(record);
+    }
+  }
+  gc();
+  checksum += keep[0].id;
+}
+
+console.log("$name:" + checksum);
+EOF
+}
+
+run_copied_minor_scaling_trace_workload() {
+    local name="$1"
+    local factor="$2"
+    local workloads_dir="$3"
+    local ts="$workloads_dir/$name.ts"
+    local bin="$TMPDIR/${name}_copied_minor_scaling"
+    local compile_output="$TMPDIR/${name}_copied_minor_scaling_compile.$$.$RANDOM"
+    LAST_GC_TRACE_FILE=""
+
+    write_copied_minor_scaling_workload "$ts" "$name" "$factor"
+
+    if ! $PERRY compile --no-cache "$ts" -o "$bin" >"$compile_output" 2>&1; then
+        printf "  FAIL [gc-trace] %-40s compile failed\n" "$name"
+        sed 's/^/    /' "$compile_output"
+        FAIL=$((FAIL + 1))
+        return
+    fi
+
+    run_one "$bin" PERRY_GC_TRACE=1
+    LAST_GC_TRACE_FILE="$LAST_STDERR_FILE"
+
+    if [[ "$LAST_EXIT" -ne 0 ]]; then
+        printf "  FAIL [gc-trace] %-40s exit=%d\n" "$name" "$LAST_EXIT"
+        sed 's/^/    /' "$LAST_STDERR_FILE"
+        record_gc_trace_evidence \
+            "copied-minor-scaling" "$name" "copied_minor_scaling" "fail" \
+            "$LAST_GC_TRACE_FILE"
+        FAIL=$((FAIL + 1))
+        return
+    fi
+    if ! grep -q "^${name}:" "$LAST_STDOUT_FILE"; then
+        printf "  FAIL [gc-trace] %-40s stdout missing workload marker\n" "$name"
+        sed 's/^/    /' "$LAST_STDOUT_FILE"
+        record_gc_trace_evidence \
+            "copied-minor-scaling" "$name" "copied_minor_scaling" "fail" \
+            "$LAST_GC_TRACE_FILE"
+        FAIL=$((FAIL + 1))
+        return
+    fi
+
+    printf "  PASS [gc-trace] %-40s trace=%s\n" "$name" "$LAST_STDERR_FILE"
+    PASS=$((PASS + 1))
+    record_gc_trace_evidence \
+        "copied-minor-scaling" "$name" "copied_minor_scaling" "pass" \
+        "$LAST_GC_TRACE_FILE"
+}
+
+run_copied_minor_scaling_traces() {
+    if [[ "$GC_EVIDENCE_ENABLED" -ne 1 ]]; then
+        return
+    fi
+
+    local workloads_dir="$TMPDIR/copied_minor_scaling_workloads"
+    mkdir -p "$workloads_dir"
+
+    local factor
+    for factor in 1 2 4 8; do
+        run_copied_minor_scaling_trace_workload \
+            "young_only_${factor}x" "$factor" "$workloads_dir"
+    done
+}
+
 write_target_collector_gate_workloads() {
     local out_dir="$1"
 
@@ -1837,6 +1934,7 @@ run_target_collector_architecture_gates
 echo ""
 echo "=== Copied-minor fallback evidence report ==="
 run_copied_minor_fallback_report
+run_copied_minor_scaling_traces
 
 echo ""
 echo "=== Targeted low-pressure benchmark gates ==="

@@ -616,6 +616,31 @@ fn normal_incremental_root_scan_pauses_before_synchronous_only_registered_scanne
 }
 
 #[test]
+fn normal_incremental_root_scan_pauses_before_budgeted_once_registered_scanner() {
+    let _guard = CopyingNurseryTestGuard::new(0);
+    let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    SYNC_ONLY_SCANNER_CALLS.store(0, Ordering::Relaxed);
+    gc_register_budgeted_once_mutable_root_scanner(sync_only_test_mutable_root_scanner);
+
+    let mut state = GcCycleState::new_full(trace_snapshot(GcTriggerKind::ArenaBytes));
+    state.set_progress_kind(GcProgressKind::NormalIncremental);
+    run_cycle_until_phase(&mut state, GcCyclePhase::RootScan);
+
+    for _ in 0..8 {
+        state.step(GcWorkBudget::bounded(1));
+    }
+
+    assert_eq!(state.phase(), GcCyclePhase::RootScan);
+    assert_eq!(
+        SYNC_ONLY_SCANNER_CALLS.load(Ordering::Relaxed),
+        0,
+        "ordinary budgeted root scan must not invoke budgeted-once scanners without a cursor"
+    );
+    incremental_mark_barrier_disable();
+    clear_mark_seeds();
+}
+
+#[test]
 fn root_scan_slices_remembered_set_dirty_slots_with_tiny_budget() {
     let _guard = CopyingNurseryTestGuard::new(0);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();

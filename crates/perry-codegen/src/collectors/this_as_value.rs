@@ -363,6 +363,12 @@ pub fn expr_uses_this_as_value(e: &perry_hir::Expr, fields: &HashSet<String>) ->
             expr_uses_this_as_value(callee, fields)
                 || args.iter().any(|a| expr_uses_this_as_value(a, fields))
         }
+        Expr::NewDynamicSpread { callee, args } => {
+            expr_uses_this_as_value(callee, fields)
+                || args.iter().any(|a| match a {
+                    CallArg::Expr(e) | CallArg::Spread(e) => expr_uses_this_as_value(e, fields),
+                })
+        }
         Expr::LocalSet(_, value) => expr_uses_this_as_value(value, fields),
         Expr::Sequence(es) => es.iter().any(|e| expr_uses_this_as_value(e, fields)),
         Expr::Yield { value, .. } => value

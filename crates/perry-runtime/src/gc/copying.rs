@@ -1,4 +1,5 @@
 use super::*;
+use std::ffi::c_void;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CopyingPointerKind {
@@ -204,6 +205,7 @@ pub(super) struct CopyingNurseryPreflight {
     pub(super) ptrs: *const CopyingPointerSet,
     pub(super) fallback_reason: Option<CopiedMinorFallbackReason>,
     pub(super) pinned_reason: CopiedMinorFallbackReason,
+    pub(super) pinned_eden_blocks: crate::fast_hash::PtrHashSet<usize>,
     pub(super) worklist: Vec<*mut GcHeader>,
     pub(super) seen: crate::fast_hash::PtrHashSet<usize>,
 }
@@ -214,6 +216,7 @@ impl CopyingNurseryPreflight {
             ptrs,
             fallback_reason: None,
             pinned_reason,
+            pinned_eden_blocks: crate::fast_hash::new_ptr_hash_set(),
             worklist: Vec::new(),
             seen: crate::fast_hash::new_ptr_hash_set(),
         }
@@ -271,13 +274,23 @@ impl CopyingNurseryPreflight {
         pinned_reason: CopiedMinorFallbackReason,
     ) {
         unsafe {
-            if matches!(
-                ptr.kind,
-                CopyingPointerKind::Eden | CopyingPointerKind::FromSurvivor
-            ) && (*ptr.header).gc_flags & GC_FLAG_PINNED != 0
+            if matches!(ptr.kind, CopyingPointerKind::FromSurvivor)
+                && (*ptr.header).gc_flags & GC_FLAG_PINNED != 0
             {
                 self.fallback_reason = Some(pinned_reason);
                 return;
+            }
+            if matches!(ptr.kind, CopyingPointerKind::Eden)
+                && (*ptr.header).gc_flags & GC_FLAG_PINNED != 0
+            {
+                if let Some(block) =
+                    crate::arena::copying_eden_block_base_for_addr(ptr.header as usize)
+                {
+                    self.pinned_eden_blocks.insert(block);
+                } else {
+                    self.fallback_reason = Some(pinned_reason);
+                    return;
+                }
             }
         }
         if matches!(
@@ -290,6 +303,16 @@ impl CopyingNurseryPreflight {
         {
             self.worklist.push(ptr.header);
         }
+    }
+
+    pub(super) fn check_pinned_eden_header(&mut self, header: *mut GcHeader) {
+        self.check_ptr_with_reason(
+            CopyingPointer {
+                header,
+                kind: CopyingPointerKind::Eden,
+            },
+            self.pinned_reason,
+        );
     }
 
     pub(super) unsafe fn drain(&mut self) {
@@ -322,7 +345,9 @@ impl CopyingNurseryPreflight {
 #[derive(Default)]
 pub(super) struct StickyRememberedSet {
     pub(super) old_pages: crate::fast_hash::PtrHashSet<usize>,
+    pub(super) old_cards: crate::fast_hash::PtrHashSet<usize>,
     pub(super) external_pages: Vec<(usize, usize)>,
+    pub(super) external_cards: Vec<(usize, usize)>,
 }
 
 impl StickyRememberedSet {
@@ -336,30 +361,38 @@ impl StickyRememberedSet {
             return;
         }
         let page = crate::arena::generation_page_for_addr(slot as usize);
+        let card = remembered_card_for_addr(slot as usize);
         if external {
             self.external_pages.push((parent_header as usize, page));
+            self.external_cards.push((parent_header as usize, card));
         } else {
             self.old_pages.insert(page);
+            self.old_cards.insert(card);
         }
     }
 
     pub(super) fn restore(&self) {
-        for &page in &self.old_pages {
-            mark_dirty_old_page(page);
+        for &card in &self.old_cards {
+            let page = remembered_page_for_card(card);
+            mark_dirty_old_card_with_page(page, card);
         }
-        for &(header, page) in &self.external_pages {
-            mark_dirty_external_slot_page(header, page);
+        for &(header, card) in &self.external_cards {
+            let page = remembered_page_for_card(card);
+            mark_dirty_external_slot_card_with_page(header, page, card);
         }
     }
 
     pub(super) fn extend(&mut self, other: StickyRememberedSet) {
         self.old_pages.extend(other.old_pages);
+        self.old_cards.extend(other.old_cards);
         self.external_pages.extend(other.external_pages);
+        self.external_cards.extend(other.external_cards);
     }
 }
 
 pub(super) struct CopyingNurseryCollector {
     pub(super) ptrs: CopyingPointerSet,
+    pub(super) pinned_eden_blocks: crate::fast_hash::PtrHashSet<usize>,
     pub(super) worklist: Vec<*mut GcHeader>,
     pub(super) marked_headers: Vec<*mut GcHeader>,
     pub(super) moved_headers: Vec<*mut GcHeader>,
@@ -370,9 +403,13 @@ pub(super) struct CopyingNurseryCollector {
 }
 
 impl CopyingNurseryCollector {
-    pub(super) fn new(ptrs: CopyingPointerSet) -> Self {
+    pub(super) fn new(
+        ptrs: CopyingPointerSet,
+        pinned_eden_blocks: crate::fast_hash::PtrHashSet<usize>,
+    ) -> Self {
         Self {
             ptrs,
+            pinned_eden_blocks,
             worklist: Vec::new(),
             marked_headers: Vec::new(),
             moved_headers: Vec::new(),
@@ -443,6 +480,14 @@ impl CopyingNurseryCollector {
         let ptr = self.ptrs.classify(addr)?;
         match ptr.kind {
             CopyingPointerKind::Eden | CopyingPointerKind::FromSurvivor => {
+                unsafe {
+                    if (*ptr.header).gc_flags & GC_FLAG_FORWARDED != 0 {
+                        return Some(self.move_young(ptr));
+                    }
+                }
+                if self.should_pin_young_in_place(ptr) {
+                    return Some(unsafe { self.mark_pinned_young(ptr) });
+                }
                 Some(unsafe { self.move_young(ptr) })
             }
             CopyingPointerKind::ToSurvivor => Some(addr),
@@ -464,6 +509,30 @@ impl CopyingNurseryCollector {
                 Some(addr)
             }
         }
+    }
+
+    fn should_pin_young_in_place(&self, ptr: CopyingPointer) -> bool {
+        if !matches!(ptr.kind, CopyingPointerKind::Eden) {
+            return false;
+        }
+        crate::arena::copying_eden_block_base_for_addr(ptr.header as usize)
+            .map(|block| self.pinned_eden_blocks.contains(&block))
+            .unwrap_or(false)
+    }
+
+    pub(super) unsafe fn mark_pinned_young(&mut self, ptr: CopyingPointer) -> usize {
+        let header = ptr.header;
+        let old_user = (header as *mut u8).add(GC_HEADER_SIZE);
+        let flags = (*header).gc_flags;
+        if flags & GC_FLAG_MARKED == 0 {
+            (*header).gc_flags = flags | GC_FLAG_MARKED;
+            self.worklist.push(header);
+            self.marked_headers.push(header);
+            let total = (*header).size as usize;
+            self.stats.pinned_eden_objects = self.stats.pinned_eden_objects.saturating_add(1);
+            self.stats.pinned_eden_bytes = self.stats.pinned_eden_bytes.saturating_add(total);
+        }
+        old_user as usize
     }
 
     pub(super) unsafe fn move_young(&mut self, ptr: CopyingPointer) -> usize {
@@ -602,11 +671,13 @@ pub(super) fn scan_remembered_dirty_slots_copying(
     mut visit: impl FnMut(*mut u64, *mut GcHeader, bool, &mut RememberedSetTraceStats),
 ) -> RememberedSetTraceStats {
     let mut stats = RememberedSetTraceStats {
-        entries_scanned: snapshot.dirty_old_pages.len()
-            + snapshot.external_dirty_entries.len()
+        entries_scanned: snapshot.dirty_old_cards.len()
+            + snapshot.external_dirty_card_entries.len()
             + snapshot.fallback_headers.len(),
         dirty_pages_before: snapshot.dirty_pages.len(),
         dirty_pages_scanned: snapshot.dirty_pages.len(),
+        dirty_cards_before: snapshot.dirty_cards.len(),
+        dirty_cards_scanned: snapshot.dirty_cards.len(),
         ..RememberedSetTraceStats::default()
     };
     let mut seen_headers = crate::fast_hash::new_ptr_hash_set();
@@ -642,7 +713,7 @@ pub(super) fn scan_remembered_dirty_slots_copying(
             visit(slot, header, external, stats);
             changed |= *slot != before;
         };
-        scan_dirty_object_slots(header, &snapshot.dirty_pages, stats, &mut visit_slot);
+        scan_dirty_object_slots(header, &snapshot.dirty_cards, stats, &mut visit_slot);
         if changed && gc_type_rewrite_hook_kind((*header).obj_type) == GcRewriteHookKind::SetIndex {
             crate::set::rebuild_set_index_for_gc(user as *mut crate::set::SetHeader);
         }
@@ -661,6 +732,7 @@ pub(super) fn scan_remembered_dirty_slots_copying(
     }
 
     stats.dirty_pages_after = remembered_dirty_page_count();
+    stats.dirty_cards_after = remembered_dirty_card_count();
     stats
 }
 
@@ -671,6 +743,7 @@ pub(super) struct CopiedMinorEligibility {
     pub(super) malloc_validation_lookups: usize,
     pub(super) malloc_registry_rebuilds: u64,
     pub(super) legacy_root_stats: LegacyRootTraceStats,
+    pub(super) pinned_eden_blocks: crate::fast_hash::PtrHashSet<usize>,
     pub(super) ptrs: Option<CopyingPointerSet>,
 }
 
@@ -697,7 +770,17 @@ impl CopiedMinorEligibility {
             );
         }
         let ptrs = CopyingPointerSet::new();
-        let (copy_only_reason, legacy_root_stats) = Self::copy_only_root_preflight_reason(&ptrs);
+        let (pinned_reason, mut pinned_eden_blocks) = Self::pinned_nursery_preflight_reason(&ptrs);
+        if let Some(reason) = pinned_reason {
+            return Self::fallback_with_ptrs_and_legacy(
+                reason,
+                malloc_sweep_due,
+                ptrs,
+                LegacyRootTraceStats::default(),
+            );
+        }
+        let (copy_only_reason, legacy_root_stats, copy_only_pinned_blocks) =
+            Self::copy_only_root_preflight_reason(&ptrs);
         if let Some(reason) = copy_only_reason {
             return Self::fallback_with_ptrs_and_legacy(
                 reason,
@@ -706,7 +789,10 @@ impl CopiedMinorEligibility {
                 legacy_root_stats,
             );
         }
-        if let Some(reason) = Self::mutable_root_preflight_reason(&ptrs) {
+        pinned_eden_blocks.extend(copy_only_pinned_blocks);
+        let (mutable_reason, mutable_pinned_blocks) = Self::mutable_root_preflight_reason(&ptrs);
+        pinned_eden_blocks.extend(mutable_pinned_blocks);
+        if let Some(reason) = mutable_reason {
             return Self::fallback_with_ptrs_and_legacy(
                 reason,
                 malloc_sweep_due,
@@ -714,7 +800,9 @@ impl CopiedMinorEligibility {
                 legacy_root_stats,
             );
         }
-        if let Some(reason) = Self::dirty_slot_preflight_reason(&ptrs) {
+        let (dirty_reason, dirty_pinned_blocks) = Self::dirty_slot_preflight_reason(&ptrs);
+        pinned_eden_blocks.extend(dirty_pinned_blocks);
+        if let Some(reason) = dirty_reason {
             return Self::fallback_with_ptrs_and_legacy(
                 reason,
                 malloc_sweep_due,
@@ -730,6 +818,7 @@ impl CopiedMinorEligibility {
             malloc_validation_lookups: ptrs.malloc_validation_lookups(),
             malloc_registry_rebuilds: ptrs.malloc_registry_rebuilds(),
             legacy_root_stats,
+            pinned_eden_blocks,
             ptrs: Some(ptrs),
         }
     }
@@ -742,6 +831,7 @@ impl CopiedMinorEligibility {
             malloc_validation_lookups: 0,
             malloc_registry_rebuilds: 0,
             legacy_root_stats: LegacyRootTraceStats::default(),
+            pinned_eden_blocks: crate::fast_hash::new_ptr_hash_set(),
             ptrs: None,
         }
     }
@@ -759,6 +849,7 @@ impl CopiedMinorEligibility {
             malloc_validation_lookups: ptrs.malloc_validation_lookups(),
             malloc_registry_rebuilds: ptrs.malloc_registry_rebuilds(),
             legacy_root_stats,
+            pinned_eden_blocks: crate::fast_hash::new_ptr_hash_set(),
             ptrs: Some(ptrs),
         }
     }
@@ -774,23 +865,109 @@ impl CopiedMinorEligibility {
         }
     }
 
+    pub(super) fn pinned_nursery_preflight_reason(
+        ptrs: &CopyingPointerSet,
+    ) -> (
+        Option<CopiedMinorFallbackReason>,
+        crate::fast_hash::PtrHashSet<usize>,
+    ) {
+        let mut checker =
+            CopyingNurseryPreflight::new(ptrs, CopiedMinorFallbackReason::PinnedYoungRoot);
+        let active_survivor = crate::arena::active_survivor_space();
+        let inactive_survivor = crate::arena::inactive_survivor_space();
+        crate::arena::arena_walk_objects_filtered(
+            |_| true,
+            |header_ptr, _block_idx| unsafe {
+                if checker.fallback_reason.is_some() {
+                    return;
+                }
+                let header = header_ptr as *mut GcHeader;
+                if (*header).gc_flags & GC_FLAG_PINNED == 0 {
+                    return;
+                }
+                let user = header_ptr.add(GC_HEADER_SIZE) as usize;
+                match crate::arena::classify_heap_space(user) {
+                    crate::arena::HeapSpace::NurseryEden => {
+                        checker.check_pinned_eden_header(header);
+                    }
+                    space if space == active_survivor || space == inactive_survivor => {
+                        checker.fallback_reason = Some(CopiedMinorFallbackReason::PinnedYoungRoot);
+                    }
+                    _ => {}
+                }
+            },
+        );
+        unsafe {
+            checker.drain();
+        }
+        (checker.fallback_reason, checker.pinned_eden_blocks)
+    }
+
     pub(super) fn copy_only_root_preflight_reason(
-        _ptrs: &CopyingPointerSet,
-    ) -> (Option<CopiedMinorFallbackReason>, LegacyRootTraceStats) {
+        ptrs: &CopyingPointerSet,
+    ) -> (
+        Option<CopiedMinorFallbackReason>,
+        LegacyRootTraceStats,
+        crate::fast_hash::PtrHashSet<usize>,
+    ) {
         let (registered_rust_scanners, registered_ffi_scanners) = copy_only_root_scanner_counts();
-        let stats = LegacyRootTraceStats {
+        if registered_rust_scanners == 0 && registered_ffi_scanners == 0 {
+            return (
+                None,
+                LegacyRootTraceStats {
+                    registered_rust_scanners,
+                    registered_ffi_scanners,
+                    ..LegacyRootTraceStats::default()
+                },
+                crate::fast_hash::new_ptr_hash_set(),
+            );
+        }
+
+        let valid_ptrs = build_valid_pointer_set();
+        let mut stats = LegacyRootTraceStats {
             registered_rust_scanners,
             registered_ffi_scanners,
             ..LegacyRootTraceStats::default()
         };
-        let reason = (registered_rust_scanners > 0 || registered_ffi_scanners > 0)
-            .then_some(CopiedMinorFallbackReason::CopyOnlyRoots);
-        (reason, stats)
+        let mut checker =
+            CopyingNurseryPreflight::new(ptrs, CopiedMinorFallbackReason::PinnedYoungTransitive);
+        let scanners: Vec<fn(&mut dyn FnMut(f64))> = ROOT_SCANNERS.with(|s| s.borrow().clone());
+        let ffi_scanners: Vec<PerryFfiRootScanner> = FFI_ROOT_SCANNERS.with(|s| s.borrow().clone());
+
+        for scanner in scanners {
+            scanner(&mut |value: f64| {
+                record_copy_only_root_for_copied_minor_preflight(
+                    value.to_bits(),
+                    &valid_ptrs,
+                    &mut checker,
+                    &mut stats,
+                );
+            });
+        }
+
+        let mut ctx = CopyOnlyRootPreflightContext {
+            valid_ptrs: &valid_ptrs as *const ValidPointerSet,
+            checker: &mut checker as *mut CopyingNurseryPreflight,
+            stats: &mut stats as *mut LegacyRootTraceStats,
+        };
+        let ctx = &mut ctx as *mut CopyOnlyRootPreflightContext as *mut c_void;
+        for scanner in ffi_scanners {
+            scanner(perry_ffi_copy_only_root_copied_minor_preflight, ctx);
+        }
+
+        unsafe {
+            checker.drain();
+        }
+
+        (checker.fallback_reason, stats, checker.pinned_eden_blocks)
     }
 
     pub(super) fn mutable_root_preflight_reason(
         ptrs: &CopyingPointerSet,
-    ) -> Option<CopiedMinorFallbackReason> {
+    ) -> (
+        Option<CopiedMinorFallbackReason>,
+        crate::fast_hash::PtrHashSet<usize>,
+    ) {
         let mut checker =
             CopyingNurseryPreflight::new(ptrs, CopiedMinorFallbackReason::PinnedYoungRoot);
         visit_mutable_root_slots(|slot| unsafe {
@@ -808,12 +985,15 @@ impl CopiedMinorEligibility {
         unsafe {
             checker.drain();
         }
-        checker.fallback_reason
+        (checker.fallback_reason, checker.pinned_eden_blocks)
     }
 
     pub(super) fn dirty_slot_preflight_reason(
         ptrs: &CopyingPointerSet,
-    ) -> Option<CopiedMinorFallbackReason> {
+    ) -> (
+        Option<CopiedMinorFallbackReason>,
+        crate::fast_hash::PtrHashSet<usize>,
+    ) {
         let snapshot = remembered_dirty_snapshot();
         let mut dirty_checker =
             CopyingNurseryPreflight::new(ptrs, CopiedMinorFallbackReason::PinnedYoungDirtySlot);
@@ -823,8 +1003,151 @@ impl CopiedMinorEligibility {
         unsafe {
             dirty_checker.drain();
         }
-        dirty_checker.fallback_reason
+        (
+            dirty_checker.fallback_reason,
+            dirty_checker.pinned_eden_blocks,
+        )
     }
+}
+
+struct CopyOnlyRootPreflightContext {
+    valid_ptrs: *const ValidPointerSet,
+    checker: *mut CopyingNurseryPreflight,
+    stats: *mut LegacyRootTraceStats,
+}
+
+fn record_copy_only_root_for_copied_minor_preflight(
+    bits: u64,
+    valid_ptrs: &ValidPointerSet,
+    checker: &mut CopyingNurseryPreflight,
+    stats: &mut LegacyRootTraceStats,
+) {
+    record_copy_only_scanner_mark_emission(bits, valid_ptrs, stats);
+    if checker.fallback_reason.is_some() {
+        return;
+    }
+    let (_addr, ptr) = match checker.ptrs().decode_bits_for_preflight(bits) {
+        Ok(Some((addr, ptr))) => (addr, ptr),
+        Ok(None) => return,
+        Err(reason) => {
+            checker.fallback_reason = Some(reason);
+            return;
+        }
+    };
+    if matches!(ptr.kind, CopyingPointerKind::FromSurvivor) {
+        checker.fallback_reason = Some(CopiedMinorFallbackReason::CopyOnlyRoots);
+        return;
+    }
+    if matches!(ptr.kind, CopyingPointerKind::Eden) {
+        if unsafe { (*ptr.header).gc_flags & GC_FLAG_FORWARDED != 0 } {
+            checker.fallback_reason = Some(CopiedMinorFallbackReason::CopyOnlyRoots);
+            return;
+        }
+        if let Some(block) = crate::arena::copying_eden_block_base_for_addr(ptr.header as usize) {
+            checker.pinned_eden_blocks.insert(block);
+        } else {
+            checker.fallback_reason = Some(CopiedMinorFallbackReason::CopyOnlyRoots);
+            return;
+        }
+    }
+    checker.check_ptr_with_reason(ptr, CopiedMinorFallbackReason::PinnedYoungTransitive);
+}
+
+extern "C" fn perry_ffi_copy_only_root_copied_minor_preflight(value: f64, ctx: *mut c_void) {
+    if ctx.is_null() {
+        return;
+    }
+    unsafe {
+        let ctx = &mut *(ctx as *mut CopyOnlyRootPreflightContext);
+        record_copy_only_root_for_copied_minor_preflight(
+            value.to_bits(),
+            &*ctx.valid_ptrs,
+            &mut *ctx.checker,
+            &mut *ctx.stats,
+        );
+    }
+}
+
+struct CopyOnlyRootCopyingContext {
+    collector: *mut CopyingNurseryCollector,
+}
+
+fn visit_copy_only_root_for_copied_minor_mark(bits: u64, collector: &mut CopyingNurseryCollector) {
+    let Some((addr, _, _)) = collector.ptrs.decode_bits(bits) else {
+        return;
+    };
+    if let Some(ptr) = collector.ptrs.classify(addr) {
+        if matches!(ptr.kind, CopyingPointerKind::FromSurvivor) {
+            debug_assert!(
+                !matches!(ptr.kind, CopyingPointerKind::FromSurvivor),
+                "copy-only survivor roots should be rejected by copied-minor preflight"
+            );
+            return;
+        }
+        if matches!(ptr.kind, CopyingPointerKind::Eden)
+            && unsafe { (*ptr.header).gc_flags & GC_FLAG_FORWARDED != 0 }
+        {
+            debug_assert!(
+                unsafe { (*ptr.header).gc_flags & GC_FLAG_FORWARDED == 0 },
+                "copy-only forwarded Eden stubs should be rejected by copied-minor preflight"
+            );
+            return;
+        }
+        if matches!(ptr.kind, CopyingPointerKind::Eden) && !collector.should_pin_young_in_place(ptr)
+        {
+            debug_assert!(
+                collector.should_pin_young_in_place(ptr),
+                "copy-only Eden roots must retain their Eden block during copied-minor preflight"
+            );
+            return;
+        }
+    }
+    let _ = collector.visit_value_bits(bits);
+}
+
+extern "C" fn perry_ffi_copy_only_root_copied_minor_mark(value: f64, ctx: *mut c_void) {
+    if ctx.is_null() {
+        return;
+    }
+    unsafe {
+        let ctx = &mut *(ctx as *mut CopyOnlyRootCopyingContext);
+        visit_copy_only_root_for_copied_minor_mark(value.to_bits(), &mut *ctx.collector);
+    }
+}
+
+fn visit_copy_only_registered_roots_copying(collector: &mut CopyingNurseryCollector) {
+    let scanners: Vec<fn(&mut dyn FnMut(f64))> = ROOT_SCANNERS.with(|s| s.borrow().clone());
+    let ffi_scanners: Vec<PerryFfiRootScanner> = FFI_ROOT_SCANNERS.with(|s| s.borrow().clone());
+    for scanner in scanners {
+        scanner(&mut |value: f64| {
+            visit_copy_only_root_for_copied_minor_mark(value.to_bits(), collector);
+        });
+    }
+
+    let mut ctx = CopyOnlyRootCopyingContext {
+        collector: collector as *mut CopyingNurseryCollector,
+    };
+    let ctx = &mut ctx as *mut CopyOnlyRootCopyingContext as *mut c_void;
+    for scanner in ffi_scanners {
+        scanner(perry_ffi_copy_only_root_copied_minor_mark, ctx);
+    }
+}
+
+fn visit_pinned_eden_headers_copying(collector: &mut CopyingNurseryCollector) {
+    if collector.pinned_eden_blocks.is_empty() {
+        return;
+    }
+    crate::arena::arena_walk_objects_filtered(
+        |block_idx| block_idx < crate::arena::general_block_count(),
+        |header_ptr, _block_idx| unsafe {
+            let header = header_ptr as *mut GcHeader;
+            if (*header).gc_flags & GC_FLAG_PINNED == 0 {
+                return;
+            }
+            let user = header_ptr.add(GC_HEADER_SIZE) as usize;
+            let _ = collector.mark_addr(user);
+        },
+    );
 }
 
 pub(super) fn gc_collect_minor_copying_fast_path(
@@ -853,17 +1176,27 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
         return None;
     }
     let malloc_sweep_due = eligibility.malloc_sweep_due;
+    let pinned_eden_blocks = eligibility.pinned_eden_blocks;
     let ptrs = eligibility
         .ptrs
         .expect("eligible copied-minor decision must carry pointer classifier");
 
     let phase_start = trace_phase_start(trace);
     let from_space_bytes = crate::arena::copying_from_space_in_use_bytes();
-    let mut collector = CopyingNurseryCollector::new(ptrs);
+    let retained_eden_bytes =
+        crate::arena::copying_eden_retained_bytes_for_blocks(&pinned_eden_blocks);
+    let mut collector = CopyingNurseryCollector::new(ptrs, pinned_eden_blocks);
     collector.stats.eligible = true;
     collector.stats.fallback_reason = CopiedMinorFallbackReason::None;
     collector.stats.malloc_sweep_due = malloc_sweep_due;
+    collector.stats.pinned_eden_blocks = collector.pinned_eden_blocks.len();
+    collector.stats.pinned_eden_retained_bytes = retained_eden_bytes;
+    collector.live_from_bytes = collector
+        .live_from_bytes
+        .saturating_add(retained_eden_bytes);
     collector.stats.reset_blocks += crate::arena::copying_prepare_to_space();
+
+    visit_pinned_eden_headers_copying(&mut collector);
 
     visit_mutable_root_slots(|slot| unsafe {
         let bits = slot.read();
@@ -926,6 +1259,8 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
         visit_ffi_mutable_registered_roots_with_sources(&mut visitor, root_sources);
     }
 
+    visit_copy_only_registered_roots_copying(&mut collector);
+
     let snapshot = remembered_dirty_snapshot();
     let remembered_stats =
         scan_remembered_dirty_slots_copying(&snapshot, |slot, header, external, stats| unsafe {
@@ -987,7 +1322,9 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
 
     crate::promise::cleanup_copied_minor_promise_contexts_for_gc();
     finalize_dead_copied_minor_from_space_side_allocations();
-    let reset = crate::arena::copying_reset_from_spaces_and_flip();
+    let reset = crate::arena::copying_reset_from_spaces_and_flip_excluding_eden_blocks(
+        &collector.pinned_eden_blocks,
+    );
     collector.stats.reset_blocks += reset.reset_blocks;
     if let Some(trace) = trace.as_mut() {
         trace.old_pages = crate::arena::old_page_summary();

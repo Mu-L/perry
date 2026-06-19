@@ -37,6 +37,7 @@ fn assert_additive_pause_telemetry_fields(
 fn test_gc_progress_contract_defaults() {
     let contract = gc_progress_contract();
 
+    assert_eq!(contract.mode, GcRuntimeMode::Throughput);
     assert_eq!(
         contract.normal_step_budget,
         GcPauseBudget::bounded(
@@ -68,6 +69,62 @@ fn test_gc_progress_contract_defaults() {
 }
 
 #[test]
+fn test_gc_progress_contract_latency_mode_tightens_budget() {
+    let _mode = GcModeTestGuard::set(GcRuntimeMode::Latency);
+    let contract = gc_progress_contract();
+
+    assert_eq!(contract.mode, GcRuntimeMode::Latency);
+    assert_eq!(
+        contract.normal_step_budget,
+        GcPauseBudget::bounded(
+            GC_LATENCY_INCREMENTAL_WORK_UNITS,
+            GC_LATENCY_INCREMENTAL_SOFT_PAUSE_US,
+        )
+    );
+    assert_eq!(
+        contract.assist_budget,
+        GcPauseBudget::bounded(
+            GC_LATENCY_MUTATOR_ASSIST_WORK_UNITS,
+            GC_LATENCY_MUTATOR_ASSIST_SOFT_PAUSE_US,
+        )
+    );
+    assert!(
+        contract.normal_step_budget.work_units.unwrap() < GC_NORMAL_INCREMENTAL_WORK_UNITS,
+        "latency mode should spend smaller host-driven slices"
+    );
+    assert!(
+        contract.assist_budget.work_units.unwrap() < GC_MUTATOR_ASSIST_WORK_UNITS,
+        "latency mode should spend smaller allocation-side assists"
+    );
+    assert_eq!(
+        gc_mutator_assist_work_units(),
+        GC_LATENCY_MUTATOR_ASSIST_WORK_UNITS,
+        "gc_check_trigger must consume the mode-specific mutator-assist budget"
+    );
+}
+
+#[test]
+fn test_gc_latency_mode_effective_trigger_uses_young_debt_ceiling() {
+    let _mode = GcModeTestGuard::set(GcRuntimeMode::Latency);
+    let previous = GC_NEXT_TRIGGER_BYTES.with(|trigger| {
+        let previous = trigger.get();
+        trigger.set(GC_THRESHOLD_INITIAL_BYTES);
+        previous
+    });
+
+    assert_eq!(
+        gc_effective_next_arena_trigger(),
+        GC_LATENCY_TRIGGER_ABSOLUTE_CEILING
+    );
+    assert_eq!(
+        GcDebtSnapshot::current().arena_debt_bytes,
+        gc_nursery_trigger_bytes().saturating_sub(GC_LATENCY_TRIGGER_ABSOLUTE_CEILING) as u64
+    );
+
+    GC_NEXT_TRIGGER_BYTES.with(|trigger| trigger.set(previous));
+}
+
+#[test]
 fn test_gc_progress_kind_is_budgeted_only_for_incremental_and_assist() {
     assert!(GcProgressKind::NormalIncremental.is_budgeted());
     assert!(GcProgressKind::MutatorAssist.is_budgeted());
@@ -91,6 +148,7 @@ fn test_gc_progress_contract_trace_json_labels_automatic_as_legacy() {
     let event = trace.into_json(GcStepSnapshot::current());
     let progress = &event["progress_contract"];
 
+    assert_eq!(progress["mode"].as_str(), Some("throughput"));
     assert_eq!(progress["kind"].as_str(), Some("legacy_synchronous"));
     assert_eq!(progress["budget_unit"].as_str(), Some("work_units"));
     assert!(progress["configured_work_budget"].is_null());
@@ -98,6 +156,38 @@ fn test_gc_progress_contract_trace_json_labels_automatic_as_legacy() {
     assert_eq!(progress["ordinary_budgeted"].as_bool(), Some(false));
     assert_eq!(progress["class"].as_str(), Some("legacy"));
     assert_additive_pause_telemetry_fields(&event, "legacy_synchronous", "legacy", false);
+}
+
+#[test]
+fn test_gc_progress_contract_trace_json_records_latency_mode() {
+    let _mode = GcModeTestGuard::set(GcRuntimeMode::Latency);
+    let mut trace = GcCycleTrace::new(
+        GcCollectionKind::Minor,
+        GcTriggerSnapshot {
+            kind: GcTriggerKind::ArenaBytes,
+            steps_before: Some(GcStepSnapshot::current()),
+        },
+    )
+    .expect("test requested GC trace capture");
+    trace.progress_kind = GcProgressKind::NormalIncremental;
+
+    let event = trace.into_json(GcStepSnapshot::current());
+    let progress = &event["progress_contract"];
+
+    assert_eq!(progress["mode"].as_str(), Some("latency"));
+    assert_eq!(progress["kind"].as_str(), Some("normal_incremental"));
+    assert_eq!(
+        progress["configured_work_budget"].as_u64(),
+        Some(GC_LATENCY_INCREMENTAL_WORK_UNITS as u64)
+    );
+    assert_eq!(
+        progress["soft_pause_target_us"].as_u64(),
+        Some(GC_LATENCY_INCREMENTAL_SOFT_PAUSE_US)
+    );
+    assert_eq!(
+        event["pause_budget"]["kind"].as_str(),
+        Some("normal_incremental")
+    );
 }
 
 #[test]

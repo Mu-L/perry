@@ -273,11 +273,11 @@ pub(crate) fn call_with_this_capturing_throw(
     this_value: f64,
     args: &[f64],
 ) -> Result<f64, f64> {
-    let prev_this = crate::object::js_implicit_this_set(this_value);
+    let prev_this = crate::object::js_implicit_this_push(this_value);
     let result = call_capturing_throw(|| unsafe {
         crate::closure::js_native_call_value(callee, args.as_ptr(), args.len())
     });
-    crate::object::js_implicit_this_set(prev_this);
+    crate::object::js_implicit_this_restore(prev_this);
     result
 }
 

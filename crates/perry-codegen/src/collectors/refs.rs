@@ -479,6 +479,14 @@ pub fn collect_ref_ids_in_expr(e: &perry_hir::Expr, out: &mut HashSet<u32>) {
                 walk(a, out);
             }
         }
+        Expr::NewDynamicSpread { callee, args } => {
+            walk(callee, out);
+            for a in args {
+                match a {
+                    CallArg::Expr(e) | CallArg::Spread(e) => walk(e, out),
+                }
+            }
+        }
         // Same gap for `Expr::RegisterFunctionPrototypeMethod` (#838
         // followup (b)): the recogniser routes `Foo.prototype.x = fn`
         // (and `var p = Foo.prototype; p.x = fn`) through this node

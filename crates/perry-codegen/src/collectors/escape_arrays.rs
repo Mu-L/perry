@@ -542,6 +542,22 @@ pub fn check_array_escapes_in_expr(
                 check_array_escapes_in_expr(a, candidates, escaped);
             }
         }
+        Expr::NewDynamic { callee, args } => {
+            check_array_escapes_in_expr(callee, candidates, escaped);
+            for a in args {
+                check_array_escapes_in_expr(a, candidates, escaped);
+            }
+        }
+        Expr::NewDynamicSpread { callee, args } => {
+            check_array_escapes_in_expr(callee, candidates, escaped);
+            for a in args {
+                match a {
+                    CallArg::Expr(e) | CallArg::Spread(e) => {
+                        check_array_escapes_in_expr(e, candidates, escaped);
+                    }
+                }
+            }
+        }
         Expr::PropertySet { object, value, .. } => {
             check_array_escapes_in_expr(object, candidates, escaped);
             check_array_escapes_in_expr(value, candidates, escaped);

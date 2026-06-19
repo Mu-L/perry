@@ -415,6 +415,16 @@ fn collect_keys_from_expr(
         Expr::Closure { body, .. } => {
             collect_keys_from_stmts(body, key_to_idx, keys);
         }
+        Expr::NewDynamicSpread { callee, args } => {
+            collect_keys_from_expr(callee, key_to_idx, keys);
+            for arg in args {
+                match arg {
+                    perry_hir::CallArg::Expr(e) | perry_hir::CallArg::Spread(e) => {
+                        collect_keys_from_expr(e, key_to_idx, keys);
+                    }
+                }
+            }
+        }
         Expr::New { args, .. }
         | Expr::NewDynamic { args, .. }
         | Expr::SuperCall(args)
@@ -679,6 +689,16 @@ fn replace_in_expr(
         }
         Expr::Closure { body, .. } => {
             replace_in_stmts(body, key_to_idx, plural_info, plural_param_map);
+        }
+        Expr::NewDynamicSpread { callee, args } => {
+            replace_in_expr(callee, key_to_idx, plural_info, plural_param_map);
+            for arg in args.iter_mut() {
+                match arg {
+                    perry_hir::CallArg::Expr(e) | perry_hir::CallArg::Spread(e) => {
+                        replace_in_expr(e, key_to_idx, plural_info, plural_param_map);
+                    }
+                }
+            }
         }
         Expr::New { args, .. }
         | Expr::NewDynamic { args, .. }

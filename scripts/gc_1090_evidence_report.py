@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -12,6 +13,7 @@ from typing import Any
 
 
 EXACT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 REQUIRED_BENCHMARKS = (
     "bench_json_roundtrip",
@@ -72,6 +74,27 @@ FALLBACK_REASONS = (
     "not_attempted",
 )
 
+COPIED_MINOR_FALLBACK_TRACE_GROUP = "copied-minor-fallback"
+REQUIRED_BENCHMARK_TRACE_GROUP = "required-benchmark"
+TARGET_COLLECTOR_TRACE_GROUP = "target-collector"
+COPIED_MINOR_SCALING_TRACE_GROUP = "copied-minor-scaling"
+COPIED_MINOR_DOMINANCE_TRACE_GROUPS = (
+    COPIED_MINOR_FALLBACK_TRACE_GROUP,
+    REQUIRED_BENCHMARK_TRACE_GROUP,
+    TARGET_COLLECTOR_TRACE_GROUP,
+    COPIED_MINOR_SCALING_TRACE_GROUP,
+)
+REQUIRED_COPIED_MINOR_DOMINANCE_TRACE_GROUPS = (
+    COPIED_MINOR_FALLBACK_TRACE_GROUP,
+    REQUIRED_BENCHMARK_TRACE_GROUP,
+    TARGET_COLLECTOR_TRACE_GROUP,
+    COPIED_MINOR_SCALING_TRACE_GROUP,
+)
+COPIED_MINOR_DOMINANCE_THRESHOLD_PCT = 99.0
+MIN_COPIED_MINOR_DOMINANCE_ELIGIBLE_MINOR_COLLECTIONS = 100
+AUTOMATIC_COPIED_MINOR_SUCCESS_TRIGGER_KINDS = ("arena_bytes", "malloc_count")
+NON_AUTOMATIC_GC_TRIGGER_KINDS = ("direct", "manual")
+SURVIVOR_PROMOTION_TRIGGER_KIND = "survivor_promotion_bytes"
 SPEED_THRESHOLD_PCT = 15.0
 MEMORY_THRESHOLD_PCT = 25.0
 MIN_SPEED_DELTA_MS = 20
@@ -113,6 +136,10 @@ def int_value(value: Any) -> int:
     return 0
 
 
+def positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
 def pct_delta(base: int | None, head: int | None) -> float | None:
     if base is None or head is None or base <= 0:
         return None
@@ -127,6 +154,135 @@ def ratio_delta(base: int | None, head: int | None) -> dict[str, Any]:
         "delta": None if base is None or head is None else head - base,
         "delta_pct": None if pct is None else round(pct, 1),
     }
+
+
+def empty_trace_totals() -> dict[str, Any]:
+    return {
+        "trace_file_count": 0,
+        "gc_cycle_count": 0,
+        "dominance_cycle_count": 0,
+        "excluded_non_automatic_cycles": 0,
+        "minor_collections": 0,
+        "eligible_minor_collections": 0,
+        "runtime_eligible_minor_collections": 0,
+        "copied_nursery_successes": 0,
+        "copied_objects": 0,
+        "copied_bytes": 0,
+        "promoted_objects": 0,
+        "promoted_bytes": 0,
+        "malformed_json_lines": 0,
+        "missing_fallback_reason_cycles": 0,
+        "missing_eligible_flag_cycles": 0,
+        "missing_collection_kind_cycles": 0,
+        "missing_trigger_kind_cycles": 0,
+        "full_gc_failures": 0,
+        "minor_fallback_failures": 0,
+        "not_attempted_failures": 0,
+        "survivor_promotion_handoff_failures": 0,
+        "fallback_reason_counts": normalize_reason_counts({}),
+        "collection_kind_counts": {},
+        "trigger_kind_counts": {},
+    }
+
+
+def add_trace_totals(dst: dict[str, Any], src: dict[str, Any]) -> None:
+    for field in (
+        "trace_file_count",
+        "gc_cycle_count",
+        "dominance_cycle_count",
+        "excluded_non_automatic_cycles",
+        "minor_collections",
+        "eligible_minor_collections",
+        "runtime_eligible_minor_collections",
+        "copied_nursery_successes",
+        "copied_objects",
+        "copied_bytes",
+        "promoted_objects",
+        "promoted_bytes",
+        "malformed_json_lines",
+        "missing_fallback_reason_cycles",
+        "missing_eligible_flag_cycles",
+        "missing_collection_kind_cycles",
+        "missing_trigger_kind_cycles",
+        "full_gc_failures",
+        "minor_fallback_failures",
+        "not_attempted_failures",
+        "survivor_promotion_handoff_failures",
+    ):
+        dst[field] = int_value(dst.get(field)) + int_value(src.get(field))
+    for reason, count in src.get("fallback_reason_counts", {}).items():
+        if isinstance(reason, str):
+            dst.setdefault("fallback_reason_counts", {})
+            dst["fallback_reason_counts"][reason] = int_value(
+                dst["fallback_reason_counts"].get(reason)
+            ) + int_value(count)
+    for kind, count in src.get("collection_kind_counts", {}).items():
+        if isinstance(kind, str):
+            dst.setdefault("collection_kind_counts", {})
+            dst["collection_kind_counts"][kind] = int_value(
+                dst["collection_kind_counts"].get(kind)
+            ) + int_value(count)
+    for kind, count in src.get("trigger_kind_counts", {}).items():
+        if isinstance(kind, str):
+            dst.setdefault("trigger_kind_counts", {})
+            dst["trigger_kind_counts"][kind] = int_value(
+                dst["trigger_kind_counts"].get(kind)
+            ) + int_value(count)
+
+
+def finalize_trace_totals(totals: dict[str, Any]) -> dict[str, Any]:
+    dominance_cycles = int_value(totals.get("dominance_cycle_count"))
+    successes = int_value(totals.get("copied_nursery_successes"))
+    rate = (
+        None
+        if dominance_cycles == 0
+        else round((successes / dominance_cycles) * 100.0, 2)
+    )
+    result = dict(totals)
+    result["fallback_reason_counts"] = normalize_reason_counts(
+        result.get("fallback_reason_counts", {})
+    )
+    result["collection_kind_counts"] = dict(
+        sorted(result.get("collection_kind_counts", {}).items())
+    )
+    result["trigger_kind_counts"] = dict(
+        sorted(result.get("trigger_kind_counts", {}).items())
+    )
+    result["dominance_failures"] = max(dominance_cycles - successes, 0)
+    result["copied_minor_success_rate_pct"] = rate
+    result["threshold_pct"] = COPIED_MINOR_DOMINANCE_THRESHOLD_PCT
+    result["gate"] = (
+        "missing"
+        if dominance_cycles == 0
+        else "pass"
+        if rate is not None and rate >= COPIED_MINOR_DOMINANCE_THRESHOLD_PCT
+        else "fail"
+    )
+    return result
+
+
+def finalize_dominance_totals(
+    totals: dict[str, Any],
+    *,
+    included_groups: list[str],
+    missing_groups: list[str],
+) -> dict[str, Any]:
+    result = finalize_trace_totals(totals)
+    dominance_cycles = int_value(result.get("dominance_cycle_count"))
+    result["included_groups"] = included_groups
+    result["missing_groups"] = missing_groups
+    result["minimum_dominance_cycles"] = (
+        MIN_COPIED_MINOR_DOMINANCE_ELIGIBLE_MINOR_COLLECTIONS
+    )
+    result["minimum_eligible_minor_collections"] = (
+        MIN_COPIED_MINOR_DOMINANCE_ELIGIBLE_MINOR_COLLECTIONS
+    )
+    if (
+        dominance_cycles
+        and dominance_cycles < MIN_COPIED_MINOR_DOMINANCE_ELIGIBLE_MINOR_COLLECTIONS
+    ):
+        result["gate"] = "insufficient"
+    return result
 
 
 def command_exit(metadata: dict[str, Any], label: str, command: str) -> int | None:
@@ -146,6 +302,14 @@ def command_status(metadata: dict[str, Any], label: str, command: str) -> str:
 
 def exact_sha(value: Any) -> bool:
     return isinstance(value, str) and EXACT_SHA_RE.fullmatch(value) is not None
+
+
+def exact_sha256(value: Any) -> bool:
+    return isinstance(value, str) and SHA256_RE.fullmatch(value) is not None
+
+
+def file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def label_paths(root: Path, label: str) -> dict[str, Path]:
@@ -174,6 +338,155 @@ def benchmark_entry(benchmarks: dict[str, Any], name: str) -> dict[str, Any]:
     return entry if isinstance(entry, dict) else {}
 
 
+def validate_node_correctness_artifact(
+    report_label: str,
+    name: str,
+    entry: dict[str, Any],
+    errors: list[str],
+    warnings: list[str],
+    *,
+    gate: bool,
+) -> None:
+    correctness = entry.get("correctness")
+    target = errors if gate else warnings
+    if not isinstance(correctness, dict):
+        return
+
+    if correctness.get("reference") != "node":
+        target.append(
+            f"{report_label}:{name}: Node reference comparison artifact missing "
+            f"(reference={correctness.get('reference')!r})"
+        )
+
+    actual = correctness.get("actual_lines")
+    expected = correctness.get("expected_lines")
+    actual_ok = isinstance(actual, list) and all(isinstance(line, str) for line in actual)
+    expected_ok = isinstance(expected, list) and all(isinstance(line, str) for line in expected)
+    if not actual_ok or not expected_ok:
+        target.append(f"{report_label}:{name}: Node comparison lines are missing or malformed")
+    elif not actual or not expected:
+        target.append(f"{report_label}:{name}: Node comparison lines are empty")
+    elif actual != expected:
+        errors.append(
+            f"{report_label}:{name}: Node comparison artifact mismatch: "
+            f"expected={expected!r}; actual={actual!r}"
+        )
+
+    if not positive_int(entry.get("node_ms")):
+        target.append(f"{report_label}:{name}: Node timing artifact missing")
+    if not positive_int(entry.get("node_rss_kb")):
+        target.append(f"{report_label}:{name}: Node RSS artifact missing")
+
+
+def validate_node_line_comparison(
+    *,
+    report_label: str,
+    name: str,
+    correctness: Any,
+    context: str,
+    errors: list[str],
+    warnings: list[str],
+    gate: bool,
+) -> None:
+    target = errors if gate else warnings
+    if not isinstance(correctness, dict):
+        target.append(f"{report_label}:{name}: {context} correctness artifact is missing")
+        return
+
+    status = correctness.get("status")
+    if status != "pass":
+        target.append(f"{report_label}:{name}: {context} correctness status is {status}")
+
+    if correctness.get("reference") != "node":
+        target.append(
+            f"{report_label}:{name}: {context} Node reference comparison artifact missing "
+            f"(reference={correctness.get('reference')!r})"
+        )
+
+    actual = correctness.get("actual_lines")
+    expected = correctness.get("expected_lines")
+    actual_ok = isinstance(actual, list) and all(isinstance(line, str) for line in actual)
+    expected_ok = isinstance(expected, list) and all(isinstance(line, str) for line in expected)
+    if not actual_ok or not expected_ok:
+        target.append(
+            f"{report_label}:{name}: {context} Node comparison lines are missing or malformed"
+        )
+    elif not actual or not expected:
+        target.append(f"{report_label}:{name}: {context} Node comparison lines are empty")
+    elif actual != expected:
+        target.append(
+            f"{report_label}:{name}: {context} Node comparison artifact mismatch: "
+            f"expected={expected!r}; actual={actual!r}"
+        )
+
+
+def benchmark_gc_trace_correctness(
+    root: Path,
+    label: str,
+    errors: list[str],
+    warnings: list[str],
+    *,
+    gate: bool,
+) -> dict[str, Any]:
+    trace_root = root / label / "benchmark-gc-traces"
+    rows: dict[str, Any] = {}
+    target = errors if gate else warnings
+
+    for name in REQUIRED_BENCHMARKS:
+        stdout_path = trace_root / "stdout" / f"{name}.out"
+        reference_stdout_path = trace_root / "reference-stdout" / f"{name}.out"
+        correctness_path = trace_root / "correctness" / f"{name}.json"
+        correctness = load_json(correctness_path, None)
+        row = {
+            "stdout_path": str(stdout_path),
+            "reference_stdout_path": str(reference_stdout_path),
+            "correctness_path": str(correctness_path),
+            "stdout_present": stdout_path.exists(),
+            "reference_stdout_present": reference_stdout_path.exists(),
+            "correctness_present": correctness_path.exists(),
+            "status": nested(correctness, "status", default="missing"),
+            "reference": nested(correctness, "reference", default="missing"),
+            "actual_lines": nested(correctness, "actual_lines", default=[]),
+            "expected_lines": nested(correctness, "expected_lines", default=[]),
+        }
+        rows[name] = row
+
+        if not stdout_path.exists():
+            target.append(f"{label}:{name}: traced benchmark Perry stdout is missing")
+        if not reference_stdout_path.exists():
+            target.append(f"{label}:{name}: traced benchmark Node reference stdout is missing")
+        if not correctness_path.exists():
+            target.append(f"{label}:{name}: traced benchmark correctness artifact is missing")
+
+        validate_node_line_comparison(
+            report_label=label,
+            name=name,
+            correctness=correctness,
+            context="traced benchmark",
+            errors=errors,
+            warnings=warnings,
+            gate=gate,
+        )
+
+    failed_rows = [
+        name
+        for name, row in rows.items()
+        if row.get("status") != "pass"
+        or row.get("reference") != "node"
+        or not row.get("stdout_present")
+        or not row.get("reference_stdout_present")
+        or not row.get("correctness_present")
+        or not row.get("actual_lines")
+        or row.get("actual_lines") != row.get("expected_lines")
+    ]
+    return {
+        "path": str(trace_root),
+        "status": "fail" if failed_rows else "pass",
+        "failed_rows": failed_rows,
+        "rows": rows,
+    }
+
+
 def benchmark_matrix(
     root: Path,
     base_label: str,
@@ -188,15 +501,16 @@ def benchmark_matrix(
     matrix: dict[str, Any] = {}
 
     for report_label, report in ((base_label, base), (head_label, head)):
+        require_full_correctness = gate and report_label == head_label
         if not report:
             errors.append(f"{report_label}: benchmark JSON is missing")
             continue
         for name, entry in nested(report, "benchmarks", default={}).items():
             correctness = entry.get("correctness", {})
-            status = correctness.get("status")
-            if gate and not isinstance(correctness, dict):
+            status = correctness.get("status") if isinstance(correctness, dict) else None
+            if require_full_correctness and not isinstance(correctness, dict):
                 errors.append(f"{report_label}:{name}: correctness output missing")
-            elif gate and status != "pass":
+            elif require_full_correctness and status != "pass":
                 errors.append(f"{report_label}:{name}: correctness status is {status}")
             elif status == "fail":
                 errors.append(
@@ -205,6 +519,14 @@ def benchmark_matrix(
                 )
             elif status == "unchecked":
                 warnings.append(f"{report_label}:{name}: correctness unchecked")
+            validate_node_correctness_artifact(
+                report_label,
+                name,
+                entry,
+                errors,
+                warnings,
+                gate=require_full_correctness,
+            )
 
     for name in REQUIRED_BENCHMARKS:
         base_entry = benchmark_entry(base, name)
@@ -260,6 +582,329 @@ def normalize_reason_counts(counts: Any) -> dict[str, int]:
             if isinstance(key, str):
                 result[key] = int_value(value)
     return result
+
+
+def trace_group(root: Path, label: str, trace_file: Path) -> str:
+    traces_root = root / label / "memory" / "traces"
+    try:
+        rel = trace_file.relative_to(traces_root)
+    except ValueError:
+        return "_unknown"
+    return rel.parts[0] if rel.parts else "_root"
+
+
+def iter_trace_files(root: Path, label: str) -> list[Path]:
+    traces_root = root / label / "memory" / "traces"
+    if not traces_root.exists():
+        return []
+    return sorted(path for path in traces_root.rglob("*") if path.is_file())
+
+
+def normalized_trigger_kind(value: Any) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    aliases = {
+        "ArenaBytes": "arena_bytes",
+        "MallocCount": "malloc_count",
+        "OldGenBytes": "old_gen_bytes",
+        "SurvivorPromotionBytes": SURVIVOR_PROMOTION_TRIGGER_KIND,
+        "Emergency": "emergency",
+        "Manual": "manual",
+        "Direct": "direct",
+    }
+    return aliases.get(value, value)
+
+
+def trace_trigger_kind(event: dict[str, Any]) -> str | None:
+    trigger = event.get("trigger")
+    if isinstance(trigger, dict):
+        kind = normalized_trigger_kind(trigger.get("kind"))
+        if kind is not None:
+            return kind
+    return normalized_trigger_kind(event.get("trigger_kind"))
+
+
+def explicitly_non_automatic_gc_cycle(
+    event: dict[str, Any],
+    trigger_kind: str | None,
+) -> bool:
+    if trigger_kind in NON_AUTOMATIC_GC_TRIGGER_KINDS:
+        return True
+    trigger = event.get("trigger")
+    trigger = trigger if isinstance(trigger, dict) else {}
+    for value in (
+        event.get("automatic"),
+        trigger.get("automatic"),
+    ):
+        if value is False:
+            return True
+    for value in (
+        event.get("classification"),
+        trigger.get("classification"),
+        trigger.get("class"),
+    ):
+        if isinstance(value, str) and value in (
+            "non_automatic",
+            "non-automatic",
+            "direct",
+            "manual",
+        ):
+            return True
+    return False
+
+
+def summarize_gc_trace_file(trace_file: Path) -> dict[str, Any]:
+    totals = empty_trace_totals()
+    totals["trace_file_count"] = 1
+    totals["path"] = str(trace_file)
+
+    try:
+        handle = trace_file.open("r", encoding="utf-8", errors="replace")
+    except OSError as exc:
+        totals["read_error"] = str(exc)
+        return finalize_trace_totals(totals)
+
+    with handle:
+        for line in handle:
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                totals["malformed_json_lines"] += 1
+                continue
+            if not isinstance(event, dict) or event.get("event") != "gc_cycle":
+                continue
+
+            totals["gc_cycle_count"] += 1
+            collection_kind = event.get("collection_kind")
+            if isinstance(collection_kind, str):
+                kind_key = collection_kind
+            else:
+                kind_key = "_missing"
+            totals["collection_kind_counts"][kind_key] = int_value(
+                totals["collection_kind_counts"].get(kind_key)
+            ) + 1
+
+            trigger_kind = trace_trigger_kind(event)
+            if trigger_kind is None:
+                trigger_key = "_missing"
+            else:
+                trigger_key = trigger_kind
+            totals["trigger_kind_counts"][trigger_key] = int_value(
+                totals["trigger_kind_counts"].get(trigger_key)
+            ) + 1
+
+            if explicitly_non_automatic_gc_cycle(event, trigger_kind):
+                totals["excluded_non_automatic_cycles"] += 1
+                continue
+
+            totals["dominance_cycle_count"] += 1
+            if trigger_kind is None:
+                totals["missing_trigger_kind_cycles"] += 1
+
+            copying = event.get("copying_nursery")
+            if not isinstance(copying, dict):
+                copying = {}
+            reason = copying.get("fallback_reason")
+            if isinstance(reason, str):
+                reason_key = reason
+            else:
+                reason_key = "_missing"
+                totals["missing_fallback_reason_cycles"] += 1
+
+            totals["fallback_reason_counts"][reason_key] = int_value(
+                totals["fallback_reason_counts"].get(reason_key)
+            ) + 1
+
+            eligible_flag = copying.get("eligible")
+            is_minor = collection_kind == "minor"
+            if is_minor:
+                totals["minor_collections"] += 1
+                if eligible_flag is True:
+                    totals["eligible_minor_collections"] += 1
+                    totals["runtime_eligible_minor_collections"] += 1
+                elif eligible_flag is not False:
+                    totals["missing_eligible_flag_cycles"] += 1
+            elif not isinstance(collection_kind, str):
+                totals["missing_collection_kind_cycles"] += 1
+                if eligible_flag is not True and eligible_flag is not False:
+                    totals["missing_eligible_flag_cycles"] += 1
+            elif collection_kind == "full":
+                totals["full_gc_failures"] += 1
+
+            if trigger_kind == SURVIVOR_PROMOTION_TRIGGER_KIND:
+                totals["survivor_promotion_handoff_failures"] += 1
+            if reason_key == "not_attempted":
+                totals["not_attempted_failures"] += 1
+
+            success = (
+                trigger_kind in AUTOMATIC_COPIED_MINOR_SUCCESS_TRIGGER_KINDS
+                and is_minor
+                and eligible_flag is True
+                and reason_key == "none"
+            )
+            if success:
+                totals["copied_nursery_successes"] += 1
+            elif is_minor:
+                totals["minor_fallback_failures"] += 1
+
+            totals["copied_objects"] += int_value(copying.get("copied_objects"))
+            totals["copied_bytes"] += int_value(copying.get("copied_bytes"))
+            totals["promoted_objects"] += int_value(copying.get("promoted_objects"))
+            totals["promoted_bytes"] += int_value(copying.get("promoted_bytes"))
+
+    return finalize_trace_totals(totals)
+
+
+def trace_row_name_from_path(path_value: Any) -> str | None:
+    if not isinstance(path_value, str) or not path_value:
+        return None
+    name = Path(path_value).stem
+    return re.sub(r"^\d+_", "", name)
+
+
+def copied_minor_trace_evidence(root: Path, label: str) -> dict[str, Any]:
+    traces_root = root / label / "memory" / "traces"
+    files = iter_trace_files(root, label)
+    totals = empty_trace_totals()
+    groups: dict[str, dict[str, Any]] = {}
+    file_summaries: list[dict[str, Any]] = []
+
+    for trace_file in files:
+        summary = summarize_gc_trace_file(trace_file)
+        add_trace_totals(totals, summary)
+        group_name = trace_group(root, label, trace_file)
+        summary["group"] = group_name
+        summary["row"] = trace_row_name_from_path(str(trace_file))
+        file_summaries.append(summary)
+        group_totals = groups.setdefault(group_name, empty_trace_totals())
+        add_trace_totals(group_totals, summary)
+
+    finalized_groups = {
+        name: finalize_trace_totals(group_totals)
+        for name, group_totals in sorted(groups.items())
+    }
+    dominance_totals = empty_trace_totals()
+    included_dominance_groups: list[str] = []
+    missing_dominance_groups: list[str] = []
+    for group_name in COPIED_MINOR_DOMINANCE_TRACE_GROUPS:
+        group_totals = finalized_groups.get(group_name)
+        if isinstance(group_totals, dict):
+            included_dominance_groups.append(group_name)
+            add_trace_totals(dominance_totals, group_totals)
+        else:
+            missing_dominance_groups.append(group_name)
+
+    dominance = finalize_dominance_totals(
+        dominance_totals,
+        included_groups=included_dominance_groups,
+        missing_groups=missing_dominance_groups,
+    )
+    return {
+        "present": bool(files),
+        "path": str(traces_root),
+        "dominance_groups": list(COPIED_MINOR_DOMINANCE_TRACE_GROUPS),
+        "required_dominance_groups": list(REQUIRED_COPIED_MINOR_DOMINANCE_TRACE_GROUPS),
+        "totals": finalize_trace_totals(totals),
+        "dominance": dominance,
+        "groups": finalized_groups,
+        "files": file_summaries,
+    }
+
+
+def gate_copied_minor_dominance(
+    label: str,
+    trace_evidence: dict[str, Any],
+    errors: list[str],
+    warnings: list[str],
+    *,
+    gate: bool,
+) -> None:
+    target = errors if gate else warnings
+    if not trace_evidence.get("present"):
+        target.append(f"{label}: GC trace artifacts are missing")
+        return
+
+    totals = trace_evidence.get("totals", {})
+    malformed = int_value(totals.get("malformed_json_lines")) if isinstance(totals, dict) else 0
+    if malformed:
+        target.append(f"{label}: GC trace artifacts contain malformed JSON lines={malformed}")
+
+    dominance = trace_evidence.get("dominance", {})
+    if not isinstance(dominance, dict):
+        target.append(f"{label}: copied-minor dominance trace summary is missing")
+        return
+
+    groups = trace_evidence.get("groups", {})
+    groups = groups if isinstance(groups, dict) else {}
+    for group_name in REQUIRED_COPIED_MINOR_DOMINANCE_TRACE_GROUPS:
+        group_summary = groups.get(group_name)
+        if not isinstance(group_summary, dict):
+            target.append(
+                f"{label}: required GC trace evidence group {group_name!r} is missing"
+            )
+            continue
+        group_dominance_cycles = int_value(group_summary.get("dominance_cycle_count"))
+        if group_dominance_cycles == 0:
+            target.append(
+                f"{label}: required GC trace evidence group {group_name!r} "
+                "has no automatic dominance cycles"
+            )
+
+    files = trace_evidence.get("files", [])
+    files = files if isinstance(files, list) else []
+    required_benchmark_rows: dict[str, int] = {name: 0 for name in REQUIRED_BENCHMARKS}
+    for summary in files:
+        if not isinstance(summary, dict):
+            continue
+        if summary.get("group") != REQUIRED_BENCHMARK_TRACE_GROUP:
+            continue
+        row = summary.get("row")
+        if row in required_benchmark_rows:
+            required_benchmark_rows[row] += int_value(
+                summary.get("dominance_cycle_count")
+            )
+    for row, dominance_count in required_benchmark_rows.items():
+        if dominance_count == 0:
+            target.append(
+                f"{label}: required benchmark GC trace row {row!r} is missing "
+                "or has no automatic dominance cycles"
+            )
+
+    dominance_cycles = int_value(dominance.get("dominance_cycle_count"))
+    successes = int_value(dominance.get("copied_nursery_successes"))
+    rate = dominance.get("copied_minor_success_rate_pct")
+    if dominance_cycles == 0:
+        target.append(
+            f"{label}: copied-minor dominance traces have no automatic dominance cycles"
+        )
+        return
+    for field, description in (
+        ("missing_trigger_kind_cycles", "trigger.kind"),
+        ("missing_collection_kind_cycles", "collection_kind"),
+        ("missing_eligible_flag_cycles", "copying_nursery.eligible"),
+        ("missing_fallback_reason_cycles", "copying_nursery.fallback_reason"),
+    ):
+        missing = int_value(dominance.get(field))
+        if missing:
+            target.append(
+                f"{label}: copied-minor dominance traces have {missing} cycles "
+                f"missing {description}"
+            )
+    if dominance_cycles < MIN_COPIED_MINOR_DOMINANCE_ELIGIBLE_MINOR_COLLECTIONS:
+        target.append(
+            f"{label}: copied-minor dominance automatic cycle sample too small: "
+            f"{dominance_cycles} < {MIN_COPIED_MINOR_DOMINANCE_ELIGIBLE_MINOR_COLLECTIONS}"
+        )
+    if not isinstance(rate, (int, float)) or rate < COPIED_MINOR_DOMINANCE_THRESHOLD_PCT:
+        errors.append(
+            f"{label}: copied-minor dominance below "
+            f"{COPIED_MINOR_DOMINANCE_THRESHOLD_PCT:.1f}%: "
+            f"{successes}/{dominance_cycles} automatic dominance cycles copied "
+            f"({rate}%)"
+        )
 
 
 def copied_report_summary(root: Path, label: str) -> dict[str, Any]:
@@ -1166,12 +1811,79 @@ def collect_report(root: Path, base_label: str, head_label: str, *, gate: bool =
     metadata = load_json(root / "metadata.json", {})
     errors: list[str] = []
     warnings: list[str] = []
+    source_state_raw = metadata.get("source_state")
+    source_state = source_state_raw if isinstance(source_state_raw, dict) else {}
 
     for key in ("base_sha", "head_sha"):
         if not exact_sha(metadata.get(key)):
             (errors if gate else warnings).append(
                 f"metadata {key} is not an exact 40-char SHA"
             )
+
+    if gate and not isinstance(source_state_raw, dict):
+        errors.append("source_state metadata is missing or invalid")
+    if isinstance(source_state_raw, dict):
+        source_mode = source_state.get("mode")
+        status_lines = source_state.get("status_porcelain_v1")
+        status_lines_valid = isinstance(status_lines, list) and all(
+            isinstance(line, str) for line in status_lines
+        )
+        if gate and not status_lines_valid:
+            errors.append("source_state status_porcelain_v1 is missing or malformed")
+        status_dirty = bool(status_lines) if status_lines_valid else bool(source_state.get("dirty"))
+        source_dirty = bool(source_state.get("dirty"))
+        if gate and source_dirty != status_dirty:
+            errors.append(
+                "source_state dirty flag does not match recorded status_porcelain_v1"
+            )
+        effective_dirty = source_dirty or status_dirty
+        if gate and source_mode not in ("exact-ref", "worktree-snapshot"):
+            errors.append(f"source_state mode is unknown: {source_mode!r}")
+        if gate:
+            for field in ("original_head_sha", "current_head_sha", "tested_head_sha"):
+                if not exact_sha(source_state.get(field)):
+                    errors.append(f"source_state {field} is not an exact 40-char SHA")
+            if (
+                exact_sha(source_state.get("tested_head_sha"))
+                and exact_sha(metadata.get("head_sha"))
+                and source_state.get("tested_head_sha") != metadata.get("head_sha")
+            ):
+                errors.append("source_state tested_head_sha does not match metadata head_sha")
+        if gate and effective_dirty and source_mode != "worktree-snapshot":
+            errors.append(
+                "source_state is dirty but mode is not worktree-snapshot; "
+                "gated evidence would not prove current worktree changes"
+            )
+        if gate and source_mode == "worktree-snapshot":
+            if not exact_sha(source_state.get("tested_head_tree_sha")):
+                errors.append("source_state tested_head_tree_sha is not an exact 40-char SHA")
+            diff_path_value = source_state.get("tested_head_diff_path")
+            diff_hash_value = source_state.get("tested_head_diff_sha256")
+            if not exact_sha256(diff_hash_value):
+                errors.append("source_state tested_head_diff_sha256 is missing or invalid")
+            if not isinstance(diff_path_value, str) or not diff_path_value:
+                errors.append("source_state tested_head_diff_path is missing")
+            else:
+                diff_path_parts = Path(diff_path_value).parts
+                if Path(diff_path_value).is_absolute() or ".." in diff_path_parts:
+                    errors.append("source_state tested_head_diff_path must stay inside packet root")
+                    diff_path = None
+                else:
+                    diff_path = root / diff_path_value
+                if diff_path is not None:
+                    if effective_dirty and diff_path.exists() and diff_path.stat().st_size == 0:
+                        errors.append(
+                            "source_state dirty worktree snapshot has an empty tested head diff"
+                        )
+                    if not diff_path.exists():
+                        errors.append(f"source_state tested head diff missing: {diff_path_value}")
+                    elif exact_sha256(diff_hash_value):
+                        actual = file_sha256(diff_path)
+                        if actual != diff_hash_value:
+                            errors.append(
+                                "source_state tested head diff hash mismatch: "
+                                f"{actual} != {diff_hash_value}"
+                            )
 
     for label in (base_label, head_label):
         if command_exit(metadata, label, "build") not in (0, None):
@@ -1185,6 +1897,11 @@ def collect_report(root: Path, base_label: str, head_label: str, *, gate: bool =
                 f"{label}: benchmark command exited {bench_exit}; "
                 "required benchmark gates are evaluated from JSON"
             )
+        trace_status = command_status(metadata, label, "benchmark_gc_traces")
+        if gate and trace_status != "pass":
+            errors.append(f"{label}: benchmark_gc_traces command status is {trace_status}")
+        elif trace_status not in ("pass", "skipped", "missing"):
+            warnings.append(f"{label}: benchmark_gc_traces command status is {trace_status}")
 
     memory = {
         base_label: memory_summary(root, base_label),
@@ -1201,11 +1918,34 @@ def collect_report(root: Path, base_label: str, head_label: str, *, gate: bool =
         base_label: copied_report_summary(root, base_label),
         head_label: copied_report_summary(root, head_label),
     }
+    copied_minor_traces = {
+        base_label: copied_minor_trace_evidence(root, base_label),
+        head_label: copied_minor_trace_evidence(root, head_label),
+    }
+    for label, trace_evidence in copied_minor_traces.items():
+        copied_minor[label]["trace_evidence"] = trace_evidence
+    benchmark_trace_correctness = {
+        label: benchmark_gc_trace_correctness(
+            root,
+            label,
+            errors,
+            warnings,
+            gate=gate,
+        )
+        for label in (base_label, head_label)
+    }
     target_collector = {
         base_label: target_collector_summary(root, base_label),
         head_label: target_collector_summary(root, head_label),
     }
     strict_workloads = gate_copied_minor(copied_minor[head_label], errors, warnings)
+    gate_copied_minor_dominance(
+        head_label,
+        copied_minor_traces[head_label],
+        errors,
+        warnings,
+        gate=gate,
+    )
 
     perf = perf_summary(metadata, base_label, head_label)
     gc_store_inventory = gc_store_inventory_summary(root, metadata, errors, warnings, gate=gate)
@@ -1238,11 +1978,14 @@ def collect_report(root: Path, base_label: str, head_label: str, *, gate: bool =
                 "sha": metadata.get("head_sha"),
             },
         },
+        "source_state": source_state if isinstance(source_state, dict) else {},
         "tool_versions": metadata.get("tool_versions", {}),
         "commands": metadata.get("commands", {}),
         "memory_stability": memory,
         "benchmarks": benchmarks,
+        "benchmark_gc_trace_correctness": benchmark_trace_correctness,
         "copied_minor": copied_minor,
+        "copied_minor_trace_evidence": copied_minor_traces,
         "strict_head_workloads": strict_workloads,
         "target_collector": target_collector,
         "gc_store_inventory": gc_store_inventory,
@@ -1275,15 +2018,20 @@ def render_markdown(packet: dict[str, Any]) -> str:
     status = packet["status"].upper()
     base_sha = nested(packet, "refs", "base", "sha", default="?")
     head_sha = nested(packet, "refs", "head", "sha", default="?")
+    source_state = packet.get("source_state", {})
+    source_mode = source_state.get("mode", "unknown") if isinstance(source_state, dict) else "unknown"
     lines = [
         f"# #1090 GC Evidence Packet: {status}",
         "",
         f"- Base: `{base_sha}`",
         f"- Head: `{head_sha}`",
+        f"- Source mode: `{source_mode}`",
         f"- Generated: `{packet['generated_at']}`",
         "",
         "## Gate Summary",
     ]
+    if isinstance(source_state, dict) and source_mode == "worktree-snapshot":
+        lines.insert(5, f"- Original head: `{source_state.get('original_head_sha', '?')}`")
     if packet["errors"]:
         lines.extend(f"- FAIL: {error}" for error in packet["errors"])
     else:
@@ -1353,16 +2101,28 @@ def render_markdown(packet: dict[str, Any]) -> str:
             "",
             "## Copied-Minor Evidence",
             "",
-            "| Ref | Fallback Reasons | Conservative Pinned Bytes | Compiled-Frame Pinned Bytes | Copy-Only Pinned Bytes | Copied/Promoted Objects | Copied/Promoted Bytes | Malloc Registry Rebuilds | External Live Bytes | External Young-Owner Checks |",
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+            f"- Dominance denominator groups: "
+            f"{', '.join(f'`{group}`' for group in COPIED_MINOR_DOMINANCE_TRACE_GROUPS)}; "
+            f"minimum automatic dominance cycles: "
+            f"`{MIN_COPIED_MINOR_DOMINANCE_ELIGIBLE_MINOR_COLLECTIONS}`",
+            "",
+            "| Ref | Trace Dominance Cycles | Trace Copied Success | Trace Success Rate | Fallback Reasons | Conservative Pinned Bytes | Compiled-Frame Pinned Bytes | Copy-Only Pinned Bytes | Copied/Promoted Objects | Copied/Promoted Bytes | Malloc Registry Rebuilds | External Live Bytes | External Young-Owner Checks |",
+            "|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|",
         ]
     )
     for label, report in packet["copied_minor"].items():
         summary = report["summary"]
+        trace = nested(report, "trace_evidence", "dominance", default={})
         copied_promoted = summary["copied_objects"] + summary["promoted_objects"]
         copied_promoted_bytes = summary["copied_bytes"] + summary["promoted_bytes"]
+        trace_rate = trace.get("copied_minor_success_rate_pct") if isinstance(trace, dict) else None
+        trace_rate_text = "missing" if trace_rate is None else f"{trace_rate:.2f}%"
         lines.append(
-            f"| `{label}` | {reason_summary(summary['fallback_reason_counts'])} "
+            f"| `{label}` "
+            f"| {trace.get('dominance_cycle_count', 0) if isinstance(trace, dict) else 0} "
+            f"| {trace.get('copied_nursery_successes', 0) if isinstance(trace, dict) else 0} "
+            f"| {trace_rate_text} "
+            f"| {reason_summary(summary['fallback_reason_counts'])} "
             f"| {summary['conservative_pinned_bytes']} "
             f"| {summary['compiled_frame_conservative_pinned_bytes']} "
             f"| {summary['legacy_copy_only_scanner_pinned_bytes']} "

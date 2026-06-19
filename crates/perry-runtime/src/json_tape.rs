@@ -1090,9 +1090,10 @@ impl PartialEq for TapeEntry {
 //   lower the lazy value to a real `ArrayHeader`-backed tree, then
 //   delegates to the generic path. Once materialized, the tape path
 //   is dead for this value.
-// - `js_json_stringify` checks `materialized.is_null()` — if true,
-//   memcpys the original blob bytes (Phase 4 fast path); if false,
-//   walks the materialized tree.
+// - `js_json_stringify` forces materialization, then walks the resulting tree.
+//   It cannot reuse original blob bytes because the parse input may contain
+//   whitespace, escape spellings, or number spellings that are not canonical
+//   `JSON.stringify` output.
 //
 // The inline tape bytes (after the header, within the same arena
 // allocation) get reclaimed with the header on the next arena block

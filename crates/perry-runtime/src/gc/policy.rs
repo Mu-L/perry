@@ -9,6 +9,82 @@ pub const GC_NORMAL_INCREMENTAL_SOFT_PAUSE_US: u64 = 2_000;
 pub const GC_MUTATOR_ASSIST_WORK_UNITS: usize = 256;
 /// Soft telemetry target for allocation-side mutator assist steps.
 pub const GC_MUTATOR_ASSIST_SOFT_PAUSE_US: u64 = 500;
+/// Latency mode spends smaller slices and triggers earlier. The values are
+/// deliberately conservative until copied-minor coverage is proven on broad
+/// workloads.
+pub const GC_LATENCY_INCREMENTAL_WORK_UNITS: usize = 1_024;
+pub const GC_LATENCY_INCREMENTAL_SOFT_PAUSE_US: u64 = 1_000;
+pub const GC_LATENCY_MUTATOR_ASSIST_WORK_UNITS: usize = 128;
+pub const GC_LATENCY_MUTATOR_ASSIST_SOFT_PAUSE_US: u64 = 250;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GcRuntimeMode {
+    Throughput,
+    Latency,
+}
+
+impl GcRuntimeMode {
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Throughput => "throughput",
+            Self::Latency => "latency",
+        }
+    }
+}
+
+fn parse_gc_runtime_mode(raw: Option<&str>) -> GcRuntimeMode {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("latency" | "low-latency" | "interactive") => GcRuntimeMode::Latency,
+        Some("throughput" | "batch" | "default") | None | Some("") => GcRuntimeMode::Throughput,
+        Some(_) => GcRuntimeMode::Throughput,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static GC_MODE_TEST_OVERRIDE: Cell<Option<GcRuntimeMode>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) struct GcModeTestGuard {
+    previous: Option<GcRuntimeMode>,
+}
+
+#[cfg(test)]
+impl GcModeTestGuard {
+    pub(super) fn set(mode: GcRuntimeMode) -> Self {
+        let previous = GC_MODE_TEST_OVERRIDE.with(|slot| {
+            let previous = slot.get();
+            slot.set(Some(mode));
+            previous
+        });
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for GcModeTestGuard {
+    fn drop(&mut self) {
+        GC_MODE_TEST_OVERRIDE.with(|slot| slot.set(self.previous));
+    }
+}
+
+pub fn gc_runtime_mode() -> GcRuntimeMode {
+    #[cfg(test)]
+    {
+        if let Some(mode) = GC_MODE_TEST_OVERRIDE.with(|slot| slot.get()) {
+            return mode;
+        }
+        parse_gc_runtime_mode(std::env::var("PERRY_GC_MODE").ok().as_deref())
+    }
+
+    #[cfg(not(test))]
+    {
+        static MODE: OnceLock<GcRuntimeMode> = OnceLock::new();
+        *MODE.get_or_init(|| parse_gc_runtime_mode(std::env::var("PERRY_GC_MODE").ok().as_deref()))
+    }
+}
 
 /// Runtime-visible classification for GC progress.
 ///
@@ -92,6 +168,7 @@ impl GcPauseBudget {
 /// GC progress policy exposed to runtime and trace consumers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GcProgressContract {
+    pub mode: GcRuntimeMode,
     pub normal_step_budget: GcPauseBudget,
     pub assist_budget: GcPauseBudget,
     pub explicit_synchronous_policy: GcPauseBudget,
@@ -115,15 +192,25 @@ impl GcProgressContract {
 
 impl Default for GcProgressContract {
     fn default() -> Self {
-        Self {
-            normal_step_budget: GcPauseBudget::bounded(
+        let mode = gc_runtime_mode();
+        let (normal_work_units, normal_pause_us, assist_work_units, assist_pause_us) = match mode {
+            GcRuntimeMode::Throughput => (
                 GC_NORMAL_INCREMENTAL_WORK_UNITS,
                 GC_NORMAL_INCREMENTAL_SOFT_PAUSE_US,
-            ),
-            assist_budget: GcPauseBudget::bounded(
                 GC_MUTATOR_ASSIST_WORK_UNITS,
                 GC_MUTATOR_ASSIST_SOFT_PAUSE_US,
             ),
+            GcRuntimeMode::Latency => (
+                GC_LATENCY_INCREMENTAL_WORK_UNITS,
+                GC_LATENCY_INCREMENTAL_SOFT_PAUSE_US,
+                GC_LATENCY_MUTATOR_ASSIST_WORK_UNITS,
+                GC_LATENCY_MUTATOR_ASSIST_SOFT_PAUSE_US,
+            ),
+        };
+        Self {
+            mode,
+            normal_step_budget: GcPauseBudget::bounded(normal_work_units, normal_pause_us),
+            assist_budget: GcPauseBudget::bounded(assist_work_units, assist_pause_us),
             explicit_synchronous_policy: GcPauseBudget::unbounded(),
             explicit_full_policy: GcPauseBudget::unbounded(),
             emergency_policy: GcPauseBudget::unbounded(),
@@ -162,10 +249,10 @@ pub(super) const GC_THRESHOLD_INITIAL_BYTES: usize = 128 * 1024 * 1024; // 128 M
 /// guardrail is `GC_TRIGGER_ABSOLUTE_CEILING` below.
 pub(super) const GC_THRESHOLD_MAX_BYTES: usize = 1024 * 1024 * 1024; // 1 GB
 
-/// Hard ceiling on the next-GC trigger (arena_total bytes), independent
+/// Hard ceiling on the next-GC trigger metric, independent
 /// of how productive recent sweeps have been. Without this, the
 /// >90%-freed branch doubles the step on every productive collection,
-/// > and `next_trigger = new_total + step` lets peak nursery occupancy
+/// > and `next_trigger = new_trigger_bytes + step` lets peak nursery occupancy
 /// > grow unboundedly even when most of what we collected was garbage.
 /// > On `bench_json_roundtrip` direct (50 iters × ~5 MB / iter, GC fires
 /// > 3 times), the step doubled from 64 MB → 67 MB → 134 MB and the
@@ -177,11 +264,12 @@ pub(super) const GC_THRESHOLD_MAX_BYTES: usize = 1024 * 1024 * 1024; // 1 GB
 /// > to roughly initial + one iter's allocation buffer + headroom for
 /// > non-arena overhead.
 ///
-/// Floor: even if `arena_total` is already near or past the ceiling
-/// (large old-gen + longlived combined live set), keep at least the
-/// 16 MB step floor as headroom — `next_trigger = max(new_total + 16 MB,
-/// min(new_total + step, ceiling))`. This avoids GC thrash when the
-/// non-nursery component of arena_total alone exceeds the ceiling.
+/// Floor: even if the active trigger metric is already near or past the
+/// ceiling, keep at least the 16 MB step floor as headroom —
+/// `next_trigger = max(new_trigger_bytes + 16 MB,
+/// min(new_trigger_bytes + step, ceiling))`. This avoids GC thrash when
+/// the post-collection nursery/survivor baseline already approaches the
+/// ceiling.
 ///
 /// 2026-05-02 raise from 64 MB → 128 MB: ECS perf-comprehensive's
 /// allocation-heavy benches (10k two-comp + sync, 5k × 3 cmds) hit
@@ -203,6 +291,8 @@ pub(super) const GC_THRESHOLD_MAX_BYTES: usize = 1024 * 1024 * 1024; // 1 GB
 /// would otherwise have pushed the trigger past the initial threshold,
 /// which is exactly the bench-RSS scenario this is targeting.
 pub(super) const GC_TRIGGER_ABSOLUTE_CEILING: usize = 128 * 1024 * 1024;
+pub(super) const GC_LATENCY_TRIGGER_INITIAL_BYTES: usize = 32 * 1024 * 1024;
+pub(super) const GC_LATENCY_TRIGGER_ABSOLUTE_CEILING: usize = 32 * 1024 * 1024;
 
 thread_local! {
     /// Lower bound for the next GC trigger. Bumped after each
@@ -247,9 +337,9 @@ thread_local! {
     pub(super) static GC_TRIGGER_BUMPED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 
-    /// Issue #745: snapshot of `arena_total_bytes()` at the most
-    /// recent `gc_suppress` call. Used by `gc_bump_malloc_trigger`
-    /// to compute the suppressed window's arena growth.
+    /// Issue #745: snapshot of the active trigger byte metric at the
+    /// most recent `gc_suppress` call. Used by `gc_bump_malloc_trigger`
+    /// to compute the suppressed window's parse growth.
     pub(super) static GC_PRE_SUPPRESS_BYTES: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 
@@ -262,6 +352,43 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+#[inline]
+pub(super) fn gc_threshold_initial_bytes() -> usize {
+    match gc_runtime_mode() {
+        GcRuntimeMode::Throughput => GC_THRESHOLD_INITIAL_BYTES,
+        GcRuntimeMode::Latency => GC_LATENCY_TRIGGER_INITIAL_BYTES,
+    }
+}
+
+#[inline]
+pub(super) fn gc_trigger_absolute_ceiling() -> usize {
+    match gc_runtime_mode() {
+        GcRuntimeMode::Throughput => GC_TRIGGER_ABSOLUTE_CEILING,
+        GcRuntimeMode::Latency => GC_LATENCY_TRIGGER_ABSOLUTE_CEILING,
+    }
+}
+
+#[inline]
+pub(super) fn gc_effective_next_arena_trigger() -> usize {
+    let configured = GC_NEXT_TRIGGER_BYTES.with(|trigger| trigger.get());
+    if configured == usize::MAX {
+        return configured;
+    }
+    match gc_runtime_mode() {
+        GcRuntimeMode::Throughput => configured,
+        GcRuntimeMode::Latency => configured.min(gc_trigger_absolute_ceiling()),
+    }
+}
+
+#[inline]
+pub(super) fn gc_nursery_trigger_bytes() -> usize {
+    if gen_gc_enabled() {
+        crate::arena::copying_from_space_in_use_bytes()
+    } else {
+        crate::arena::arena_total_bytes()
+    }
+}
+
 pub(super) const GC_SUPPRESSED_TINY_PARSE_BYTES: usize = 1024 * 1024;
 pub(super) const GC_SUPPRESSED_TINY_PARSE_IN_USE_TRIGGER_BYTES: usize = 48 * 1024 * 1024;
 pub(super) const GC_SUPPRESSED_TINY_PARSE_FULL_GC_IN_USE_TRIGGER_BYTES: usize = 24 * 1024 * 1024;
@@ -270,15 +397,28 @@ pub(super) fn gc_suppressed_parse_is_tiny(parse_growth: usize) -> bool {
     parse_growth <= GC_SUPPRESSED_TINY_PARSE_BYTES
 }
 
+#[inline]
+pub(super) fn gc_suppressed_parse_collection_pressure_due(
+    use_gen_gc: bool,
+    nursery_trigger_bytes: usize,
+    heap_in_use_bytes: usize,
+) -> bool {
+    if use_gen_gc {
+        nursery_trigger_bytes >= GC_SUPPRESSED_TINY_PARSE_IN_USE_TRIGGER_BYTES
+    } else {
+        heap_in_use_bytes >= GC_SUPPRESSED_TINY_PARSE_FULL_GC_IN_USE_TRIGGER_BYTES
+    }
+}
+
 pub(super) fn gc_bump_arena_trigger_target(
     bytes_now: usize,
     step: usize,
     is_tiny_parse: bool,
 ) -> usize {
-    let bytes_step = step.min(GC_THRESHOLD_INITIAL_BYTES);
+    let bytes_step = step.min(gc_threshold_initial_bytes());
     let target = bytes_now.saturating_add(bytes_step);
-    if is_tiny_parse {
-        target.min(GC_TRIGGER_ABSOLUTE_CEILING)
+    if is_tiny_parse || matches!(gc_runtime_mode(), GcRuntimeMode::Latency) {
+        target.min(gc_trigger_absolute_ceiling())
     } else {
         target
     }
@@ -481,8 +621,8 @@ impl GcStepSnapshot {
     #[inline]
     pub(super) fn current() -> Self {
         Self {
-            arena_step_bytes: GC_STEP_BYTES.with(|c| c.get()),
-            next_arena_trigger_bytes: GC_NEXT_TRIGGER_BYTES.with(|c| c.get()),
+            arena_step_bytes: GC_STEP_BYTES.with(|c| c.get().min(gc_threshold_initial_bytes())),
+            next_arena_trigger_bytes: gc_effective_next_arena_trigger(),
             malloc_step: GC_MALLOC_COUNT_STEP.with(|c| c.get()),
             next_malloc_trigger: GC_NEXT_MALLOC_TRIGGER.with(|c| c.get()),
             trigger_bumped: GC_TRIGGER_BUMPED.with(|c| c.get()),
@@ -573,10 +713,10 @@ pub fn gc_suppress() {
     {
         crate::arena::arena_start_fresh_general_block();
     }
-    // Issue #745: snapshot arena_total at suppress-start so the
+    // Issue #745: snapshot the trigger metric at suppress-start so the
     // matching `gc_bump_malloc_trigger` can size the suppressed
     // window's parse growth and gate the bytes-trigger bump on it.
-    GC_PRE_SUPPRESS_BYTES.with(|c| c.set(crate::arena::arena_total_bytes()));
+    GC_PRE_SUPPRESS_BYTES.with(|c| c.set(gc_nursery_trigger_bytes()));
     GC_FLAGS.with(|f| f.set(f.get() | GC_FLAG_SUPPRESSED));
 }
 
@@ -585,14 +725,14 @@ pub fn gc_unsuppress() {
     GC_FLAGS.with(|f| f.set(f.get() & !GC_FLAG_SUPPRESSED));
 }
 
-/// Rebaseline the malloc-count AND arena-bytes triggers to the current
-/// live set so that objects just created during a GC-suppressed window
+/// Rebaseline the malloc-count and trigger-byte goals to the current
+/// allocation-debt baseline so objects just created during a GC-suppressed window
 /// (e.g. JSON.parse) don't immediately trip a collection on the next
 /// allocation.
 ///
 /// Pre-fix: only the malloc-count trigger was bumped. JSON.parse on the
-/// 108 MB honest_bench fixture lifts arena_total to ~108 MB, the bytes
-/// trigger is still at its initial 128 MB threshold, and the iterate+
+/// 108 MB honest_bench fixture lifts the trigger byte metric toward the
+/// initial threshold, and the iterate+
 /// rebuild pass that immediately follows trips bytes-based GC after
 /// only ~20 MB of new allocations. The 4 mark/sweep cycles each walk
 /// the entire 400 MB live heap (the records tree dominates) and add
@@ -604,17 +744,15 @@ pub fn gc_unsuppress() {
 /// of four.
 pub fn gc_bump_malloc_trigger() {
     let current = MALLOC_STATE.with(|s| s.borrow().objects.len());
-    use crate::arena::arena_total_bytes;
-    let bytes_now = arena_total_bytes();
+    let bytes_now = gc_nursery_trigger_bytes();
     let is_tiny_parse = gc_bump_malloc_trigger_with_snapshot(current, bytes_now);
     if is_tiny_parse {
         let use_gen_gc = gen_gc_enabled();
-        let in_use_trigger = if use_gen_gc {
-            GC_SUPPRESSED_TINY_PARSE_IN_USE_TRIGGER_BYTES
-        } else {
-            GC_SUPPRESSED_TINY_PARSE_FULL_GC_IN_USE_TRIGGER_BYTES
-        };
-        if crate::arena::arena_in_use_bytes() < in_use_trigger {
+        if !gc_suppressed_parse_collection_pressure_due(
+            use_gen_gc,
+            bytes_now,
+            crate::arena::arena_in_use_bytes(),
+        ) {
             return;
         }
         if use_gen_gc {
@@ -658,12 +796,23 @@ pub fn gc_collect_pending_suppressed_parse() {
         return;
     }
 
-    let total = crate::arena::arena_total_bytes();
+    let total = gc_nursery_trigger_bytes();
     GC_NEXT_TRIGGER_BYTES.with(|trigger| {
         if trigger.get() > total {
             trigger.set(total);
         }
     });
+    if !gen_gc_enabled() {
+        // The mark-sweep escape hatch has no cheap young collection to make
+        // progress here; complete the armed full cycle at the parse boundary
+        // so JSON churn does not outrun tiny mutator-assist slices.
+        let _ = gc_budgeted_step_work_units_inner_with_progress(
+            usize::MAX,
+            GcProgressKind::LegacySynchronous,
+            false,
+        );
+        return;
+    }
     gc_check_trigger();
 }
 
@@ -679,7 +828,11 @@ pub fn gc_schedule_parse_boundary_collection_if_pressure() {
     if !gen_gc_enabled() {
         return;
     }
-    if crate::arena::arena_in_use_bytes() < GC_SUPPRESSED_TINY_PARSE_IN_USE_TRIGGER_BYTES {
+    if !gc_suppressed_parse_collection_pressure_due(
+        true,
+        gc_nursery_trigger_bytes(),
+        crate::arena::arena_in_use_bytes(),
+    ) {
         return;
     }
     GC_SUPPRESSED_TINY_PARSE_COLLECTION_PENDING.with(|pending| pending.set(true));
@@ -921,7 +1074,7 @@ fn gc_finish_arena_trigger_collection(pre_in_use: usize, outcome: GcCollectOutco
             );
         }
     }
-    let new_total = crate::arena::arena_total_bytes();
+    let new_total = gc_nursery_trigger_bytes();
     // C4b-δ-tune: hard cap on next_trigger so the >90%-freed
     // step-doubling can't drive peak nursery past the initial
     // threshold. Floor: at least 16 MB of headroom past
@@ -929,7 +1082,7 @@ fn gc_finish_arena_trigger_collection(pre_in_use: usize, outcome: GcCollectOutco
     // approaches the ceiling doesn't thrash on every fresh
     // allocation.
     let stepped = new_total.saturating_add(step);
-    let capped = stepped.min(GC_TRIGGER_ABSOLUTE_CEILING);
+    let capped = stepped.min(gc_trigger_absolute_ceiling());
     let floor = new_total.saturating_add(16 * 1024 * 1024);
     let next_trigger = std::cmp::max(capped, floor);
     GC_NEXT_TRIGGER_BYTES.with(|c| c.set(next_trigger));
@@ -989,8 +1142,9 @@ fn gc_finish_malloc_trigger_collection(pre_count: usize, outcome: GcCollectOutco
 ///
 /// Arena and malloc thresholds are heap goals. Crossing them starts or resumes
 /// a budgeted cycle. Allocation-side assists spend at most
-/// `GC_MUTATOR_ASSIST_WORK_UNITS` and only enter phases that already consume
-/// that budget; unsliced phases stay active for host-driven budgeted steps.
+/// `GC_MUTATOR_ASSIST_WORK_UNITS` and only enter phases that consume that
+/// budget internally. Process-wide allocator maintenance remains fail-closed
+/// for ordinary budgeted cycles.
 pub fn gc_check_trigger() {
     if GC_BUDGETED_STEP_ACTIVE.with(Cell::get) {
         return;
@@ -1014,9 +1168,17 @@ pub fn gc_check_trigger() {
     }
 
     let _ = gc_mutator_assist_step_work_units_inner_with_progress(
-        GC_MUTATOR_ASSIST_WORK_UNITS,
+        gc_mutator_assist_work_units(),
         GcProgressKind::MutatorAssist,
     );
+}
+
+#[inline]
+pub(crate) fn gc_mutator_assist_work_units() -> usize {
+    gc_progress_contract()
+        .budget_for(GcProgressKind::MutatorAssist)
+        .work_units
+        .unwrap_or(GC_MUTATOR_ASSIST_WORK_UNITS)
 }
 
 pub const JS_GC_STEP_STATUS_IDLE: u32 = 0;
@@ -1045,11 +1207,32 @@ enum BudgetedGcRebaseline {
     OldReclaim,
 }
 
+enum BudgetedGcWork {
+    Cycle(GcCycleState),
+    PendingCopiedMinor { progress_kind: GcProgressKind },
+}
+
 struct BudgetedGcCycle {
-    state: GcCycleState,
+    work: BudgetedGcWork,
     trigger_kind: GcTriggerKind,
     collection_kind: GcCollectionKind,
     rebaseline: BudgetedGcRebaseline,
+}
+
+impl BudgetedGcCycle {
+    fn phase(&self) -> GcCyclePhase {
+        match &self.work {
+            BudgetedGcWork::Cycle(state) => state.phase(),
+            BudgetedGcWork::PendingCopiedMinor { .. } => GcCyclePhase::BuildValidPointerSet,
+        }
+    }
+
+    fn progress_kind(&self) -> GcProgressKind {
+        match &self.work {
+            BudgetedGcWork::Cycle(state) => state.progress_kind(),
+            BudgetedGcWork::PendingCopiedMinor { progress_kind } => *progress_kind,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1063,24 +1246,55 @@ thread_local! {
     static GC_BUDGETED_CYCLE: RefCell<Option<BudgetedGcCycle>> = const { RefCell::new(None) };
     static GC_BUDGETED_CYCLE_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static GC_BUDGETED_STEP_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static GC_HOST_POLL_DEPTH: Cell<u32> = const { Cell::new(0) };
+    static GC_HOST_POLL_STEP_PAID: Cell<bool> = const { Cell::new(false) };
 }
 
 pub(super) fn gc_budgeted_cycle_active() -> bool {
     GC_BUDGETED_CYCLE_ACTIVE.with(Cell::get)
 }
 
-fn gc_budgeted_start_blocked() -> bool {
+fn gc_budgeted_start_base_blocked() -> bool {
     GC_FLAGS.with(|f| f.get()) & (GC_FLAG_IN_ALLOC | GC_FLAG_SUPPRESSED) != 0
         || gc_blocked_by_unsafe_zone()
         || GC_ROOT_LOCK_DEPTH.with(|depth| depth.get() != 0)
-        || registered_root_scanners_block_budgeted_gc()
 }
 
-fn gc_budgeted_resume_blocked() -> bool {
-    GC_FLAGS.with(|f| f.get()) & GC_FLAG_SUPPRESSED != 0
+fn gc_budgeted_start_blocked_for_trigger(trigger: BudgetedGcTrigger) -> bool {
+    gc_budgeted_start_base_blocked()
+        || (!budgeted_trigger_starts_with_copied_minor(trigger)
+            && registered_root_scanners_block_budgeted_gc())
+}
+
+fn gc_budgeted_resume_blocked_for_current_work() -> bool {
+    let base_blocked = GC_FLAGS.with(|f| f.get()) & GC_FLAG_SUPPRESSED != 0
         || gc_blocked_by_unsafe_zone()
-        || GC_ROOT_LOCK_DEPTH.with(|depth| depth.get() != 0)
-        || registered_root_scanners_block_budgeted_gc()
+        || GC_ROOT_LOCK_DEPTH.with(|depth| depth.get() != 0);
+    if base_blocked {
+        return true;
+    }
+    let pending_copied_minor = GC_BUDGETED_CYCLE.with(|slot| {
+        matches!(
+            slot.borrow().as_ref().map(|cycle| &cycle.work),
+            Some(BudgetedGcWork::PendingCopiedMinor { .. })
+        )
+    });
+    let synchronous_scanners_allowed = GC_BUDGETED_CYCLE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|cycle| !cycle.progress_kind().is_budgeted())
+    });
+    !pending_copied_minor
+        && !synchronous_scanners_allowed
+        && registered_root_scanners_block_budgeted_gc()
+}
+
+fn budgeted_trigger_starts_with_copied_minor(trigger: BudgetedGcTrigger) -> bool {
+    gen_gc_enabled()
+        && matches!(
+            trigger,
+            BudgetedGcTrigger::ArenaBytes | BudgetedGcTrigger::MallocCount
+        )
 }
 
 pub(super) fn gc_old_reclaim_debt_bytes(old_in_use: usize, baseline: usize) -> u64 {
@@ -1093,6 +1307,22 @@ pub(super) fn gc_old_reclaim_debt_bytes(old_in_use: usize, baseline: usize) -> u
 }
 
 fn gc_budgeted_due_trigger() -> Option<BudgetedGcTrigger> {
+    let total = gc_nursery_trigger_bytes();
+    let next_arena_trigger = gc_effective_next_arena_trigger();
+    let arena_due = total >= next_arena_trigger;
+    let malloc_count = malloc_object_count();
+    let next_malloc_trigger = GC_NEXT_MALLOC_TRIGGER.with(|c| c.get());
+    let malloc_due = malloc_count >= next_malloc_trigger;
+
+    if gen_gc_enabled() {
+        if arena_due {
+            return Some(BudgetedGcTrigger::ArenaBytes);
+        }
+        if malloc_due {
+            return Some(BudgetedGcTrigger::MallocCount);
+        }
+    }
+
     let old_pending = GC_OLD_RECLAIM_PENDING.with(Cell::get);
     let old_in_use = crate::arena::old_gen_in_use_bytes();
     let old_baseline = GC_LAST_OLD_RECLAIM_IN_USE_BYTES.with(|bytes| bytes.get());
@@ -1100,15 +1330,11 @@ fn gc_budgeted_due_trigger() -> Option<BudgetedGcTrigger> {
         return Some(BudgetedGcTrigger::OldReclaim);
     }
 
-    let total = crate::arena::arena_total_bytes();
-    let next_arena_trigger = GC_NEXT_TRIGGER_BYTES.with(|c| c.get());
-    if total >= next_arena_trigger {
+    if arena_due {
         return Some(BudgetedGcTrigger::ArenaBytes);
     }
 
-    let malloc_count = malloc_object_count();
-    let next_malloc_trigger = GC_NEXT_MALLOC_TRIGGER.with(|c| c.get());
-    if malloc_count >= next_malloc_trigger {
+    if malloc_due {
         return Some(BudgetedGcTrigger::MallocCount);
     }
 
@@ -1136,6 +1362,33 @@ impl Drop for BudgetedGcStepGuard {
     }
 }
 
+pub(crate) struct GcHostPollScope;
+
+pub(crate) fn gc_enter_host_poll_scope() -> GcHostPollScope {
+    GC_HOST_POLL_DEPTH.with(|depth| {
+        let current = depth.get();
+        if current == 0 {
+            GC_HOST_POLL_STEP_PAID.with(|paid| paid.set(false));
+        }
+        depth.set(current.saturating_add(1));
+    });
+    GcHostPollScope
+}
+
+impl Drop for GcHostPollScope {
+    fn drop(&mut self) {
+        GC_HOST_POLL_DEPTH.with(|depth| {
+            let current = depth.get();
+            if current <= 1 {
+                depth.set(0);
+                GC_HOST_POLL_STEP_PAID.with(|paid| paid.set(false));
+            } else {
+                depth.set(current - 1);
+            }
+        });
+    }
+}
+
 fn gc_start_budgeted_full_cycle(
     trigger_kind: GcTriggerKind,
     rebaseline: BudgetedGcRebaseline,
@@ -1145,24 +1398,13 @@ fn gc_start_budgeted_full_cycle(
     state.set_progress_kind(progress_kind);
     BudgetedGcCycle {
         collection_kind: state.collection_kind(),
-        state,
+        work: BudgetedGcWork::Cycle(state),
         trigger_kind,
         rebaseline,
     }
 }
 
-fn gc_start_budgeted_minor_fallback_cycle(
-    trigger_kind: GcTriggerKind,
-    rebaseline: BudgetedGcRebaseline,
-    progress_kind: GcProgressKind,
-) -> BudgetedGcCycle {
-    gc_start_budgeted_minor_fallback_cycle_with_snapshot(
-        GcTriggerSnapshot::capture(trigger_kind),
-        rebaseline,
-        progress_kind,
-    )
-}
-
+#[cfg(test)]
 fn gc_start_budgeted_minor_fallback_cycle_with_snapshot(
     trigger: GcTriggerSnapshot,
     rebaseline: BudgetedGcRebaseline,
@@ -1213,7 +1455,7 @@ fn gc_start_budgeted_minor_fallback_cycle_with_snapshot(
     );
     BudgetedGcCycle {
         collection_kind: state.collection_kind(),
-        state,
+        work: BudgetedGcWork::Cycle(state),
         trigger_kind: trigger.kind,
         rebaseline,
     }
@@ -1235,13 +1477,144 @@ pub(super) fn test_start_budgeted_minor_fallback_state_with_trace(
         },
         progress_kind,
     );
-    cycle.state
+    match cycle.work {
+        BudgetedGcWork::Cycle(state) => state,
+        BudgetedGcWork::PendingCopiedMinor { .. } => {
+            unreachable!("minor fallback test helper must create fallback cycle work")
+        }
+    }
 }
 
-fn gc_start_budgeted_cycle_for_pressure(progress_kind: GcProgressKind) -> Option<BudgetedGcCycle> {
-    let trigger = gc_budgeted_due_trigger()?;
+fn gc_start_budgeted_copied_minor_cycle(
+    trigger_kind: GcTriggerKind,
+    rebaseline: BudgetedGcRebaseline,
+    progress_kind: GcProgressKind,
+) -> BudgetedGcCycle {
+    BudgetedGcCycle {
+        work: BudgetedGcWork::PendingCopiedMinor { progress_kind },
+        trigger_kind,
+        collection_kind: GcCollectionKind::Minor,
+        rebaseline,
+    }
+}
+
+struct BudgetedCopiedMinorFallback {
+    trigger: GcTriggerSnapshot,
+    trace: Option<GcCycleTrace>,
+    start: Instant,
+    prev_in_alloc: u8,
+    previous_pause_us: u64,
+    current_rss_bytes: u64,
+}
+
+fn gc_attempt_budgeted_copied_minor(
+    trigger_kind: GcTriggerKind,
+    progress_kind: GcProgressKind,
+) -> Result<GcCollectOutcome, BudgetedCopiedMinorFallback> {
+    let trigger = GcTriggerSnapshot::capture(trigger_kind);
+    let prev_in_alloc = GC_FLAGS.with(|f| {
+        let prev = f.get();
+        f.set(prev | GC_FLAG_IN_ALLOC);
+        prev & GC_FLAG_IN_ALLOC
+    });
+    let mut trace = GcCycleTrace::new(GcCollectionKind::Minor, trigger);
+    if let Some(trace) = trace.as_mut() {
+        trace.progress_kind = progress_kind;
+    }
+    let start = Instant::now();
+    crate::arena::old_pages_begin_gc_cycle();
+    let previous_pause_us = gc_last_pause_us();
+    let current_rss_bytes = crate::process::get_rss_bytes();
+
+    clear_mark_seeds();
+    let eligibility = CopiedMinorEligibility::evaluate(trigger.kind);
+    if let Some(fast_path) =
+        gc_collect_minor_copying_fast_path_with_eligibility(&mut trace, start, eligibility)
+    {
+        let freed_bytes = fast_path.freed_bytes;
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        GC_STATS.with(|stats| {
+            let mut stats = stats.borrow_mut();
+            stats.collection_count += 1;
+            stats.total_freed_bytes += freed_bytes;
+            stats.last_pause_us = elapsed_us;
+        });
+        restore_minor_in_alloc(prev_in_alloc);
+        if let Some(trace) = trace.as_mut() {
+            trace.pause_us = elapsed_us;
+            trace.capture_layout_scans();
+        }
+        return Ok(GcCollectOutcome {
+            freed_bytes,
+            malloc_swept: fast_path.malloc_swept,
+            trace,
+        });
+    }
+
+    clear_mark_seeds();
+    Err(BudgetedCopiedMinorFallback {
+        trigger,
+        trace,
+        start,
+        prev_in_alloc,
+        previous_pause_us,
+        current_rss_bytes,
+    })
+}
+
+fn gc_start_budgeted_minor_fallback_cycle_from_copied_attempt(
+    fallback: BudgetedCopiedMinorFallback,
+    rebaseline: BudgetedGcRebaseline,
+    progress_kind: GcProgressKind,
+) -> BudgetedGcCycle {
+    let low_pause_non_moving = progress_kind.is_budgeted();
+    let evacuation_policy_allowed = !low_pause_non_moving && gen_gc_evacuate_enabled();
+    let force_evacuation = !low_pause_non_moving && gc_force_evacuate_enabled();
+    let evacuation_policy_disabled_reason = if low_pause_non_moving {
+        EVACUATION_POLICY_LOW_PAUSE_NON_MOVING_REASON
+    } else {
+        EVACUATION_POLICY_DISABLED_REASON
+    };
+    let old_page_selection = if evacuation_policy_allowed && old_to_young_tracking_complete() {
+        select_old_page_defrag_pages(force_evacuation)
+    } else {
+        OldPageDefragSelection::default()
+    };
+    let old_page_source_blocks =
+        crate::arena::old_arena_source_blocks_for_pages(&old_page_selection.pages);
+    let state = GcCycleState::new_minor_fallback(
+        fallback.trigger,
+        fallback.trace,
+        fallback.start,
+        progress_kind,
+        fallback.prev_in_alloc,
+        fallback.previous_pause_us,
+        fallback.current_rss_bytes,
+        evacuation_policy_allowed,
+        force_evacuation,
+        evacuation_policy_disabled_reason,
+        old_page_selection,
+        old_page_source_blocks,
+    );
+    BudgetedGcCycle {
+        collection_kind: state.collection_kind(),
+        work: BudgetedGcWork::Cycle(state),
+        trigger_kind: fallback.trigger.kind,
+        rebaseline,
+    }
+}
+
+fn abort_budgeted_copied_minor_fallback(fallback: BudgetedCopiedMinorFallback) {
+    clear_mark_seeds();
+    restore_minor_in_alloc(fallback.prev_in_alloc);
+}
+
+fn gc_start_budgeted_cycle_for_trigger(
+    trigger: BudgetedGcTrigger,
+    progress_kind: GcProgressKind,
+) -> BudgetedGcCycle {
     GC_TRIGGER_BUMPED.with(|c| c.set(false));
-    Some(match trigger {
+    match trigger {
         BudgetedGcTrigger::OldReclaim => {
             GC_OLD_RECLAIM_PENDING.with(|pending| pending.set(false));
             gc_start_budgeted_full_cycle(
@@ -1255,7 +1628,7 @@ fn gc_start_budgeted_cycle_for_pressure(progress_kind: GcProgressKind) -> Option
                 pre_in_use: crate::arena::arena_in_use_bytes(),
             };
             if gen_gc_enabled() {
-                gc_start_budgeted_minor_fallback_cycle(
+                gc_start_budgeted_copied_minor_cycle(
                     GcTriggerKind::ArenaBytes,
                     rebaseline,
                     progress_kind,
@@ -1269,7 +1642,7 @@ fn gc_start_budgeted_cycle_for_pressure(progress_kind: GcProgressKind) -> Option
                 pre_count: malloc_object_count(),
             };
             if gen_gc_enabled() {
-                gc_start_budgeted_minor_fallback_cycle(
+                gc_start_budgeted_copied_minor_cycle(
                     GcTriggerKind::MallocCount,
                     rebaseline,
                     progress_kind,
@@ -1278,7 +1651,7 @@ fn gc_start_budgeted_cycle_for_pressure(progress_kind: GcProgressKind) -> Option
                 gc_start_budgeted_full_cycle(GcTriggerKind::MallocCount, rebaseline, progress_kind)
             }
         }
-    })
+    }
 }
 
 fn gc_step_result(
@@ -1310,7 +1683,7 @@ fn gc_idle_step_result() -> JsGcStepResult {
 fn gc_cycle_step_result(status: u32, cycle: &BudgetedGcCycle, completed: bool) -> JsGcStepResult {
     gc_step_result(
         status,
-        cycle.state.phase().ffi_code(),
+        cycle.phase().ffi_code(),
         cycle.collection_kind.ffi_code(),
         cycle.trigger_kind.ffi_code(),
         !completed,
@@ -1350,12 +1723,13 @@ fn gc_budgeted_skipped_result() -> JsGcStepResult {
     })
 }
 
-fn gc_finish_budgeted_cycle(mut cycle: BudgetedGcCycle) -> JsGcStepResult {
-    let outcome = cycle
-        .state
-        .take_outcome()
-        .expect("completed budgeted GC cycle must produce an outcome");
-    match cycle.rebaseline {
+fn gc_finish_budgeted_outcome(
+    rebaseline: BudgetedGcRebaseline,
+    collection_kind: GcCollectionKind,
+    trigger_kind: GcTriggerKind,
+    outcome: GcCollectOutcome,
+) -> JsGcStepResult {
+    match rebaseline {
         BudgetedGcRebaseline::ArenaBytes { pre_in_use } => {
             gc_finish_arena_trigger_collection(pre_in_use, outcome);
         }
@@ -1370,16 +1744,39 @@ fn gc_finish_budgeted_cycle(mut cycle: BudgetedGcCycle) -> JsGcStepResult {
     gc_step_result(
         JS_GC_STEP_STATUS_COMPLETED,
         GcCyclePhase::Complete.ffi_code(),
-        cycle.collection_kind.ffi_code(),
-        cycle.trigger_kind.ffi_code(),
+        collection_kind.ffi_code(),
+        trigger_kind.ffi_code(),
         false,
         true,
+    )
+}
+
+fn gc_finish_budgeted_cycle(mut cycle: BudgetedGcCycle) -> JsGcStepResult {
+    let outcome = match &mut cycle.work {
+        BudgetedGcWork::Cycle(state) => state
+            .take_outcome()
+            .expect("completed budgeted GC cycle must produce an outcome"),
+        BudgetedGcWork::PendingCopiedMinor { .. } => {
+            unreachable!("pending copied-minor work completes through a copied-minor outcome")
+        }
+    };
+    gc_finish_budgeted_outcome(
+        cycle.rebaseline,
+        cycle.collection_kind,
+        cycle.trigger_kind,
+        outcome,
     )
 }
 
 enum BudgetedStepOutcome {
     Result(JsGcStepResult),
     Completed(BudgetedGcCycle),
+    CompletedOutcome {
+        rebaseline: BudgetedGcRebaseline,
+        collection_kind: GcCollectionKind,
+        trigger_kind: GcTriggerKind,
+        outcome: GcCollectOutcome,
+    },
 }
 
 fn gc_budgeted_step_work_units_inner(work_units: usize) -> JsGcStepResult {
@@ -1403,33 +1800,117 @@ fn gc_budgeted_step_work_units_inner_with_progress(
         return gc_budgeted_skipped_result();
     };
 
+    let mut started_pending_copied_minor = false;
     if !gc_budgeted_cycle_active() {
-        if gc_budgeted_due_trigger().is_none() {
+        let Some(trigger) = gc_budgeted_due_trigger() else {
             return gc_idle_step_result();
-        }
-        if gc_budgeted_start_blocked() {
+        };
+        if gc_budgeted_start_blocked_for_trigger(trigger) {
             return gc_budgeted_skipped_result();
         }
-        let cycle = gc_start_budgeted_cycle_for_pressure(start_progress_kind)
-            .expect("budgeted GC pressure was observed before starting cycle");
+        let cycle = gc_start_budgeted_cycle_for_trigger(trigger, start_progress_kind);
+        started_pending_copied_minor =
+            matches!(cycle.work, BudgetedGcWork::PendingCopiedMinor { .. });
         GC_BUDGETED_CYCLE.with(|slot| {
             *slot.borrow_mut() = Some(cycle);
         });
         GC_BUDGETED_CYCLE_ACTIVE.with(|active| active.set(true));
     }
 
-    if gc_budgeted_resume_blocked() {
+    if gc_budgeted_resume_blocked_for_current_work() {
         return gc_budgeted_skipped_result();
+    }
+
+    if started_pending_copied_minor && !mutator_assist_only {
+        return gc_budgeted_status_result();
     }
 
     let outcome = GC_BUDGETED_CYCLE.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let Some(cycle) = slot.as_mut() else {
+        if slot.is_none() {
             GC_BUDGETED_CYCLE_ACTIVE.with(|active| active.set(false));
             return BudgetedStepOutcome::Result(gc_idle_step_result());
         };
 
-        if mutator_assist_only && !cycle.state.phase().mutator_assist_honors_budget() {
+        if matches!(
+            slot.as_ref().map(|cycle| &cycle.work),
+            Some(BudgetedGcWork::PendingCopiedMinor { .. })
+        ) {
+            let cycle = slot.as_ref().expect("active budgeted GC cycle exists");
+            let trigger_kind = cycle.trigger_kind;
+            let collection_kind = cycle.collection_kind;
+            let rebaseline = cycle.rebaseline;
+            let progress_kind = match &cycle.work {
+                BudgetedGcWork::PendingCopiedMinor { progress_kind } => *progress_kind,
+                BudgetedGcWork::Cycle(_) => unreachable!("pending copied-minor branch checked"),
+            };
+            match gc_attempt_budgeted_copied_minor(trigger_kind, progress_kind) {
+                Ok(outcome) => {
+                    let _ = slot.take();
+                    return BudgetedStepOutcome::CompletedOutcome {
+                        rebaseline,
+                        collection_kind,
+                        trigger_kind,
+                        outcome,
+                    };
+                }
+                Err(fallback) => {
+                    if copied_minor_promotion_handoff_due(trigger_kind) {
+                        let handoff_progress_kind = if registered_root_scanners_block_budgeted_gc()
+                        {
+                            GcProgressKind::EmergencyFull
+                        } else {
+                            progress_kind
+                        };
+                        abort_budgeted_copied_minor_fallback(fallback);
+                        let handoff_cycle = gc_start_budgeted_full_cycle(
+                            GcTriggerKind::SurvivorPromotionBytes,
+                            rebaseline,
+                            handoff_progress_kind,
+                        );
+                        let cycle = slot.as_mut().expect("active budgeted GC cycle exists");
+                        *cycle = handoff_cycle;
+                        return BudgetedStepOutcome::Result(gc_cycle_step_result(
+                            JS_GC_STEP_STATUS_ACTIVE,
+                            cycle,
+                            false,
+                        ));
+                    }
+                    if registered_root_scanners_block_budgeted_gc() {
+                        abort_budgeted_copied_minor_fallback(fallback);
+                        let _ = slot.take();
+                        GC_BUDGETED_CYCLE_ACTIVE.with(|active| active.set(false));
+                        return BudgetedStepOutcome::Result(gc_step_result(
+                            JS_GC_STEP_STATUS_SKIPPED,
+                            0,
+                            0,
+                            0,
+                            false,
+                            false,
+                        ));
+                    }
+                    let fallback_cycle = gc_start_budgeted_minor_fallback_cycle_from_copied_attempt(
+                        fallback,
+                        rebaseline,
+                        progress_kind,
+                    );
+                    let cycle = slot.as_mut().expect("active budgeted GC cycle exists");
+                    *cycle = fallback_cycle;
+                    return BudgetedStepOutcome::Result(gc_cycle_step_result(
+                        JS_GC_STEP_STATUS_ACTIVE,
+                        cycle,
+                        false,
+                    ));
+                }
+            }
+        }
+
+        let cycle = slot.as_mut().expect("active budgeted GC cycle exists");
+        let BudgetedGcWork::Cycle(state) = &mut cycle.work else {
+            unreachable!("pending copied-minor work handled before cycle stepping")
+        };
+
+        if mutator_assist_only && !state.phase().mutator_assist_honors_budget() {
             return BudgetedStepOutcome::Result(gc_cycle_step_result(
                 JS_GC_STEP_STATUS_ACTIVE,
                 cycle,
@@ -1437,7 +1918,7 @@ fn gc_budgeted_step_work_units_inner_with_progress(
             ));
         }
 
-        let step = cycle.state.step(GcWorkBudget::bounded(work_units));
+        let step = state.step(GcWorkBudget::bounded(work_units));
         if step.completed {
             BudgetedStepOutcome::Completed(slot.take().expect("active budgeted GC cycle exists"))
         } else {
@@ -1452,6 +1933,12 @@ fn gc_budgeted_step_work_units_inner_with_progress(
     match outcome {
         BudgetedStepOutcome::Result(result) => result,
         BudgetedStepOutcome::Completed(cycle) => gc_finish_budgeted_cycle(cycle),
+        BudgetedStepOutcome::CompletedOutcome {
+            rebaseline,
+            collection_kind,
+            trigger_kind,
+            outcome,
+        } => gc_finish_budgeted_outcome(rebaseline, collection_kind, trigger_kind, outcome),
     }
 }
 
@@ -1463,6 +1950,20 @@ fn gc_mutator_assist_step_work_units_inner_with_progress(
 }
 
 pub(crate) fn gc_runtime_safepoint() -> JsGcStepResult {
+    let in_host_poll = GC_HOST_POLL_DEPTH.with(|depth| depth.get() > 0);
+    if in_host_poll {
+        let already_paid = GC_HOST_POLL_STEP_PAID.with(|paid| {
+            let previous = paid.get();
+            if !previous {
+                paid.set(true);
+            }
+            previous
+        });
+        if already_paid {
+            return gc_budgeted_status_result();
+        }
+    }
+
     let budget = gc_progress_contract().budget_for(GcProgressKind::NormalIncremental);
     let Some(work_units) = budget.work_units else {
         return gc_budgeted_status_result();

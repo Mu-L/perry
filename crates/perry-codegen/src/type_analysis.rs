@@ -45,6 +45,10 @@ fn is_process_namespace_version_property(object: &Expr, property: &str) -> bool 
         && matches!(object, Expr::NativeModuleRef(module) if is_process_module_ref_name(module))
 }
 
+fn json_stringify_return_type() -> HirType {
+    HirType::Union(vec![HirType::String, HirType::Void])
+}
+
 /// Refine an `Any`-typed local's static type based on its initializer
 /// expression. Returns Some(Type) when we can statically prove the
 /// initializer produces a more specific type, so the `Stmt::Let`
@@ -214,13 +218,14 @@ pub(crate) fn refine_type_from_init(ctx: &FnCtx<'_>, init: &Expr) -> Option<HirT
         // node:path constants
         | Expr::PathSep
         | Expr::PathDelimiter
-        // JSON.stringify returns a string (Union<String,Void> for toJSON
-        // interop, but always a string in practice for the common case —
-        // explicitly refining to String makes `s.includes(...)` /
-        // `s.split(...)` etc. hit the string method fast path).
+        // JSON.stringify usually returns a string, but top-level undefined,
+        // functions, symbols, and toJSON/replacer results can produce
+        // undefined. Preserve that in codegen so property access like
+        // `JSON.stringify(x).length` still takes the normal nullish-throw
+        // path when stringify does not produce a string.
         | Expr::JsonStringify(_)
         | Expr::JsonStringifyPretty { .. }
-        | Expr::JsonStringifyFull(..) => Some(HirType::String),
+        | Expr::JsonStringifyFull(..) => Some(json_stringify_return_type()),
         // `atob(b64)` / `btoa(s)` return raw binary strings. Without
         // this refinement, `const dec = atob(...)` is typed as Any, so
         // chained `dec.charCodeAt(i)` routes through the universal
@@ -1468,9 +1473,6 @@ pub(crate) fn is_definitely_string_expr(ctx: &FnCtx<'_>, e: &Expr) -> bool {
         Expr::StringCoerce(_)
         | Expr::TypeOf(_)
         | Expr::ArrayJoin { .. }
-        | Expr::JsonStringify(_)
-        | Expr::JsonStringifyPretty { .. }
-        | Expr::JsonStringifyFull(..)
         | Expr::StringFromCodePoint(_)
         | Expr::StringFromCharCode(_)
         | Expr::StringFromCharCodeSpread(_)
@@ -1618,12 +1620,10 @@ pub(crate) fn is_string_expr(ctx: &FnCtx<'_>, e: &Expr) -> bool {
         } => args
             .first()
             .map_or(false, |arg| is_definitely_string_expr(ctx, arg)),
-        // String coerce, JSON.stringify, ArrayJoin, etc. all return
-        // strings.
+        // String coerce, ArrayJoin, and related helpers return strings.
         Expr::StringCoerce(_)
         | Expr::TypeOf(_)
         | Expr::ArrayJoin { .. }
-        | Expr::JsonStringifyFull(..)
         | Expr::FsReadFileSync(_)
         | Expr::FsReadFileBinary(_)
         | Expr::PathJoin(..)
@@ -1668,12 +1668,7 @@ pub(crate) fn is_string_expr(ctx: &FnCtx<'_>, e: &Expr) -> bool {
         | Expr::DateToJSON(_)
         // node:path constants
         | Expr::PathSep
-        | Expr::PathDelimiter
-        // JSON.stringify returns a string. #853: `JsonStringifyFull(..)`
-        // is already enumerated in the earlier (line ~878) arm — listing
-        // it again here was dead.
-        | Expr::JsonStringify(_)
-        | Expr::JsonStringifyPretty { .. } => true,
+        | Expr::PathDelimiter => true,
         // process.* / os.* string-returning accessors. These lower to runtime
         // calls that return raw StringHeader* pointers, NaN-boxed with STRING_TAG
         // in expr.rs. Without this, `process.version.startsWith('v')` falls
@@ -2155,6 +2150,9 @@ pub(crate) fn static_type_of(ctx: &FnCtx<'_>, e: &Expr) -> Option<HirType> {
         Expr::String(_) | Expr::WtfString(_) => Some(HirType::String),
         Expr::Number(_) | Expr::Integer(_) => Some(HirType::Number),
         Expr::Bool(_) => Some(HirType::Boolean),
+        Expr::JsonStringify(_) | Expr::JsonStringifyPretty { .. } | Expr::JsonStringifyFull(..) => {
+            Some(json_stringify_return_type())
+        }
         Expr::LocalGet(id) => ctx.local_types.get(id).cloned(),
         Expr::StaticMethodCall {
             class_name,

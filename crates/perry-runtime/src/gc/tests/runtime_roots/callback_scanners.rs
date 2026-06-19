@@ -799,6 +799,18 @@ fn test_evacuation_verify_copy_only_root_rejects_forwarded_target() {
     });
 }
 
+#[test]
+fn test_evacuation_verify_copy_only_raw_root_rejects_forwarded_target() {
+    let fixture = ForwardedRootFixture::new();
+    assert_panics_with("copy-only root scanner", || {
+        verify_copy_only_scanner_bits(
+            fixture.nursery_user as u64,
+            &fixture.valid_ptrs,
+            "copy-only root scanner",
+        );
+    });
+}
+
 struct ForwardedRootFixture {
     valid_ptrs: ValidPointerSet,
     nursery_user: *mut u8,
@@ -1013,6 +1025,7 @@ fn test_gc_init_mutable_scanner_families_rewrite_runtime_slots() {
     crate::object::scan_object_cache_roots_mut(&mut visitor);
     crate::object::scan_class_side_table_roots_mut(&mut visitor);
     json_parse_mutable_root_scanner(&mut visitor);
+    json_stringify_mutable_root_scanner(&mut visitor);
     intern_table_mutable_root_scanner(&mut visitor);
     small_int_cache_mutable_root_scanner(&mut visitor);
     crate::builtins::scan_console_log_singleton_roots_mut(&mut visitor);

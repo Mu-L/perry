@@ -841,9 +841,9 @@ fn evaluate_synthetic_module(module: *mut ObjectHeader) -> f64 {
     let callback = get_field(module, FIELD_EVALUATE_CALLBACK);
     let js = JSValue::from_bits(callback.to_bits());
     if !js.is_undefined() && !js.is_null() {
-        let prev = crate::object::js_implicit_this_set(object_value(module));
+        let prev = crate::object::js_implicit_this_push(object_value(module));
         let _ = unsafe { crate::closure::js_native_call_value(callback, std::ptr::null(), 0) };
-        crate::object::js_implicit_this_set(prev);
+        crate::object::js_implicit_this_restore(prev);
     }
     set_status(module, STATUS_EVALUATED);
     undefined_value()

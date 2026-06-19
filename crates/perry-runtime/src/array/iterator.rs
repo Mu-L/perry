@@ -808,9 +808,9 @@ pub extern "C" fn js_iterator_next_result(iter_f64: f64) -> f64 {
     if !is_callable_value(next) {
         crate::closure::throw_not_callable();
     }
-    let prev_this = crate::object::js_implicit_this_set(iter_f64);
+    let prev_this = crate::object::js_implicit_this_push(iter_f64);
     let result = unsafe { crate::closure::js_native_call_value(next, std::ptr::null(), 0) };
-    crate::object::js_implicit_this_set(prev_this);
+    crate::object::js_implicit_this_restore(prev_this);
     if !is_object_like_value(result) {
         throw_iterator_result_not_object();
     }
@@ -832,9 +832,9 @@ pub extern "C" fn js_iterator_close_if_not_done(iter_f64: f64, done_f64: f64) ->
         crate::closure::throw_not_callable();
     }
 
-    let prev_this = crate::object::js_implicit_this_set(iter_f64);
+    let prev_this = crate::object::js_implicit_this_push(iter_f64);
     let result = unsafe { crate::closure::js_native_call_value(ret, std::ptr::null(), 0) };
-    crate::object::js_implicit_this_set(prev_this);
+    crate::object::js_implicit_this_restore(prev_this);
     if !is_object_like_value(result) {
         throw_iterator_result_not_object();
     }
@@ -939,9 +939,9 @@ fn call_symbol_async_iterator(value: f64) -> Option<f64> {
     if !is_callable_value(method) {
         return None;
     }
-    let prev_this = crate::object::js_implicit_this_set(value);
+    let prev_this = crate::object::js_implicit_this_push(value);
     let iterator = unsafe { crate::closure::js_native_call_value(method, std::ptr::null(), 0) };
-    crate::object::js_implicit_this_set(prev_this);
+    crate::object::js_implicit_this_restore(prev_this);
     if iterator.to_bits() == crate::value::TAG_UNDEFINED {
         None
     } else {

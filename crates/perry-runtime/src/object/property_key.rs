@@ -306,9 +306,9 @@ pub unsafe extern "C" fn js_object_super_call(
         return callee;
     }
     let bound = crate::closure::clone_closure_rebind_this(callee.to_bits(), receiver);
-    let prev_this = crate::object::js_implicit_this_set(receiver);
+    let prev_this = crate::object::js_implicit_this_push(receiver);
     let result = crate::closure::js_native_call_value(f64::from_bits(bound), args_ptr, args_len);
-    crate::object::js_implicit_this_set(prev_this);
+    crate::object::js_implicit_this_restore(prev_this);
     result
 }
 

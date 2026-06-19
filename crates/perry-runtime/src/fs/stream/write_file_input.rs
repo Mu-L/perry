@@ -150,9 +150,9 @@ fn well_known_iterator_method(value: f64, name: &str) -> Option<f64> {
 
 fn call_well_known_iterator(value: f64, name: &str) -> Option<f64> {
     let method = well_known_iterator_method(value, name)?;
-    let prev_this = crate::object::js_implicit_this_set(value);
+    let prev_this = crate::object::js_implicit_this_push(value);
     let iterator = unsafe { crate::closure::js_native_call_value(method, std::ptr::null(), 0) };
-    crate::object::js_implicit_this_set(prev_this);
+    crate::object::js_implicit_this_restore(prev_this);
     if iterator.to_bits() == crate::value::TAG_UNDEFINED {
         None
     } else {

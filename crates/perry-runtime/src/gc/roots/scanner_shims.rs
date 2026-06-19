@@ -88,6 +88,10 @@ pub fn json_parse_mutable_root_scanner(visitor: &mut RuntimeRootVisitor<'_>) {
     crate::json::scan_parse_roots_mut(visitor);
 }
 
+pub fn json_stringify_mutable_root_scanner(visitor: &mut RuntimeRootVisitor<'_>) {
+    crate::json::scan_stringify_roots_mut(visitor);
+}
+
 pub fn shadow_stack_root_scanner(mark: &mut dyn FnMut(f64)) {
     visit_shadow_stack_root_slots(|slot| unsafe {
         let bits = slot.read();

@@ -503,11 +503,11 @@ fn sys_namespace_types_member_reuses_util_types() {
 fn stream_promises_finished_resolves_for_finished_writable_side_stub_stream() {
     let stream = crate::node_stream::js_node_stream_passthrough_new(undefined_value());
     let end = get_object_property(stream, b"end").expect("stream.end should exist");
-    let prev_this = crate::object::js_implicit_this_set(stream);
+    let prev_this = crate::object::js_implicit_this_push(stream);
     unsafe {
         let _ = crate::closure::js_native_call_value(end, std::ptr::null(), 0);
     }
-    crate::object::js_implicit_this_set(prev_this);
+    crate::object::js_implicit_this_restore(prev_this);
     let _ = crate::promise::js_promise_run_microtasks();
 
     let opts = js_object_alloc(0, 1);
@@ -870,11 +870,11 @@ fn stream_promises_finished_with_signal_resolves_for_finished_writable_side_stub
     );
     let stream = crate::node_stream::js_node_stream_passthrough_new(undefined_value());
     let end = get_object_property(stream, b"end").expect("stream.end should exist");
-    let prev_this = crate::object::js_implicit_this_set(stream);
+    let prev_this = crate::object::js_implicit_this_push(stream);
     unsafe {
         let _ = crate::closure::js_native_call_value(end, std::ptr::null(), 0);
     }
-    crate::object::js_implicit_this_set(prev_this);
+    crate::object::js_implicit_this_restore(prev_this);
     let _ = crate::promise::js_promise_run_microtasks();
 
     let promise_value =

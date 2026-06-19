@@ -23,9 +23,13 @@ pub(super) struct RememberedSetTraceStats {
     pub(super) dirty_pages_before: usize,
     pub(super) dirty_pages_after: usize,
     pub(super) dirty_pages_scanned: usize,
+    pub(super) dirty_cards_before: usize,
+    pub(super) dirty_cards_after: usize,
+    pub(super) dirty_cards_scanned: usize,
     pub(super) old_objects_considered: usize,
     pub(super) dirty_objects_scanned: usize,
     pub(super) dirty_slot_pages_considered: usize,
+    pub(super) dirty_cards_considered: usize,
     pub(super) dirty_slot_ranges_scanned: usize,
     pub(super) dirty_slots_scanned: usize,
 }
@@ -129,6 +133,10 @@ pub(super) struct CopyingNurseryTraceStats {
     pub(super) copied_bytes: usize,
     pub(super) promoted_objects: usize,
     pub(super) promoted_bytes: usize,
+    pub(super) pinned_eden_objects: usize,
+    pub(super) pinned_eden_bytes: usize,
+    pub(super) pinned_eden_blocks: usize,
+    pub(super) pinned_eden_retained_bytes: usize,
     pub(super) large_excluded_objects: usize,
     pub(super) large_excluded_bytes: usize,
     pub(super) reset_blocks: usize,
@@ -412,6 +420,9 @@ pub(super) struct BarrierTraceCounters {
     pub(super) new_inserts: u64,
     pub(super) dirty_page_mark_attempts: u64,
     pub(super) new_dirty_pages: u64,
+    pub(super) dirty_card_mark_attempts: u64,
+    pub(super) new_dirty_cards: u64,
+    pub(super) same_card_fast_path_hits: u64,
     pub(super) conservative_parent_span_marks: u64,
 }
 
@@ -428,6 +439,9 @@ impl BarrierTraceCounters {
             new_inserts: 0,
             dirty_page_mark_attempts: 0,
             new_dirty_pages: 0,
+            dirty_card_mark_attempts: 0,
+            new_dirty_cards: 0,
+            same_card_fast_path_hits: 0,
             conservative_parent_span_marks: 0,
         }
     }
@@ -445,6 +459,9 @@ pub(super) enum BarrierTraceCounter {
     NewInserts,
     DirtyPageMarkAttempts,
     NewDirtyPages,
+    DirtyCardMarkAttempts,
+    NewDirtyCards,
+    SameCardFastPathHits,
     ConservativeParentSpanMarks,
 }
 
@@ -458,15 +475,15 @@ pub(super) struct GcDebtSnapshot {
 impl GcDebtSnapshot {
     #[inline]
     pub(super) fn current() -> Self {
-        let total = crate::arena::arena_total_bytes();
-        let next_arena_trigger = GC_NEXT_TRIGGER_BYTES.with(|c| c.get());
+        let trigger_bytes = gc_nursery_trigger_bytes();
+        let next_arena_trigger = gc_effective_next_arena_trigger();
         let malloc_count = malloc_object_count();
         let next_malloc_trigger = GC_NEXT_MALLOC_TRIGGER.with(|c| c.get());
         let old_in_use = crate::arena::old_gen_in_use_bytes();
         let old_baseline = GC_LAST_OLD_RECLAIM_IN_USE_BYTES.with(|bytes| bytes.get());
 
         Self {
-            arena_debt_bytes: total.saturating_sub(next_arena_trigger) as u64,
+            arena_debt_bytes: trigger_bytes.saturating_sub(next_arena_trigger) as u64,
             malloc_debt_objects: malloc_count.saturating_sub(next_malloc_trigger) as u64,
             old_reclaim_debt_bytes: gc_old_reclaim_debt_bytes(old_in_use, old_baseline),
         }
@@ -759,9 +776,13 @@ impl GcCycleTrace {
             "dirty_pages_before": self.remembered_set.dirty_pages_before,
             "dirty_pages_after": remembered_dirty_page_count(),
             "dirty_pages_scanned": self.remembered_set.dirty_pages_scanned,
+            "dirty_cards_before": self.remembered_set.dirty_cards_before,
+            "dirty_cards_after": remembered_dirty_card_count(),
+            "dirty_cards_scanned": self.remembered_set.dirty_cards_scanned,
             "old_objects_considered": self.remembered_set.old_objects_considered,
             "dirty_objects_scanned": self.remembered_set.dirty_objects_scanned,
             "dirty_slot_pages_considered": self.remembered_set.dirty_slot_pages_considered,
+            "dirty_cards_considered": self.remembered_set.dirty_cards_considered,
             "dirty_slot_ranges_scanned": self.remembered_set.dirty_slot_ranges_scanned,
             "dirty_slots_scanned": self.remembered_set.dirty_slots_scanned,
         });
@@ -843,6 +864,10 @@ impl GcCycleTrace {
             "copied_bytes": self.copying_nursery.copied_bytes,
             "promoted_objects": self.copying_nursery.promoted_objects,
             "promoted_bytes": self.copying_nursery.promoted_bytes,
+            "pinned_eden_objects": self.copying_nursery.pinned_eden_objects,
+            "pinned_eden_bytes": self.copying_nursery.pinned_eden_bytes,
+            "pinned_eden_blocks": self.copying_nursery.pinned_eden_blocks,
+            "pinned_eden_retained_bytes": self.copying_nursery.pinned_eden_retained_bytes,
             "large_excluded_objects": self.copying_nursery.large_excluded_objects,
             "large_excluded_bytes": self.copying_nursery.large_excluded_bytes,
             "reset_blocks": self.copying_nursery.reset_blocks,
@@ -904,13 +929,18 @@ impl GcCycleTrace {
             "new_inserts": self.write_barrier.new_inserts,
             "dirty_page_mark_attempts": self.write_barrier.dirty_page_mark_attempts,
             "new_dirty_pages": self.write_barrier.new_dirty_pages,
+            "dirty_card_mark_attempts": self.write_barrier.dirty_card_mark_attempts,
+            "new_dirty_cards": self.write_barrier.new_dirty_cards,
+            "same_card_fast_path_hits": self.write_barrier.same_card_fast_path_hits,
             "conservative_parent_span_marks": self.write_barrier.conservative_parent_span_marks,
         });
         let trigger_json = serde_json::json!({
             "kind": self.trigger_kind.as_str(),
         });
-        let progress_budget = gc_progress_contract().budget_for(self.progress_kind);
+        let progress_contract = gc_progress_contract();
+        let progress_budget = progress_contract.budget_for(self.progress_kind);
         let progress_contract_json = serde_json::json!({
+            "mode": progress_contract.mode.as_str(),
             "kind": self.progress_kind.as_str(),
             "budget_unit": "work_units",
             "configured_work_budget": progress_budget.work_units,

@@ -883,7 +883,9 @@ fn expr_kind_for_diag(e: &Expr) -> &'static str {
         Expr::PropertyGet { .. } => "a property access (e.g. `routes.HOME`)",
         Expr::Array(_) | Expr::ArraySpread(_) => "an array literal",
         Expr::Object(_) | Expr::ObjectSpread { .. } => "an object literal",
-        Expr::New { .. } | Expr::NewDynamic { .. } => "a `new` / object-literal expression",
+        Expr::New { .. } | Expr::NewDynamic { .. } | Expr::NewDynamicSpread { .. } => {
+            "a `new` / object-literal expression"
+        }
         Expr::NativeMethodCall { .. } => "a native method call",
         Expr::Binary { .. } | Expr::Compare { .. } | Expr::Logical { .. } => {
             "a binary expression (string concat / comparison)"

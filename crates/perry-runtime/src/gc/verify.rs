@@ -13,7 +13,7 @@ pub(super) fn try_rewrite_value(bits: u64, valid_ptrs: &ValidPointerSet) -> Opti
                 return None;
             }
             // Raw pointer fallback: lower 48 bits valid range.
-            if !(0x1000..=0x0000_FFFF_FFFF_FFFF).contains(&bits) {
+            if !(0x1000..=0x0000_FFFF_FFFF_FFFF).contains(&bits) || bits & 0x7 != 0 {
                 return None;
             }
             (bits as usize, false)
@@ -381,11 +381,11 @@ pub(super) fn old_young_external_slot_covered(
     parent_header: usize,
     slot: *mut u64,
 ) -> bool {
-    let page = crate::arena::generation_page_for_addr(slot as usize);
+    let card = remembered_card_for_addr(slot as usize);
     snapshot
-        .external_dirty_entries
+        .external_dirty_card_entries
         .iter()
-        .any(|&(entry_page, entry_header)| entry_page == page && entry_header == parent_header)
+        .any(|&(entry_card, entry_header)| entry_card == card && entry_header == parent_header)
 }
 
 #[inline]
@@ -394,12 +394,12 @@ pub(super) fn old_young_slot_covered(
     parent_header: usize,
     slot: *mut u64,
 ) -> bool {
-    let page = crate::arena::generation_page_for_addr(slot as usize);
     if matches!(
         crate::arena::classify_heap_generation(slot as usize),
         crate::arena::HeapGeneration::Old
     ) {
-        snapshot.dirty_old_pages.contains(&page)
+        let card = remembered_card_for_addr(slot as usize);
+        snapshot.dirty_old_cards.contains(&card)
     } else {
         old_young_external_slot_covered(snapshot, parent_header, slot)
     }
@@ -426,12 +426,114 @@ pub(super) unsafe fn old_parent_has_remembered_metadata(
 }
 
 #[inline]
+fn malloc_header_addr_for_user_addr(user_addr: usize) -> Option<usize> {
+    if user_addr < GC_HEADER_SIZE {
+        return None;
+    }
+    let header_addr = user_addr - GC_HEADER_SIZE;
+    MALLOC_STATE
+        .with(|s| {
+            s.borrow()
+                .objects
+                .iter()
+                .any(|&tracked| tracked as usize == header_addr)
+        })
+        .then_some(header_addr)
+}
+
+#[inline]
+fn old_parent_header_addr_for_user_addr(user_addr: usize) -> Option<usize> {
+    if user_addr == 0 {
+        return None;
+    }
+    if matches!(
+        crate::arena::classify_heap_generation(user_addr),
+        crate::arena::HeapGeneration::Old
+    ) {
+        return Some(unsafe { header_from_user_ptr(user_addr as *const u8) as usize });
+    }
+    malloc_header_addr_for_user_addr(user_addr)
+}
+
+#[inline]
+fn old_parent_header_addr_for_bits(bits: u64) -> Option<usize> {
+    let decoded = decode_heap_addr(bits);
+    if let Some(header_addr) = old_parent_header_addr_for_user_addr(decoded) {
+        return Some(header_addr);
+    }
+    old_parent_header_addr_for_user_addr(bits as usize)
+}
+
+#[inline]
+fn enqueue_rooted_old_parent(
+    rooted: &mut crate::fast_hash::PtrHashSet<usize>,
+    worklist: &mut Vec<usize>,
+    header_addr: usize,
+) {
+    if rooted.insert(header_addr) {
+        worklist.push(header_addr);
+    }
+}
+
+unsafe fn enqueue_reachable_old_parent_children(
+    rooted: &mut crate::fast_hash::PtrHashSet<usize>,
+    worklist: &mut Vec<usize>,
+    header_addr: usize,
+) {
+    let header = header_addr as *mut GcHeader;
+    if header.is_null() || (*header).gc_flags & GC_FLAG_FORWARDED != 0 {
+        return;
+    }
+    visit_gc_rewrite_slots(header, |slot| unsafe {
+        if let Some(child_header_addr) = old_parent_header_addr_for_bits(*slot.slot) {
+            enqueue_rooted_old_parent(rooted, worklist, child_header_addr);
+        }
+    });
+}
+
+fn rooted_old_parent_headers() -> crate::fast_hash::PtrHashSet<usize> {
+    let mut rooted = crate::fast_hash::new_ptr_hash_set();
+    let mut worklist = Vec::new();
+    visit_mutable_root_slots(|slot| unsafe {
+        if let Some(header_addr) = old_parent_header_addr_for_bits(slot.read()) {
+            enqueue_rooted_old_parent(&mut rooted, &mut worklist, header_addr);
+        }
+    });
+    let mut registered_bits = Vec::new();
+    {
+        let mut collect = |value: f64| registered_bits.push(value.to_bits());
+        let mut visitor = RuntimeRootVisitor::for_copy(&mut collect);
+        visit_mutable_registered_roots(&mut visitor);
+    }
+    for bits in registered_bits {
+        if let Some(header_addr) = old_parent_header_addr_for_bits(bits) {
+            enqueue_rooted_old_parent(&mut rooted, &mut worklist, header_addr);
+        }
+    }
+    visit_copy_only_registered_root_bits(|bits| {
+        if let Some(header_addr) = old_parent_header_addr_for_bits(bits) {
+            enqueue_rooted_old_parent(&mut rooted, &mut worklist, header_addr);
+        }
+    });
+    while let Some(header_addr) = worklist.pop() {
+        unsafe {
+            enqueue_reachable_old_parent_children(&mut rooted, &mut worklist, header_addr);
+        }
+    }
+    rooted
+}
+
+#[inline]
 pub(super) unsafe fn old_young_parent_should_be_checked(
     snapshot: &RememberedDirtySnapshot,
+    rooted_old_parents: &crate::fast_hash::PtrHashSet<usize>,
     header: *mut GcHeader,
 ) -> bool {
     if header.is_null() || (*header).gc_flags & GC_FLAG_FORWARDED != 0 {
         return false;
+    }
+    if rooted_old_parents.contains(&(header as usize)) {
+        return true;
     }
     if (*header).gc_flags & (GC_FLAG_MARKED | GC_FLAG_PINNED) != 0 {
         return true;
@@ -461,10 +563,11 @@ pub(super) unsafe fn verify_old_young_slot_covered(
 
 pub(super) unsafe fn verify_old_young_parent_slots_covered(
     snapshot: &RememberedDirtySnapshot,
+    rooted_old_parents: &crate::fast_hash::PtrHashSet<usize>,
     stats: &mut OldYoungEdgeVerifyStats,
     header: *mut GcHeader,
 ) {
-    if !old_young_parent_should_be_checked(snapshot, header) {
+    if !old_young_parent_should_be_checked(snapshot, rooted_old_parents, header) {
         return;
     }
     stats.checked_old_objects = stats.checked_old_objects.saturating_add(1);
@@ -494,18 +597,29 @@ pub(super) fn panic_old_young_edge_verifier_failed(stats: OldYoungEdgeVerifyStat
 
 pub(super) fn verify_old_to_young_edges_covered() -> OldYoungEdgeVerifyStats {
     let snapshot = remembered_dirty_snapshot();
+    let rooted_old_parents = rooted_old_parent_headers();
     let mut stats = OldYoungEdgeVerifyStats {
         checked_remembered_pages: snapshot.dirty_pages.len(),
         ..OldYoungEdgeVerifyStats::default()
     };
     crate::arena::old_arena_walk_objects(|hp| unsafe {
-        verify_old_young_parent_slots_covered(&snapshot, &mut stats, hp as *mut GcHeader);
+        verify_old_young_parent_slots_covered(
+            &snapshot,
+            &rooted_old_parents,
+            &mut stats,
+            hp as *mut GcHeader,
+        );
     });
     MALLOC_STATE.with(|s| {
         let s = s.borrow();
         for &header in s.objects.iter() {
             unsafe {
-                verify_old_young_parent_slots_covered(&snapshot, &mut stats, header);
+                verify_old_young_parent_slots_covered(
+                    &snapshot,
+                    &rooted_old_parents,
+                    &mut stats,
+                    header,
+                );
             }
         }
     });
@@ -774,7 +888,7 @@ pub(super) fn verify_copy_only_scanner_bits(
     valid_ptrs: &ValidPointerSet,
     surface: &'static str,
 ) {
-    if let Some(new_bits) = try_rewrite_nanboxed_value(bits, valid_ptrs) {
+    if let Some(new_bits) = try_rewrite_value(bits, valid_ptrs) {
         panic_stale_forwarded_reference(surface, 0, bits, new_bits);
     }
 }

@@ -616,6 +616,22 @@ pub fn check_object_literal_escapes_in_expr(
                 check_object_literal_escapes_in_expr(a, candidates, escaped);
             }
         }
+        Expr::NewDynamic { callee, args } => {
+            check_object_literal_escapes_in_expr(callee, candidates, escaped);
+            for a in args {
+                check_object_literal_escapes_in_expr(a, candidates, escaped);
+            }
+        }
+        Expr::NewDynamicSpread { callee, args } => {
+            check_object_literal_escapes_in_expr(callee, candidates, escaped);
+            for a in args {
+                match a {
+                    CallArg::Expr(e) | CallArg::Spread(e) => {
+                        check_object_literal_escapes_in_expr(e, candidates, escaped);
+                    }
+                }
+            }
+        }
         Expr::Sequence(es) => {
             for e in es {
                 check_object_literal_escapes_in_expr(e, candidates, escaped);

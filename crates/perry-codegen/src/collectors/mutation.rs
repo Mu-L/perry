@@ -235,6 +235,16 @@ pub fn expr_has_mutation(e: &perry_hir::Expr, id: u32) -> bool {
             ArrayElement::Hole => false,
         }),
         Expr::Object(props) => props.iter().any(|(_, v)| expr_has_mutation(v, id)),
+        Expr::New { args, .. } => args.iter().any(|a| expr_has_mutation(a, id)),
+        Expr::NewDynamic { callee, args } => {
+            expr_has_mutation(callee, id) || args.iter().any(|a| expr_has_mutation(a, id))
+        }
+        Expr::NewDynamicSpread { callee, args } => {
+            expr_has_mutation(callee, id)
+                || args.iter().any(|a| match a {
+                    CallArg::Expr(e) | CallArg::Spread(e) => expr_has_mutation(e, id),
+                })
+        }
         Expr::Closure { body, .. } => has_any_mutation(body, id),
         Expr::Sequence(es) => es.iter().any(|e| expr_has_mutation(e, id)),
         Expr::ArrayPush { array_id, value } => *array_id == id || expr_has_mutation(value, id),

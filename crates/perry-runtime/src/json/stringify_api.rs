@@ -43,21 +43,12 @@ pub(crate) unsafe fn redirect_lazy_to_materialized(value: f64) -> f64 {
     f64::from_bits(JSValue::object_ptr((*lazy).materialized as *mut u8).bits())
 }
 
-/// Issue #179 Phase 4: lazy-stringify fast path. If `value` is a
-/// lazy-parse top-level array whose `materialized` is still null (no
-/// indexed access or mutation has forced tree build), memcpy the
-/// original blob bytes into a fresh string — no tree walk, no
-/// escape handling. Returns `None` if `value` is not a
-/// tape-backed-and-unmutated lazy array, in which case the caller
-/// falls through to the generic stringify path.
-///
-/// Correctness invariant: if the lazy value is unmutated, the bytes
-/// spanning `[root.offset .. root_end.offset+1]` in the original
-/// blob are exactly what `JSON.stringify` would produce for that
-/// value (modulo whitespace the user's original blob may contain —
-/// `JSON.stringify` never emits whitespace for the 2-arg form, so
-/// this is only correct when the blob came from `JSON.stringify` or
-/// is otherwise whitespace-free in the array span).
+/// Issue #179 Phase 4 originally tried to stringify an unmaterialized
+/// lazy-parse top-level array by copying the original source span. That is
+/// only correct for already-canonical source bytes. `JSON.stringify` must
+/// remove insignificant whitespace and re-emit strings/numbers through its
+/// own canonical formatter, so this helper now uses the lazy header only to
+/// force materialization and returns `None` for the normal tree walker.
 pub(crate) unsafe fn try_stringify_lazy_array(value: f64) -> Option<*mut StringHeader> {
     let bits = value.to_bits();
     let top16 = bits >> 48;
@@ -87,51 +78,16 @@ pub(crate) unsafe fn try_stringify_lazy_array(value: f64) -> Option<*mut StringH
     if (*lazy).magic != crate::json_tape::LAZY_ARRAY_MAGIC || !(*lazy).materialized.is_null() {
         return None;
     }
-    // Phase 5: if the sparse per-element cache has ANY bit set,
-    // stringify might miss mutations made through a cached element
-    // (e.g. `parsed[0].name = "x"` modifies the materialized object
-    // but leaves the blob bytes untouched). Force-materialize the
-    // full tree (which consults the sparse cache and preserves
-    // cached mutations), then bail out so `redirect_lazy_to_materialized`
-    // forwards to the materialized ArrayHeader on the next stringify
-    // dispatch. No bits set means we haven't handed any pointers to
-    // user code yet, so the blob bytes are authoritative.
-    if !(*lazy).materialized_bitmap.is_null() && (*lazy).cached_length > 0 {
-        let bitmap = (*lazy).materialized_bitmap;
-        let bitmap_words = ((*lazy).cached_length as usize).div_ceil(64);
-        let mut has_bits = false;
-        for w in 0..bitmap_words {
-            if *bitmap.add(w) != 0 {
-                has_bits = true;
-                break;
-            }
-        }
-        if has_bits {
-            crate::json_tape::force_materialize_lazy(
-                lazy as *mut crate::json_tape::LazyArrayHeader,
-            );
-            return None;
-        }
-    }
-    let tape = crate::json_tape::LazyArrayHeader::tape_slice(lazy);
-    let blob_bytes = crate::json_tape::LazyArrayHeader::blob_bytes(lazy);
-    if tape.is_empty() {
-        return None;
-    }
-    let root = (*lazy).root_idx as usize;
-    let start = tape[root].offset as usize;
-    let end_idx = tape[root].link as usize;
-    let end = tape[end_idx].offset as usize + 1; // +1 includes `]`
-    if end > blob_bytes.len() || start > end {
-        return None;
-    }
-    let slice = &blob_bytes[start..end];
-    Some(json_string_from_output_bytes(slice))
+    crate::json_tape::force_materialize_lazy(lazy as *mut crate::json_tape::LazyArrayHeader);
+    None
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn js_json_stringify(value: f64, type_hint: u32) -> *mut StringHeader {
-    if let Some(ptr) = try_stringify_lazy_array(value) {
+    let root_scope = crate::gc::RuntimeHandleScope::new();
+    let value_handle = root_scope.root_nanbox_f64(value);
+
+    if let Some(ptr) = try_stringify_lazy_array(value_handle.get_nanbox_f64()) {
         return ptr;
     }
     // If the value is a lazy array that's already been materialized
@@ -139,7 +95,7 @@ pub unsafe extern "C" fn js_json_stringify(value: f64, type_hint: u32) -> *mut S
     // tree directly — the generic walker would otherwise read the
     // LazyArrayHeader's fields as if they were array elements and
     // crash on the first deref of a bogus pointer.
-    let value = redirect_lazy_to_materialized(value);
+    value_handle.set_nanbox_f64(redirect_lazy_to_materialized(value_handle.get_nanbox_f64()));
 
     // Non-reentrant fast path (issue #67): skip the shape_cache save/restore
     // round-trip (two RefCell.borrow_mut's + a Vec mem::take/assign) for the
@@ -168,13 +124,49 @@ pub unsafe extern "C" fn js_json_stringify(value: f64, type_hint: u32) -> *mut S
     } else {
         None
     };
+
+    if root_stringify_returns_undefined(value_handle.get_nanbox_f64()) {
+        match saved_cache {
+            Some(s) => restore_shape_cache(s),
+            None => clear_shape_cache(),
+        }
+        STRINGIFY_DEPTH.with(|d| d.set(d.get() - 1));
+        return std::ptr::null_mut();
+    }
+
+    // The root value is serialized through SerializeJSONProperty(""):
+    // toJSON runs once before the value itself is emitted. Nested object/array
+    // paths already do their own per-property toJSON handling.
+    if let Some(ptr) = extract_pointer(value_handle.get_nanbox_f64().to_bits()) {
+        if gc_obj_type(ptr) == crate::gc::GC_TYPE_OBJECT
+            && !crate::buffer::is_registered_buffer(ptr as usize)
+        {
+            if let Some(to_json_val) = object_get_to_json(ptr) {
+                value_handle.set_nanbox_f64(to_json_val);
+                if root_stringify_returns_undefined(value_handle.get_nanbox_f64()) {
+                    match saved_cache {
+                        Some(s) => restore_shape_cache(s),
+                        None => clear_shape_cache(),
+                    }
+                    STRINGIFY_DEPTH.with(|d| d.set(d.get() - 1));
+                    return std::ptr::null_mut();
+                }
+                let _ = try_stringify_lazy_array(value_handle.get_nanbox_f64());
+                value_handle
+                    .set_nanbox_f64(redirect_lazy_to_materialized(value_handle.get_nanbox_f64()));
+                arm_to_json_result_guard(value_handle.get_nanbox_f64());
+            }
+        }
+    }
+
     let mut buf = take_stringify_buf();
     // Scratch buffer is pre-sized to 4096 on first thread-local init and
     // retained across calls, so most small stringifies never hit a
     // String::reserve. `push_str` grows on overflow for the rare
     // single-call output that exceeds that, so skip the estimate call
     // (issue #67: it was ~10ns of wasted work per call for small values).
-    stringify_value(value, type_hint, &mut buf);
+    stringify_value(value_handle.get_nanbox_f64(), type_hint, &mut buf);
+    SUPPRESS_NEXT_TO_JSON.with(|c| c.set(false));
     let ptr = json_string_from_output_bytes(buf.as_bytes());
     restore_stringify_buf(buf);
     match saved_cache {

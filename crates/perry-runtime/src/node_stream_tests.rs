@@ -838,14 +838,14 @@ fn stream_json_stringify_uses_node_state_shape() {
 #[test]
 fn stream_methods_use_implicit_this_without_closure_capture() {
     let stream = js_node_stream_passthrough_new(f64::from_bits(TAG_UNDEFINED));
-    let prev_this = crate::object::js_implicit_this_set(stream);
+    let prev_this = crate::object::js_implicit_this_push(stream);
     let _ = ns_end3(
         std::ptr::null(),
         f64::from_bits(TAG_UNDEFINED),
         f64::from_bits(TAG_UNDEFINED),
         f64::from_bits(TAG_UNDEFINED),
     );
-    crate::object::js_implicit_this_set(prev_this);
+    crate::object::js_implicit_this_restore(prev_this);
 
     assert!(js_node_stream_is_stub_ended_after_read(stream));
 }
@@ -859,11 +859,11 @@ fn stream_method_closure_capture_wins_over_stale_implicit_this() {
         hidden_key(b"end"),
     );
 
-    let prev_this = crate::object::js_implicit_this_set(other);
+    let prev_this = crate::object::js_implicit_this_push(other);
     unsafe {
         let _ = crate::closure::js_native_call_value(end, std::ptr::null(), 0);
     }
-    crate::object::js_implicit_this_set(prev_this);
+    crate::object::js_implicit_this_restore(prev_this);
 
     assert!(js_node_stream_is_stub_ended_after_read(stream));
     assert!(!stream_hidden_ended(other));

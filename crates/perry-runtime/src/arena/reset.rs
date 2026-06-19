@@ -53,6 +53,52 @@ fn reset_region_to_zero(arena: &mut Arena) -> (usize, usize) {
     (reset_blocks, reusable_bytes)
 }
 
+fn block_span_overlaps_bases(
+    block: &ArenaBlock,
+    retained_block_bases: &crate::fast_hash::PtrHashSet<usize>,
+) -> bool {
+    !block.data.is_null() && retained_block_bases.contains(&(block.data as usize))
+}
+
+fn reset_region_to_zero_excluding_blocks(
+    arena: &mut Arena,
+    retained_block_bases: &crate::fast_hash::PtrHashSet<usize>,
+) -> (usize, usize) {
+    let mut reset_blocks = 0usize;
+    let mut reusable_bytes = 0usize;
+    for block in arena.blocks.iter_mut() {
+        if block.data.is_null() {
+            continue;
+        }
+        if block_span_overlaps_bases(block, retained_block_bases) {
+            block.dead_cycles = 0;
+            continue;
+        }
+        if block.offset != 0 {
+            reset_blocks += 1;
+            reusable_bytes = reusable_bytes.saturating_add(block.offset);
+        }
+        block.offset = 0;
+        block.dead_cycles = 0;
+    }
+    arena.current = arena
+        .blocks
+        .iter()
+        .enumerate()
+        .find(|(_, block)| !block.data.is_null() && block.offset == 0)
+        .map(|(idx, _)| idx)
+        .or_else(|| {
+            arena
+                .blocks
+                .iter()
+                .enumerate()
+                .find(|(_, block)| !block.data.is_null())
+                .map(|(idx, _)| idx)
+        })
+        .unwrap_or(0);
+    (reset_blocks, reusable_bytes)
+}
+
 /// Reset the inactive survivor semispace before a copying minor starts.
 pub(crate) fn copying_prepare_to_space() -> usize {
     let idx = inactive_survivor_index();
@@ -81,6 +127,39 @@ pub(crate) fn copying_from_space_in_use_bytes() -> usize {
     eden + survivor
 }
 
+pub(crate) fn copying_eden_block_base_for_addr(addr: usize) -> Option<usize> {
+    sync_inline_arena_state();
+    ARENA.with(|arena| {
+        let arena = unsafe { &*arena.get() };
+        arena.blocks.iter().find_map(|block| {
+            if block.data.is_null() {
+                return None;
+            }
+            let base = block.data as usize;
+            let end = base.saturating_add(block.size);
+            (addr >= base && addr < end).then_some(base)
+        })
+    })
+}
+
+pub(crate) fn copying_eden_retained_bytes_for_blocks(
+    retained_block_bases: &crate::fast_hash::PtrHashSet<usize>,
+) -> usize {
+    if retained_block_bases.is_empty() {
+        return 0;
+    }
+    sync_inline_arena_state();
+    ARENA.with(|arena| {
+        let arena = unsafe { &*arena.get() };
+        arena
+            .blocks
+            .iter()
+            .filter(|block| block_span_overlaps_bases(block, retained_block_bases))
+            .map(|block| block.offset)
+            .sum()
+    })
+}
+
 pub(crate) fn active_survivor_block_index_range() -> std::ops::Range<usize> {
     let general_n = ARENA.with(|a| unsafe { (*a.get()).blocks.len() });
     let survivor0_n = SURVIVOR_ARENA_0.with(|a| unsafe { (*a.get()).blocks.len() });
@@ -94,13 +173,16 @@ pub(crate) fn active_survivor_block_index_range() -> std::ops::Range<usize> {
 
 /// Reset Eden and the active survivor from-space, then flip the survivor
 /// roles so the to-space populated by the copying collector becomes active.
-pub(crate) fn copying_reset_from_spaces_and_flip() -> ArenaResetStats {
+pub(crate) fn copying_reset_from_spaces_and_flip_excluding_eden_blocks(
+    retained_eden_block_bases: &crate::fast_hash::PtrHashSet<usize>,
+) -> ArenaResetStats {
     sync_inline_arena_state();
     let mut reset_blocks = 0usize;
     let mut reusable_bytes = 0usize;
     ARENA.with(|arena| unsafe {
         let arena = &mut *arena.get();
-        let (blocks, bytes) = reset_region_to_zero(arena);
+        let (blocks, bytes) =
+            reset_region_to_zero_excluding_blocks(arena, retained_eden_block_bases);
         reset_blocks += blocks;
         reusable_bytes = reusable_bytes.saturating_add(bytes);
         crate::gc::ARENA_FREE_LIST.with(|fl| fl.borrow_mut().clear());

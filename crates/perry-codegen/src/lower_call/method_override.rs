@@ -90,7 +90,7 @@ pub(super) fn emit_own_method_override_check(
         .unwrap_or_else(|| double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
     let prev_this = ctx
         .block()
-        .call(DOUBLE, "js_implicit_this_set", &[(DOUBLE, &recv_for_this)]);
+        .call(DOUBLE, "js_implicit_this_push", &[(DOUBLE, &recv_for_this)]);
     let v_override = ctx.block().call(
         DOUBLE,
         "js_native_call_value",
@@ -101,7 +101,7 @@ pub(super) fn emit_own_method_override_check(
         ],
     );
     ctx.block()
-        .call(DOUBLE, "js_implicit_this_set", &[(DOUBLE, &prev_this)]);
+        .call(DOUBLE, "js_implicit_this_restore", &[(DOUBLE, &prev_this)]);
     let after_override = ctx.block().label.clone();
     if !ctx.block().is_terminated() {
         ctx.block().br(&merge_label);

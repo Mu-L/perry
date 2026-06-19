@@ -1314,6 +1314,20 @@ pub fn collect_localset_ids_in_expr_filtered(
                 walk(a, out);
             }
         }
+        Expr::NewDynamic { callee, args } => {
+            walk(callee, out);
+            for a in args {
+                walk(a, out);
+            }
+        }
+        Expr::NewDynamicSpread { callee, args } => {
+            walk(callee, out);
+            for a in args {
+                match a {
+                    CallArg::Expr(e) | CallArg::Spread(e) => walk(e, out),
+                }
+            }
+        }
         Expr::MapNew | Expr::SetNew => {}
         Expr::SetNewFromArray(arr) => walk(arr, out),
         Expr::MapSet { map, key, value } => {

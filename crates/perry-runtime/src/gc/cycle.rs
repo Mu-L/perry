@@ -45,13 +45,7 @@ impl GcCyclePhase {
 
     #[inline]
     pub(super) const fn mutator_assist_honors_budget(self) -> bool {
-        matches!(
-            self,
-            Self::BuildValidPointerSet
-                | Self::RootScan
-                | Self::MarkPropagation
-                | Self::BlockPersistence
-        )
+        !matches!(self, Self::Complete)
     }
 }
 
@@ -940,6 +934,10 @@ impl GcCycleState {
         if let Some(trace) = self.trace.as_mut() {
             trace.progress_kind = progress_kind;
         }
+    }
+
+    pub(super) fn progress_kind(&self) -> GcProgressKind {
+        self.progress_kind
     }
 
     pub(super) fn step(&mut self, budget: GcWorkBudget) -> GcCycleStepResult {

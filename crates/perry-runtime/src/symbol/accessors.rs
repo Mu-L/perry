@@ -96,9 +96,9 @@ pub(super) unsafe fn invoke_symbol_accessor_getter(get_bits: u64, receiver: f64)
     if closure.is_null() {
         return f64::from_bits(TAG_UNDEFINED);
     }
-    let prev = crate::object::js_implicit_this_set(receiver);
+    let prev = crate::object::js_implicit_this_push(receiver);
     let result = crate::closure::js_closure_call0(closure);
-    crate::object::js_implicit_this_set(prev);
+    crate::object::js_implicit_this_restore(prev);
     result
 }
 

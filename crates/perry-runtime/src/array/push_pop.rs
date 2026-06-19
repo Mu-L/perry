@@ -356,10 +356,18 @@ pub extern "C" fn js_array_set_length(arr: *mut ArrayHeader, new_length: f64) {
     if arr.is_null() {
         return;
     }
-    let n = array_length_from_property_value_or_throw(new_length);
     let scope = crate::gc::RuntimeHandleScope::new();
-    let _arr_handle = scope.root_raw_mut_ptr(arr);
+    let arr_handle = scope.root_raw_mut_ptr(arr);
+    let new_length_handle = scope.root_nanbox_f64(new_length);
+    let n = array_length_from_property_value_or_throw(new_length_handle.get_nanbox_f64());
+    if !array_can_set_length(arr_handle.get_raw_mut_ptr::<ArrayHeader>(), n) {
+        return;
+    }
     unsafe {
+        let arr = arr_handle.get_raw_mut_ptr::<ArrayHeader>();
+        if arr.is_null() {
+            return;
+        }
         let cur = (*arr).length;
         let flags = array_object_flags(arr);
         if flags & crate::gc::OBJ_FLAG_FROZEN != 0 {
@@ -410,6 +418,19 @@ pub extern "C" fn js_array_set_length(arr: *mut ArrayHeader, new_length: f64) {
         }
         // n == cur is a no-op.
     }
+}
+
+pub(crate) fn js_array_set_length_checked(arr: *mut ArrayHeader, new_length: f64) -> bool {
+    let arr = clean_arr_ptr_mut(arr);
+    if arr.is_null() {
+        return false;
+    }
+    let n = array_length_from_property_value_or_throw(new_length);
+    if !array_can_set_length(arr, n) {
+        return false;
+    }
+    js_array_set_length(arr, new_length);
+    true
 }
 
 /// Delete an element from an array by index, creating a "hole".

@@ -1070,11 +1070,11 @@ fn invoke_writable_write(stream: f64, chunk: f64, enc: f64, len: f64, callback: 
         js_closure_set_capture_f64(cb, 2, callback);
         let cb_value = f64::from_bits(JSValue::pointer(cb as *const u8).bits());
         let args = [chunk, enc, cb_value];
-        let prev_this = crate::object::js_implicit_this_set(stream);
+        let prev_this = crate::object::js_implicit_this_push(stream);
         unsafe {
             let _ = crate::closure::js_native_call_value(write, args.as_ptr(), args.len());
         }
-        crate::object::js_implicit_this_set(prev_this);
+        crate::object::js_implicit_this_restore(prev_this);
     } else {
         complete_writable_write(stream, len, callback, f64::from_bits(TAG_UNDEFINED));
     }
@@ -1085,11 +1085,11 @@ fn invoke_writable_writev(stream: f64, chunks: f64) {
         let cb = js_closure_alloc(writable_write_callback_noop as *const u8, 0);
         let cb_value = f64::from_bits(JSValue::pointer(cb as *const u8).bits());
         let args = [chunks, cb_value];
-        let prev_this = crate::object::js_implicit_this_set(stream);
+        let prev_this = crate::object::js_implicit_this_push(stream);
         unsafe {
             let _ = crate::closure::js_native_call_value(writev, args.as_ptr(), args.len());
         }
-        crate::object::js_implicit_this_set(prev_this);
+        crate::object::js_implicit_this_restore(prev_this);
     }
 }
 
@@ -1129,11 +1129,11 @@ fn invoke_transform_write(stream: f64, chunk: f64, enc: f64, len: f64, callback:
         js_closure_set_capture_f64(cb, 2, callback);
         let cb_value = f64::from_bits(JSValue::pointer(cb as *const u8).bits());
         let args = [chunk, enc, cb_value];
-        let prev_this = crate::object::js_implicit_this_set(stream);
+        let prev_this = crate::object::js_implicit_this_push(stream);
         unsafe {
             let _ = crate::closure::js_native_call_value(transform, args.as_ptr(), args.len());
         }
-        crate::object::js_implicit_this_set(prev_this);
+        crate::object::js_implicit_this_restore(prev_this);
         return;
     }
     emit_writable_chunk(stream, chunk);

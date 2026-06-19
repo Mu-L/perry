@@ -11,7 +11,14 @@ OUT=""
 SKIP_PERF_COMPREHENSIVE=0
 KEEP_WORKTREES=0
 GATE=0
+HEAD_WORKTREE_SNAPSHOT=0
 PERF_MATH_SLICE_ROWS=()
+REQUIRED_BENCHMARK_TRACE_ROWS=(
+  "bench_json_roundtrip"
+  "bench_gc_pressure"
+  "07_object_create"
+  "12_binary_trees"
+)
 
 usage() {
   cat <<'EOF'
@@ -23,6 +30,7 @@ Options:
   --runs N                       Benchmark samples per benchmark (default: 5)
   --out PATH                     Output root (default: tmp/gc-1090-evidence-<utc>)
   --gate                         Fail on missing strict evidence
+  --head-worktree-snapshot       Test a synthetic commit made from the dirty current worktree
   --perf-math-slice-row NAME     Limit nested perf-frontier math slices
   --skip-perf-comprehensive      Skip optional perf-comprehensive probe
   --keep-worktrees               Keep detached worktrees after the run
@@ -37,6 +45,7 @@ while [[ $# -gt 0 ]]; do
     --runs) RUNS="$2"; shift 2 ;;
     --out) OUT="$2"; shift 2 ;;
     --gate) GATE=1; shift ;;
+    --head-worktree-snapshot) HEAD_WORKTREE_SNAPSHOT=1; shift ;;
     --perf-math-slice-row) PERF_MATH_SLICE_ROWS+=("$2"); shift 2 ;;
     --skip-perf-comprehensive) SKIP_PERF_COMPREHENSIVE=1; shift ;;
     --keep-worktrees) KEEP_WORKTREES=1; shift ;;
@@ -57,13 +66,14 @@ fi
 cd "$ROOT"
 
 BASE_SHA="$(git rev-parse --verify "$BASE_REF^{commit}")"
-HEAD_SHA="$(git rev-parse --verify "$HEAD_REF^{commit}")"
+ORIGINAL_HEAD_SHA="$(git rev-parse --verify "$HEAD_REF^{commit}")"
+HEAD_SHA="$ORIGINAL_HEAD_SHA"
 if ! [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   echo "base ref did not resolve to an exact 40-char SHA: $BASE_REF -> $BASE_SHA" >&2
   exit 2
 fi
-if ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-  echo "head ref did not resolve to an exact 40-char SHA: $HEAD_REF -> $HEAD_SHA" >&2
+if ! [[ "$ORIGINAL_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "head ref did not resolve to an exact 40-char SHA: $HEAD_REF -> $ORIGINAL_HEAD_SHA" >&2
   exit 2
 fi
 OUT_ABS="$(python3 - "$ROOT" "$OUT" <<'PY'
@@ -102,11 +112,78 @@ if [[ -n "$(git ls-files -- "$OUT_REL" "$OUT_REL/**")" ]]; then
   exit 2
 fi
 
+if [[ "$GATE" -eq 1 && -d "$OUT_ABS" && -n "$(find "$OUT_ABS" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+  echo "gated evidence output path must be empty; choose a fresh ignored path: $OUT_REL" >&2
+  exit 2
+fi
+
 mkdir -p "$OUT_ABS"
 
 BASE_WT="$OUT_ABS/worktrees/base"
 HEAD_WT="$OUT_ABS/worktrees/head"
 METADATA="$OUT_ABS/metadata.json"
+SOURCE_STATUS="$OUT_ABS/source-status.txt"
+SOURCE_DIFF="$OUT_ABS/source-diff.patch"
+SOURCE_TESTED_HEAD_DIFF="$OUT_ABS/source-tested-head.patch"
+SOURCE_STATE_MODE="exact-ref"
+CURRENT_HEAD_SHA="$(git rev-parse --verify HEAD^{commit})"
+
+sha256_file() {
+  python3 - "$1" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+print(hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+}
+
+git status --porcelain=v1 --untracked-files=all >"$SOURCE_STATUS"
+if ! git diff --binary HEAD -- >"$SOURCE_DIFF"; then
+  : >"$SOURCE_DIFF"
+fi
+SOURCE_DIFF_SHA256="$(sha256_file "$SOURCE_DIFF")"
+
+create_head_worktree_snapshot() {
+  if [[ "$ORIGINAL_HEAD_SHA" != "$CURRENT_HEAD_SHA" ]]; then
+    echo "--head-worktree-snapshot requires --head-ref to resolve to the current HEAD" >&2
+    echo "head ref: $HEAD_REF -> $ORIGINAL_HEAD_SHA" >&2
+    echo "current HEAD: $CURRENT_HEAD_SHA" >&2
+    exit 2
+  fi
+
+  local snapshot_index
+  local snapshot_tree
+  snapshot_index="$(mktemp "$OUT_ABS/head-worktree-index.XXXXXX")"
+  GIT_INDEX_FILE="$snapshot_index" git read-tree "$CURRENT_HEAD_SHA"
+  GIT_INDEX_FILE="$snapshot_index" git add -A -- .
+  snapshot_tree="$(GIT_INDEX_FILE="$snapshot_index" git write-tree)"
+  HEAD_SHA="$(
+    printf 'GC evidence worktree snapshot for %s\n' "$CURRENT_HEAD_SHA" \
+      | git commit-tree "$snapshot_tree" -p "$CURRENT_HEAD_SHA"
+  )"
+  rm -f "$snapshot_index"
+  SOURCE_STATE_MODE="worktree-snapshot"
+}
+
+if [[ "$HEAD_WORKTREE_SNAPSHOT" -eq 1 ]]; then
+  create_head_worktree_snapshot
+elif [[ "$GATE" -eq 1 && "$ORIGINAL_HEAD_SHA" == "$CURRENT_HEAD_SHA" && -s "$SOURCE_STATUS" ]]; then
+  echo "gated evidence would ignore dirty current worktree changes; use --head-worktree-snapshot or commit the work first" >&2
+  exit 2
+fi
+
+HEAD_TREE_SHA="$(git show -s --format=%T "$HEAD_SHA")"
+if [[ "$SOURCE_STATE_MODE" == "worktree-snapshot" ]]; then
+  if ! git diff --binary "$CURRENT_HEAD_SHA" "$HEAD_SHA" -- >"$SOURCE_TESTED_HEAD_DIFF"; then
+    : >"$SOURCE_TESTED_HEAD_DIFF"
+  fi
+else
+  if ! git diff --binary "$ORIGINAL_HEAD_SHA" "$HEAD_SHA" -- >"$SOURCE_TESTED_HEAD_DIFF"; then
+    : >"$SOURCE_TESTED_HEAD_DIFF"
+  fi
+fi
+SOURCE_TESTED_HEAD_DIFF_SHA256="$(sha256_file "$SOURCE_TESTED_HEAD_DIFF")"
 
 cleanup() {
   if [[ "$KEEP_WORKTREES" -eq 0 ]]; then
@@ -117,7 +194,7 @@ cleanup() {
 trap cleanup EXIT
 
 write_metadata() {
-  python3 - "$METADATA" "$BASE_REF" "$HEAD_REF" "$BASE_SHA" "$HEAD_SHA" "$RUNS" "$SKIP_PERF_COMPREHENSIVE" "$GATE" <<'PY'
+  python3 - "$METADATA" "$BASE_REF" "$HEAD_REF" "$BASE_SHA" "$HEAD_SHA" "$RUNS" "$SKIP_PERF_COMPREHENSIVE" "$GATE" "$SOURCE_STATE_MODE" "$ORIGINAL_HEAD_SHA" "$CURRENT_HEAD_SHA" "$HEAD_TREE_SHA" "$SOURCE_STATUS" "$SOURCE_DIFF_SHA256" "$SOURCE_TESTED_HEAD_DIFF_SHA256" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
@@ -127,9 +204,14 @@ path = Path(sys.argv[1])
 existing = {}
 if path.exists():
     existing = json.loads(path.read_text(encoding="utf-8"))
+status_path = Path(sys.argv[13])
+try:
+    status_lines = status_path.read_text(encoding="utf-8", errors="replace").splitlines()
+except Exception:
+    status_lines = []
 existing.update({
     "schema_version": 1,
-    "generated_at": existing.get("generated_at") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     "base_ref": sys.argv[2],
     "head_ref": sys.argv[3],
     "base_sha": sys.argv[4],
@@ -137,8 +219,22 @@ existing.update({
     "runs": int(sys.argv[6]),
     "skip_perf_comprehensive": sys.argv[7] == "1",
     "gate": sys.argv[8] == "1",
-    "commands": existing.get("commands", {}),
-    "tool_versions": existing.get("tool_versions", {}),
+    "source_state": {
+        "mode": sys.argv[9],
+        "original_head_sha": sys.argv[10],
+        "current_head_sha": sys.argv[11],
+        "tested_head_sha": sys.argv[5],
+        "tested_head_tree_sha": sys.argv[12],
+        "dirty": bool(status_lines),
+        "status_path": "source-status.txt",
+        "status_porcelain_v1": status_lines,
+        "tracked_diff_path": "source-diff.patch",
+        "tracked_diff_sha256": sys.argv[14],
+        "tested_head_diff_path": "source-tested-head.patch",
+        "tested_head_diff_sha256": sys.argv[15],
+    },
+    "commands": {},
+    "tool_versions": {},
 })
 path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -218,9 +314,12 @@ PY
 write_metadata
 capture_tool_versions
 
-echo "=== #1090 exact-head GC evidence packet ==="
+echo "=== #1090 GC evidence packet ==="
 echo "base: $BASE_REF -> $BASE_SHA"
 echo "head: $HEAD_REF -> $HEAD_SHA"
+if [[ "$SOURCE_STATE_MODE" == "worktree-snapshot" ]]; then
+  echo "head source: worktree snapshot of $ORIGINAL_HEAD_SHA"
+fi
 echo "out:  $OUT_ABS"
 
 mkdir -p "$OUT_ABS/worktrees"
@@ -251,6 +350,266 @@ run_logged() {
   return 0
 }
 
+trace_has_gc_cycle() {
+  local trace_file="$1"
+  python3 - "$trace_file" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    handle = path.open("r", encoding="utf-8", errors="replace")
+except OSError:
+    raise SystemExit(1)
+
+with handle:
+    for line in handle:
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("event") == "gc_cycle":
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+strip_suite_types_to_mjs() {
+  local src="$1"
+  local dst="$2"
+  sed -E \
+    -e 's/: (number|string|boolean|any|void)(\[\])*//g' \
+    -e 's/\): (number|string|boolean|any|void)(\[\])* \{/) {/g' \
+    "$src" >"$dst"
+}
+
+precompile_node_reference() {
+  local src="$1"
+  local dst="$2"
+  case "$NODE_TS_STRIP" in
+    esbuild)
+      esbuild "$src" --format=esm --platform=neutral --target=esnext \
+        --outfile="$dst" --log-level=warning >/dev/null 2>&1
+      ;;
+    npx-esbuild)
+      npx --no-install esbuild "$src" --format=esm --platform=neutral \
+        --target=esnext --outfile="$dst" --log-level=warning >/dev/null 2>&1
+      ;;
+    tsc)
+      local d b
+      d=$(dirname "$dst")
+      b=$(basename "$src" .ts)
+      tsc --target esnext --module esnext --moduleResolution bundler \
+        --outDir "$d" "$src" >/dev/null 2>&1 || return 1
+      [[ -f "$d/$b.js" ]] || return 1
+      mv "$d/$b.js" "$dst"
+      ;;
+    suite-sed)
+      strip_suite_types_to_mjs "$src" "$dst"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+write_bench_gc_pressure_trace_source() {
+  local dst="$1"
+  cat >"$dst" <<'EOF'
+// Generated by gc_1090_evidence_packet.sh for required benchmark GC tracing.
+//
+// The regular bench_gc_pressure benchmark permits scalar replacement so it
+// keeps measuring the fast allocation path. GC evidence needs real escaping
+// nursery pressure, so this generated variant retains a bounded ring while
+// preserving the same semantic checksum line.
+
+const ITERATIONS = 500000;
+const PRESSURE_RETAIN = 8192;
+const pressureSink: any[] = new Array(PRESSURE_RETAIN);
+
+// Warmup
+for (let i = 0; i < 1000; i++) {
+  const obj = { x: i, y: i * 2, name: "item_" + i };
+  pressureSink[i % PRESSURE_RETAIN] = obj;
+}
+
+const start = Date.now();
+
+let checksum = 0;
+for (let i = 0; i < ITERATIONS; i++) {
+  const obj: any = { x: i, y: i * 2, name: "item_" + i };
+  const arr = [i, i + 1, i + 2];
+  if ((i & 3) === 0) {
+    pressureSink[(i >> 2) % PRESSURE_RETAIN] = { obj, arr };
+  }
+  checksum += obj.x + arr[0];
+}
+
+const elapsed = Date.now() - start;
+console.log("gc_pressure:" + elapsed);
+console.log("checksum:" + checksum);
+EOF
+}
+
+correctness_status() {
+  local report="$1"
+  python3 - "$report" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    print("missing")
+    raise SystemExit(0)
+status = data.get("status")
+print(status if isinstance(status, str) else "missing")
+PY
+}
+
+run_required_benchmark_gc_traces() {
+  local label="$1"
+  local worktree="$2"
+  local label_out="$3"
+  local perry_bin="$worktree/target/release/perry"
+  local verifier="$worktree/benchmarks/verify_benchmark_output.py"
+  local trace_root="$label_out/memory/traces/required-benchmark"
+  local evidence_root="$label_out/benchmark-gc-traces"
+  local log="$label_out/logs/benchmark-gc-traces.log"
+  local code=0
+  local index=0
+  local node_available=0
+  local node_strip="suite-sed"
+
+  if command -v node >/dev/null 2>&1; then
+    node_available=1
+  fi
+  if command -v esbuild >/dev/null 2>&1; then
+    node_strip="esbuild"
+  elif command -v npx >/dev/null 2>&1 && npx --no-install esbuild --version >/dev/null 2>&1; then
+    node_strip="npx-esbuild"
+  elif command -v tsc >/dev/null 2>&1; then
+    node_strip="tsc"
+  fi
+
+  mkdir -p \
+    "$trace_root" \
+    "$evidence_root/bin" \
+    "$evidence_root/reference" \
+    "$evidence_root/source" \
+    "$evidence_root/stdout" \
+    "$evidence_root/stderr" \
+    "$evidence_root/reference-stdout" \
+    "$evidence_root/reference-stderr" \
+    "$evidence_root/correctness" \
+    "$evidence_root/compile" \
+    "$label_out/logs"
+  : >"$log"
+
+  local row
+  for row in "${REQUIRED_BENCHMARK_TRACE_ROWS[@]}"; do
+    index=$((index + 1))
+    local src="$worktree/benchmarks/suite/$row.ts"
+    if [[ "$row" == "bench_gc_pressure" ]]; then
+      src="$evidence_root/source/bench_gc_pressure_trace.ts"
+      write_bench_gc_pressure_trace_source "$src"
+    fi
+    local bin="$evidence_root/bin/$row"
+    local compile_log="$evidence_root/compile/$row.log"
+    local stdout="$evidence_root/stdout/$row.out"
+    local stderr="$evidence_root/stderr/$row.trace.log"
+    local reference_input="$evidence_root/reference/$row.mjs"
+    local reference_stdout="$evidence_root/reference-stdout/$row.out"
+    local reference_stderr="$evidence_root/reference-stderr/$row.log"
+    local correctness_json="$evidence_root/correctness/$row.json"
+    local copied_trace
+    copied_trace=$(printf '%s/%03d_%s.log' "$trace_root" "$index" "$row")
+
+    {
+      echo "=== required benchmark GC trace: $row ==="
+      if [[ ! -f "$src" ]]; then
+        echo "missing source: $src"
+        code=1
+        continue
+      fi
+      if ! "$perry_bin" compile --no-cache "$src" -o "$bin" >"$compile_log" 2>&1; then
+        echo "compile failed: $compile_log"
+        code=1
+        continue
+      fi
+      if [[ "$node_available" -ne 1 ]]; then
+        echo "node is required for traced benchmark reference output"
+        code=1
+        continue
+      fi
+      if [[ ! -f "$verifier" ]]; then
+        echo "missing benchmark output verifier: $verifier"
+        code=1
+        continue
+      fi
+      NODE_TS_STRIP="$node_strip"
+      if ! precompile_node_reference "$src" "$reference_input"; then
+        echo "failed to prepare Node reference input: $src"
+        code=1
+        continue
+      fi
+      if ! env PERRY_GC_TRACE=1 node "$reference_input" >"$reference_stdout" 2>"$reference_stderr"; then
+        echo "Node reference run failed: $reference_stderr"
+        code=1
+        continue
+      fi
+      if ! env PERRY_GC_TRACE=1 PERRY_GC_MODE=latency "$bin" >"$stdout" 2>"$stderr"; then
+        echo "trace run failed: $stderr"
+        code=1
+        if [[ -f "$stderr" ]]; then
+          cp "$stderr" "$copied_trace" || true
+        fi
+        continue
+      fi
+      if ! trace_has_gc_cycle "$stderr"; then
+        echo "trace emitted no gc_cycle JSON events: $stderr"
+        code=1
+      fi
+      if ! cp "$stderr" "$copied_trace"; then
+        echo "failed to copy trace: $stderr -> $copied_trace"
+        code=1
+        continue
+      fi
+      if ! python3 "$verifier" \
+        --expected "$reference_stdout" \
+        --actual "$stdout" \
+        --reference node \
+        --json-out "$correctness_json"; then
+        echo "traced stdout does not match Node reference: $correctness_json"
+        code=1
+      fi
+      local status
+      status="$(correctness_status "$correctness_json")"
+      if [[ "$status" != "pass" ]]; then
+        echo "traced stdout correctness did not pass (status=$status): $correctness_json"
+        code=1
+      fi
+      echo "trace: $copied_trace"
+      echo "reference_stdout: $reference_stdout"
+      echo "correctness: $correctness_json"
+    } >>"$log" 2>&1
+  done
+
+  local status="pass"
+  if [[ "$code" -ne 0 ]]; then
+    status="fail"
+  fi
+  record_command "$label" "benchmark_gc_traces" "$status" "$code" "$log" ""
+  echo "=== $label: benchmark_gc_traces ==="
+  echo "  $status (exit=$code, log=$log)"
+}
+
 run_for_label() {
   local label="$1"
   local worktree="$2"
@@ -264,6 +623,7 @@ run_for_label() {
   if [[ "$(command_status "$label" build)" == "fail" ]]; then
     record_command "$label" "memory_stability" "skipped" 0 "" "build failed"
     record_command "$label" "benchmarks" "skipped" 0 "" "build failed"
+    record_command "$label" "benchmark_gc_traces" "skipped" 0 "" "build failed"
     return
   fi
 
@@ -272,6 +632,8 @@ run_for_label() {
 
   run_logged "$label" "benchmarks" "$worktree" "$label_out/logs/benchmarks-full-runs${RUNS}.log" \
     env "PERRY_BIN=$perry_bin" benchmarks/compare.sh --full --runs "$RUNS" --json-out "$label_out/benchmarks/full.json"
+
+  run_required_benchmark_gc_traces "$label" "$worktree" "$label_out"
 
   run_perf_comprehensive "$label" "$worktree" "$label_out"
 }

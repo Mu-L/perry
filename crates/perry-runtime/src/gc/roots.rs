@@ -14,9 +14,10 @@ pub use scanner_shims::{
     async_context_mutable_root_scanner, async_context_root_scanner,
     async_hooks_mutable_root_scanner, async_hooks_root_scanner, exception_mutable_root_scanner,
     exception_root_scanner, intern_table_mutable_root_scanner, intern_table_root_scanner,
-    json_parse_mutable_root_scanner, json_parse_root_scanner, overflow_fields_mutable_root_scanner,
-    overflow_fields_root_scanner, promise_mutable_root_scanner, promise_root_scanner,
-    shadow_stack_root_scanner, shape_cache_mutable_root_scanner, shape_cache_root_scanner,
+    json_parse_mutable_root_scanner, json_parse_root_scanner, json_stringify_mutable_root_scanner,
+    overflow_fields_mutable_root_scanner, overflow_fields_root_scanner,
+    promise_mutable_root_scanner, promise_root_scanner, shadow_stack_root_scanner,
+    shape_cache_mutable_root_scanner, shape_cache_root_scanner,
     small_int_cache_mutable_root_scanner, small_int_cache_root_scanner, timer_mutable_root_scanner,
     timer_root_scanner, transition_cache_mutable_root_scanner, transition_cache_root_scanner,
 };
@@ -274,8 +275,11 @@ pub(super) fn conservative_stack_scan_decision() -> ConservativeStackScanDecisio
 /// Register a root scanner function.
 /// Each scanner is called during the mark phase to discover roots.
 /// This legacy API exposes copied values only. It remains supported for
-/// fallback/full GC, where discovered targets can be pinned, but registering
-/// any copy-only scanner makes low-pause copied-minor collection ineligible.
+/// fallback/full GC, where discovered targets can be pinned. Low-pause
+/// copied-minor collection remains eligible while registered scanners emit no
+/// roots, non-moving old/malloc roots, or malformed non-roots. Emitted moving
+/// young roots still force fallback because there is no mutable scanner slot to
+/// rewrite after evacuation.
 pub fn gc_register_root_scanner(scanner: fn(&mut dyn FnMut(f64))) {
     ROOT_SCANNERS.with(|scanners| {
         scanners.borrow_mut().push(scanner);
@@ -337,6 +341,22 @@ pub(super) fn gc_register_mutable_root_scanner_with_source(
             budgeted_state_factory: None,
         });
     });
+}
+
+pub(super) fn gc_register_budgeted_once_mutable_root_scanner_with_source(
+    scanner: MutableRootScanner,
+    source: MutableRootScannerSource,
+) {
+    // Historical compatibility name: one-shot scanners have no resumable
+    // cursor, so ordinary budgeted GC treats them as synchronous-only.
+    gc_register_mutable_root_scanner_with_source(scanner, source);
+}
+
+pub(super) fn gc_register_budgeted_once_mutable_root_scanner(scanner: MutableRootScanner) {
+    gc_register_budgeted_once_mutable_root_scanner_with_source(
+        scanner,
+        MutableRootScannerSource::RuntimeMutableScanner,
+    );
 }
 
 pub(super) fn gc_register_budgeted_mutable_root_scanner_with_source(
@@ -1111,7 +1131,7 @@ impl<'a> RuntimeRootVisitor<'a> {
     }
 
     #[inline]
-    pub(super) fn visit_metadata_raw_addr(&mut self, addr: usize) -> Option<usize> {
+    pub(crate) fn visit_metadata_raw_addr(&mut self, addr: usize) -> Option<usize> {
         if addr == 0 {
             return None;
         }
@@ -1720,10 +1740,17 @@ pub(super) fn nanboxed_root_header(
     valid_ptrs: &ValidPointerSet,
 ) -> Option<*mut GcHeader> {
     let tag = value_bits & TAG_MASK;
-    if tag != POINTER_TAG && tag != STRING_TAG && tag != BIGINT_TAG {
-        return None;
-    }
-    let ptr_val = (value_bits & POINTER_MASK) as usize;
+    let ptr_val = if tag == POINTER_TAG || tag == STRING_TAG || tag == BIGINT_TAG {
+        (value_bits & POINTER_MASK) as usize
+    } else {
+        if tag >= 0x7FF8_0000_0000_0000
+            || !(0x1000..=POINTER_MASK).contains(&value_bits)
+            || value_bits & 0x7 != 0
+        {
+            return None;
+        }
+        value_bits as usize
+    };
     if ptr_val == 0 || !valid_ptrs.maybe_contains(ptr_val) || !valid_ptrs.contains(&ptr_val) {
         return None;
     }
@@ -1818,6 +1845,39 @@ pub(super) extern "C" fn perry_ffi_visit_mutable_root_slot(
 
 pub(super) fn visit_ffi_mutable_registered_roots(visitor: &mut RuntimeRootVisitor<'_>) {
     visit_ffi_mutable_registered_roots_with_sources(visitor, None);
+}
+
+pub(super) fn visit_mutable_registered_roots(visitor: &mut RuntimeRootVisitor<'_>) {
+    let scanners: Vec<MutableRootScannerEntry> = MUTABLE_ROOT_SCANNERS.with(|s| s.borrow().clone());
+    for entry in scanners {
+        (entry.scanner)(visitor);
+    }
+    visit_ffi_mutable_registered_roots(visitor);
+}
+
+struct CopyOnlyRootBitsVisitContext<'a> {
+    visit: &'a mut dyn FnMut(u64),
+}
+
+extern "C" fn perry_ffi_visit_copy_only_root_bits(value: f64, ctx: *mut c_void) {
+    if ctx.is_null() {
+        return;
+    }
+    let ctx = unsafe { &mut *(ctx as *mut CopyOnlyRootBitsVisitContext<'_>) };
+    (ctx.visit)(value.to_bits());
+}
+
+pub(super) fn visit_copy_only_registered_root_bits(mut visit: impl FnMut(u64)) {
+    let scanners: Vec<fn(&mut dyn FnMut(f64))> = ROOT_SCANNERS.with(|s| s.borrow().clone());
+    let ffi_scanners: Vec<PerryFfiRootScanner> = FFI_ROOT_SCANNERS.with(|s| s.borrow().clone());
+    for scanner in scanners {
+        scanner(&mut |value: f64| visit(value.to_bits()));
+    }
+    let mut ctx = CopyOnlyRootBitsVisitContext { visit: &mut visit };
+    let ctx = &mut ctx as *mut CopyOnlyRootBitsVisitContext<'_> as *mut c_void;
+    for scanner in ffi_scanners {
+        scanner(perry_ffi_visit_copy_only_root_bits, ctx);
+    }
 }
 
 pub(super) fn visit_ffi_mutable_registered_roots_with_sources(

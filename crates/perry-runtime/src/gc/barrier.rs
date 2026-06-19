@@ -3,30 +3,45 @@ use super::*;
 /// Snapshot the remembered dirty ranges before the collection clears them.
 pub(super) struct RememberedDirtySnapshot {
     pub(super) dirty_old_pages: crate::fast_hash::PtrHashSet<usize>,
+    pub(super) dirty_old_cards: crate::fast_hash::PtrHashSet<usize>,
     pub(super) external_dirty_entries: Vec<(usize, usize)>,
+    pub(super) external_dirty_card_entries: Vec<(usize, usize)>,
     pub(super) dirty_pages: crate::fast_hash::PtrHashSet<usize>,
+    pub(super) dirty_cards: crate::fast_hash::PtrHashSet<usize>,
     pub(super) fallback_headers: Vec<usize>,
 }
 
 pub(super) fn remembered_dirty_snapshot() -> RememberedDirtySnapshot {
-    let dirty_old_pages: crate::fast_hash::PtrHashSet<usize> =
-        DIRTY_OLD_PAGES.with(|s| s.borrow().iter().copied().collect());
+    let (dirty_old_pages, dirty_old_cards) = dirty_old_page_card_snapshot();
     let external_dirty_entries: Vec<(usize, usize)> = EXTERNAL_DIRTY_SLOT_PAGES.with(|s| {
         s.borrow()
             .iter()
             .flat_map(|(&page, headers)| headers.iter().copied().map(move |header| (page, header)))
             .collect()
     });
+    let external_dirty_card_entries: Vec<(usize, usize)> = EXTERNAL_DIRTY_SLOT_CARDS.with(|s| {
+        s.borrow()
+            .iter()
+            .flat_map(|(&card, headers)| headers.iter().copied().map(move |header| (card, header)))
+            .collect()
+    });
     let mut dirty_pages = dirty_old_pages.clone();
     for (page, _) in &external_dirty_entries {
         dirty_pages.insert(*page);
+    }
+    let mut dirty_cards = dirty_old_cards.clone();
+    for (card, _) in &external_dirty_card_entries {
+        dirty_cards.insert(*card);
     }
     let fallback_headers = REMEMBERED_SET.with(|s| s.borrow().iter().copied().collect());
 
     RememberedDirtySnapshot {
         dirty_old_pages,
+        dirty_old_cards,
         external_dirty_entries,
+        external_dirty_card_entries,
         dirty_pages,
+        dirty_cards,
         fallback_headers,
     }
 }
@@ -60,6 +75,45 @@ enum DirtySlotWork {
     Range(DirtySlotRangeWork),
 }
 
+struct DirtySlotTelemetryTracker {
+    cards_considered: crate::fast_hash::PtrHashSet<usize>,
+    pages_considered: crate::fast_hash::PtrHashSet<usize>,
+}
+
+impl DirtySlotTelemetryTracker {
+    fn new() -> Self {
+        Self {
+            cards_considered: crate::fast_hash::new_ptr_hash_set(),
+            pages_considered: crate::fast_hash::new_ptr_hash_set(),
+        }
+    }
+
+    #[inline]
+    fn record_card(&mut self, card: usize, stats: &mut RememberedSetTraceStats) {
+        if self.cards_considered.insert(card) {
+            stats.dirty_cards_considered += 1;
+        }
+        if self.pages_considered.insert(remembered_page_for_card(card)) {
+            stats.dirty_slot_pages_considered += 1;
+        }
+    }
+
+    #[inline]
+    fn record_slot_if_dirty(
+        &mut self,
+        slot_addr: usize,
+        dirty_cards: &crate::fast_hash::PtrHashSet<usize>,
+        stats: &mut RememberedSetTraceStats,
+    ) -> bool {
+        let card = remembered_card_for_addr(slot_addr);
+        if !dirty_cards.contains(&card) {
+            return false;
+        }
+        self.record_card(card, stats);
+        true
+    }
+}
+
 struct DirtyHeaderSlotScan {
     header: *mut GcHeader,
     user_ptr: usize,
@@ -71,7 +125,7 @@ struct DirtyHeaderSlotScan {
 impl DirtyHeaderSlotScan {
     unsafe fn new(
         header: *mut GcHeader,
-        dirty_pages: &crate::fast_hash::PtrHashSet<usize>,
+        dirty_cards: &crate::fast_hash::PtrHashSet<usize>,
         valid_ptrs: &ValidPointerSet,
         stats: &mut RememberedSetTraceStats,
     ) -> Option<Self> {
@@ -89,9 +143,10 @@ impl DirtyHeaderSlotScan {
         stats.dirty_objects_scanned += 1;
 
         let mut work = Vec::new();
+        let mut telemetry = DirtySlotTelemetryTracker::new();
         visit_gc_rewrite_slot_descriptors(header, |descriptor| match descriptor {
             GcMutableSlotDescriptor::Slot(slot) => {
-                if dirty_pages_contains_addr(dirty_pages, slot.slot as usize) {
+                if telemetry.record_slot_if_dirty(slot.slot as usize, dirty_cards, stats) {
                     work.push(DirtySlotWork::Single {
                         slot: slot.slot,
                         layout_kind: slot.layout_kind,
@@ -99,7 +154,8 @@ impl DirtyHeaderSlotScan {
                 }
             }
             GcMutableSlotDescriptor::Range { range, layout_kind } => {
-                for (start, end) in dirty_slot_ranges_for(range, dirty_pages, stats) {
+                for (start, end) in dirty_slot_ranges_for(range, dirty_cards, stats, &mut telemetry)
+                {
                     work.push(DirtySlotWork::Range(DirtySlotRangeWork {
                         slots: range.slots(),
                         cursor: start,
@@ -130,15 +186,13 @@ impl DirtyHeaderSlotScan {
         while *remaining > 0 && self.cursor < self.work.len() {
             match &mut self.work[self.cursor] {
                 DirtySlotWork::Single { slot, layout_kind } => unsafe {
-                    if !crate::weakref::is_weak_target_trace_slot(self.header, *slot) {
-                        process_dirty_slot_work(
-                            *slot,
-                            *layout_kind,
-                            stats,
-                            visit_slot,
-                            &mut self.changed,
-                        );
-                    }
+                    process_dirty_slot_work(
+                        *slot,
+                        *layout_kind,
+                        stats,
+                        visit_slot,
+                        &mut self.changed,
+                    );
                     self.cursor += 1;
                     *remaining -= 1;
                 },
@@ -149,15 +203,13 @@ impl DirtyHeaderSlotScan {
                     }
                     while *remaining > 0 && range.cursor < range.end {
                         let slot = range.slots.add(range.cursor);
-                        if !crate::weakref::is_weak_target_trace_slot(self.header, slot) {
-                            process_dirty_slot_work(
-                                slot,
-                                range.layout_kind,
-                                stats,
-                                visit_slot,
-                                &mut self.changed,
-                            );
-                        }
+                        process_dirty_slot_work(
+                            slot,
+                            range.layout_kind,
+                            stats,
+                            visit_slot,
+                            &mut self.changed,
+                        );
                         range.cursor += 1;
                         *remaining -= 1;
                     }
@@ -206,15 +258,13 @@ unsafe fn process_dirty_slot_work(
 
 fn dirty_slot_ranges_for(
     range: HeapSlotRange,
-    dirty_pages: &crate::fast_hash::PtrHashSet<usize>,
+    dirty_cards: &crate::fast_hash::PtrHashSet<usize>,
     stats: &mut RememberedSetTraceStats,
+    telemetry: &mut DirtySlotTelemetryTracker,
 ) -> Vec<(usize, usize)> {
-    if range.is_empty() || dirty_pages.is_empty() {
+    if range.is_empty() || dirty_cards.is_empty() {
         return Vec::new();
     }
-
-    const PAGE_SHIFT: usize = 12;
-    const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
 
     let slots = range.slots() as usize;
     let slot_count = range.slot_count();
@@ -226,15 +276,15 @@ fn dirty_slot_ranges_for(
     };
 
     let mut ranges = Vec::new();
-    for &page in dirty_pages {
-        let page_start = page << PAGE_SHIFT;
-        let page_end = page_start + PAGE_SIZE;
-        let start = slots.max(page_start);
-        let end = slots_end.min(page_end);
+    for &card in dirty_cards {
+        let card_start = card << CARD_SHIFT;
+        let card_end = card_start + CARD_SIZE;
+        let start = slots.max(card_start);
+        let end = slots_end.min(card_end);
         if start >= end {
             continue;
         }
-        stats.dirty_slot_pages_considered += 1;
+        telemetry.record_card(card, stats);
         let first = (start - slots) / std::mem::size_of::<u64>();
         let last = (end - slots).div_ceil(std::mem::size_of::<u64>());
         if first < last {
@@ -259,6 +309,57 @@ fn dirty_slot_ranges_for(
     merged
 }
 
+const PAGE_SHIFT: usize = 12;
+const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
+pub(super) const CARD_SHIFT: usize = 9;
+pub(super) const CARD_SIZE: usize = 1 << CARD_SHIFT;
+const CARDS_PER_PAGE: usize = PAGE_SIZE / CARD_SIZE;
+const ALL_PAGE_CARDS_MASK: u8 = u8::MAX;
+
+#[inline]
+pub(super) fn remembered_card_for_addr(addr: usize) -> usize {
+    addr >> CARD_SHIFT
+}
+
+#[inline]
+pub(super) fn remembered_page_for_card(card: usize) -> usize {
+    card >> (PAGE_SHIFT - CARD_SHIFT)
+}
+
+#[inline]
+fn first_card_for_page(page: usize) -> usize {
+    page << (PAGE_SHIFT - CARD_SHIFT)
+}
+
+#[inline]
+fn card_bit_on_page(card: usize) -> u8 {
+    1u8 << (card & (CARDS_PER_PAGE - 1))
+}
+
+fn dirty_old_page_card_snapshot() -> (
+    crate::fast_hash::PtrHashSet<usize>,
+    crate::fast_hash::PtrHashSet<usize>,
+) {
+    DIRTY_OLD_PAGE_CARDS.with(|s| {
+        let page_cards = s.borrow();
+        let mut pages = crate::fast_hash::new_ptr_hash_set();
+        let mut cards = crate::fast_hash::new_ptr_hash_set();
+        for (&page, &mask) in page_cards.iter() {
+            if mask == 0 {
+                continue;
+            }
+            pages.insert(page);
+            let first_card = first_card_for_page(page);
+            for card_index in 0..CARDS_PER_PAGE {
+                if mask & (1u8 << card_index) != 0 {
+                    cards.insert(first_card + card_index);
+                }
+            }
+        }
+        (pages, cards)
+    })
+}
+
 pub(super) struct RememberedSetRootMarkState {
     snapshot: RememberedDirtySnapshot,
     stats: RememberedSetTraceStats,
@@ -274,11 +375,13 @@ impl RememberedSetRootMarkState {
     pub(super) fn new() -> Self {
         let snapshot = remembered_dirty_snapshot();
         let stats = RememberedSetTraceStats {
-            entries_scanned: snapshot.dirty_old_pages.len()
-                + snapshot.external_dirty_entries.len()
+            entries_scanned: snapshot.dirty_old_cards.len()
+                + snapshot.external_dirty_card_entries.len()
                 + snapshot.fallback_headers.len(),
             dirty_pages_before: snapshot.dirty_pages.len(),
             dirty_pages_scanned: snapshot.dirty_pages.len(),
+            dirty_cards_before: snapshot.dirty_cards.len(),
+            dirty_cards_scanned: snapshot.dirty_cards.len(),
             ..RememberedSetTraceStats::default()
         };
         let old_page_cursor = (!snapshot.dirty_old_pages.is_empty())
@@ -325,7 +428,7 @@ impl RememberedSetRootMarkState {
                 self.current_header = unsafe {
                     DirtyHeaderSlotScan::new(
                         header_addr as *mut GcHeader,
-                        &self.snapshot.dirty_pages,
+                        &self.snapshot.dirty_cards,
                         valid_ptrs,
                         &mut self.stats,
                     )
@@ -361,6 +464,7 @@ impl RememberedSetRootMarkState {
             && self.fallback_cursor >= self.snapshot.fallback_headers.len()
         {
             self.stats.dirty_pages_after = remembered_dirty_page_count();
+            self.stats.dirty_cards_after = remembered_dirty_card_count();
             self.finalized = true;
         }
 
@@ -394,7 +498,10 @@ pub(super) fn scan_remembered_dirty_slot_ranges(
     stats: &mut RememberedSetTraceStats,
     visit_slot: &mut dyn FnMut(*mut u64, &mut RememberedSetTraceStats),
 ) {
-    if snapshot.dirty_old_pages.is_empty() && snapshot.external_dirty_entries.is_empty() {
+    if snapshot.dirty_old_pages.is_empty()
+        && snapshot.external_dirty_entries.is_empty()
+        && snapshot.dirty_cards.is_empty()
+    {
         return;
     }
 
@@ -409,7 +516,7 @@ pub(super) fn scan_remembered_dirty_slot_ranges(
                 }
                 scan_dirty_header_once(
                     header,
-                    &snapshot.dirty_pages,
+                    &snapshot.dirty_cards,
                     valid_ptrs,
                     stats,
                     visit_slot,
@@ -424,7 +531,7 @@ pub(super) fn scan_remembered_dirty_slot_ranges(
         unsafe {
             scan_dirty_header_once(
                 header_addr as *mut GcHeader,
-                &snapshot.dirty_pages,
+                &snapshot.dirty_cards,
                 valid_ptrs,
                 stats,
                 visit_slot,
@@ -435,7 +542,7 @@ pub(super) fn scan_remembered_dirty_slot_ranges(
 
 pub(super) unsafe fn scan_dirty_header_once(
     header: *mut GcHeader,
-    dirty_pages: &crate::fast_hash::PtrHashSet<usize>,
+    dirty_cards: &crate::fast_hash::PtrHashSet<usize>,
     valid_ptrs: &ValidPointerSet,
     stats: &mut RememberedSetTraceStats,
     visit_slot: &mut dyn FnMut(*mut u64, &mut RememberedSetTraceStats),
@@ -454,24 +561,25 @@ pub(super) unsafe fn scan_dirty_header_once(
     stats.old_objects_considered += 1;
     stats.valid_roots += 1;
     stats.dirty_objects_scanned += 1;
-    scan_dirty_object_slots(header, dirty_pages, stats, visit_slot);
+    scan_dirty_object_slots(header, dirty_cards, stats, visit_slot);
 }
 
 #[inline]
-pub(super) fn dirty_pages_contains_addr(
-    dirty_pages: &crate::fast_hash::PtrHashSet<usize>,
+pub(super) fn dirty_cards_contains_addr(
+    dirty_cards: &crate::fast_hash::PtrHashSet<usize>,
     addr: usize,
 ) -> bool {
-    dirty_pages.contains(&crate::arena::generation_page_for_addr(addr))
+    dirty_cards.contains(&remembered_card_for_addr(addr))
 }
 
 pub(super) unsafe fn scan_dirty_slot(
     slot: *mut u64,
-    dirty_pages: &crate::fast_hash::PtrHashSet<usize>,
+    dirty_cards: &crate::fast_hash::PtrHashSet<usize>,
     stats: &mut RememberedSetTraceStats,
     visit_slot: &mut dyn FnMut(*mut u64, &mut RememberedSetTraceStats),
 ) {
-    if !dirty_pages_contains_addr(dirty_pages, slot as usize) {
+    let mut telemetry = DirtySlotTelemetryTracker::new();
+    if !telemetry.record_slot_if_dirty(slot as usize, dirty_cards, stats) {
         return;
     }
     stats.dirty_slots_scanned += 1;
@@ -482,11 +590,12 @@ pub(super) unsafe fn scan_dirty_slot(
 pub(super) unsafe fn scan_dirty_slot_with_layout(
     slot: *mut u64,
     layout_kind: HeapChildSlotReadKind,
-    dirty_pages: &crate::fast_hash::PtrHashSet<usize>,
+    dirty_cards: &crate::fast_hash::PtrHashSet<usize>,
     stats: &mut RememberedSetTraceStats,
     visit_slot: &mut dyn FnMut(*mut u64, &mut RememberedSetTraceStats),
 ) {
-    if !dirty_pages_contains_addr(dirty_pages, slot as usize) {
+    let mut telemetry = DirtySlotTelemetryTracker::new();
+    if !telemetry.record_slot_if_dirty(slot as usize, dirty_cards, stats) {
         return;
     }
     record_layout_child_slot_read(layout_kind);
@@ -498,57 +607,20 @@ pub(super) unsafe fn scan_dirty_slot_with_layout(
 pub(super) unsafe fn scan_dirty_slot_range(
     slots: *mut u64,
     slot_count: usize,
-    dirty_pages: &crate::fast_hash::PtrHashSet<usize>,
+    dirty_cards: &crate::fast_hash::PtrHashSet<usize>,
     stats: &mut RememberedSetTraceStats,
     visit_slot: &mut dyn FnMut(*mut u64, &mut RememberedSetTraceStats),
 ) {
-    if slots.is_null() || slot_count == 0 || dirty_pages.is_empty() {
+    if slots.is_null() || slot_count == 0 || dirty_cards.is_empty() {
         return;
     }
-    const PAGE_SHIFT: usize = 12;
-    const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
-
-    let slots_start = slots as usize;
-    let Some(slots_bytes) = slot_count.checked_mul(std::mem::size_of::<u64>()) else {
-        return;
-    };
-    let Some(slots_end) = slots_start.checked_add(slots_bytes) else {
-        return;
-    };
-    let mut ranges = Vec::<(usize, usize)>::new();
-
-    for &page in dirty_pages {
-        let page_start = page << PAGE_SHIFT;
-        let page_end = page_start + PAGE_SIZE;
-        if page_end <= slots_start || page_start >= slots_end {
-            continue;
-        }
-        stats.dirty_slot_pages_considered += 1;
-        let start_addr = page_start.max(slots_start);
-        let end_addr = page_end.min(slots_end);
-        let start_idx = (start_addr - slots_start + 7) / 8;
-        let end_idx = (end_addr - slots_start + 7) / 8;
-        if start_idx < end_idx && start_idx < slot_count {
-            ranges.push((start_idx, end_idx.min(slot_count)));
-        }
-    }
-
-    if ranges.is_empty() {
-        return;
-    }
-    ranges.sort_unstable();
-    let mut merged = Vec::<(usize, usize)>::with_capacity(ranges.len());
-    for (start, end) in ranges {
-        if let Some((_, last_end)) = merged.last_mut() {
-            if start <= *last_end {
-                *last_end = (*last_end).max(end);
-                continue;
-            }
-        }
-        merged.push((start, end));
-    }
-
-    for (start, end) in merged {
+    let mut telemetry = DirtySlotTelemetryTracker::new();
+    for (start, end) in dirty_slot_ranges_for(
+        HeapSlotRange::new(slots, slot_count),
+        dirty_cards,
+        stats,
+        &mut telemetry,
+    ) {
         stats.dirty_slot_ranges_scanned += 1;
         for i in start..end {
             stats.dirty_slots_scanned += 1;
@@ -562,56 +634,16 @@ pub(super) unsafe fn scan_dirty_slot_range(
 pub(super) unsafe fn scan_dirty_slot_range_with_layout(
     range: HeapSlotRange,
     layout_kind: HeapChildSlotReadKind,
-    dirty_pages: &crate::fast_hash::PtrHashSet<usize>,
+    dirty_cards: &crate::fast_hash::PtrHashSet<usize>,
     stats: &mut RememberedSetTraceStats,
     visit_slot: &mut dyn FnMut(*mut u64, &mut RememberedSetTraceStats),
 ) {
-    if range.slots().is_null() || range.slot_count() == 0 || dirty_pages.is_empty() {
+    if range.slots().is_null() || range.slot_count() == 0 || dirty_cards.is_empty() {
         return;
     }
-    const PAGE_SHIFT: usize = 12;
-    const PAGE_SIZE: usize = 1 << PAGE_SHIFT;
-
     let slots = range.slots();
-    let slot_count = range.slot_count();
-    let slots_start = slots as usize;
-    let Some(slots_bytes) = slot_count.checked_mul(std::mem::size_of::<u64>()) else {
-        return;
-    };
-    let Some(slots_end) = slots_start.checked_add(slots_bytes) else {
-        return;
-    };
-    let mut ranges = Vec::<(usize, usize)>::new();
-    for &page in dirty_pages {
-        let page_start = page << PAGE_SHIFT;
-        let page_end = page_start + PAGE_SIZE;
-        let start = slots_start.max(page_start);
-        let end = slots_end.min(page_end);
-        if start >= end {
-            continue;
-        }
-        stats.dirty_slot_pages_considered += 1;
-        let first = (start - slots_start) / std::mem::size_of::<u64>();
-        let last = (end - slots_start).div_ceil(std::mem::size_of::<u64>());
-        ranges.push((first.min(slot_count), last.min(slot_count)));
-    }
-
-    if ranges.is_empty() {
-        return;
-    }
-    ranges.sort_unstable();
-    let mut merged = Vec::<(usize, usize)>::with_capacity(ranges.len());
-    for (start, end) in ranges {
-        if let Some((_, last_end)) = merged.last_mut() {
-            if start <= *last_end {
-                *last_end = (*last_end).max(end);
-                continue;
-            }
-        }
-        merged.push((start, end));
-    }
-
-    for (start, end) in merged {
+    let mut telemetry = DirtySlotTelemetryTracker::new();
+    for (start, end) in dirty_slot_ranges_for(range, dirty_cards, stats, &mut telemetry) {
         stats.dirty_slot_ranges_scanned += 1;
         for i in start..end {
             stats.dirty_slots_scanned += 1;
@@ -625,42 +657,41 @@ pub(super) unsafe fn scan_dirty_slot_range_with_layout(
 
 pub(super) unsafe fn scan_dirty_object_slots(
     header: *mut GcHeader,
-    dirty_pages: &crate::fast_hash::PtrHashSet<usize>,
+    dirty_cards: &crate::fast_hash::PtrHashSet<usize>,
     stats: &mut RememberedSetTraceStats,
     visit_slot: &mut dyn FnMut(*mut u64, &mut RememberedSetTraceStats),
 ) {
+    let mut telemetry = DirtySlotTelemetryTracker::new();
+    let mut changed = false;
     visit_gc_rewrite_slot_descriptors(header, |descriptor| unsafe {
         match descriptor {
             GcMutableSlotDescriptor::Slot(slot) => {
-                if crate::weakref::is_weak_target_trace_slot(header, slot.slot) {
-                    return;
-                }
-                if let Some(layout_kind) = slot.layout_kind {
-                    scan_dirty_slot_with_layout(
+                if telemetry.record_slot_if_dirty(slot.slot as usize, dirty_cards, stats) {
+                    process_dirty_slot_work(
                         slot.slot,
-                        layout_kind,
-                        dirty_pages,
+                        slot.layout_kind,
                         stats,
                         visit_slot,
+                        &mut changed,
                     );
-                } else {
-                    scan_dirty_slot(slot.slot, dirty_pages, stats, visit_slot);
                 }
             }
             GcMutableSlotDescriptor::Range { range, layout_kind } => {
-                for (start, end) in dirty_slot_ranges_for(range, dirty_pages, stats) {
+                if range.slots().is_null() || range.slot_count() == 0 || dirty_cards.is_empty() {
+                    return;
+                }
+                let slots = range.slots();
+                for (start, end) in dirty_slot_ranges_for(range, dirty_cards, stats, &mut telemetry)
+                {
                     stats.dirty_slot_ranges_scanned += 1;
                     for i in start..end {
-                        let slot = range.slot(i);
-                        if crate::weakref::is_weak_target_trace_slot(header, slot) {
-                            continue;
-                        }
-                        if let Some(layout_kind) = layout_kind {
-                            record_layout_child_slot_read(layout_kind);
-                        }
-                        stats.dirty_slots_scanned += 1;
-                        crate::arena::old_page_account_dirty_slot(slot as usize);
-                        visit_slot(slot, stats);
+                        process_dirty_slot_work(
+                            slots.add(i),
+                            layout_kind,
+                            stats,
+                            visit_slot,
+                            &mut changed,
+                        );
                     }
                 }
             }
@@ -697,12 +728,14 @@ thread_local! {
     pub(super) static INCREMENTAL_MARK_BARRIER_VALID_PTRS: Cell<*const ValidPointerSet> =
         const { Cell::new(std::ptr::null()) };
 
-    /// Dirty old-generation pages that have received a YOUNG-gen
-    /// pointer since the last collection. This is Perry's compact
-    /// modbuf: barriers log bounded page regions, and minor GC scans
-    /// old objects intersecting those pages.
-    pub(crate) static DIRTY_OLD_PAGES: std::cell::RefCell<crate::fast_hash::PtrHashSet<usize>> =
-        std::cell::RefCell::new(crate::fast_hash::new_ptr_hash_set());
+    /// Dirty cards inside old-generation pages. The key is the 4 KiB old-page
+    /// index and the value is an 8-bit mask for its 512-byte cards.
+    ///
+    /// This keeps the normal old→young barrier path to one pointer-keyed map
+    /// lookup plus a byte update. Collection snapshots still expand this into
+    /// page/card sets for the existing scanner APIs.
+    pub(crate) static DIRTY_OLD_PAGE_CARDS: std::cell::RefCell<crate::fast_hash::PtrHashMap<usize, u8>> =
+        std::cell::RefCell::new(crate::fast_hash::new_ptr_hash_map());
 
     /// Dirty non-arena slot pages owned by old-generation parents.
     /// `Map.entries` lives in a malloc buffer behind an old MapHeader,
@@ -711,8 +744,13 @@ thread_local! {
     pub(crate) static EXTERNAL_DIRTY_SLOT_PAGES: std::cell::RefCell<crate::fast_hash::PtrHashMap<usize, Vec<usize>>> =
         std::cell::RefCell::new(crate::fast_hash::new_ptr_hash_map());
 
+    /// Dirty 512-byte external cards keyed by malloc/side-buffer card and
+    /// retaining the old owner headers that need their external slots scanned.
+    pub(crate) static EXTERNAL_DIRTY_SLOT_CARDS: std::cell::RefCell<crate::fast_hash::PtrHashMap<usize, Vec<usize>>> =
+        std::cell::RefCell::new(crate::fast_hash::new_ptr_hash_map());
+
     /// Test-only object-level fallback remembered set. Production
-    /// barriers use `DIRTY_OLD_PAGES`; tests keep this path available
+    /// barriers use `DIRTY_OLD_PAGE_CARDS`; tests keep this path available
     /// for parity checks and rollback coverage without a user-facing
     /// runtime mode.
     pub(crate) static REMEMBERED_SET: std::cell::RefCell<std::collections::HashSet<usize>> =
@@ -735,6 +773,15 @@ thread_local! {
 
     pub(super) static WRITE_BARRIER_TRACE_COUNTERS: Cell<BarrierTraceCounters> =
         const { Cell::new(BarrierTraceCounters::zero()) };
+
+    /// Last old-page/card dirtied by this thread's generational barrier.
+    ///
+    /// Codegen emits a barrier after every heap store, and tight loops commonly
+    /// rewrite adjacent slots on the same old card. Keep a tiny TLS cache so
+    /// duplicate stores can avoid repeating hash-set lookups until the next
+    /// remembered-set snapshot.
+    static LAST_DIRTY_OLD_PAGE: Cell<usize> = const { Cell::new(usize::MAX) };
+    static LAST_DIRTY_OLD_CARD: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
 pub(super) static GENERATED_WRITE_BARRIERS_EMITTED: AtomicUsize = AtomicUsize::new(0);
@@ -746,7 +793,7 @@ pub(super) fn incremental_mark_barrier_enable(valid_ptrs: &ValidPointerSet) {
 }
 
 pub(super) fn incremental_mark_barrier_disable() {
-    INCREMENTAL_MARK_BARRIER_VALID_PTRS.with(|cell| {
+    let _ = INCREMENTAL_MARK_BARRIER_VALID_PTRS.try_with(|cell| {
         cell.set(std::ptr::null());
     });
 }
@@ -787,7 +834,7 @@ pub(super) unsafe fn plausible_arena_user_ptr_header(
     let size = (*header).size as usize;
     if gc_type_info(obj_type).is_none()
         || size < GC_HEADER_SIZE
-        || size as u64 > (1u64 << 34)
+        || size > (1usize << 34)
         || (*header).gc_flags & GC_FLAG_ARENA == 0
         || (*header).gc_flags & GC_FLAG_FORWARDED != 0
     {
@@ -923,6 +970,9 @@ pub(super) fn bump_write_barrier_trace_counter(counter: BarrierTraceCounter) {
             BarrierTraceCounter::NewInserts => counters.new_inserts += 1,
             BarrierTraceCounter::DirtyPageMarkAttempts => counters.dirty_page_mark_attempts += 1,
             BarrierTraceCounter::NewDirtyPages => counters.new_dirty_pages += 1,
+            BarrierTraceCounter::DirtyCardMarkAttempts => counters.dirty_card_mark_attempts += 1,
+            BarrierTraceCounter::NewDirtyCards => counters.new_dirty_cards += 1,
+            BarrierTraceCounter::SameCardFastPathHits => counters.same_card_fast_path_hits += 1,
             BarrierTraceCounter::ConservativeParentSpanMarks => {
                 counters.conservative_parent_span_marks += 1;
             }
@@ -937,6 +987,12 @@ pub(super) fn take_write_barrier_trace_counters() -> BarrierTraceCounters {
         cell.set(BarrierTraceCounters::zero());
         counters
     })
+}
+
+#[inline]
+fn reset_remembered_fast_path_cache() {
+    LAST_DIRTY_OLD_PAGE.with(|page| page.set(usize::MAX));
+    LAST_DIRTY_OLD_CARD.with(|card| card.set(usize::MAX));
 }
 
 /// Gen-GC Phase C4b: walk the current arena+malloc marked set and
@@ -1048,7 +1104,7 @@ pub(super) fn malloc_gc_parent_addr(parent_addr: usize) -> bool {
         let size = (*header).size as usize;
         gc_type_info(obj_type).is_some()
             && size >= GC_HEADER_SIZE
-            && size as u64 <= (1u64 << 34)
+            && size <= (1usize << 34)
             && (*header).gc_flags & GC_FLAG_ARENA == 0
             && (*header).gc_flags & GC_FLAG_FORWARDED == 0
     }
@@ -1092,7 +1148,7 @@ pub(super) fn remember_old_to_young_slot(parent_addr: usize, slot_addr: usize) -
             crate::arena::HeapGeneration::Old
         )
     {
-        return mark_dirty_old_page(crate::arena::generation_page_for_addr(slot_addr));
+        return mark_dirty_old_slot(slot_addr);
     }
     bump_write_barrier_trace_counter(BarrierTraceCounter::ConservativeParentSpanMarks);
     mark_dirty_parent_span(parent_addr)
@@ -1122,25 +1178,84 @@ pub(super) fn remember_old_to_young_external_slot(parent_addr: usize, slot_addr:
         return false;
     }
     let header_addr = parent_addr - GC_HEADER_SIZE;
-    mark_dirty_external_slot_page(
-        header_addr,
-        crate::arena::generation_page_for_addr(slot_addr),
-    )
+    mark_dirty_external_slot_addr(header_addr, slot_addr)
+}
+
+pub(super) fn mark_dirty_old_slot(slot_addr: usize) -> bool {
+    let page = crate::arena::generation_page_for_addr(slot_addr);
+    let card = remembered_card_for_addr(slot_addr);
+    mark_dirty_old_card_with_page(page, card)
+}
+
+pub(super) fn mark_dirty_old_card_with_page(page: usize, card: usize) -> bool {
+    if LAST_DIRTY_OLD_PAGE.with(|last| last.get() == page)
+        && LAST_DIRTY_OLD_CARD.with(|last| last.get() == card)
+    {
+        bump_write_barrier_trace_counter(BarrierTraceCounter::SameCardFastPathHits);
+        return false;
+    }
+
+    bump_write_barrier_trace_counter(BarrierTraceCounter::DirtyPageMarkAttempts);
+    let inserted = mark_dirty_old_page_cards(page, card_bit_on_page(card), 1);
+    LAST_DIRTY_OLD_PAGE.with(|last| last.set(page));
+    LAST_DIRTY_OLD_CARD.with(|last| last.set(card));
+    inserted
 }
 
 pub(super) fn mark_dirty_old_page(page: usize) -> bool {
     bump_write_barrier_trace_counter(BarrierTraceCounter::DirtyPageMarkAttempts);
-    DIRTY_OLD_PAGES.with(|s| {
-        let inserted = s.borrow_mut().insert(page);
+    mark_dirty_old_page_cards(page, ALL_PAGE_CARDS_MASK, CARDS_PER_PAGE)
+}
+
+fn mark_dirty_old_page_cards(page: usize, mask: u8, card_attempts: usize) -> bool {
+    if mask == 0 {
+        return false;
+    }
+    for _ in 0..card_attempts {
+        bump_write_barrier_trace_counter(BarrierTraceCounter::DirtyCardMarkAttempts);
+    }
+    DIRTY_OLD_PAGE_CARDS.with(|s| {
+        let mut page_cards = s.borrow_mut();
+        let entry = page_cards.entry(page).or_insert(0);
+        let previous = *entry;
+        let new_mask = mask & !previous;
+        *entry = previous | mask;
         crate::arena::old_page_mark_dirty(page);
-        if inserted {
+        if previous == 0 {
             bump_write_barrier_trace_counter(BarrierTraceCounter::NewDirtyPages);
         }
-        inserted
+        for _ in 0..new_mask.count_ones() {
+            bump_write_barrier_trace_counter(BarrierTraceCounter::NewDirtyCards);
+        }
+        previous == 0 || new_mask != 0
     })
 }
 
+fn mark_dirty_external_slot_addr(header_addr: usize, slot_addr: usize) -> bool {
+    let page = crate::arena::generation_page_for_addr(slot_addr);
+    let card = remembered_card_for_addr(slot_addr);
+    mark_dirty_external_slot_card_with_page(header_addr, page, card)
+}
+
+pub(super) fn mark_dirty_external_slot_card_with_page(
+    header_addr: usize,
+    page: usize,
+    card: usize,
+) -> bool {
+    mark_dirty_external_slot_page_entry(header_addr, page)
+        | mark_dirty_external_slot_card_entry(header_addr, card)
+}
+
 pub(super) fn mark_dirty_external_slot_page(header_addr: usize, page: usize) -> bool {
+    let mut inserted_any = mark_dirty_external_slot_page_entry(header_addr, page);
+    let first_card = first_card_for_page(page);
+    for card in first_card..first_card + CARDS_PER_PAGE {
+        inserted_any |= mark_dirty_external_slot_card_entry(header_addr, card);
+    }
+    inserted_any
+}
+
+fn mark_dirty_external_slot_page_entry(header_addr: usize, page: usize) -> bool {
     bump_write_barrier_trace_counter(BarrierTraceCounter::DirtyPageMarkAttempts);
     EXTERNAL_DIRTY_SLOT_PAGES.with(|s| {
         let mut pages = s.borrow_mut();
@@ -1154,6 +1269,25 @@ pub(super) fn mark_dirty_external_slot_page(header_addr: usize, page: usize) -> 
         };
         if page_was_new {
             bump_write_barrier_trace_counter(BarrierTraceCounter::NewDirtyPages);
+        }
+        header_was_new
+    })
+}
+
+fn mark_dirty_external_slot_card_entry(header_addr: usize, card: usize) -> bool {
+    bump_write_barrier_trace_counter(BarrierTraceCounter::DirtyCardMarkAttempts);
+    EXTERNAL_DIRTY_SLOT_CARDS.with(|s| {
+        let mut cards = s.borrow_mut();
+        let card_was_new = !cards.contains_key(&card);
+        let headers = cards.entry(card).or_insert_with(Vec::new);
+        let header_was_new = if headers.contains(&header_addr) {
+            false
+        } else {
+            headers.push(header_addr);
+            true
+        };
+        if card_was_new {
+            bump_write_barrier_trace_counter(BarrierTraceCounter::NewDirtyCards);
         }
         header_was_new
     })
@@ -1396,28 +1530,53 @@ pub(super) fn dirty_external_slot_span(
     let first_page = crate::arena::generation_page_for_addr(first_slot_addr);
     let last_page = crate::arena::generation_page_for_addr(last_byte);
     for page in first_page..=last_page {
-        mark_dirty_external_slot_page(header_addr, page);
+        mark_dirty_external_slot_page_entry(header_addr, page);
+    }
+    let first_card = remembered_card_for_addr(first_slot_addr);
+    let last_card = remembered_card_for_addr(last_byte);
+    for card in first_card..=last_card {
+        mark_dirty_external_slot_card_entry(header_addr, card);
     }
 }
 
 pub(super) fn remembered_dirty_page_count() -> usize {
-    DIRTY_OLD_PAGES.with(|old| {
-        let old = old.borrow();
-        EXTERNAL_DIRTY_SLOT_PAGES.with(|external| {
-            let external = external.borrow();
-            if external.is_empty() {
-                return old.len();
-            }
-            let mut pages = crate::fast_hash::new_ptr_hash_set();
-            for &page in old.iter() {
-                pages.insert(page);
-            }
-            for &page in external.keys() {
-                pages.insert(page);
-            }
-            pages.len()
-        })
+    let (old_pages, _) = dirty_old_page_card_snapshot();
+    EXTERNAL_DIRTY_SLOT_PAGES.with(|external| {
+        let external = external.borrow();
+        if external.is_empty() {
+            return old_pages.len();
+        }
+        let mut pages = old_pages;
+        for &page in external.keys() {
+            pages.insert(page);
+        }
+        pages.len()
     })
+}
+
+pub(super) fn remembered_dirty_card_count() -> usize {
+    let (_, old_cards) = dirty_old_page_card_snapshot();
+    EXTERNAL_DIRTY_SLOT_CARDS.with(|external| {
+        let external = external.borrow();
+        if external.is_empty() {
+            return old_cards.len();
+        }
+        let mut cards = old_cards;
+        for &card in external.keys() {
+            cards.insert(card);
+        }
+        cards.len()
+    })
+}
+
+#[allow(dead_code)]
+pub(super) fn remembered_dirty_old_page_count() -> usize {
+    DIRTY_OLD_PAGE_CARDS.with(|s| s.borrow().values().filter(|&&mask| mask != 0).count())
+}
+
+#[allow(dead_code)]
+pub(super) fn remembered_dirty_old_page_contains(page: usize) -> bool {
+    DIRTY_OLD_PAGE_CARDS.with(|s| s.borrow().get(&page).copied().unwrap_or(0) != 0)
 }
 
 /// Gen-GC Phase C: read the current remembered set size — used
@@ -1438,18 +1597,46 @@ pub(super) struct MaintenanceClearStep {
 enum RememberedSetClearSubphase {
     DirtyOldPages,
     ExternalDirtySlots,
+    ExternalDirtySlotCards,
     FallbackHeaders,
     Done,
 }
 
 pub(super) struct RememberedSetClearState {
     subphase: RememberedSetClearSubphase,
+    dirty_old_pages: crate::fast_hash::PtrHashMap<usize, u8>,
+    external_dirty_slot_headers: crate::fast_hash::PtrHashMap<usize, Vec<usize>>,
+    external_dirty_slot_card_headers: crate::fast_hash::PtrHashMap<usize, Vec<usize>>,
+    current_external_dirty_slot_headers: Option<Vec<usize>>,
+    current_external_dirty_slot_card_headers: Option<Vec<usize>>,
+    fallback_headers: std::collections::HashSet<usize>,
 }
 
 impl RememberedSetClearState {
     pub(super) fn new() -> Self {
+        reset_remembered_fast_path_cache();
+        let dirty_old_pages = DIRTY_OLD_PAGE_CARDS.with(|s| {
+            std::mem::replace(&mut *s.borrow_mut(), crate::fast_hash::new_ptr_hash_map())
+        });
+
+        let external_dirty_slot_headers = EXTERNAL_DIRTY_SLOT_PAGES.with(|s| {
+            std::mem::replace(&mut *s.borrow_mut(), crate::fast_hash::new_ptr_hash_map())
+        });
+        let external_dirty_slot_card_headers = EXTERNAL_DIRTY_SLOT_CARDS.with(|s| {
+            std::mem::replace(&mut *s.borrow_mut(), crate::fast_hash::new_ptr_hash_map())
+        });
+
+        let fallback_headers = REMEMBERED_SET.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        reset_remembered_fast_path_cache();
+
         Self {
             subphase: RememberedSetClearSubphase::DirtyOldPages,
+            dirty_old_pages,
+            external_dirty_slot_headers,
+            external_dirty_slot_card_headers,
+            current_external_dirty_slot_headers: None,
+            current_external_dirty_slot_card_headers: None,
+            fallback_headers,
         }
     }
 
@@ -1462,40 +1649,87 @@ impl RememberedSetClearState {
         loop {
             match self.subphase {
                 RememberedSetClearSubphase::DirtyOldPages => {
-                    if dirty_old_pages_empty() {
+                    if self.dirty_old_pages.is_empty() {
                         self.subphase = RememberedSetClearSubphase::ExternalDirtySlots;
                         continue;
                     }
                     if work_units == budget {
                         break;
                     }
-                    if clear_one_dirty_old_page() {
-                        work_units = work_units.saturating_add(1);
+                    let (page, mask) = pop_one_ptr_hash_map_entry(&mut self.dirty_old_pages)
+                        .expect("dirty old page snapshot is not empty");
+                    if mask != 0 {
+                        clear_snapshotted_dirty_old_page(page);
                     }
+                    work_units = work_units.saturating_add(1);
                 }
                 RememberedSetClearSubphase::ExternalDirtySlots => {
-                    if external_dirty_slot_headers_empty() {
+                    if let Some(headers) = self.current_external_dirty_slot_headers.as_mut() {
+                        if work_units == budget {
+                            break;
+                        }
+                        if headers.pop().is_some() {
+                            work_units = work_units.saturating_add(1);
+                            continue;
+                        }
+                        self.current_external_dirty_slot_headers = None;
+                        continue;
+                    }
+                    if self.external_dirty_slot_headers.is_empty() {
+                        self.subphase = RememberedSetClearSubphase::ExternalDirtySlotCards;
+                        continue;
+                    }
+                    if work_units == budget {
+                        break;
+                    }
+                    let (_, headers) =
+                        pop_one_ptr_hash_map_entry(&mut self.external_dirty_slot_headers)
+                            .expect("external dirty slot snapshot is not empty");
+                    if headers.is_empty() {
+                        work_units = work_units.saturating_add(1);
+                    } else {
+                        self.current_external_dirty_slot_headers = Some(headers);
+                    }
+                }
+                RememberedSetClearSubphase::ExternalDirtySlotCards => {
+                    if let Some(headers) = self.current_external_dirty_slot_card_headers.as_mut() {
+                        if work_units == budget {
+                            break;
+                        }
+                        if headers.pop().is_some() {
+                            work_units = work_units.saturating_add(1);
+                            continue;
+                        }
+                        self.current_external_dirty_slot_card_headers = None;
+                        continue;
+                    }
+                    if self.external_dirty_slot_card_headers.is_empty() {
                         self.subphase = RememberedSetClearSubphase::FallbackHeaders;
                         continue;
                     }
                     if work_units == budget {
                         break;
                     }
-                    if clear_one_external_dirty_slot_header() {
+                    let (_, headers) =
+                        pop_one_ptr_hash_map_entry(&mut self.external_dirty_slot_card_headers)
+                            .expect("external dirty slot card snapshot is not empty");
+                    if headers.is_empty() {
                         work_units = work_units.saturating_add(1);
+                    } else {
+                        self.current_external_dirty_slot_card_headers = Some(headers);
                     }
                 }
                 RememberedSetClearSubphase::FallbackHeaders => {
-                    if fallback_remembered_set_empty() {
+                    if self.fallback_headers.is_empty() {
                         self.subphase = RememberedSetClearSubphase::Done;
                         continue;
                     }
                     if work_units == budget {
                         break;
                     }
-                    if clear_one_fallback_remembered_header() {
-                        work_units = work_units.saturating_add(1);
-                    }
+                    pop_one_hash_set_entry(&mut self.fallback_headers)
+                        .expect("fallback remembered snapshot is not empty");
+                    work_units = work_units.saturating_add(1);
                 }
                 RememberedSetClearSubphase::Done => {
                     return MaintenanceClearStep {
@@ -1512,59 +1746,23 @@ impl RememberedSetClearState {
     }
 }
 
-fn dirty_old_pages_empty() -> bool {
-    DIRTY_OLD_PAGES.with(|s| s.borrow().is_empty())
+fn pop_one_ptr_hash_map_entry<V>(
+    map: &mut crate::fast_hash::PtrHashMap<usize, V>,
+) -> Option<(usize, V)> {
+    let key = map.keys().next().copied()?;
+    map.remove_entry(&key)
 }
 
-fn clear_one_dirty_old_page() -> bool {
-    DIRTY_OLD_PAGES.with(|s| {
-        let mut pages = s.borrow_mut();
-        let Some(page) = pages.iter().next().copied() else {
-            return false;
-        };
+fn pop_one_hash_set_entry(set: &mut std::collections::HashSet<usize>) -> Option<usize> {
+    let value = set.iter().next().copied()?;
+    set.take(&value)
+}
+
+fn clear_snapshotted_dirty_old_page(page: usize) {
+    let still_live_dirty = remembered_dirty_old_page_contains(page);
+    if !still_live_dirty {
         crate::arena::old_page_clear_dirty(page);
-        pages.remove(&page);
-        true
-    })
-}
-
-fn external_dirty_slot_headers_empty() -> bool {
-    EXTERNAL_DIRTY_SLOT_PAGES.with(|s| s.borrow().is_empty())
-}
-
-fn clear_one_external_dirty_slot_header() -> bool {
-    EXTERNAL_DIRTY_SLOT_PAGES.with(|s| {
-        let mut pages = s.borrow_mut();
-        let Some(page) = pages.keys().next().copied() else {
-            return false;
-        };
-        let remove_page = match pages.get_mut(&page) {
-            Some(headers) => {
-                headers.pop();
-                headers.is_empty()
-            }
-            None => false,
-        };
-        if remove_page {
-            pages.remove(&page);
-        }
-        true
-    })
-}
-
-fn fallback_remembered_set_empty() -> bool {
-    REMEMBERED_SET.with(|s| s.borrow().is_empty())
-}
-
-fn clear_one_fallback_remembered_header() -> bool {
-    REMEMBERED_SET.with(|s| {
-        let mut headers = s.borrow_mut();
-        let Some(header) = headers.iter().next().copied() else {
-            return false;
-        };
-        headers.remove(&header);
-        true
-    })
+    }
 }
 
 pub(super) struct ConservativePinClearState {

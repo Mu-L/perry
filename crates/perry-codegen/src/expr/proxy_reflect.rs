@@ -356,7 +356,16 @@ fn is_numeric_string_key(key: &str) -> bool {
         && !(key.len() > 1 && key.starts_with('0'))
 }
 
-fn put_value_index_fast_path(ctx: &FnCtx<'_>, target: &Expr, key: &Expr, receiver: &Expr) -> bool {
+fn put_value_index_fast_path(
+    ctx: &FnCtx<'_>,
+    target: &Expr,
+    key: &Expr,
+    receiver: &Expr,
+    strict: bool,
+) -> bool {
+    if strict {
+        return false;
+    }
     if !same_side_effect_free_receiver(target, receiver) || !is_array_expr(ctx, target) {
         return false;
     }
@@ -577,7 +586,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     },
                 );
             }
-            if put_value_index_fast_path(ctx, target, key, receiver) {
+            if put_value_index_fast_path(ctx, target, key, receiver, *strict) {
                 return super::index_set::lower(
                     ctx,
                     &Expr::IndexSet {

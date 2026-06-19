@@ -110,6 +110,7 @@ pub fn invalidate_exact_receivers_for_expr(expr: &Expr, facts: &mut ExactReceive
         | Expr::SuperMethodCall { .. }
         | Expr::New { .. }
         | Expr::NewDynamic { .. }
+        | Expr::NewDynamicSpread { .. }
         | Expr::ObjectAssign { .. }
         | Expr::PropertySet { .. }
         // #4126 lowers property assignments as `PutValueSet`; an

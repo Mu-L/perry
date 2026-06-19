@@ -949,9 +949,9 @@ pub extern "C" fn js_set_foreach(set: *const SetHeader, callback: f64, this_arg:
             let args = [value, value, set_value];
             let cb = callback_handle.get_nanbox_f64();
             let this_v = this_handle.get_nanbox_f64();
-            let prev_this = crate::object::js_implicit_this_set(this_v);
+            let prev_this = crate::object::js_implicit_this_push(this_v);
             let _ = crate::closure::js_native_call_value(cb, args.as_ptr(), args.len());
-            crate::object::js_implicit_this_set(prev_this);
+            crate::object::js_implicit_this_restore(prev_this);
         }
     }
 }

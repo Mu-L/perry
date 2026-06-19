@@ -116,6 +116,35 @@ fn arena_pressure_runtime_safepoint_starts_bounded_normal_work() {
 }
 
 #[test]
+fn allocation_side_assist_attempts_copied_minor_without_host_safepoint() {
+    let _guard = CopyingNurseryTestGuard::new(1);
+    let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    reset_old_reclaim_pressure();
+    make_arena_pressure(&trigger_guard, b"allocation_assist_live");
+
+    let before = gc_collection_count();
+    gc_check_trigger();
+
+    assert!(
+        gc_collection_count() > before,
+        "allocation-side mutator assist should attempt and finish eligible copied-minor work"
+    );
+    assert!(
+        !gc_budgeted_cycle_active(),
+        "eligible copied-minor assist should not wait for a host safepoint to drain"
+    );
+    assert!(
+        GC_NEXT_TRIGGER_BYTES.with(|trigger| trigger.get()) > gc_nursery_trigger_bytes(),
+        "completed allocation-side assist should rebaseline the nursery trigger"
+    );
+
+    let live_after = (js_shadow_slot_get(0) & POINTER_MASK) as *const crate::StringHeader;
+    unsafe {
+        assert_string_bytes(live_after, b"allocation_assist_live");
+    }
+}
+
+#[test]
 fn repeated_runtime_safepoints_complete_cycle_rebaseline_debt_and_preserve_roots() {
     let _guard = CopyingNurseryTestGuard::new(1);
     let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
@@ -131,7 +160,7 @@ fn repeated_runtime_safepoints_complete_cycle_rebaseline_debt_and_preserve_roots
     assert_eq!(completed.completed, 1);
     assert_eq!(completed.arena_debt_bytes, 0);
     assert!(
-        GC_NEXT_TRIGGER_BYTES.with(|trigger| trigger.get()) > crate::arena::arena_total_bytes(),
+        GC_NEXT_TRIGGER_BYTES.with(|trigger| trigger.get()) > gc_nursery_trigger_bytes(),
         "completed safepoint cycle should rebaseline the arena trigger"
     );
 
@@ -245,6 +274,7 @@ fn host_safepoint_trace_reports_normal_incremental_budgeted_steps() {
     let _trace_guard = TestGcTraceCaptureGuard::force_enabled();
     let _guard = CopyingNurseryTestGuard::new(1);
     let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let _barrier_guard = GeneratedWriteBarrierTestGuard::inactive();
     reset_old_reclaim_pressure();
     make_arena_pressure(&trigger_guard, b"host_safepoint_trace_live");
 

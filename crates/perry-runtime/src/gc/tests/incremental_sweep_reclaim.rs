@@ -8,7 +8,7 @@ fn reset_old_reclaim_pressure() {
 }
 
 fn remembered_maintenance_entry_count() -> usize {
-    let dirty_old = DIRTY_OLD_PAGES.with(|s| s.borrow().len());
+    let dirty_old = remembered_dirty_old_page_count();
     let external_dirty =
         EXTERNAL_DIRTY_SLOT_PAGES.with(|s| s.borrow().values().map(Vec::len).sum::<usize>());
     let fallback = REMEMBERED_SET.with(|s| s.borrow().len());
@@ -33,6 +33,13 @@ fn old_dirty_pages_for_reclaim_test(count: usize) -> Vec<usize> {
         "test old object should span {count} old pages"
     );
     pages
+}
+
+fn dirty_old_page_metadata_count(pages: &[usize]) -> usize {
+    pages
+        .iter()
+        .filter(|&&page| old_page_dirty_for(page))
+        .count()
 }
 
 fn seed_remembered_reclaim_entries(dirty_pages: &[usize]) {
@@ -159,6 +166,7 @@ fn malloc_sweep_pauses_mid_list_and_eventually_frees_dead_malloc() {
 fn budgeted_malloc_sweep_revalidates_live_malloc_moved_by_realloc() {
     let _guard = CopyingNurseryTestGuard::new(1);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let _barrier_guard = GeneratedWriteBarrierTestGuard::inactive();
     reset_old_reclaim_pressure();
 
     let dead_headers = allocate_dead_malloc_churn_headers(32);
@@ -331,6 +339,7 @@ fn old_generation_targeted_and_full_reclaim_are_bounded_and_publish_telemetry() 
 fn budgeted_sweep_phase_requires_multiple_host_steps() {
     let _guard = CopyingNurseryTestGuard::new(1);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let _barrier_guard = GeneratedWriteBarrierTestGuard::inactive();
     reset_old_reclaim_pressure();
 
     let live_malloc = gc_malloc(
@@ -372,6 +381,7 @@ fn budgeted_sweep_phase_requires_multiple_host_steps() {
 fn budgeted_reclaim_phase_is_split_from_completion() {
     let _guard = CopyingNurseryTestGuard::new(1);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let _barrier_guard = GeneratedWriteBarrierTestGuard::inactive();
     reset_old_reclaim_pressure();
 
     let live = young_leaf();
@@ -404,6 +414,7 @@ fn budgeted_reclaim_phase_is_split_from_completion() {
 fn budgeted_reclaim_slices_remembered_maintenance_entries() {
     let _guard = CopyingNurseryTestGuard::new(1);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let _barrier_guard = GeneratedWriteBarrierTestGuard::inactive();
     reset_old_reclaim_pressure();
 
     let dirty_pages = old_dirty_pages_for_reclaim_test(4);
@@ -425,8 +436,13 @@ fn budgeted_reclaim_slices_remembered_maintenance_entries() {
     assert_eq!(status.phase, GcCyclePhase::Reclaim.ffi_code());
     assert_eq!(
         remembered_maintenance_entry_count(),
-        initial - 1,
-        "one reclaim work unit should clear exactly one remembered maintenance entry"
+        0,
+        "remembered clear snapshots existing entries so new barriers use live sets"
+    );
+    assert_eq!(
+        dirty_old_page_metadata_count(&dirty_pages),
+        dirty_pages.len().saturating_sub(1),
+        "one reclaim work unit should clear one snapshotted dirty page"
     );
 
     for _ in 0..3 {
@@ -436,8 +452,9 @@ fn budgeted_reclaim_slices_remembered_maintenance_entries() {
         );
         assert_eq!(status.phase, GcCyclePhase::Reclaim.ffi_code());
     }
-    assert!(
-        remembered_maintenance_entry_count() > 0,
+    assert_eq!(
+        status.phase,
+        GcCyclePhase::Reclaim.ffi_code(),
         "remembered maintenance cleanup should still be active after a few one-unit steps"
     );
 
@@ -455,6 +472,7 @@ fn budgeted_reclaim_slices_remembered_maintenance_entries() {
 fn budgeted_reclaim_slices_many_external_dirty_slot_page_buckets() {
     let _guard = CopyingNurseryTestGuard::new(1);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let _barrier_guard = GeneratedWriteBarrierTestGuard::inactive();
     reset_old_reclaim_pressure();
 
     let live = young_leaf();
@@ -470,7 +488,7 @@ fn budgeted_reclaim_slices_many_external_dirty_slot_page_buckets() {
     assert_eq!(initial_pages, 64);
     assert_eq!(initial_entries, 32);
 
-    for step in 1..=3 {
+    for _ in 1..=3 {
         assert_eq!(
             js_gc_step_work_units(1, &mut status),
             JS_GC_STEP_STATUS_ACTIVE
@@ -478,13 +496,10 @@ fn budgeted_reclaim_slices_many_external_dirty_slot_page_buckets() {
         assert_eq!(status.phase, GcCyclePhase::Reclaim.ffi_code());
         assert_eq!(
             external_dirty_slot_page_count(),
-            initial_pages - step,
-            "one reclaim work unit should clear exactly one external dirty-slot page bucket"
+            0,
+            "remembered clear snapshots external buckets so new barriers use live sets"
         );
-        assert!(
-            remembered_maintenance_entry_count() >= initial_entries.saturating_sub(step),
-            "one reclaim work unit must not bulk-prune external dirty-slot headers"
-        );
+        assert_eq!(remembered_maintenance_entry_count(), 0);
     }
 
     let completed = complete_budgeted_gc_cycle();
@@ -499,6 +514,7 @@ fn budgeted_reclaim_slices_many_external_dirty_slot_page_buckets() {
 fn budgeted_reclaim_slices_conservative_pin_cleanup() {
     let _guard = CopyingNurseryTestGuard::new(1);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let _barrier_guard = GeneratedWriteBarrierTestGuard::inactive();
     reset_old_reclaim_pressure();
 
     let live = young_leaf();
@@ -547,6 +563,7 @@ fn budgeted_reclaim_skips_process_malloc_trim() {
     let _trace_guard = TestGcTraceCaptureGuard::force_enabled();
     let _guard = CopyingNurseryTestGuard::new(1);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let _barrier_guard = GeneratedWriteBarrierTestGuard::inactive();
     reset_old_reclaim_pressure();
 
     let live = young_leaf();

@@ -1,5 +1,7 @@
 import importlib.util
+import hashlib
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -181,6 +183,16 @@ def copied_report(**overrides):
         for name in REPORT.STRICT_COPIED_MINOR_WORKLOADS
     }
     workloads.update(overrides)
+    fallback_reason_counts = {reason: 0 for reason in REPORT.FALLBACK_REASONS}
+    for workload in workloads.values():
+        counts = workload.get("fallback_reason_counts", {})
+        if not isinstance(counts, dict):
+            continue
+        for reason, count in counts.items():
+            if isinstance(reason, str):
+                fallback_reason_counts[reason] = fallback_reason_counts.get(
+                    reason, 0
+                ) + REPORT.int_value(count)
     external_registered_bytes = sum(
         REPORT.nested(workload, "external_memory", "registered_bytes", default=0)
         for workload in workloads.values()
@@ -221,7 +233,7 @@ def copied_report(**overrides):
     return {
         "summary": {
             "cycles": len(workloads),
-            "fallback_reason_counts": {"none": len(workloads)},
+            "fallback_reason_counts": fallback_reason_counts,
             "conservative_pinned_bytes": 0,
             "compiled_frame_conservative_pinned_bytes": 0,
             "conservative_stack": {
@@ -301,20 +313,177 @@ def target_report():
     }
 
 
-def benchmark_report(multiplier=1, correctness="pass"):
+def benchmark_report(
+    multiplier=1,
+    correctness="pass",
+    *,
+    reference="node",
+    actual_lines=None,
+    expected_lines=None,
+    include_node=True,
+):
+    if actual_lines is None:
+        actual_lines = ["checksum:1"]
+    if expected_lines is None:
+        expected_lines = ["checksum:1"]
     benchmarks = {}
     for name in REQUIRED_BENCHMARKS:
-        benchmarks[name] = {
+        entry = {
             "perry_ms": 100 * multiplier,
             "perry_rss_kb": 100_000 * multiplier,
             "correctness": {
                 "status": correctness,
+                "reference": reference,
                 "reason": "matched",
-                "actual_lines": ["checksum:1"],
-                "expected_lines": ["checksum:1"],
+                "actual_lines": list(actual_lines),
+                "expected_lines": list(expected_lines),
             },
         }
+        if include_node:
+            entry["node_ms"] = 120 * multiplier
+            entry["node_rss_kb"] = 120_000 * multiplier
+        benchmarks[name] = entry
     return {"commit": "abc", "benchmarks": benchmarks}
+
+
+def trace_cycle(
+    fallback_reason="none",
+    *,
+    collection_kind="minor",
+    eligible=True,
+    trigger_kind="arena_bytes",
+    copied_objects=1,
+    copied_bytes=16,
+    promoted_objects=0,
+    promoted_bytes=0,
+):
+    return {
+        "event": "gc_cycle",
+        "collection_kind": collection_kind,
+        "trigger": {"kind": trigger_kind},
+        "copying_nursery": {
+            "eligible": eligible,
+            "fallback_reason": fallback_reason,
+            "copied_objects": copied_objects,
+            "copied_bytes": copied_bytes,
+            "promoted_objects": promoted_objects,
+            "promoted_bytes": promoted_bytes,
+        },
+    }
+
+
+def first_fallback_reason(workload):
+    counts = workload.get("fallback_reason_counts", {})
+    if not isinstance(counts, dict):
+        return "none"
+    for reason, count in counts.items():
+        if isinstance(reason, str) and isinstance(count, int) and count > 0:
+            return reason
+    return "none"
+
+
+def write_copied_minor_traces(root, label, report, *, cycles_per_workload=10):
+    traces_root = root / label / "memory" / "traces" / "copied-minor-fallback"
+    if traces_root.exists():
+        shutil.rmtree(traces_root)
+    traces_root.mkdir(parents=True, exist_ok=True)
+    workloads = report.get("workloads", {}) if isinstance(report, dict) else {}
+    for index, (name, workload) in enumerate(sorted(workloads.items()), start=1):
+        reason = first_fallback_reason(workload if isinstance(workload, dict) else {})
+        copying = REPORT.nested(workload, "copying_nursery", default={})
+        cycle = trace_cycle(
+            reason,
+            eligible=reason == "none",
+            copied_objects=REPORT.int_value(copying.get("copied_objects"))
+            if isinstance(copying, dict)
+            else 0,
+            copied_bytes=REPORT.int_value(copying.get("copied_bytes"))
+            if isinstance(copying, dict)
+            else 0,
+            promoted_objects=REPORT.int_value(copying.get("promoted_objects"))
+            if isinstance(copying, dict)
+            else 0,
+            promoted_bytes=REPORT.int_value(copying.get("promoted_bytes"))
+            if isinstance(copying, dict)
+            else 0,
+        )
+        path = traces_root / f"{index:03d}_{name}.log"
+        with path.open("w", encoding="utf-8") as handle:
+            for _ in range(cycles_per_workload):
+                handle.write(json.dumps(cycle))
+                handle.write("\n")
+
+
+def write_default_expanded_dominance_traces(root, label):
+    write_trace_group(
+        root,
+        label,
+        "required-benchmark",
+        {
+            name: [trace_cycle() for _ in range(20)]
+            for name in REQUIRED_BENCHMARKS
+        },
+    )
+    write_trace_group(
+        root,
+        label,
+        "target-collector",
+        {
+            "default_copying": [trace_cycle() for _ in range(40)],
+            "string_heavy": [trace_cycle() for _ in range(20)],
+        },
+    )
+    write_trace_group(
+        root,
+        label,
+        "copied-minor-scaling",
+        {
+            "young_only_1x": [trace_cycle() for _ in range(10)],
+            "young_only_2x": [trace_cycle() for _ in range(10)],
+            "young_only_4x": [trace_cycle() for _ in range(10)],
+            "young_only_8x": [trace_cycle() for _ in range(10)],
+        },
+    )
+
+
+def write_trace_group(root, label, group, traces):
+    traces_root = root / label / "memory" / "traces" / group
+    if traces_root.exists():
+        shutil.rmtree(traces_root)
+    traces_root.mkdir(parents=True, exist_ok=True)
+    for index, (name, cycles) in enumerate(sorted(traces.items()), start=1):
+        path = traces_root / f"{index:03d}_{name}.log"
+        with path.open("w", encoding="utf-8") as handle:
+            for cycle in cycles:
+                handle.write(json.dumps(cycle))
+                handle.write("\n")
+
+
+def write_benchmark_trace_correctness(root, label):
+    trace_root = root / label / "benchmark-gc-traces"
+    for subdir in ("stdout", "reference-stdout", "correctness"):
+        (trace_root / subdir).mkdir(parents=True, exist_ok=True)
+    for name in REQUIRED_BENCHMARKS:
+        actual_lines = ["checksum:1"]
+        expected_lines = ["checksum:1"]
+        (trace_root / "stdout" / f"{name}.out").write_text(
+            "\n".join(actual_lines) + "\n",
+            encoding="utf-8",
+        )
+        (trace_root / "reference-stdout" / f"{name}.out").write_text(
+            "\n".join(expected_lines) + "\n",
+            encoding="utf-8",
+        )
+        write_json(
+            trace_root / "correctness" / f"{name}.json",
+            {
+                "status": "pass",
+                "reference": "node",
+                "reason": "matched 1 semantic line(s)",
+                "actual_lines": actual_lines,
+                "expected_lines": expected_lines,
+            },
+        )
 
 
 def perf_frontier_packet():
@@ -442,21 +611,36 @@ class Gc1090EvidenceReportTests(unittest.TestCase):
             "head_ref": "HEAD",
             "base_sha": "a" * 40,
             "head_sha": "b" * 40,
+            "source_state": {
+                "mode": "exact-ref",
+                "original_head_sha": "b" * 40,
+                "current_head_sha": "b" * 40,
+                "tested_head_sha": "b" * 40,
+                "dirty": False,
+                "status_porcelain_v1": [],
+            },
             "commands": {
                 "base": {
                     "build": {"status": "pass", "exit_code": 0},
                     "memory_stability": {"status": "pass", "exit_code": 0},
                     "benchmarks": {"status": "pass", "exit_code": 0},
+                    "benchmark_gc_traces": {"status": "pass", "exit_code": 0},
                 },
                 "head": {
                     "build": {"status": "pass", "exit_code": 0},
                     "memory_stability": {"status": "pass", "exit_code": 0},
                     "benchmarks": {"status": "pass", "exit_code": 0},
+                    "benchmark_gc_traces": {"status": "pass", "exit_code": 0},
                 },
             },
         }
         write_json(root / "metadata.json", metadata)
         for label in ("base", "head"):
+            copied = (
+                head_copied
+                if label == "head" and head_copied is not None
+                else copied_report()
+            )
             write_json(
                 root / label / "memory" / "reports" / "memory_stability_summary.json",
                 {
@@ -468,8 +652,11 @@ class Gc1090EvidenceReportTests(unittest.TestCase):
             )
             write_json(
                 root / label / "memory" / "reports" / "copied_minor_fallback_report.json",
-                head_copied if label == "head" and head_copied is not None else copied_report(),
+                copied,
             )
+            write_copied_minor_traces(root, label, copied)
+            write_default_expanded_dominance_traces(root, label)
+            write_benchmark_trace_correctness(root, label)
             write_json(
                 root / label / "memory" / "reports" / "target_collector_gates_report.json",
                 target_report(),
@@ -611,6 +798,17 @@ class Gc1090EvidenceReportTests(unittest.TestCase):
         self.assertEqual(packet["status"], "fail")
         self.assertTrue(any("correctness failed" in error for error in packet["errors"]))
 
+    def test_gate_fails_malformed_benchmark_correctness_artifact(self):
+        head = benchmark_report()
+        head["benchmarks"]["bench_json_roundtrip"]["correctness"] = "malformed"
+
+        packet = self.collect_gate(head_benchmarks=head)
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(
+            any("correctness output missing" in error for error in packet["errors"])
+        )
+
     def test_fails_memory_stability(self):
         packet = self.collect(head_memory_failed=1)
         self.assertEqual(packet["status"], "fail")
@@ -620,6 +818,17 @@ class Gc1090EvidenceReportTests(unittest.TestCase):
         packet = self.collect_gate()
         self.assertEqual(packet["status"], "pass")
         self.assertIn("tool_versions", packet)
+        dominance = packet["copied_minor_trace_evidence"]["head"]["dominance"]
+        self.assertEqual(dominance["included_groups"], [
+            "copied-minor-fallback",
+            "required-benchmark",
+            "target-collector",
+            "copied-minor-scaling",
+        ])
+        self.assertEqual(dominance["dominance_cycle_count"], 240)
+        self.assertEqual(dominance["eligible_minor_collections"], 240)
+        self.assertEqual(dominance["copied_nursery_successes"], 240)
+        self.assertEqual(dominance["copied_minor_success_rate_pct"], 100.0)
         self.assertEqual(packet["gc_store_inventory"]["status"], "pass")
         self.assertEqual(packet["gc_store_inventory"]["summary"]["unaudited_sites"], 0)
         self.assertEqual(packet["old_page_policy"]["status"], "pass")
@@ -632,6 +841,358 @@ class Gc1090EvidenceReportTests(unittest.TestCase):
         self.assertEqual(
             packet["perf_frontier"]["baseline"]["input_path"],
             "tmp/perf-frontier-baseline.json",
+        )
+
+    def test_gate_fails_missing_gc_trace_artifacts(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        shutil.rmtree(root / "head" / "memory" / "traces")
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(
+            any("GC trace artifacts are missing" in error for error in packet["errors"])
+        )
+
+    def test_gate_fails_missing_required_benchmark_trace_evidence(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        shutil.rmtree(root / "head" / "memory" / "traces" / "required-benchmark")
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(
+            any(
+                "required GC trace evidence group 'required-benchmark' is missing" in error
+                for error in packet["errors"]
+            )
+        )
+
+    def test_gate_fails_missing_copied_minor_scaling_trace_evidence(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        shutil.rmtree(root / "head" / "memory" / "traces" / "copied-minor-scaling")
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(
+            any(
+                "required GC trace evidence group 'copied-minor-scaling' is missing"
+                in error
+                for error in packet["errors"]
+            )
+        )
+
+    def test_gate_fails_partial_required_benchmark_trace_rows(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        write_trace_group(
+            root,
+            "head",
+            "required-benchmark",
+            {"bench_json_roundtrip": [trace_cycle() for _ in range(120)]},
+        )
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(
+            any(
+                "required benchmark GC trace row 'bench_gc_pressure' is missing"
+                in error
+                for error in packet["errors"]
+            )
+        )
+
+    def test_gate_fails_schema_light_dominance_trace_cycles(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        schema_light_cycle = {
+            "event": "gc_cycle",
+            "trigger": {"kind": "arena_bytes"},
+            "copying_nursery": {
+                "fallback_reason": "none",
+                "copied_objects": 1,
+                "copied_bytes": 16,
+            },
+        }
+        write_trace_group(
+            root,
+            "head",
+            "copied-minor-scaling",
+            {"young_only_1x": [schema_light_cycle for _ in range(120)]},
+        )
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(
+            any("missing collection_kind" in error for error in packet["errors"])
+        )
+        self.assertTrue(
+            any("missing copying_nursery.eligible" in error for error in packet["errors"])
+        )
+
+    def test_trace_dominance_counts_automatic_failures_and_excludes_direct_manual(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        trace_path = Path(temp.name) / "dominance.log"
+        cycles = [
+            trace_cycle(trigger_kind="arena_bytes"),
+            trace_cycle(
+                eligible=False,
+                trigger_kind="arena_bytes",
+                copied_objects=0,
+                copied_bytes=0,
+            ),
+            trace_cycle(
+                "not_attempted",
+                eligible=False,
+                trigger_kind="malloc_count",
+                copied_objects=0,
+                copied_bytes=0,
+            ),
+            trace_cycle(
+                collection_kind="full",
+                trigger_kind="arena_bytes",
+                copied_objects=0,
+                copied_bytes=0,
+            ),
+            trace_cycle(trigger_kind="survivor_promotion_bytes"),
+            trace_cycle(
+                "not_attempted",
+                collection_kind="full",
+                eligible=False,
+                trigger_kind="direct",
+                copied_objects=0,
+                copied_bytes=0,
+            ),
+            trace_cycle(
+                "conservative_stack",
+                eligible=False,
+                trigger_kind="manual",
+                copied_objects=0,
+                copied_bytes=0,
+            ),
+        ]
+        with trace_path.open("w", encoding="utf-8") as handle:
+            for cycle in cycles:
+                handle.write(json.dumps(cycle))
+                handle.write("\n")
+
+        summary = REPORT.summarize_gc_trace_file(trace_path)
+
+        self.assertEqual(summary["gc_cycle_count"], 7)
+        self.assertEqual(summary["excluded_non_automatic_cycles"], 2)
+        self.assertEqual(summary["dominance_cycle_count"], 5)
+        self.assertEqual(summary["copied_nursery_successes"], 1)
+        self.assertEqual(summary["dominance_failures"], 4)
+        self.assertEqual(summary["minor_fallback_failures"], 3)
+        self.assertEqual(summary["full_gc_failures"], 1)
+        self.assertEqual(summary["not_attempted_failures"], 1)
+        self.assertEqual(summary["survivor_promotion_handoff_failures"], 1)
+        self.assertEqual(summary["copied_minor_success_rate_pct"], 20.0)
+
+    def test_gate_fails_automatic_full_not_attempted_and_survivor_promotion_handoffs(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        benchmark_cycles = [trace_cycle() for _ in range(96)]
+        benchmark_cycles.extend(
+            [
+                trace_cycle(
+                    collection_kind="full",
+                    trigger_kind="arena_bytes",
+                    copied_objects=0,
+                    copied_bytes=0,
+                ),
+                trace_cycle(
+                    "not_attempted",
+                    eligible=False,
+                    trigger_kind="malloc_count",
+                    copied_objects=0,
+                    copied_bytes=0,
+                ),
+                trace_cycle(trigger_kind="survivor_promotion_bytes"),
+                trace_cycle(
+                    collection_kind="full",
+                    trigger_kind="malloc_count",
+                    copied_objects=0,
+                    copied_bytes=0,
+                ),
+            ]
+        )
+        write_trace_group(
+            root,
+            "head",
+            "required-benchmark",
+            {
+                "07_object_create": [trace_cycle() for _ in range(20)],
+                "12_binary_trees": [trace_cycle() for _ in range(20)],
+                "bench_gc_pressure": [trace_cycle() for _ in range(20)],
+                "bench_json_roundtrip": benchmark_cycles,
+            },
+        )
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        dominance = packet["copied_minor_trace_evidence"]["head"]["dominance"]
+        self.assertEqual(dominance["dominance_cycle_count"], 320)
+        self.assertEqual(dominance["copied_nursery_successes"], 316)
+        self.assertEqual(dominance["full_gc_failures"], 2)
+        self.assertEqual(dominance["not_attempted_failures"], 1)
+        self.assertEqual(dominance["survivor_promotion_handoff_failures"], 1)
+        self.assertTrue(
+            any("copied-minor dominance below 99.0%" in error for error in packet["errors"])
+        )
+
+    def test_gate_fails_low_copied_minor_dominance_sample_count(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        write_trace_group(
+            root,
+            "head",
+            "copied-minor-fallback",
+            {"json_roundtrip": [trace_cycle() for _ in range(10)]},
+        )
+        write_trace_group(
+            root,
+            "head",
+            "required-benchmark",
+            {"bench_json_roundtrip": [trace_cycle() for _ in range(10)]},
+        )
+        write_trace_group(
+            root,
+            "head",
+            "target-collector",
+            {"default_copying": [trace_cycle() for _ in range(10)]},
+        )
+        write_trace_group(
+            root,
+            "head",
+            "copied-minor-scaling",
+            {"young_only_1x": [trace_cycle() for _ in range(10)]},
+        )
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        dominance = packet["copied_minor_trace_evidence"]["head"]["dominance"]
+        self.assertEqual(dominance["dominance_cycle_count"], 40)
+        self.assertEqual(dominance["gate"], "insufficient")
+        self.assertTrue(
+            any("automatic cycle sample too small: 40 < 100" in error for error in packet["errors"])
+        )
+
+    def test_gate_fails_copied_minor_dominance_below_threshold_with_expanded_denominator(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        benchmark_cycles = [trace_cycle() for _ in range(96)]
+        benchmark_cycles.extend(
+            [
+                trace_cycle("copy_only_roots", eligible=False, copied_objects=0, copied_bytes=0),
+                trace_cycle("conservative_stack", eligible=False, copied_objects=0, copied_bytes=0),
+                trace_cycle("pinned_young_root", eligible=False, copied_objects=0, copied_bytes=0),
+                trace_cycle("pinned_young_transitive", eligible=False, copied_objects=0, copied_bytes=0),
+            ]
+        )
+        write_trace_group(
+            root,
+            "head",
+            "required-benchmark",
+            {"bench_json_roundtrip": benchmark_cycles},
+        )
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        dominance = packet["copied_minor_trace_evidence"]["head"]["dominance"]
+        self.assertEqual(dominance["dominance_cycle_count"], 260)
+        self.assertEqual(dominance["eligible_minor_collections"], 256)
+        self.assertEqual(dominance["copied_nursery_successes"], 256)
+        self.assertTrue(
+            any("copied-minor dominance below 99.0%" in error for error in packet["errors"])
+        )
+
+    def test_gate_fails_missing_node_reference_artifact(self):
+        packet = self.collect_gate(
+            head_benchmarks=benchmark_report(reference="none")
+        )
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(
+            any("Node reference comparison artifact missing" in error for error in packet["errors"])
+        )
+
+    def test_gate_fails_mismatched_node_comparison_artifact(self):
+        packet = self.collect_gate(
+            head_benchmarks=benchmark_report(
+                actual_lines=["checksum:2"],
+                expected_lines=["checksum:1"],
+            )
+        )
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(
+            any("Node comparison artifact mismatch" in error for error in packet["errors"])
+        )
+
+    def test_gate_fails_missing_traced_benchmark_node_reference_stdout(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        (
+            root
+            / "head"
+            / "benchmark-gc-traces"
+            / "reference-stdout"
+            / "bench_json_roundtrip.out"
+        ).unlink()
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(
+            any(
+                "traced benchmark Node reference stdout is missing" in error
+                for error in packet["errors"]
+            )
+        )
+
+    def test_gate_fails_mismatched_traced_benchmark_node_comparison(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        correctness_path = (
+            root
+            / "head"
+            / "benchmark-gc-traces"
+            / "correctness"
+            / "bench_json_roundtrip.json"
+        )
+        correctness = json.loads(correctness_path.read_text(encoding="utf-8"))
+        correctness["actual_lines"] = ["checksum:2"]
+        write_json(correctness_path, correctness)
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(
+            any(
+                "traced benchmark Node comparison artifact mismatch" in error
+                for error in packet["errors"]
+            )
         )
 
     def test_old_page_policy_retained_rss_improvement_can_pass_when_peak_does_not(self):
@@ -766,6 +1327,191 @@ class Gc1090EvidenceReportTests(unittest.TestCase):
         self.assertTrue(any("exact 40-char SHA" in error for error in packet["errors"]))
         self.assertTrue(any("perf frontier packet is missing" in error for error in packet["errors"]))
         self.assertTrue(any("GC store-site inventory is missing" in error for error in packet["errors"]))
+
+    def test_gate_rejects_dirty_exact_ref_source_state(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+        metadata["source_state"] = {
+            "mode": "exact-ref",
+            "original_head_sha": "b" * 40,
+            "current_head_sha": "b" * 40,
+            "tested_head_sha": "b" * 40,
+            "dirty": True,
+            "status_porcelain_v1": [" M crates/perry-runtime/src/gc/barrier.rs"],
+        }
+        write_json(root / "metadata.json", metadata)
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(
+            any("dirty but mode is not worktree-snapshot" in error for error in packet["errors"])
+        )
+
+    def test_gate_rejects_dirty_status_even_when_dirty_flag_false(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+        metadata["source_state"] = {
+            "mode": "exact-ref",
+            "original_head_sha": "b" * 40,
+            "current_head_sha": "b" * 40,
+            "tested_head_sha": "b" * 40,
+            "dirty": False,
+            "status_porcelain_v1": [" M scripts/gc_1090_evidence_report.py"],
+        }
+        write_json(root / "metadata.json", metadata)
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(
+            any("dirty flag does not match" in error for error in packet["errors"])
+        )
+        self.assertTrue(
+            any("dirty but mode is not worktree-snapshot" in error for error in packet["errors"])
+        )
+
+    def test_gate_accepts_dirty_worktree_snapshot_with_hashed_diff(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        diff_bytes = b"diff --git a/untracked.txt b/untracked.txt\nnew file mode 100644\n"
+        (root / "source-tested-head.patch").write_bytes(diff_bytes)
+        metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+        metadata["source_state"] = {
+            "mode": "worktree-snapshot",
+            "original_head_sha": "c" * 40,
+            "current_head_sha": "c" * 40,
+            "tested_head_sha": "b" * 40,
+            "tested_head_tree_sha": "d" * 40,
+            "dirty": True,
+            "status_porcelain_v1": ["?? untracked.txt"],
+            "tested_head_diff_path": "source-tested-head.patch",
+            "tested_head_diff_sha256": hashlib.sha256(diff_bytes).hexdigest(),
+        }
+        write_json(root / "metadata.json", metadata)
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "pass", packet["errors"])
+        self.assertEqual(
+            packet["source_state"]["tested_head_diff_sha256"],
+            hashlib.sha256(diff_bytes).hexdigest(),
+        )
+
+    def test_gate_rejects_worktree_snapshot_hash_mismatch(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        (root / "source-tested-head.patch").write_bytes(b"actual")
+        metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+        metadata["source_state"] = {
+            "mode": "worktree-snapshot",
+            "original_head_sha": "c" * 40,
+            "current_head_sha": "c" * 40,
+            "tested_head_sha": "b" * 40,
+            "tested_head_tree_sha": "d" * 40,
+            "dirty": True,
+            "status_porcelain_v1": ["?? untracked.txt"],
+            "tested_head_diff_path": "source-tested-head.patch",
+            "tested_head_diff_sha256": hashlib.sha256(b"expected").hexdigest(),
+        }
+        write_json(root / "metadata.json", metadata)
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(any("diff hash mismatch" in error for error in packet["errors"]))
+
+    def test_gate_rejects_missing_source_state(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+        metadata.pop("source_state")
+        write_json(root / "metadata.json", metadata)
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(any("source_state metadata is missing" in error for error in packet["errors"]))
+
+    def test_gate_rejects_worktree_snapshot_head_mismatch(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        diff_bytes = b"diff --git a/untracked.txt b/untracked.txt\nnew file mode 100644\n"
+        (root / "source-tested-head.patch").write_bytes(diff_bytes)
+        metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+        metadata["source_state"] = {
+            "mode": "worktree-snapshot",
+            "original_head_sha": "c" * 40,
+            "current_head_sha": "c" * 40,
+            "tested_head_sha": "e" * 40,
+            "tested_head_tree_sha": "d" * 40,
+            "dirty": True,
+            "status_porcelain_v1": ["?? untracked.txt"],
+            "tested_head_diff_path": "source-tested-head.patch",
+            "tested_head_diff_sha256": hashlib.sha256(diff_bytes).hexdigest(),
+        }
+        write_json(root / "metadata.json", metadata)
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(any("tested_head_sha does not match" in error for error in packet["errors"]))
+
+    def test_gate_rejects_worktree_snapshot_empty_dirty_diff(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        diff_bytes = b""
+        (root / "source-tested-head.patch").write_bytes(diff_bytes)
+        metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+        metadata["source_state"] = {
+            "mode": "worktree-snapshot",
+            "original_head_sha": "c" * 40,
+            "current_head_sha": "c" * 40,
+            "tested_head_sha": "b" * 40,
+            "tested_head_tree_sha": "d" * 40,
+            "dirty": True,
+            "status_porcelain_v1": ["A  staged-new.txt"],
+            "tested_head_diff_path": "source-tested-head.patch",
+            "tested_head_diff_sha256": hashlib.sha256(diff_bytes).hexdigest(),
+        }
+        write_json(root / "metadata.json", metadata)
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(any("empty tested head diff" in error for error in packet["errors"]))
+
+    def test_gate_rejects_worktree_snapshot_escaping_diff_path(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+        metadata["source_state"] = {
+            "mode": "worktree-snapshot",
+            "original_head_sha": "c" * 40,
+            "current_head_sha": "c" * 40,
+            "tested_head_sha": "b" * 40,
+            "tested_head_tree_sha": "d" * 40,
+            "dirty": True,
+            "status_porcelain_v1": ["?? untracked.txt"],
+            "tested_head_diff_path": "../source-tested-head.patch",
+            "tested_head_diff_sha256": hashlib.sha256(b"outside").hexdigest(),
+        }
+        write_json(root / "metadata.json", metadata)
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(any("must stay inside packet root" in error for error in packet["errors"]))
 
     def test_gate_fails_unaudited_store_sites(self):
         temp, root = self.make_root()

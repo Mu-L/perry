@@ -5,9 +5,9 @@ use super::*;
 use crate::value::js_nanbox_string;
 
 pub(super) unsafe fn call_replace_callback(callback: f64, args: &[f64]) -> String {
-    let prev = crate::object::js_implicit_this_set(f64::from_bits(crate::value::TAG_UNDEFINED));
+    let prev = crate::object::js_implicit_this_push(f64::from_bits(crate::value::TAG_UNDEFINED));
     let ret = crate::closure::js_native_call_value(callback, args.as_ptr(), args.len());
-    crate::object::js_implicit_this_set(prev);
+    crate::object::js_implicit_this_restore(prev);
     let ptr = crate::value::js_get_string_pointer_unified(ret) as *const StringHeader;
     if is_valid_ptr(ptr) {
         string_as_str(ptr).to_string()

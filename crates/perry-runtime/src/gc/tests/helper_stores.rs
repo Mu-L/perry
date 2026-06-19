@@ -47,6 +47,33 @@ unsafe fn assert_slot_rewritten_to_nursery(slot: *const u64, before: usize) -> u
 }
 
 #[test]
+fn json_parse_input_root_rewrites_across_moving_minor() {
+    let _guard = CopyingNurseryTestGuard::new(0);
+    let _env_guard = EnvVarGuard::set("PERRY_GC_VERIFY_EVACUATION", "1");
+    let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    gc_register_mutable_root_scanner(json_parse_mutable_root_scanner);
+
+    let input = br#"{"k":"value"}"#;
+    let text = crate::string::js_string_from_bytes(input.as_ptr(), input.len() as u32);
+    assert!(crate::arena::pointer_in_nursery(text as usize));
+
+    let root = crate::json::parse_root_push(crate::JSValue::string_ptr(text));
+    let trace = collect_minor_trace(GcTriggerKind::Direct);
+    assert_verified_copied_minor(&trace);
+
+    let rooted = crate::json::parse_root_get(root);
+    let moved = (rooted.bits() & POINTER_MASK) as *const crate::StringHeader;
+    assert_ne!(moved as usize, text as usize);
+    assert!(crate::arena::pointer_in_nursery(moved as usize));
+    unsafe {
+        let data = (moved as *const u8).add(std::mem::size_of::<crate::StringHeader>());
+        let bytes = std::slice::from_raw_parts(data, (*moved).byte_len as usize);
+        assert_eq!(bytes, input);
+    }
+    crate::json::parse_root_restore(root);
+}
+
+#[test]
 fn shared_array_and_object_slot_helpers_preserve_young_children() {
     let _guard = CopyingNurseryTestGuard::new(0);
     let _env_guard = EnvVarGuard::set("PERRY_GC_VERIFY_EVACUATION", "1");
@@ -150,6 +177,10 @@ fn json_large_object_materialization_preserves_young_string_fields() {
     };
     let first_child = unsafe { (*fields & POINTER_MASK) as usize };
     assert!(crate::arena::pointer_in_nursery(first_child));
+    assert!(
+        remembered_set_size() > 0,
+        "old JSON materialization must remember young string field slots before copied minor"
+    );
 
     let trace = collect_minor_trace(GcTriggerKind::Direct);
     let obj_after = (js_shadow_slot_get(0) & POINTER_MASK) as *mut crate::object::ObjectHeader;

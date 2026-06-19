@@ -55,12 +55,84 @@ unsafe fn field_indices_on_distinct_pages(fields: *mut u64, field_count: u32) ->
     panic!("test object did not span two field pages");
 }
 
+unsafe fn field_indices_on_distinct_cards_same_page(
+    fields: *mut u64,
+    field_count: u32,
+) -> (usize, usize) {
+    assert!(field_count > 1);
+    for first in 0..field_count as usize {
+        let first_addr = fields.add(first) as usize;
+        let first_page = crate::arena::generation_page_for_addr(first_addr);
+        let first_card = remembered_card_for_addr(first_addr);
+        for second in first + 1..field_count as usize {
+            let second_addr = fields.add(second) as usize;
+            if crate::arena::generation_page_for_addr(second_addr) == first_page
+                && remembered_card_for_addr(second_addr) != first_card
+            {
+                return (first, second);
+            }
+        }
+    }
+    panic!("test object did not have two field cards on one page");
+}
+
+unsafe fn field_indices_on_same_card(fields: *mut u64, field_count: u32) -> (usize, usize) {
+    assert!(field_count > 1);
+    for first in 0..field_count as usize {
+        let first_card = remembered_card_for_addr(fields.add(first) as usize);
+        for second in first + 1..field_count as usize {
+            if remembered_card_for_addr(fields.add(second) as usize) == first_card {
+                return (first, second);
+            }
+        }
+    }
+    panic!("test object did not have two fields on one card");
+}
+
+unsafe fn old_promise_with_value_reason_on_same_card() -> *mut crate::promise::Promise {
+    for _ in 0..128 {
+        let promise = alloc_old_test_promise();
+        let value_slot = &mut (*promise).value as *mut f64 as usize;
+        let reason_slot = &mut (*promise).reason as *mut f64 as usize;
+        if remembered_card_for_addr(value_slot) == remembered_card_for_addr(reason_slot) {
+            return promise;
+        }
+    }
+    panic!("test could not allocate Promise with value/reason on the same card");
+}
+
 fn remembered_maintenance_entry_count() -> usize {
-    let dirty_old = DIRTY_OLD_PAGES.with(|s| s.borrow().len());
+    let dirty_old = remembered_dirty_old_page_count();
     let external_dirty =
         EXTERNAL_DIRTY_SLOT_PAGES.with(|s| s.borrow().values().map(Vec::len).sum::<usize>());
+    let external_dirty_cards =
+        EXTERNAL_DIRTY_SLOT_CARDS.with(|s| s.borrow().values().map(Vec::len).sum::<usize>());
     let fallback = REMEMBERED_SET.with(|s| s.borrow().len());
-    dirty_old + external_dirty + fallback
+    dirty_old + external_dirty + external_dirty_cards + fallback
+}
+
+thread_local! {
+    static VERIFIER_MUTABLE_SCANNER_ROOT: std::cell::RefCell<u64> =
+        const { std::cell::RefCell::new(0) };
+}
+
+fn test_verifier_mutable_root_scanner(visitor: &mut RuntimeRootVisitor<'_>) {
+    VERIFIER_MUTABLE_SCANNER_ROOT.with(|slot| {
+        visitor.visit_nanbox_u64_slot(&mut *slot.borrow_mut());
+    });
+}
+
+extern "C" fn test_verifier_ffi_mutable_root_scanner(
+    visit: PerryFfiMutableRootVisitor,
+    ctx: *mut std::ffi::c_void,
+) {
+    VERIFIER_MUTABLE_SCANNER_ROOT.with(|slot| {
+        visit(
+            PERRY_FFI_ROOT_SLOT_NANBOX_U64,
+            (&mut *slot.borrow_mut() as *mut u64).cast::<std::ffi::c_void>(),
+            ctx,
+        );
+    });
 }
 
 #[test]
@@ -129,6 +201,189 @@ fn test_write_barrier_slot_marks_dirty_page_and_dedups() {
 }
 
 #[test]
+fn test_write_barrier_slot_reuses_same_card_fast_path() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_remembered_set();
+    let tracing = gc_trace_enabled();
+    let _ = take_write_barrier_trace_counters();
+
+    let young = crate::arena::arena_alloc_gc(40, 8, GC_TYPE_OBJECT) as usize;
+    let (old_obj, fields) = unsafe { alloc_old_test_object(8) };
+    unsafe {
+        *fields = POINTER_TAG | young as u64;
+    }
+
+    let parent = POINTER_TAG | old_obj as u64;
+    let child = POINTER_TAG | young as u64;
+    js_write_barrier_slot(parent, fields as u64, child);
+    js_write_barrier_slot(parent, fields as u64, child);
+
+    assert_eq!(remembered_dirty_page_count(), 1);
+    assert_eq!(remembered_dirty_card_count(), 1);
+
+    let counters = take_write_barrier_trace_counters();
+    if tracing {
+        assert_eq!(counters.calls, 2);
+        assert_eq!(counters.old_to_young_slow_hits, 2);
+        assert_eq!(counters.remembered_set_insert_attempts, 2);
+        assert_eq!(counters.dirty_page_mark_attempts, 1);
+        assert_eq!(counters.dirty_card_mark_attempts, 1);
+        assert_eq!(counters.same_card_fast_path_hits, 1);
+    }
+}
+
+#[test]
+fn test_write_barrier_slot_same_card_fast_path_preserves_card_semantics() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_remembered_set();
+    clear_marks();
+    let tracing = gc_trace_enabled();
+    let _ = take_write_barrier_trace_counters();
+
+    let first_child = crate::arena::arena_alloc_gc(40, 8, GC_TYPE_OBJECT) as usize;
+    let second_child = crate::arena::arena_alloc_gc(40, 8, GC_TYPE_OBJECT) as usize;
+    let (old_obj, fields) = unsafe { alloc_old_test_object(128) };
+    let (first_idx, second_idx) = unsafe { field_indices_on_same_card(fields, 128) };
+    let first_slot = unsafe { fields.add(first_idx) };
+    let second_slot = unsafe { fields.add(second_idx) };
+    unsafe {
+        *first_slot = POINTER_TAG | first_child as u64;
+        *second_slot = POINTER_TAG | second_child as u64;
+    }
+
+    let parent = POINTER_TAG | old_obj as u64;
+    js_write_barrier_slot(parent, first_slot as u64, POINTER_TAG | first_child as u64);
+    js_write_barrier_slot(
+        parent,
+        second_slot as u64,
+        POINTER_TAG | second_child as u64,
+    );
+
+    assert_eq!(remembered_dirty_page_count(), 1);
+    assert_eq!(remembered_dirty_card_count(), 1);
+
+    let valid_ptrs = build_valid_pointer_set();
+    let stats = mark_remembered_set_roots(&valid_ptrs);
+    assert_eq!(stats.dirty_cards_considered, 1);
+    assert_eq!(stats.dirty_slot_pages_considered, 1);
+    assert_eq!(stats.dirty_slot_ranges_scanned, 1);
+    assert_eq!(stats.newly_marked, 2);
+    unsafe {
+        let first_header = header_from_user_ptr(first_child as *const u8);
+        let second_header = header_from_user_ptr(second_child as *const u8);
+        assert_ne!((*first_header).gc_flags & GC_FLAG_MARKED, 0);
+        assert_ne!((*second_header).gc_flags & GC_FLAG_MARKED, 0);
+    }
+
+    let counters = take_write_barrier_trace_counters();
+    if tracing {
+        assert_eq!(counters.calls, 2);
+        assert_eq!(counters.old_to_young_slow_hits, 2);
+        assert_eq!(counters.dirty_page_mark_attempts, 1);
+        assert_eq!(counters.dirty_card_mark_attempts, 1);
+        assert_eq!(counters.same_card_fast_path_hits, 1);
+    }
+
+    clear_marks();
+    remembered_set_clear();
+}
+
+#[test]
+fn test_write_barrier_slot_records_two_cards_in_one_page_mask() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_remembered_set();
+    let tracing = gc_trace_enabled();
+    let _ = take_write_barrier_trace_counters();
+
+    let first_child = crate::arena::arena_alloc_gc(40, 8, GC_TYPE_OBJECT) as usize;
+    let second_child = crate::arena::arena_alloc_gc(40, 8, GC_TYPE_OBJECT) as usize;
+    let (old_obj, fields) = unsafe { alloc_old_test_object(1024) };
+    let (first_idx, second_idx) =
+        unsafe { field_indices_on_distinct_cards_same_page(fields, 1024) };
+    let first_slot = unsafe { fields.add(first_idx) };
+    let second_slot = unsafe { fields.add(second_idx) };
+    unsafe {
+        *first_slot = POINTER_TAG | first_child as u64;
+        *second_slot = POINTER_TAG | second_child as u64;
+    }
+
+    let parent = POINTER_TAG | old_obj as u64;
+    js_write_barrier_slot(parent, first_slot as u64, POINTER_TAG | first_child as u64);
+    js_write_barrier_slot(
+        parent,
+        second_slot as u64,
+        POINTER_TAG | second_child as u64,
+    );
+
+    let dirty_page = crate::arena::generation_page_for_addr(first_slot as usize);
+    assert_eq!(
+        crate::arena::generation_page_for_addr(second_slot as usize),
+        dirty_page
+    );
+    assert_eq!(remembered_dirty_old_page_count(), 1);
+    assert!(remembered_dirty_old_page_contains(dirty_page));
+    assert_eq!(remembered_dirty_page_count(), 1);
+    assert_eq!(remembered_dirty_card_count(), 2);
+
+    let counters = take_write_barrier_trace_counters();
+    if tracing {
+        assert_eq!(counters.calls, 2);
+        assert_eq!(counters.old_to_young_slow_hits, 2);
+        assert_eq!(counters.remembered_set_insert_attempts, 2);
+        assert_eq!(counters.dirty_page_mark_attempts, 2);
+        assert_eq!(counters.dirty_card_mark_attempts, 2);
+        assert_eq!(counters.new_dirty_pages, 1);
+        assert_eq!(counters.new_dirty_cards, 2);
+        assert_eq!(counters.same_card_fast_path_hits, 0);
+    }
+}
+
+#[test]
+fn test_dirty_fixed_slots_on_one_card_count_card_and_page_once() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_remembered_set();
+    clear_marks();
+
+    let first_child = crate::arena::arena_alloc_gc(40, 8, GC_TYPE_OBJECT) as usize;
+    let second_child = crate::arena::arena_alloc_gc(40, 8, GC_TYPE_OBJECT) as usize;
+    let promise = unsafe { old_promise_with_value_reason_on_same_card() };
+    unsafe {
+        (*promise).value = f64::from_bits(POINTER_TAG | first_child as u64);
+        (*promise).reason = f64::from_bits(POINTER_TAG | second_child as u64);
+    }
+    let value_slot = unsafe { &mut (*promise).value as *mut f64 as usize };
+    let dirty_page = crate::arena::generation_page_for_addr(value_slot);
+    let dirty_card = remembered_card_for_addr(value_slot);
+    assert!(mark_dirty_old_card_with_page(dirty_page, dirty_card));
+
+    let valid_ptrs = build_valid_pointer_set();
+    let stats = mark_remembered_set_roots(&valid_ptrs);
+    assert_eq!(stats.dirty_pages_scanned, 1);
+    assert_eq!(stats.dirty_cards_scanned, 1);
+    assert_eq!(stats.old_objects_considered, 1);
+    assert_eq!(stats.dirty_objects_scanned, 1);
+    assert_eq!(
+        stats.dirty_cards_considered, 1,
+        "multiple fixed slots on one dirty card should count one considered card"
+    );
+    assert_eq!(
+        stats.dirty_slot_pages_considered, 1,
+        "multiple fixed slots on one dirty card should count one considered page"
+    );
+    assert_eq!(stats.dirty_slot_ranges_scanned, 0);
+    assert_eq!(stats.newly_marked, 2);
+    unsafe {
+        let first_header = header_from_user_ptr(first_child as *const u8);
+        let second_header = header_from_user_ptr(second_child as *const u8);
+        assert_ne!((*first_header).gc_flags & GC_FLAG_MARKED, 0);
+        assert_ne!((*second_header).gc_flags & GC_FLAG_MARKED, 0);
+    }
+
+    clear_marks();
+    remembered_set_clear();
+}
+
+#[test]
 fn test_barriered_slot_store_api_trace_counters() {
     let _guard = GcTestIsolationGuard::new();
     reset_remembered_set();
@@ -193,6 +448,11 @@ fn test_remembered_set_clear_state_slices_maintenance_entries() {
         pages.insert(0x1000, vec![0x10, 0x20]);
         pages.insert(0x2000, vec![0x30]);
     });
+    EXTERNAL_DIRTY_SLOT_CARDS.with(|s| {
+        let mut cards = s.borrow_mut();
+        cards.insert(0x1000, vec![0x10, 0x20]);
+        cards.insert(0x2000, vec![0x30]);
+    });
     REMEMBERED_SET.with(|s| {
         let mut headers = s.borrow_mut();
         headers.insert(0x40);
@@ -200,17 +460,29 @@ fn test_remembered_set_clear_state_slices_maintenance_entries() {
     });
 
     let initial = remembered_maintenance_entry_count();
-    assert_eq!(initial, dirty_pages.len() + 5);
+    assert_eq!(initial, dirty_pages.len() + 8);
 
     let mut state = RememberedSetClearState::new();
+    assert_eq!(
+        remembered_maintenance_entry_count(),
+        0,
+        "clear state should snapshot existing entries so new barriers use live sets"
+    );
     assert!(
         !state.step(1),
         "one cleanup unit must not drain all maintenance structures"
     );
-    assert_eq!(remembered_maintenance_entry_count(), initial - 1);
+    assert_eq!(
+        dirty_pages
+            .iter()
+            .filter(|&&page| !old_page_dirty_for(page))
+            .count(),
+        1,
+        "one cleanup unit should clear one snapshotted old page's metadata"
+    );
     assert!(
-        DIRTY_OLD_PAGES.with(|s| !s.borrow().is_empty()),
-        "one cleanup unit should remove one dirty old page, not bulk-clear the set"
+        dirty_pages.iter().any(|&page| old_page_dirty_for(page)),
+        "one cleanup unit should not bulk-clear old page metadata"
     );
 
     let mut calls = 1usize;
@@ -230,6 +502,133 @@ fn test_remembered_set_clear_state_slices_maintenance_entries() {
             "dirty old-page metadata should be clear after cleanup completes"
         );
     }
+}
+
+#[test]
+fn test_remembered_set_clear_state_slices_empty_external_buckets() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_remembered_set();
+
+    EXTERNAL_DIRTY_SLOT_PAGES.with(|s| {
+        let mut pages = s.borrow_mut();
+        pages.insert(0x1000, Vec::new());
+        pages.insert(0x2000, Vec::new());
+    });
+    EXTERNAL_DIRTY_SLOT_CARDS.with(|s| {
+        let mut cards = s.borrow_mut();
+        cards.insert(0x3000, Vec::new());
+        cards.insert(0x4000, Vec::new());
+    });
+    assert_eq!(
+        remembered_maintenance_entry_count(),
+        0,
+        "empty external buckets are not header entries but still require bounded cleanup"
+    );
+
+    let mut state = RememberedSetClearState::new();
+    assert_eq!(remembered_dirty_page_count(), 0);
+    assert_eq!(remembered_dirty_card_count(), 0);
+
+    let first = state.step_counted(1);
+    assert_eq!(first.work_units, 1);
+    assert!(
+        !first.done,
+        "empty bucket cleanup should not finish all snapshot buckets in one step"
+    );
+
+    let mut calls = 1usize;
+    let mut total_work = first.work_units;
+    while calls < 16 {
+        let step = state.step_counted(1);
+        calls += 1;
+        total_work += step.work_units;
+        assert!(step.work_units <= 1);
+        if step.done {
+            break;
+        }
+    }
+    assert!(calls > 1);
+    assert!(total_work >= 2);
+    assert!(
+        state.step_counted(1).done,
+        "empty external bucket cleanup should finish in bounded steps"
+    );
+}
+
+#[test]
+fn test_remembered_set_clear_state_preserves_new_barriers_after_snapshot() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_remembered_set();
+
+    let old = crate::arena::arena_alloc_gc_old(16 * 1024, 8, GC_TYPE_STRING) as usize;
+    let old_header = unsafe { header_from_user_ptr(old as *const u8) };
+    let old_total = unsafe { (*old_header).size as usize };
+    let dirty_page = crate::arena::old_object_page_overlaps(old_header as usize, old_total)
+        .into_iter()
+        .map(|(page, _)| page)
+        .next()
+        .expect("old object should occupy an old page");
+
+    mark_dirty_old_page(dirty_page);
+    assert!(old_page_dirty_for(dirty_page));
+
+    let mut state = RememberedSetClearState::new();
+    assert_eq!(remembered_maintenance_entry_count(), 0);
+
+    mark_dirty_old_page(dirty_page);
+    assert_eq!(remembered_dirty_page_count(), 1);
+    assert!(old_page_dirty_for(dirty_page));
+
+    while !state.step(1) {}
+
+    assert_eq!(
+        remembered_dirty_page_count(),
+        1,
+        "new dirty page inserted after clear snapshot must survive old cleanup"
+    );
+    assert!(
+        remembered_dirty_old_page_contains(dirty_page),
+        "live dirty-page set should still contain the post-snapshot barrier"
+    );
+    assert!(
+        old_page_dirty_for(dirty_page),
+        "old page metadata should not be cleared over a post-snapshot barrier"
+    );
+}
+
+#[test]
+fn test_remembered_set_clear_state_preserves_new_external_barriers_after_snapshot() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_remembered_set();
+
+    let page = 0x1000;
+    let old_header = 0x10;
+    let new_header = 0x20;
+    let card = remembered_card_for_addr(page << 12);
+    EXTERNAL_DIRTY_SLOT_PAGES.with(|s| {
+        s.borrow_mut().insert(page, vec![old_header]);
+    });
+    EXTERNAL_DIRTY_SLOT_CARDS.with(|s| {
+        s.borrow_mut().insert(card, vec![old_header]);
+    });
+
+    let mut state = RememberedSetClearState::new();
+    assert_eq!(remembered_dirty_page_count(), 0);
+    assert_eq!(remembered_dirty_card_count(), 0);
+
+    mark_dirty_external_slot_card_with_page(new_header, page, card);
+    while !state.step(1) {}
+
+    assert_eq!(remembered_dirty_page_count(), 1);
+    assert_eq!(remembered_dirty_card_count(), 1);
+    EXTERNAL_DIRTY_SLOT_PAGES.with(|s| {
+        let pages = s.borrow();
+        assert_eq!(pages.get(&page).map(Vec::as_slice), Some(&[new_header][..]));
+    });
+    EXTERNAL_DIRTY_SLOT_CARDS.with(|s| {
+        let cards = s.borrow();
+        assert_eq!(cards.get(&card).map(Vec::as_slice), Some(&[new_header][..]));
+    });
 }
 
 #[test]
@@ -413,6 +812,55 @@ fn test_dirty_page_scan_marks_young_child() {
 }
 
 #[test]
+fn test_dirty_card_scan_ignores_clean_card_on_same_old_page() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_remembered_set();
+    clear_marks();
+    let dirty_child = crate::arena::arena_alloc_gc(40, 8, GC_TYPE_OBJECT) as usize;
+    let clean_child = crate::arena::arena_alloc_gc(40, 8, GC_TYPE_OBJECT) as usize;
+    let (old_obj, fields) = unsafe { alloc_old_test_object(1024) };
+    let (dirty_idx, clean_idx) = unsafe { field_indices_on_distinct_cards_same_page(fields, 1024) };
+    let dirty_slot = unsafe { fields.add(dirty_idx) };
+    let clean_slot = unsafe { fields.add(clean_idx) };
+    unsafe {
+        *dirty_slot = POINTER_TAG | dirty_child as u64;
+        *clean_slot = POINTER_TAG | clean_child as u64;
+    }
+
+    js_write_barrier_slot(
+        POINTER_TAG | old_obj as u64,
+        dirty_slot as u64,
+        POINTER_TAG | dirty_child as u64,
+    );
+
+    assert_eq!(remembered_dirty_page_count(), 1);
+    assert_eq!(remembered_dirty_card_count(), 1);
+
+    let valid_ptrs = build_valid_pointer_set();
+    let stats = mark_remembered_set_roots(&valid_ptrs);
+    assert_eq!(stats.dirty_pages_scanned, 1);
+    assert_eq!(stats.dirty_cards_scanned, 1);
+    assert_eq!(stats.dirty_cards_considered, 1);
+    assert!(
+        stats.dirty_slots_scanned <= CARD_SIZE / std::mem::size_of::<u64>(),
+        "one dirty card should bound scanning to one card"
+    );
+    assert_eq!(stats.newly_marked, 1);
+    unsafe {
+        let dirty_header = header_from_user_ptr(dirty_child as *const u8);
+        let clean_header = header_from_user_ptr(clean_child as *const u8);
+        assert_ne!((*dirty_header).gc_flags & GC_FLAG_MARKED, 0);
+        assert_eq!(
+            (*clean_header).gc_flags & GC_FLAG_MARKED,
+            0,
+            "young child stored only on a clean card should not be marked"
+        );
+    }
+    clear_marks();
+    remembered_set_clear();
+}
+
+#[test]
 fn test_old_young_edge_verifier_rejects_unbarriered_old_object_field() {
     let _guard = GcTestIsolationGuard::new();
     reset_remembered_set();
@@ -434,6 +882,272 @@ fn test_old_young_edge_verifier_rejects_unbarriered_old_object_field() {
     unsafe {
         (*old_header).gc_flags &= !GC_FLAG_MARKED;
     }
+    clear_marks();
+    remembered_set_clear();
+}
+
+#[test]
+fn test_old_young_edge_verifier_rejects_unbarriered_shadow_rooted_old_object_field() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_remembered_set();
+    clear_marks();
+    let frame = js_shadow_frame_push(1);
+    let young = crate::arena::arena_alloc_gc(40, 8, GC_TYPE_OBJECT) as usize;
+    let (old_obj, fields) = unsafe { alloc_old_test_object(1) };
+    let old_header = unsafe { header_from_user_ptr(old_obj as *const u8) };
+    unsafe {
+        *fields = ptr_bits(young);
+        assert_eq!(
+            (*old_header).gc_flags & (GC_FLAG_MARKED | GC_FLAG_PINNED),
+            0,
+            "regression must exercise an old parent made live only by the shadow root"
+        );
+    }
+    js_shadow_slot_set(0, ptr_bits(old_obj as usize));
+
+    let result = std::panic::catch_unwind(verify_old_to_young_edges_covered);
+
+    js_shadow_frame_pop(frame);
+    assert!(
+        result.is_err(),
+        "unbarriered shadow-rooted old-to-young field must fail the verifier"
+    );
+    clear_marks();
+    remembered_set_clear();
+}
+
+#[test]
+fn test_old_young_edge_verifier_accepts_barriered_shadow_rooted_old_object_field() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_remembered_set();
+    clear_marks();
+    let frame = js_shadow_frame_push(1);
+    let young = crate::arena::arena_alloc_gc(40, 8, GC_TYPE_OBJECT) as usize;
+    let (old_obj, fields) = unsafe { alloc_old_test_object(1) };
+    let old_header = unsafe { header_from_user_ptr(old_obj as *const u8) };
+    unsafe {
+        *fields = ptr_bits(young);
+        assert_eq!(
+            (*old_header).gc_flags & (GC_FLAG_MARKED | GC_FLAG_PINNED),
+            0,
+            "regression must exercise an old parent made live only by the shadow root"
+        );
+    }
+    js_shadow_slot_set(0, ptr_bits(old_obj as usize));
+    js_write_barrier_slot(ptr_bits(old_obj as usize), fields as u64, ptr_bits(young));
+
+    let stats = verify_old_to_young_edges_covered();
+
+    js_shadow_frame_pop(frame);
+    assert_eq!(stats.checked_old_to_young_edges, 1);
+    assert_eq!(stats.missing_edges, 0);
+    clear_marks();
+    remembered_set_clear();
+}
+
+#[test]
+fn test_old_young_edge_verifier_rejects_unbarriered_global_rooted_old_object_field() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_remembered_set();
+    clear_marks();
+    let young = crate::arena::arena_alloc_gc(40, 8, GC_TYPE_OBJECT) as usize;
+    let (old_obj, fields) = unsafe { alloc_old_test_object(1) };
+    let old_header = unsafe { header_from_user_ptr(old_obj as *const u8) };
+    unsafe {
+        *fields = ptr_bits(young);
+        assert_eq!(
+            (*old_header).gc_flags & (GC_FLAG_MARKED | GC_FLAG_PINNED),
+            0,
+            "regression must exercise an old parent made live only by the global root"
+        );
+    }
+    let mut global_root = old_obj as u64;
+    js_gc_register_global_root((&mut global_root as *mut u64) as i64);
+
+    let result = std::panic::catch_unwind(verify_old_to_young_edges_covered);
+
+    assert!(
+        result.is_err(),
+        "unbarriered raw-global-rooted old-to-young field must fail the verifier"
+    );
+    clear_marks();
+    remembered_set_clear();
+}
+
+#[test]
+fn test_old_young_edge_verifier_rejects_unbarriered_registered_mutable_rooted_old_object_field() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_remembered_set();
+    clear_marks();
+    gc_register_mutable_root_scanner(test_verifier_mutable_root_scanner);
+    let young = crate::arena::arena_alloc_gc(40, 8, GC_TYPE_OBJECT) as usize;
+    let (old_obj, fields) = unsafe { alloc_old_test_object(1) };
+    let old_header = unsafe { header_from_user_ptr(old_obj as *const u8) };
+    unsafe {
+        *fields = ptr_bits(young);
+        assert_eq!(
+            (*old_header).gc_flags & (GC_FLAG_MARKED | GC_FLAG_PINNED),
+            0,
+            "regression must exercise an old parent made live only by a registered mutable scanner"
+        );
+    }
+    VERIFIER_MUTABLE_SCANNER_ROOT.with(|slot| *slot.borrow_mut() = ptr_bits(old_obj as usize));
+
+    let result = std::panic::catch_unwind(verify_old_to_young_edges_covered);
+
+    VERIFIER_MUTABLE_SCANNER_ROOT.with(|slot| *slot.borrow_mut() = 0);
+    assert!(
+        result.is_err(),
+        "unbarriered registered-mutable-rooted old-to-young field must fail the verifier"
+    );
+    clear_marks();
+    remembered_set_clear();
+}
+
+#[test]
+fn test_old_young_edge_verifier_rejects_unbarriered_ffi_mutable_rooted_old_object_field() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_remembered_set();
+    clear_marks();
+    perry_ffi_gc_register_mutable_root_scanner(test_verifier_ffi_mutable_root_scanner);
+    let young = crate::arena::arena_alloc_gc(40, 8, GC_TYPE_OBJECT) as usize;
+    let (old_obj, fields) = unsafe { alloc_old_test_object(1) };
+    let old_header = unsafe { header_from_user_ptr(old_obj as *const u8) };
+    unsafe {
+        *fields = ptr_bits(young);
+        assert_eq!(
+            (*old_header).gc_flags & (GC_FLAG_MARKED | GC_FLAG_PINNED),
+            0,
+            "regression must exercise an old parent made live only by an FFI mutable scanner"
+        );
+    }
+    VERIFIER_MUTABLE_SCANNER_ROOT.with(|slot| *slot.borrow_mut() = ptr_bits(old_obj as usize));
+
+    let result = std::panic::catch_unwind(verify_old_to_young_edges_covered);
+
+    VERIFIER_MUTABLE_SCANNER_ROOT.with(|slot| *slot.borrow_mut() = 0);
+    assert!(
+        result.is_err(),
+        "unbarriered FFI-mutable-rooted old-to-young field must fail the verifier"
+    );
+    clear_marks();
+    remembered_set_clear();
+}
+
+#[test]
+fn test_old_young_edge_verifier_rejects_unbarriered_copy_only_rooted_old_object_field() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_remembered_set();
+    clear_marks();
+    let young = crate::arena::arena_alloc_gc(40, 8, GC_TYPE_OBJECT) as usize;
+    let (old_obj, fields) = unsafe { alloc_old_test_object(1) };
+    let old_header = unsafe { header_from_user_ptr(old_obj as *const u8) };
+    unsafe {
+        *fields = ptr_bits(young);
+        assert_eq!(
+            (*old_header).gc_flags & (GC_FLAG_MARKED | GC_FLAG_PINNED),
+            0,
+            "regression must exercise an old parent made live only by a copy-only scanner"
+        );
+    }
+    let _copy_only_root_guard =
+        TemporaryCopyOnlyRootScanner::rust_bits(&[ptr_bits(old_obj as usize)]);
+
+    let result = std::panic::catch_unwind(verify_old_to_young_edges_covered);
+
+    assert!(
+        result.is_err(),
+        "unbarriered copy-only-rooted old-to-young field must fail the verifier"
+    );
+    clear_marks();
+    remembered_set_clear();
+}
+
+#[test]
+fn test_old_young_edge_verifier_rejects_unbarriered_ffi_copy_only_rooted_old_object_field() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_remembered_set();
+    clear_marks();
+    let young = crate::arena::arena_alloc_gc(40, 8, GC_TYPE_OBJECT) as usize;
+    let (old_obj, fields) = unsafe { alloc_old_test_object(1) };
+    let old_header = unsafe { header_from_user_ptr(old_obj as *const u8) };
+    unsafe {
+        *fields = ptr_bits(young);
+        assert_eq!(
+            (*old_header).gc_flags & (GC_FLAG_MARKED | GC_FLAG_PINNED),
+            0,
+            "regression must exercise an old parent made live only by an FFI copy-only scanner"
+        );
+    }
+    let _copy_only_root_guard =
+        TemporaryCopyOnlyRootScanner::ffi_bits(&[ptr_bits(old_obj as usize)]);
+
+    let result = std::panic::catch_unwind(verify_old_to_young_edges_covered);
+
+    assert!(
+        result.is_err(),
+        "unbarriered FFI-copy-only-rooted old-to-young field must fail the verifier"
+    );
+    clear_marks();
+    remembered_set_clear();
+}
+
+#[test]
+fn test_old_young_edge_verifier_accepts_barriered_copy_only_rooted_old_object_field() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_remembered_set();
+    clear_marks();
+    let young = crate::arena::arena_alloc_gc(40, 8, GC_TYPE_OBJECT) as usize;
+    let (old_obj, fields) = unsafe { alloc_old_test_object(1) };
+    let old_header = unsafe { header_from_user_ptr(old_obj as *const u8) };
+    unsafe {
+        *fields = ptr_bits(young);
+        assert_eq!(
+            (*old_header).gc_flags & (GC_FLAG_MARKED | GC_FLAG_PINNED),
+            0,
+            "regression must exercise an old parent made live only by a copy-only scanner"
+        );
+    }
+    let _copy_only_root_guard =
+        TemporaryCopyOnlyRootScanner::rust_bits(&[ptr_bits(old_obj as usize)]);
+    js_write_barrier_slot(ptr_bits(old_obj as usize), fields as u64, ptr_bits(young));
+
+    let stats = verify_old_to_young_edges_covered();
+
+    assert_eq!(stats.checked_old_to_young_edges, 1);
+    assert_eq!(stats.missing_edges, 0);
+    clear_marks();
+    remembered_set_clear();
+}
+
+#[test]
+fn test_old_young_edge_verifier_rejects_unbarriered_transitively_rooted_old_object_field() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_remembered_set();
+    clear_marks();
+    let frame = js_shadow_frame_push(1);
+    let young = crate::arena::arena_alloc_gc(40, 8, GC_TYPE_OBJECT) as usize;
+    let (root_obj, root_fields) = unsafe { alloc_old_test_object(1) };
+    let (old_child, child_fields) = unsafe { alloc_old_test_object(1) };
+    let child_header = unsafe { header_from_user_ptr(old_child as *const u8) };
+    unsafe {
+        *root_fields = ptr_bits(old_child as usize);
+        *child_fields = ptr_bits(young);
+        assert_eq!(
+            (*child_header).gc_flags & (GC_FLAG_MARKED | GC_FLAG_PINNED),
+            0,
+            "regression must exercise a transitive old parent before mark metadata exists"
+        );
+    }
+    js_shadow_slot_set(0, ptr_bits(root_obj as usize));
+
+    let result = std::panic::catch_unwind(verify_old_to_young_edges_covered);
+
+    js_shadow_frame_pop(frame);
+    assert!(
+        result.is_err(),
+        "unbarriered old-to-young field reachable through rooted old graph must fail"
+    );
     clear_marks();
     remembered_set_clear();
 }
@@ -730,8 +1444,8 @@ fn test_dirty_page_array_scan_is_slot_range_bounded() {
     assert_eq!(stats.dirty_objects_scanned, 1);
     assert_eq!(stats.dirty_slot_ranges_scanned, 1);
     assert!(
-        stats.dirty_slots_scanned <= 512,
-        "one dirty page should scan at most one 4 KiB page of u64 slots"
+        stats.dirty_slots_scanned <= CARD_SIZE / std::mem::size_of::<u64>(),
+        "one dirty card should scan at most one 512-byte card of u64 slots"
     );
     unsafe {
         let dirty_header = header_from_user_ptr(dirty_child as *const u8);
@@ -778,8 +1492,8 @@ fn test_dirty_page_scan_ignores_clean_old_pages() {
     assert_eq!(stats.dirty_objects_scanned, 1);
     assert_eq!(stats.dirty_slot_ranges_scanned, 1);
     assert!(
-        stats.dirty_slots_scanned <= 512,
-        "one dirty field page should not scan the whole old object"
+        stats.dirty_slots_scanned <= CARD_SIZE / std::mem::size_of::<u64>(),
+        "one dirty field card should not scan the whole old object"
     );
     unsafe {
         let dirty_header = header_from_user_ptr(dirty_child as *const u8);
@@ -833,8 +1547,8 @@ fn test_dirty_page_scan_dedupes_object_spanning_dirty_pages() {
     assert_eq!(stats.dirty_slot_pages_considered, 2);
     assert!(stats.dirty_slot_ranges_scanned <= 2);
     assert!(
-        stats.dirty_slots_scanned <= 1024,
-        "two dirty field pages should bound scanning to two pages"
+        stats.dirty_slots_scanned <= (CARD_SIZE / std::mem::size_of::<u64>()) * 2,
+        "two dirty field cards should bound scanning to two cards"
     );
     assert_eq!(stats.newly_marked, 2);
     unsafe {
@@ -878,8 +1592,8 @@ fn test_dirty_page_map_entry_scan_is_external_range_bounded() {
     assert_eq!(stats.dirty_objects_scanned, 1);
     assert_eq!(stats.dirty_slot_ranges_scanned, 1);
     assert!(
-        stats.dirty_slots_scanned <= 512,
-        "one dirty map entries page should not scan the whole map"
+        stats.dirty_slots_scanned <= CARD_SIZE / std::mem::size_of::<u64>(),
+        "one dirty map entries card should not scan the whole map"
     );
     unsafe {
         let dirty_header = header_from_user_ptr(dirty_child as *const u8);

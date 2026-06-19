@@ -5,12 +5,12 @@ use crate::native_value::{
     BufferAccessFacts, BufferAccessMode, BufferAccessProof, BufferElem, BufferEndian,
     BufferIndexUnit, ExpectedNativeRep, LoweredValue, MaterializationReason,
 };
-use crate::types::{DOUBLE, F32, I16, I32, I8, PTR};
+use crate::types::{DOUBLE, F32, I16, I32, I64, I8, PTR};
 
 use super::{
     attach_native_owned_view_fact, bounds_for_buffer_access_width, buffer_alias_metadata_suffix,
     buffer_view_lowered_value, can_lower_expr_as_i32, effective_alias_state_for_access,
-    is_numeric_expr, lower_expr, lower_expr_native, FnCtx,
+    emit_i32_index_span_inbounds_assume, is_numeric_expr, lower_expr, lower_expr_native, FnCtx,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -308,28 +308,26 @@ pub(crate) fn emit_buffer_access_pointer(
         blk.load_invariant(I32, &header_ptr)
     };
     if proof.may_emit_inbounds {
-        let bounds_width_units = spec.bounds_width_units();
-        let in_bounds = if bounds_width_units == 1 {
-            blk.icmp_ult(I32, &proof.index.value, &len_i32)
-        } else {
-            let end_i32 = blk.add(I32, &proof.index.value, &bounds_width_units.to_string());
-            blk.icmp_ule(I32, &end_i32, &len_i32)
-        };
-        blk.emit_raw(format!("call void @llvm.assume(i1 {})", in_bounds));
-    }
-    let byte_index = if spec.element_width_bytes > 1 {
-        blk.mul(
-            I32,
+        emit_i32_index_span_inbounds_assume(
+            blk,
             &proof.index.value,
-            &spec.element_width_bytes.to_string(),
+            &len_i32,
+            spec.bounds_width_units(),
+        );
+    }
+    let (byte_index_ty, byte_index) = if spec.element_width_bytes > 1 {
+        let index_i64 = blk.sext(I32, &proof.index.value, I64);
+        (
+            I64,
+            blk.mul(I64, &index_i64, &spec.element_width_bytes.to_string()),
         )
     } else {
-        proof.index.value.clone()
+        (I32, proof.index.value.clone())
     };
     let elem_ptr = if proof.may_emit_inbounds {
-        blk.gep_inbounds(I8, &data_ptr, &[(I32, &byte_index)])
+        blk.gep_inbounds(I8, &data_ptr, &[(byte_index_ty, &byte_index)])
     } else {
-        blk.gep(I8, &data_ptr, &[(I32, &byte_index)])
+        blk.gep(I8, &data_ptr, &[(byte_index_ty, &byte_index)])
     };
     let alias_metadata = if proof.may_emit_noalias {
         buffer_alias_metadata_suffix(proof.view.scope_idx.expect("scope for noalias proof"))

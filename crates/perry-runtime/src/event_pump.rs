@@ -273,6 +273,7 @@ extern "C" {
 /// when nothing is registered.
 #[no_mangle]
 pub extern "C" fn perry_poll() -> i32 {
+    let _gc_scope = crate::gc::gc_enter_host_poll_scope();
     // SAFETY: every call site below is a Perry C FFI surface declared with
     // `extern "C"` linkage and stable across host builds; no thread-safety
     // invariants beyond what each individual function already documents.

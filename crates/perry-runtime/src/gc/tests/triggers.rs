@@ -173,6 +173,40 @@ fn test_gc_bump_never_lowers_existing_arena_trigger() {
 }
 
 #[test]
+fn test_suppressed_parse_pressure_uses_nursery_bytes_for_gen_gc() {
+    assert!(
+        !gc_suppressed_parse_collection_pressure_due(
+            true,
+            GC_SUPPRESSED_TINY_PARSE_IN_USE_TRIGGER_BYTES - 1,
+            usize::MAX,
+        ),
+        "large old/longlived heap pressure must not arm a gen-GC parse-boundary collection"
+    );
+    assert!(gc_suppressed_parse_collection_pressure_due(
+        true,
+        GC_SUPPRESSED_TINY_PARSE_IN_USE_TRIGGER_BYTES,
+        0,
+    ));
+}
+
+#[test]
+fn test_suppressed_parse_pressure_uses_heap_bytes_for_non_gen_gc() {
+    assert!(
+        !gc_suppressed_parse_collection_pressure_due(
+            false,
+            usize::MAX,
+            GC_SUPPRESSED_TINY_PARSE_FULL_GC_IN_USE_TRIGGER_BYTES - 1,
+        ),
+        "non-generational fallback should still gate on whole-heap full-GC pressure"
+    );
+    assert!(gc_suppressed_parse_collection_pressure_due(
+        false,
+        0,
+        GC_SUPPRESSED_TINY_PARSE_FULL_GC_IN_USE_TRIGGER_BYTES,
+    ));
+}
+
+#[test]
 fn test_old_reclaim_pressure_uses_threshold_and_growth() {
     assert!(!old_reclaim_pressure_due(
         GC_OLD_GEN_RECLAIM_THRESHOLD_BYTES - 1,

@@ -385,9 +385,9 @@ unsafe fn call_method_for_primitive(
     // receiver, so rebinding is a correct no-op. Mirrors #1982.
     let recv = value_handle.get_nanbox_f64();
     let bound = crate::closure::clone_closure_rebind_this(method_bits, recv);
-    let prev_this = crate::object::js_implicit_this_set(recv);
+    let prev_this = crate::object::js_implicit_this_push(recv);
     let ret = crate::closure::js_native_call_value(f64::from_bits(bound), std::ptr::null(), 0);
-    crate::object::js_implicit_this_set(prev_this);
+    crate::object::js_implicit_this_restore(prev_this);
     let ret_jsv = JSValue::from_bits(ret.to_bits());
     let is_primitive = ret_jsv.is_any_string()
         || ret_jsv.is_number()

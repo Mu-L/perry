@@ -665,6 +665,16 @@ pub fn check_escapes_in_expr(
                 check_escapes_in_expr(a, candidates, classes, escaped);
             }
         }
+        Expr::NewDynamicSpread { callee, args } => {
+            check_escapes_in_expr(callee, candidates, classes, escaped);
+            for a in args {
+                match a {
+                    CallArg::Expr(e) | CallArg::Spread(e) => {
+                        check_escapes_in_expr(e, candidates, classes, escaped);
+                    }
+                }
+            }
+        }
         Expr::FetchWithOptions {
             url,
             method,

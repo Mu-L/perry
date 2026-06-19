@@ -10,7 +10,7 @@ use super::*;
 
 /// Helper: does this expression contain `LocalGet(target_id)` anywhere?
 pub fn expr_contains_local_get(e: &perry_hir::Expr, target_id: u32) -> bool {
-    use perry_hir::Expr;
+    use perry_hir::{CallArg, Expr};
     match e {
         Expr::LocalGet(id) => *id == target_id,
         Expr::Binary { left, right, .. }
@@ -40,6 +40,12 @@ pub fn expr_contains_local_get(e: &perry_hir::Expr, target_id: u32) -> bool {
             expr_contains_local_get(callee, target_id)
                 || args.iter().any(|a| expr_contains_local_get(a, target_id))
         }
+        Expr::CallSpread { callee, args, .. } => {
+            expr_contains_local_get(callee, target_id)
+                || args.iter().any(|a| match a {
+                    CallArg::Expr(e) | CallArg::Spread(e) => expr_contains_local_get(e, target_id),
+                })
+        }
         Expr::PropertyGet { object, .. } | Expr::PropertyUpdate { object, .. } => {
             expr_contains_local_get(object, target_id)
         }
@@ -66,6 +72,16 @@ pub fn expr_contains_local_get(e: &perry_hir::Expr, target_id: u32) -> bool {
             .iter()
             .any(|(_, v)| expr_contains_local_get(v, target_id)),
         Expr::New { args, .. } => args.iter().any(|a| expr_contains_local_get(a, target_id)),
+        Expr::NewDynamic { callee, args } => {
+            expr_contains_local_get(callee, target_id)
+                || args.iter().any(|a| expr_contains_local_get(a, target_id))
+        }
+        Expr::NewDynamicSpread { callee, args } => {
+            expr_contains_local_get(callee, target_id)
+                || args.iter().any(|a| match a {
+                    CallArg::Expr(e) | CallArg::Spread(e) => expr_contains_local_get(e, target_id),
+                })
+        }
         Expr::Sequence(es) => es.iter().any(|e| expr_contains_local_get(e, target_id)),
         Expr::Update { id, .. } => *id == target_id,
         _ => false, // Conservative: we don't recurse into everything, but false means "not found" which is safe

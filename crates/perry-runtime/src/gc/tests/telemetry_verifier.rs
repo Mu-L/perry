@@ -133,6 +133,7 @@ fn allocation_heavy_arena_debt_reports_budgeted_steps_and_debt() {
     let _trace_guard = TestGcTraceCaptureGuard::force_enabled();
     let _guard = CopyingNurseryTestGuard::new(1);
     let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let _barrier_guard = GeneratedWriteBarrierTestGuard::inactive();
     reset_old_reclaim_pressure();
 
     let live = live_test_string(b"telemetry_arena_live");
@@ -174,6 +175,7 @@ fn dirty_store_workload_reports_remembered_set_and_ordinary_pauses() {
     let _trace_guard = TestGcTraceCaptureGuard::force_enabled();
     let _guard = CopyingNurseryTestGuard::new(1);
     let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let _barrier_guard = GeneratedWriteBarrierTestGuard::inactive();
     reset_old_reclaim_pressure();
     let _ = take_write_barrier_trace_counters();
 
@@ -198,6 +200,27 @@ fn dirty_store_workload_reports_remembered_set_and_ordinary_pauses() {
             > 0,
         "remembered-set scan should visit the dirty old-to-young slot"
     );
+    assert_eq!(
+        event["remembered_set"]["dirty_cards_before"]
+            .as_u64()
+            .unwrap_or(0),
+        1,
+        "dirty store workload should start with one exact dirty card"
+    );
+    assert_eq!(
+        event["remembered_set"]["dirty_cards_scanned"]
+            .as_u64()
+            .unwrap_or(0),
+        1,
+        "remembered-set scan should consume one exact dirty card"
+    );
+    assert_eq!(
+        event["remembered_set"]["dirty_cards_after"]
+            .as_u64()
+            .unwrap_or(0),
+        1,
+        "sticky restore should preserve card precision after copied-minor GC"
+    );
     unsafe {
         assert_eq!(*fields, string_bits(child));
     }
@@ -209,6 +232,7 @@ fn root_heavy_workload_reports_root_sources_and_budgeted_progression() {
     let roots = 64_u32;
     let _guard = CopyingNurseryTestGuard::new(roots);
     let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let _barrier_guard = GeneratedWriteBarrierTestGuard::inactive();
     reset_old_reclaim_pressure();
 
     let first_live = live_test_string(b"telemetry_root_0");

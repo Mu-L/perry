@@ -670,10 +670,10 @@ pub(super) fn call_listener_args(stream: f64, listener: f64, args: &[f64]) -> f6
     if !is_callable_value(listener) {
         return f64::from_bits(super::TAG_UNDEFINED);
     }
-    let prev = crate::object::js_implicit_this_set(stream);
+    let prev = crate::object::js_implicit_this_push(stream);
     let result =
         unsafe { crate::closure::js_native_call_value(listener, args.as_ptr(), args.len()) };
-    crate::object::js_implicit_this_set(prev);
+    crate::object::js_implicit_this_restore(prev);
     result
 }
 

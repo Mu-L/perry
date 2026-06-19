@@ -4,8 +4,11 @@
 use anyhow::{anyhow, Result};
 use perry_hir::Expr;
 
-use super::{can_lower_expr_as_i32, lower_expr, lower_expr_as_i32, FnCtx};
-use crate::types::{DOUBLE, I32, I8, PTR};
+use super::{
+    bounds_for_buffer_access_width, can_lower_expr_as_i32, emit_i32_index_span_inbounds_assume,
+    lower_expr, lower_expr_as_i32, FnCtx,
+};
+use crate::types::{DOUBLE, I32, I64, I8, PTR};
 
 /// Return the HIR enum variant name for an expression. Uses Debug
 /// formatting and extracts the leading identifier so we get the actual
@@ -263,16 +266,23 @@ pub(crate) fn try_match_channel_reduction(
         if !all_match {
             continue;
         }
-        // Offsets must be a length-N consecutive integer progression
-        // (any starting point — the canonical case is `[0, 1, 2]` but
-        // `[1, 2, 3]` would fuse identically). Require strictly
-        // monotonic increase by 1 to keep the gather pattern a contiguous
-        // load instead of a scatter.
+        // Offsets must be a length-N consecutive non-negative integer
+        // progression (the canonical case is `[0, 1, 2]`). Require
+        // strictly monotonic increase by 1 to keep the gather pattern a
+        // contiguous load instead of a scatter. Negative-offset groups go
+        // through the scalar checked path; a single max-offset proof does
+        // not cover `base - 1`.
         let mut sorted = offsets.clone();
         sorted.sort();
+        if sorted.first().is_some_and(|offset| *offset < 0) {
+            continue;
+        }
         let mut consecutive = true;
         for i in 1..sorted.len() {
-            if sorted[i] != sorted[i - 1] + 1 {
+            if sorted[i - 1]
+                .checked_add(1)
+                .is_none_or(|next| sorted[i] != next)
+            {
                 consecutive = false;
                 break;
             }
@@ -311,15 +321,30 @@ pub(crate) fn try_match_channel_reduction(
 /// Requires the array to have a `buffer_data_slot` entry — without the
 /// pre-computed data ptr we'd have to re-derive it inline, which costs
 /// the same as the scalar Uint8ArrayGet path and gives up the win.
-/// Caller (in `lower_stmts`) checks this and falls back to scalar
-/// lowering when absent.
-pub(crate) fn lower_channel_reduction(ctx: &mut FnCtx<'_>, r: &ChannelReduction) -> Result<()> {
+/// Caller (in `lower_stmts`) falls back to scalar lowering when this returns
+/// `Ok(false)`.
+pub(crate) fn lower_channel_reduction(ctx: &mut FnCtx<'_>, r: &ChannelReduction) -> Result<bool> {
     let Some((ptr_slot, scope_idx)) = ctx.buffer_data_slots.get(&r.array_id).cloned() else {
         return Err(anyhow!(
             "lower_channel_reduction: array {} has no buffer_data_slot — caller should have skipped",
             r.array_id
         ));
     };
+    let Some(max_off) = r.offsets.last().copied() else {
+        return Ok(false);
+    };
+    let span_width_units = u32::try_from(i64::from(max_off) + 1).unwrap_or(u32::MAX);
+    let bounds =
+        bounds_for_buffer_access_width(ctx, r.array_id, r.base_idx.as_ref(), span_width_units);
+    if !bounds.allows_inbounds() {
+        return Ok(false);
+    }
+    if r.acc_ids
+        .iter()
+        .any(|acc_id| !ctx.i32_counter_slots.contains_key(acc_id))
+    {
+        return Ok(false);
+    }
     // Lower the base index to i32 ahead of time — the gather reads N
     // consecutive bytes from `data_ptr + base_idx + offset[c]`.
     let i32_slots = ctx.i32_counter_slots.clone();
@@ -367,15 +392,11 @@ pub(crate) fn lower_channel_reduction(ctx: &mut FnCtx<'_>, r: &ChannelReduction)
     let data_ptr = blk.load(PTR, &ptr_slot);
     let header_ptr = blk.gep(I8, &data_ptr, &[(I32, "-8")]);
     let len_i32 = blk.load_invariant(I32, &header_ptr);
-    // Tell LLVM the highest channel offset is in-bounds. The
-    // `Uint8ArrayGet` scalar path emits one assume per access; one
-    // assume covering the highest offset is sufficient because
-    // `inbounds(base + max_offset)` implies `inbounds(base + i)` for
-    // `0 <= i <= max_offset`.
-    let max_off = *r.offsets.last().unwrap();
-    let max_idx = blk.add(I32, &base_idx_i32, &max_off.to_string());
-    let in_bounds = blk.icmp_ult(I32, &max_idx, &len_i32);
-    blk.emit_raw(format!("call void @llvm.assume(i1 {})", in_bounds));
+    // Tell LLVM the whole lane span is in-bounds. The proof arithmetic is
+    // widened inside the helper so `base + max_offset` cannot wrap before
+    // the assume.
+    emit_i32_index_span_inbounds_assume(blk, &base_idx_i32, &len_i32, span_width_units);
+    let base_idx_i64 = blk.sext(I32, &base_idx_i32, I64);
     // Build the byte vector by N consecutive loads + insertelement. LLVM
     // SLP combines the scalar loads into a single vector load when the
     // addresses are contiguous (which they are after the assume above).
@@ -386,8 +407,8 @@ pub(crate) fn lower_channel_reduction(ctx: &mut FnCtx<'_>, r: &ChannelReduction)
     // ones chain through register values.
     let mut vec_i32 = "<i32 0, i32 0, i32 0, i32 0>".to_string();
     for (lane, &offset) in r.offsets.iter().enumerate() {
-        let off_i32 = blk.add(I32, &base_idx_i32, &offset.to_string());
-        let byte_ptr = blk.gep_inbounds(I8, &data_ptr, &[(I32, &off_i32)]);
+        let off_i64 = blk.add(I64, &base_idx_i64, &offset.to_string());
+        let byte_ptr = blk.gep_inbounds(I8, &data_ptr, &[(I64, &off_i64)]);
         let byte_val = blk.fresh_reg();
         blk.emit_raw(format!(
             "{} = load i8, ptr {}{}",
@@ -470,5 +491,5 @@ pub(crate) fn lower_channel_reduction(ctx: &mut FnCtx<'_>, r: &ChannelReduction)
         let dbl_val = blk.sitofp(I32, &lane_val, DOUBLE);
         blk.store(DOUBLE, &dbl_val, &dbl_slot);
     }
-    Ok(())
+    Ok(true)
 }

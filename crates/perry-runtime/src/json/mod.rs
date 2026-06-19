@@ -79,6 +79,13 @@ pub(crate) use stringify_api::{
     redirect_lazy_to_materialized, string_from_header, try_stringify_lazy_array,
 };
 
+type ShapeCacheEntries = Vec<(*mut crate::ArrayHeader, Box<ShapeTemplate>)>;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SavedShapeCache {
+    depth: usize,
+}
+
 // ─── Circular reference detection ────────────────────────────────────────────
 thread_local! {
     /// Stack of object pointers currently being stringified (for circular detection).
@@ -103,7 +110,12 @@ thread_local! {
     /// `Box<ShapeTemplate>` lives on the heap so its address is stable
     /// even when the cache `Vec` reallocates — we hand out raw pointers
     /// to the templates and they must outlive the borrow.
-    pub(crate) static SHAPE_CACHE: RefCell<Vec<(*mut crate::ArrayHeader, Box<ShapeTemplate>)>> =
+    pub(crate) static SHAPE_CACHE: RefCell<ShapeCacheEntries> =
+        const { RefCell::new(Vec::new()) };
+    /// Shape caches saved while a reentrant stringify call is active. These
+    /// entries are no longer in `SHAPE_CACHE`, but they still hold heap keys
+    /// that must be visible to moving GC until the outer call restores them.
+    static SAVED_SHAPE_CACHES: RefCell<Vec<ShapeCacheEntries>> =
         const { RefCell::new(Vec::new()) };
 
     /// Key string intern cache for JSON.parse (issue #51 follow-up).
@@ -390,13 +402,25 @@ pub(crate) fn json_string_from_output_bytes(bytes: &[u8]) -> *mut StringHeader {
 /// call's templates and (worse) clear them on exit, dangling pointers we
 /// already handed out. Mirrors `take_stringify_buf` in spirit.
 #[inline]
-pub(crate) fn take_shape_cache() -> Vec<(*mut crate::ArrayHeader, Box<ShapeTemplate>)> {
-    SHAPE_CACHE.with(|c| std::mem::take(&mut *c.borrow_mut()))
+pub(crate) fn take_shape_cache() -> SavedShapeCache {
+    let saved = SHAPE_CACHE.with(|c| std::mem::take(&mut *c.borrow_mut()));
+    SAVED_SHAPE_CACHES.with(|s| {
+        let mut saved_stack = s.borrow_mut();
+        saved_stack.push(saved);
+        SavedShapeCache {
+            depth: saved_stack.len(),
+        }
+    })
 }
 
 #[inline]
-pub(crate) fn restore_shape_cache(saved: Vec<(*mut crate::ArrayHeader, Box<ShapeTemplate>)>) {
-    SHAPE_CACHE.with(|c| *c.borrow_mut() = saved);
+pub(crate) fn restore_shape_cache(saved: SavedShapeCache) {
+    let restored = SAVED_SHAPE_CACHES.with(|s| {
+        let mut saved_stack = s.borrow_mut();
+        debug_assert_eq!(saved_stack.len(), saved.depth);
+        saved_stack.pop().unwrap_or_default()
+    });
+    SHAPE_CACHE.with(|c| *c.borrow_mut() = restored);
 }
 
 /// Clear cache without allocating a fresh Vec (keeps capacity, drops entries).
@@ -442,6 +466,36 @@ pub fn scan_parse_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
     });
 }
 
+pub fn scan_stringify_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
+    STRINGIFY_STACK.with(|s| {
+        for ptr in s.borrow_mut().iter_mut() {
+            visitor.visit_usize_slot(ptr);
+        }
+    });
+    SHAPE_CACHE.with(|c| {
+        scan_shape_cache_entries(c.borrow_mut().iter_mut(), visitor);
+    });
+    SAVED_SHAPE_CACHES.with(|s| {
+        for cache in s.borrow_mut().iter_mut() {
+            scan_shape_cache_entries(cache.iter_mut(), visitor);
+        }
+    });
+}
+
+fn scan_shape_cache_entries<'a>(
+    entries: impl Iterator<Item = &'a mut (*mut crate::ArrayHeader, Box<ShapeTemplate>)>,
+    visitor: &mut crate::gc::RuntimeRootVisitor<'_>,
+) {
+    for (keys_arr, template) in entries {
+        if visitor.visit_raw_mut_ptr_slot(keys_arr) {
+            template.keys_arr = *keys_arr;
+        } else {
+            visitor.visit_raw_mut_ptr_slot(&mut template.keys_arr);
+            *keys_arr = template.keys_arr;
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn test_seed_parse_roots(value: f64, key_ptr: *const StringHeader) {
     PARSE_ROOTS.with(|r| {
@@ -454,6 +508,76 @@ pub(crate) fn test_seed_parse_roots(value: f64, key_ptr: *const StringHeader) {
         c.clear();
         c.insert(b"test".to_vec(), key_ptr);
     });
+}
+
+#[cfg(test)]
+pub(crate) fn test_seed_stringify_roots(stack_ptr: usize, keys_arr: *mut crate::ArrayHeader) {
+    STRINGIFY_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        stack.clear();
+        stack.push(stack_ptr);
+    });
+    SHAPE_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        cache.clear();
+        cache.push((
+            keys_arr,
+            Box::new(ShapeTemplate {
+                keys_arr,
+                prefixes: Vec::new(),
+                shape_fields: 0,
+                primitive_only: false,
+            }),
+        ));
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn test_stringify_roots_snapshot() -> (usize, usize, usize) {
+    let stack_ptr = STRINGIFY_STACK.with(|s| s.borrow().first().copied().unwrap_or(0));
+    let (cache_keys, template_keys) = SHAPE_CACHE.with(|c| {
+        c.borrow()
+            .first()
+            .map(|(keys, template)| (*keys as usize, template.keys_arr as usize))
+            .unwrap_or((0, 0))
+    });
+    (stack_ptr, cache_keys, template_keys)
+}
+
+#[cfg(test)]
+pub(crate) fn test_seed_saved_stringify_shape_cache(keys_arr: *mut crate::ArrayHeader) {
+    SHAPE_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        cache.clear();
+        cache.push((
+            keys_arr,
+            Box::new(ShapeTemplate {
+                keys_arr,
+                prefixes: Vec::new(),
+                shape_fields: 0,
+                primitive_only: false,
+            }),
+        ));
+    });
+    let _saved = take_shape_cache();
+}
+
+#[cfg(test)]
+pub(crate) fn test_saved_stringify_shape_cache_snapshot() -> (usize, usize) {
+    SAVED_SHAPE_CACHES.with(|s| {
+        s.borrow()
+            .last()
+            .and_then(|cache| cache.first())
+            .map(|(keys, template)| (*keys as usize, template.keys_arr as usize))
+            .unwrap_or((0, 0))
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn test_clear_stringify_roots() {
+    STRINGIFY_STACK.with(|s| s.borrow_mut().clear());
+    SHAPE_CACHE.with(|c| c.borrow_mut().clear());
+    SAVED_SHAPE_CACHES.with(|s| s.borrow_mut().clear());
 }
 
 #[cfg(test)]
@@ -509,6 +633,12 @@ pub(crate) unsafe fn extract_pointer(bits: u64) -> Option<*const u8> {
     } else {
         None
     }
+}
+
+#[inline]
+pub(crate) unsafe fn root_stringify_returns_undefined(value: f64) -> bool {
+    let bits = value.to_bits();
+    bits == TAG_UNDEFINED || is_closure_value(bits) || crate::symbol::js_is_symbol(value) != 0
 }
 
 /// Read the GC header's object type tag for a user-space heap pointer.

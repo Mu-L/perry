@@ -908,11 +908,11 @@ extern "C" fn promise_resolve_thenable_job(closure: *const crate::closure::Closu
     let reject_value = crate::value::js_nanbox_pointer(reject_closure as i64);
     let args = [resolve_value, reject_value];
 
-    let prev_this = crate::object::js_implicit_this_set(thenable);
+    let prev_this = crate::object::js_implicit_this_push(thenable);
     let result = combinator_catch_js(|| unsafe {
         crate::closure::js_native_call_value(then_action, args.as_ptr(), args.len())
     });
-    crate::object::js_implicit_this_set(prev_this);
+    crate::object::js_implicit_this_restore(prev_this);
     if let Err(reason) = result {
         if thenable_job_take_guard(guard_arr) {
             js_promise_reject(promise, reason);

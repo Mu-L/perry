@@ -168,10 +168,10 @@ fn call_function(callback: f64, this: f64, args: &[f64]) -> f64 {
         callback.to_bits(),
         this,
     ));
-    let prev = crate::object::js_implicit_this_set(this);
+    let prev = crate::object::js_implicit_this_push(this);
     let result =
         unsafe { crate::closure::js_native_call_value(rebound, args.as_ptr(), args.len()) };
-    crate::object::js_implicit_this_set(prev);
+    crate::object::js_implicit_this_restore(prev);
     result
 }
 
