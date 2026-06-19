@@ -329,6 +329,9 @@ impl CopyingNurseryPreflight {
 
     pub(super) unsafe fn scan_object_fields(&mut self, header: *mut GcHeader) {
         visit_gc_rewrite_slots(header, |slot| unsafe {
+            if crate::weakref::is_weak_target_trace_slot(header, slot.slot) {
+                return;
+            }
             slot.record_layout_read();
             self.scan_slot(slot.slot as *const u64);
         });
@@ -645,6 +648,9 @@ impl CopyingNurseryCollector {
     pub(super) unsafe fn scan_object_fields(&mut self, header: *mut GcHeader) {
         let mut changed = false;
         visit_gc_rewrite_slots(header, |slot| unsafe {
+            if crate::weakref::is_weak_target_trace_slot(header, slot.slot) {
+                return;
+            }
             slot.record_layout_read();
             let before = *slot.slot;
             self.visit_slot_with_parent(slot.slot, header, slot.external);
@@ -705,6 +711,9 @@ pub(super) fn scan_remembered_dirty_slots_copying(
         stats.dirty_objects_scanned += 1;
         let mut changed = false;
         let mut visit_slot = |slot: *mut u64, stats: &mut RememberedSetTraceStats| {
+            if crate::weakref::is_weak_target_trace_slot(header, slot) {
+                return;
+            }
             let external = !matches!(
                 crate::arena::classify_heap_generation(slot as usize),
                 crate::arena::HeapGeneration::Old
@@ -1288,6 +1297,11 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
     unsafe {
         collector.drain();
     }
+    rewrite_weak_target_slots_after_copied_minor(&collector);
+    {
+        let valid_ptrs = build_valid_pointer_set();
+        crate::weakref::process_weak_targets_after_mark(&valid_ptrs, true, false);
+    }
     {
         let scanners: Vec<MutableRootScannerEntry> =
             MUTABLE_ROOT_SCANNERS.with(|s| s.borrow().clone());
@@ -1375,4 +1389,39 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
 fn finalize_dead_copied_minor_from_space_side_allocations() {
     crate::map::finalize_dead_copied_minor_from_space_maps();
     crate::set::finalize_dead_copied_minor_from_space_sets();
+}
+
+fn rewrite_weak_target_slots_after_copied_minor(collector: &CopyingNurseryCollector) {
+    let rewrite_header = |header: *mut GcHeader| unsafe {
+        if header.is_null() || (*header).gc_flags & GC_FLAG_FORWARDED != 0 {
+            return;
+        }
+        let user = (header as *mut u8).add(GC_HEADER_SIZE) as usize;
+        let retained = matches!(
+            crate::arena::classify_heap_generation(user),
+            crate::arena::HeapGeneration::Old | crate::arena::HeapGeneration::Longlived
+        ) || MALLOC_STATE
+            .with(|s| s.borrow().objects.iter().any(|&tracked| tracked == header));
+        if !retained && (*header).gc_flags & (GC_FLAG_MARKED | GC_FLAG_PINNED) == 0 {
+            return;
+        }
+        visit_gc_rewrite_slots(header, |slot| {
+            if !crate::weakref::is_weak_target_trace_slot(header, slot.slot) {
+                return;
+            }
+            if let Some(new_bits) = collector.rewrite_value_bits(*slot.slot) {
+                *slot.slot = new_bits;
+            }
+        });
+    };
+
+    crate::arena::arena_walk_objects(|header_ptr| {
+        rewrite_header(header_ptr as *mut GcHeader);
+    });
+    MALLOC_STATE.with(|s| {
+        let s = s.borrow();
+        for &header in s.objects.iter() {
+            rewrite_header(header);
+        }
+    });
 }

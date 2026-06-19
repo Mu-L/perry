@@ -497,13 +497,13 @@ pub fn walk_index_uses_in_expr(e: &perry_hir::Expr, out: &mut HashSet<u32>) {
                 walk_index_uses_in_expr(a, out);
             }
         }
-        Expr::NewDynamic { callee, args } => {
+        Expr::NewDynamic { callee, args, .. } => {
             walk_index_uses_in_expr(callee, out);
             for a in args {
                 walk_index_uses_in_expr(a, out);
             }
         }
-        Expr::NewDynamicSpread { callee, args } => {
+        Expr::NewDynamicSpread { callee, args, .. } => {
             walk_index_uses_in_expr(callee, out);
             for a in args {
                 match a {

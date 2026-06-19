@@ -152,6 +152,31 @@ fn map_and_set_external_helper_stores_preserve_young_children() {
 }
 
 #[test]
+fn external_dirty_slot_page_registration_marks_all_cards_for_page_parity() {
+    let _guard = CopyingNurseryTestGuard::new(0);
+    let (set, elements, layout) = unsafe { alloc_old_test_set(1) };
+    let page = crate::arena::generation_page_for_addr(elements as usize);
+    let first_card = remembered_card_for_addr(page << 12);
+
+    assert!(mark_dirty_external_slot_page(set as usize, page));
+
+    let snapshot = remembered_dirty_snapshot();
+    for card in first_card..first_card + 8 {
+        assert!(
+            snapshot
+                .external_dirty_card_entries
+                .iter()
+                .any(|&(entry_card, header)| entry_card == card && header == set as usize),
+            "external dirty page registration must mirror page coverage into card {card}"
+        );
+    }
+
+    unsafe {
+        retire_old_test_set(set, elements, layout);
+    }
+}
+
+#[test]
 fn json_large_object_materialization_preserves_young_string_fields() {
     let _guard = CopyingNurseryTestGuard::new(1);
     let _env_guard = EnvVarGuard::set("PERRY_GC_VERIFY_EVACUATION", "1");

@@ -501,6 +501,34 @@ fn test_implicit_this_saved_stack_rewrites_before_restore() {
 }
 
 #[test]
+fn test_implicit_this_restore_discards_unwound_nested_saved_entries() {
+    clear_marks();
+    clear_mark_seeds();
+
+    let original_this = crate::object::js_implicit_this_get();
+    let outer_saved = crate::arena::arena_alloc_gc(64, 8, GC_TYPE_OBJECT);
+    let outer_active = crate::arena::arena_alloc_gc(64, 8, GC_TYPE_OBJECT);
+    let inner_active = crate::arena::arena_alloc_gc(64, 8, GC_TYPE_OBJECT);
+
+    crate::object::js_implicit_this_set(f64::from_bits(ptr_bits(outer_saved as usize)));
+    let outer_previous =
+        crate::object::js_implicit_this_push(f64::from_bits(ptr_bits(outer_active as usize)));
+    let _inner_previous =
+        crate::object::js_implicit_this_push(f64::from_bits(ptr_bits(inner_active as usize)));
+
+    crate::object::js_implicit_this_restore(outer_previous);
+    assert_eq!(
+        crate::object::js_implicit_this_get().to_bits(),
+        ptr_bits(outer_saved as usize),
+        "outer restore must discard saved implicit-this entries from skipped nested frames"
+    );
+
+    crate::object::js_implicit_this_set(original_this);
+    clear_marks();
+    clear_mark_seeds();
+}
+
+#[test]
 fn test_json_stringify_root_scanner_marks_and_rewrites_stack_and_shape_cache() {
     clear_marks();
     clear_mark_seeds();
@@ -584,6 +612,57 @@ fn test_json_stringify_root_scanner_marks_and_rewrites_saved_shape_cache() {
         crate::json::test_saved_stringify_shape_cache_snapshot();
     assert_eq!(cache_keys_after, keys_old as usize);
     assert_eq!(template_keys_after, keys_old as usize);
+
+    crate::json::test_clear_stringify_roots();
+    clear_marks();
+    clear_mark_seeds();
+}
+
+#[test]
+fn test_gc_init_registers_json_stringify_mutable_scanner() {
+    let _guard = GcTestIsolationGuard::new();
+    crate::json::test_clear_stringify_roots();
+
+    let stack_user = crate::arena::arena_alloc_gc(64, 8, GC_TYPE_OBJECT);
+    let keys_payload = std::mem::size_of::<crate::ArrayHeader>();
+    let keys_arr =
+        crate::arena::arena_alloc_gc(keys_payload, 8, GC_TYPE_ARRAY) as *mut crate::ArrayHeader;
+    unsafe {
+        (*keys_arr).length = 0;
+        (*keys_arr).capacity = 0;
+    }
+    crate::json::test_seed_stringify_roots(stack_user as usize, keys_arr);
+
+    let prev_init = test_set_gc_init_done(false);
+    gc_init();
+    test_set_gc_init_done(prev_init);
+
+    let valid_ptrs = build_valid_pointer_set();
+    let stack_old = crate::arena::arena_alloc_gc_old(64, 8, GC_TYPE_OBJECT);
+    let (keys_old, _) = unsafe { alloc_old_test_array(0) };
+    let stack_hdr = unsafe { header_from_user_ptr(stack_user) as *mut GcHeader };
+    let keys_hdr = unsafe { header_from_user_ptr(keys_arr as *const u8) as *mut GcHeader };
+    visit_mutable_registered_roots(&mut RuntimeRootVisitor::for_mark(&valid_ptrs));
+    unsafe {
+        assert_ne!(
+            (*stack_hdr).gc_flags & GC_FLAG_MARKED,
+            0,
+            "gc_init must register the JSON.stringify stack scanner"
+        );
+        assert_ne!(
+            (*keys_hdr).gc_flags & GC_FLAG_MARKED,
+            0,
+            "gc_init must register the JSON.stringify shape-cache scanner"
+        );
+        set_forwarding_address(stack_hdr, stack_old);
+        set_forwarding_address(keys_hdr, keys_old as *mut u8);
+    }
+    visit_mutable_registered_roots(&mut RuntimeRootVisitor::for_rewrite(&valid_ptrs));
+    let (stack_after, cache_keys_after, template_keys_after) =
+        crate::json::test_stringify_roots_snapshot();
+    assert_eq!(stack_after, stack_old as usize);
+    assert_eq!(cache_keys_after, keys_old as usize);
+    assert_eq!(cache_keys_after, template_keys_after);
 
     crate::json::test_clear_stringify_roots();
     clear_marks();

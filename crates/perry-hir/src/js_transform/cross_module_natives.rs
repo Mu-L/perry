@@ -911,7 +911,7 @@ pub fn fix_native_instance_expr(
                 fix_native_instance_expr(arg, native_instances, local_id_instances);
             }
         }
-        Expr::NewDynamicSpread { callee, args } => {
+        Expr::NewDynamicSpread { callee, args, .. } => {
             fix_native_instance_expr(callee, native_instances, local_id_instances);
             for arg in args {
                 match arg {

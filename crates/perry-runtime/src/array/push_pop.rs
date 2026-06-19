@@ -4,9 +4,9 @@ use crate::arena::arena_alloc_gc;
 use std::ptr;
 
 /// `pop`/`shift`/`push`/`unshift` on a frozen array perform a `Set`/`Delete`
-/// with `Throw = true` internally (ECMA-262 §23.1.3.*), so a non-writable
-/// `length` / non-extensible receiver makes them throw a **TypeError** — they
-/// must not silently no-op. Used by the frozen guards below.
+/// with `Throw = true` internally (ECMA-262 §23.1.3.*), so non-writable
+/// properties make them throw a **TypeError** — they must not silently no-op.
+/// Used by the frozen/sealed guards below.
 #[cold]
 fn throw_frozen_array_mutation() -> ! {
     crate::collection_iter::throw_type_error("Cannot mutate a frozen array");
@@ -33,6 +33,16 @@ fn throw_non_writable_length() -> ! {
     crate::collection_iter::throw_type_error(
         "Cannot assign to read only property 'length' of object '[object Array]'",
     );
+}
+
+#[cold]
+fn throw_array_not_extensible() -> ! {
+    crate::collection_iter::throw_type_error("Cannot add property, object is not extensible");
+}
+
+#[inline]
+fn array_is_sealed(arr: *const ArrayHeader) -> bool {
+    array_object_flags(arr) & crate::gc::OBJ_FLAG_SEALED != 0
 }
 
 #[inline]
@@ -154,10 +164,21 @@ unsafe fn proxy_array_length(proxy: f64) -> u64 {
 /// #5135: `Set(proxy, <string key>, value)` through the proxy's `set` trap. The
 /// key string is allocated fresh per call so an intervening GC can't leave a
 /// stale interior pointer.
-unsafe fn proxy_set_str_key(proxy: f64, key_bytes: &[u8], value: f64) {
+unsafe fn proxy_set_str_key(proxy: f64, key_bytes: &[u8], value: f64) -> bool {
     let key = crate::string::js_string_from_bytes(key_bytes.as_ptr(), key_bytes.len() as u32);
     let key_f64 = crate::value::js_nanbox_string(key as i64);
-    crate::proxy::js_proxy_set(proxy, key_f64, value);
+    crate::value::js_is_truthy(crate::proxy::js_proxy_set(proxy, key_f64, value)) != 0
+}
+
+unsafe fn proxy_get_str_key(proxy: f64, key_bytes: &[u8]) -> f64 {
+    let key = crate::string::js_string_from_bytes(key_bytes.as_ptr(), key_bytes.len() as u32);
+    let key_f64 = crate::value::js_nanbox_string(key as i64);
+    crate::proxy::js_proxy_get(proxy, key_f64)
+}
+
+#[cold]
+fn throw_proxy_push_set_failed() -> ! {
+    crate::collection_iter::throw_type_error("'set' on proxy: trap returned falsish for property")
 }
 
 /// Returns a pointer to the (possibly reallocated) array
@@ -173,8 +194,11 @@ pub extern "C" fn js_array_push_f64(arr: *mut ArrayHeader, value: f64) -> *mut A
     if let Some(proxy) = array_ptr_as_proxy(arr) {
         let len = unsafe { proxy_array_length(proxy) };
         unsafe {
-            proxy_set_str_key(proxy, len.to_string().as_bytes(), value);
-            proxy_set_str_key(proxy, b"length", (len as f64) + 1.0);
+            if !proxy_set_str_key(proxy, len.to_string().as_bytes(), value)
+                || !proxy_set_str_key(proxy, b"length", (len as f64) + 1.0)
+            {
+                throw_proxy_push_set_failed();
+            }
         }
         return arr;
     }
@@ -187,7 +211,7 @@ pub extern "C" fn js_array_push_f64(arr: *mut ArrayHeader, value: f64) -> *mut A
     }
     guard_writable_length(arr);
     if array_is_sealed_or_no_extend(arr) {
-        return arr;
+        throw_array_not_extensible();
     }
     unsafe {
         let length = (*arr).length;
@@ -222,10 +246,13 @@ pub extern "C" fn js_array_numeric_push_f64_unboxed(
     if arr.is_null() {
         return js_array_alloc(0);
     }
-    if array_is_sealed_or_no_extend(arr) || array_is_frozen(arr) {
-        return arr;
+    if array_is_frozen(arr) {
+        throw_frozen_array_mutation();
     }
     guard_writable_length(arr);
+    if array_is_sealed_or_no_extend(arr) {
+        throw_array_not_extensible();
+    }
     unsafe {
         if array_numeric_raw_f64_push_inbounds(arr, value) {
             return arr;
@@ -273,6 +300,52 @@ pub extern "C" fn js_array_push_spread_f64(
     target: *mut ArrayHeader,
     source: *const ArrayHeader,
 ) -> *mut ArrayHeader {
+    let target_proxy = array_ptr_as_proxy(target);
+    if target_proxy.is_none() {
+        if array_is_frozen(target) {
+            throw_frozen_array_mutation();
+        }
+        guard_writable_length(target);
+    }
+    if let Some(source_proxy) = array_ptr_as_proxy(source) {
+        let src_len = unsafe { proxy_array_length(source_proxy) };
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let target_handle = target_proxy
+            .is_none()
+            .then(|| scope.root_raw_mut_ptr(target));
+        let mut proxy_target_current = target;
+        if src_len == 0 {
+            if let Some(target_proxy) = target_proxy {
+                let len = unsafe { proxy_array_length(target_proxy) };
+                unsafe {
+                    if !proxy_set_str_key(target_proxy, b"length", len as f64) {
+                        throw_proxy_push_set_failed();
+                    }
+                }
+            }
+            return target_handle
+                .as_ref()
+                .map(|handle| handle.get_raw_mut_ptr::<ArrayHeader>())
+                .unwrap_or(target);
+        }
+        for i in 0..src_len {
+            let value = unsafe { proxy_get_str_key(source_proxy, i.to_string().as_bytes()) };
+            let current = target_handle
+                .as_ref()
+                .map(|handle| handle.get_raw_mut_ptr::<ArrayHeader>())
+                .unwrap_or(proxy_target_current);
+            let pushed = js_array_push_f64(current, value);
+            if let Some(handle) = target_handle.as_ref() {
+                handle.set_raw_mut_ptr(pushed);
+            } else {
+                proxy_target_current = pushed;
+            }
+        }
+        return target_handle
+            .as_ref()
+            .map(|handle| handle.get_raw_mut_ptr::<ArrayHeader>())
+            .unwrap_or(proxy_target_current);
+    }
     let source = clean_arr_ptr(source);
     if source.is_null() {
         return target;
@@ -282,6 +355,12 @@ pub extern "C" fn js_array_push_spread_f64(
     unsafe {
         let src_len = (*source).length;
         if src_len == 0 {
+            if let Some(target_proxy) = target_proxy {
+                let len = proxy_array_length(target_proxy);
+                if !proxy_set_str_key(target_proxy, b"length", len as f64) {
+                    throw_proxy_push_set_failed();
+                }
+            }
             return target;
         }
         let mut current = target;
@@ -327,6 +406,9 @@ pub extern "C" fn js_array_pop_f64(arr: *mut ArrayHeader) -> f64 {
         let length = (*arr).length;
         if length == 0 {
             return TAG_UNDEFINED_F64;
+        }
+        if array_is_sealed(arr) {
+            throw_frozen_array_mutation();
         }
 
         let new_length = length - 1;
@@ -493,6 +575,9 @@ pub extern "C" fn js_array_shift_f64(arr: *mut ArrayHeader) -> f64 {
         if length == 0 {
             return TAG_UNDEFINED_F64;
         }
+        if array_is_sealed(arr) {
+            throw_frozen_array_mutation();
+        }
 
         let elements_ptr = (arr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut f64;
         let value = *elements_ptr;
@@ -519,7 +604,7 @@ pub extern "C" fn js_array_unshift_f64(arr: *mut ArrayHeader, value: f64) -> *mu
     }
     guard_writable_length(arr);
     if array_is_sealed_or_no_extend(arr) {
-        return arr;
+        throw_array_not_extensible();
     }
     let scope = crate::gc::RuntimeHandleScope::new();
     let _arr_handle = scope.root_raw_mut_ptr(arr);
@@ -572,12 +657,15 @@ pub extern "C" fn js_array_unshift_variadic(
     }
     // `unshift` always performs `Set(O, "length", …)` (even zero-arg), so a
     // non-writable `length` throws before the no-op early return.
+    if array_is_frozen(arr) {
+        throw_frozen_array_mutation();
+    }
     guard_writable_length(arr);
     if count == 0 {
         return arr;
     }
-    if array_is_sealed_or_no_extend(arr) || array_is_frozen(arr) {
-        return arr;
+    if array_is_sealed_or_no_extend(arr) {
+        throw_array_not_extensible();
     }
     let scope = crate::gc::RuntimeHandleScope::new();
     let _arr_handle = scope.root_raw_mut_ptr(arr);

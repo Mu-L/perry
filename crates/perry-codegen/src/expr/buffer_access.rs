@@ -539,9 +539,6 @@ pub(crate) fn lower_typed_array_load(
         },
         _ => return Ok(None),
     };
-    if !view.alias.allows_noalias() || view.scope_idx.is_none() {
-        return Ok(None);
-    }
     let Some(spec) = typed_array_get_spec(&view) else {
         return Ok(None);
     };
@@ -618,9 +615,6 @@ pub(crate) fn lower_typed_array_store(
         },
         _ => return Ok(None),
     };
-    if !view.alias.allows_noalias() || view.scope_idx.is_none() {
-        return Ok(None);
-    }
     let Some(spec) = typed_array_set_spec(&view) else {
         return Ok(None);
     };

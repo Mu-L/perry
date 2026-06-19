@@ -239,7 +239,9 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // array pointer doesn't change unless we grow. The slow
             // branches both update the slot via the existing
             // boxed/captured/local fall-through below.
-            if !ctx.boxed_vars.contains(array_id)
+            let raw_local_inline_push_enabled = false;
+            if raw_local_inline_push_enabled
+                && !ctx.boxed_vars.contains(array_id)
                 && !ctx.closure_captures.contains_key(array_id)
                 && ctx.locals.contains_key(array_id)
             {
@@ -415,11 +417,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         // array's LocalId and the source expression (any iterable, in
         // practice an array or Set). Mirrors `Expr::ArrayPush` above:
         // load the destination from its slot, unbox both pointers, call
-        // the runtime's `js_array_concat` (which walks the source and
-        // calls `js_array_push_f64` per element + already handles
-        // Set sources via SET_REGISTRY), NaN-box the realloc-aware
-        // return pointer, and write back to whichever storage backs
-        // `array_id`. Issue #248.
+        // the runtime's push-spread helper (which preserves push semantics
+        // for sealed/frozen/proxy receivers and source proxy traps),
+        // NaN-box the realloc-aware return pointer, and write back to
+        // whichever storage backs `array_id`. Issue #248.
         Expr::ArrayPushSpread { array_id, source } => {
             let src_box = lower_expr(ctx, source)?;
             let arr_box = lower_expr(ctx, &Expr::LocalGet(*array_id))?;
@@ -428,7 +429,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let src_handle = unbox_to_i64(blk, &src_box);
             let new_handle = blk.call(
                 I64,
-                "js_array_concat",
+                "js_array_push_spread_f64",
                 &[(I64, &dst_handle), (I64, &src_handle)],
             );
             let new_box = nanbox_pointer_inline(blk, &new_handle);

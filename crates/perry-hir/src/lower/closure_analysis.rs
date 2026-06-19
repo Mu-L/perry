@@ -252,7 +252,7 @@ fn widen_mutable_captures_expr(
                 widen_mutable_captures_expr(arg, scope_mutable);
             }
         }
-        Expr::NewDynamicSpread { callee, args } => {
+        Expr::NewDynamicSpread { callee, args, .. } => {
             widen_mutable_captures_expr(callee, scope_mutable);
             for arg in args {
                 match arg {
@@ -570,7 +570,7 @@ fn collect_closure_assigned_expr(expr: &Expr, out: &mut std::collections::HashSe
                 collect_closure_assigned_expr(arg, out);
             }
         }
-        Expr::NewDynamicSpread { callee, args } => {
+        Expr::NewDynamicSpread { callee, args, .. } => {
             collect_closure_assigned_expr(callee, out);
             for arg in args {
                 match arg {
@@ -873,13 +873,13 @@ fn collect_closure_captures_expr(expr: &Expr, out: &mut std::collections::HashSe
                 collect_closure_captures_expr(arg, out);
             }
         }
-        Expr::NewDynamic { callee, args } => {
+        Expr::NewDynamic { callee, args, .. } => {
             collect_closure_captures_expr(callee, out);
             for arg in args {
                 collect_closure_captures_expr(arg, out);
             }
         }
-        Expr::NewDynamicSpread { callee, args } => {
+        Expr::NewDynamicSpread { callee, args, .. } => {
             collect_closure_captures_expr(callee, out);
             for arg in args {
                 match arg {
@@ -1319,7 +1319,7 @@ fn collect_closure_assigned_in_body_expr(
                 collect_closure_assigned_in_body_expr(arg, out);
             }
         }
-        Expr::NewDynamicSpread { callee, args } => {
+        Expr::NewDynamicSpread { callee, args, .. } => {
             collect_closure_assigned_in_body_expr(callee, out);
             for arg in args {
                 match arg {

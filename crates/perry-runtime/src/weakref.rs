@@ -510,7 +510,11 @@ pub(crate) fn process_weak_targets_after_mark(
 ) {
     crate::arena::arena_walk_objects(|header_ptr| unsafe {
         let header = header_ptr as *mut crate::gc::GcHeader;
-        if (*header).obj_type != crate::gc::GC_TYPE_OBJECT || !header_is_live(header) {
+        let user = header_ptr.add(crate::gc::GC_HEADER_SIZE) as usize;
+        let retained_minor_wrapper = minor_only && !crate::arena::pointer_in_nursery(user);
+        if (*header).obj_type != crate::gc::GC_TYPE_OBJECT
+            || (!retained_minor_wrapper && !header_is_live(header))
+        {
             return;
         }
         let obj = header_ptr.add(crate::gc::GC_HEADER_SIZE) as *mut ObjectHeader;

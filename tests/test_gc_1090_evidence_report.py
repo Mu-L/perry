@@ -321,6 +321,7 @@ def benchmark_report(
     actual_lines=None,
     expected_lines=None,
     include_node=True,
+    node_reference=None,
 ):
     if actual_lines is None:
         actual_lines = ["checksum:1"]
@@ -343,7 +344,25 @@ def benchmark_report(
             entry["node_ms"] = 120 * multiplier
             entry["node_rss_kb"] = 120_000 * multiplier
         benchmarks[name] = entry
-    return {"commit": "abc", "benchmarks": benchmarks}
+    if node_reference is None:
+        if include_node:
+            node_reference = {
+                "available": True,
+                "binary": "/usr/bin/node",
+                "command": ["/usr/bin/node", "--experimental-strip-types"],
+                "input_mode": "experimental-strip-types",
+                "tried": ["/usr/bin/node"],
+            }
+        else:
+            node_reference = {
+                "available": False,
+                "binary": None,
+                "command": [],
+                "input_mode": None,
+                "tried": ["/missing/node"],
+                "error": "no usable Node.js runtime found for benchmark references",
+            }
+    return {"commit": "abc", "node_reference": node_reference, "benchmarks": benchmarks}
 
 
 def trace_cycle(
@@ -516,6 +535,38 @@ def perf_frontier_packet():
     }
 
 
+def type_lowering_packet(**summary_overrides):
+    summary = {
+        "speedup_fast_vs_disabled": 8.3,
+        "speedup_threshold": 8.0,
+        "rss_regression_pct_fast_vs_disabled": 0.5,
+        "loads_per_run": 131_072_000,
+        "fast_median_ms": 95,
+        "disabled_median_ms": 791,
+        "node_median_ms": 79,
+        "checksum": "6323324000",
+        "offset_subarray_checksum": "98",
+        "fast_gc_cycles": 0,
+        "copied_minor_eligible_cycles": 0,
+        "copied_minor_success_rate": None,
+        "fast_buffer_slow_path_accesses_static": 0,
+        "disabled_buffer_slow_path_accesses_static": 2,
+        "typed_array_slow_path_reduction_static": 2,
+        "fast_typed_array_element_helpers_static": 0,
+        "disabled_typed_array_element_helpers_static": 2,
+        "typed_array_element_helper_reduction_static": 2,
+        "fast_boxed_number_allocations_static": 0,
+        "disabled_boxed_number_allocations_static": 0,
+    }
+    summary.update(summary_overrides)
+    return {
+        "schema_version": 1,
+        "status": "pass",
+        "errors": [],
+        "summary": summary,
+    }
+
+
 def gc_store_inventory_packet(**summary_overrides):
     summary = {
         "annotations": 61,
@@ -683,6 +734,10 @@ class Gc1090EvidenceReportTests(unittest.TestCase):
             "status": "pass",
             "exit_code": 0,
         }
+        metadata.setdefault("commands", {}).setdefault("packet", {})["type_lowering"] = {
+            "status": "pass",
+            "exit_code": 0,
+        }
         if old_page_policy:
             metadata.setdefault("commands", {}).setdefault("packet", {})["old_page_policy"] = {
                 "status": "pass",
@@ -691,6 +746,7 @@ class Gc1090EvidenceReportTests(unittest.TestCase):
         write_json(root / "metadata.json", metadata)
         write_json(root / "perf-frontier" / "perf-frontier-packet.json", perf_frontier_packet())
         write_json(root / "gc-store-site-inventory.json", gc_store_inventory_packet())
+        write_json(root / "type-lowering" / "type-lowering-evidence.json", type_lowering_packet())
         if old_page_policy:
             write_json(
                 root / "old-page-policy.json",
@@ -831,6 +887,13 @@ class Gc1090EvidenceReportTests(unittest.TestCase):
         self.assertEqual(dominance["copied_minor_success_rate_pct"], 100.0)
         self.assertEqual(packet["gc_store_inventory"]["status"], "pass")
         self.assertEqual(packet["gc_store_inventory"]["summary"]["unaudited_sites"], 0)
+        self.assertEqual(packet["type_lowering"]["status"], "pass")
+        self.assertEqual(
+            packet["type_lowering"]["summary"]["offset_subarray_checksum"], "98"
+        )
+        self.assertGreaterEqual(
+            packet["type_lowering"]["summary"]["loads_per_run"], 100_000_000
+        )
         self.assertEqual(packet["old_page_policy"]["status"], "pass")
         self.assertEqual(
             packet["old_page_policy"]["bench_json_roundtrip"]["rss_gate"],
@@ -854,6 +917,123 @@ class Gc1090EvidenceReportTests(unittest.TestCase):
         self.assertEqual(packet["status"], "fail")
         self.assertTrue(
             any("GC trace artifacts are missing" in error for error in packet["errors"])
+        )
+
+    def test_gate_fails_missing_type_lowering_packet(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        (root / "type-lowering" / "type-lowering-evidence.json").unlink()
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(
+            any(
+                "type-lowering evidence packet is missing" in error
+                for error in packet["errors"]
+            )
+        )
+
+    def test_gate_fails_type_lowering_without_offset_checksum(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        write_json(
+            root / "type-lowering" / "type-lowering-evidence.json",
+            type_lowering_packet(offset_subarray_checksum=None),
+        )
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(
+            any(
+                "type-lowering offset/subarray checksum parity summary is missing"
+                in error
+                for error in packet["errors"]
+            )
+        )
+
+    def test_gate_fails_type_lowering_below_material_speedup(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        write_json(
+            root / "type-lowering" / "type-lowering-evidence.json",
+            type_lowering_packet(speedup_fast_vs_disabled=7.99),
+        )
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(
+            any(
+                "type-lowering speedup below material threshold" in error
+                for error in packet["errors"]
+            ),
+            packet["errors"],
+        )
+
+    def test_gate_fails_type_lowering_missing_speedup_threshold(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        packet_data = type_lowering_packet()
+        del packet_data["summary"]["speedup_threshold"]
+        write_json(root / "type-lowering" / "type-lowering-evidence.json", packet_data)
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(
+            any(
+                "type-lowering speedup threshold metadata is missing" in error
+                for error in packet["errors"]
+            ),
+            packet["errors"],
+        )
+
+    def test_gate_fails_type_lowering_weak_packet_threshold(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        write_json(
+            root / "type-lowering" / "type-lowering-evidence.json",
+            type_lowering_packet(speedup_threshold=2.0),
+        )
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(
+            any(
+                "type-lowering packet speedup threshold below 8.0x" in error
+                for error in packet["errors"]
+            ),
+            packet["errors"],
+        )
+
+    def test_gate_fails_type_lowering_missing_static_helper_pressure(self):
+        temp, root = self.make_root()
+        self.addCleanup(temp.cleanup)
+        self.add_perf_frontier(root)
+        packet_data = type_lowering_packet(
+            fast_buffer_slow_path_accesses_static=None,
+            disabled_buffer_slow_path_accesses_static=None,
+            typed_array_slow_path_reduction_static=None,
+        )
+        write_json(root / "type-lowering" / "type-lowering-evidence.json", packet_data)
+
+        packet = REPORT.collect_report(root, "base", "head", gate=True)
+
+        self.assertEqual(packet["status"], "fail")
+        self.assertTrue(
+            any(
+                "static slow-path helper pressure proof is missing" in error
+                for error in packet["errors"]
+            ),
+            packet["errors"],
         )
 
     def test_gate_fails_missing_required_benchmark_trace_evidence(self):
@@ -1132,6 +1312,34 @@ class Gc1090EvidenceReportTests(unittest.TestCase):
 
         self.assertEqual(packet["status"], "fail")
         self.assertTrue(
+            any("Node reference comparison artifact missing" in error for error in packet["errors"])
+        )
+
+    def test_gate_reports_node_unavailable_once(self):
+        packet = self.collect_gate(
+            head_benchmarks=benchmark_report(
+                correctness="unchecked",
+                reference="none",
+                include_node=False,
+                actual_lines=[],
+                expected_lines=[],
+            )
+        )
+
+        self.assertEqual(packet["status"], "fail")
+        node_errors = [
+            error
+            for error in packet["errors"]
+            if "benchmark Node reference unavailable" in error
+        ]
+        self.assertEqual(node_errors, [
+            "head: benchmark Node reference unavailable: "
+            "no usable Node.js runtime found for benchmark references"
+        ])
+        self.assertFalse(
+            any("correctness status is unchecked" in error for error in packet["errors"])
+        )
+        self.assertFalse(
             any("Node reference comparison artifact missing" in error for error in packet["errors"])
         )
 

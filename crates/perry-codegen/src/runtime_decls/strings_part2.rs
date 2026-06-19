@@ -99,6 +99,7 @@ pub(crate) fn declare_phase_b_strings_part2(module: &mut LlModule) {
     // offset/length validation (kind, source, offset_value, length_value).
     module.declare_function("js_typed_array_view", I64, &[I32, DOUBLE, DOUBLE, DOUBLE]);
     module.declare_function("js_typed_array_length", I32, &[I64]);
+    module.declare_function("js_typed_array_data_ptr", PTR, &[I64]);
     module.declare_function("js_typed_array_get", DOUBLE, &[I64, I32]);
     // #2063: string / dynamic-key `ta[key]` [[Get]] dispatcher (canonical
     // numeric index → element, else ordinary named-property [[Get]]).

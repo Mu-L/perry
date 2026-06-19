@@ -138,6 +138,53 @@ print(hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest())
 PY
 }
 
+NODE_BIN_ENV="${NODE_BIN:-}"
+NODE_RESOLVED_BIN=""
+NODE_RESOLUTION_ERROR=""
+NODE_CANDIDATES=()
+NODE_RESOLUTION_TRIED=()
+
+append_node_candidate() {
+  local candidate="${1:-}"
+  [[ -z "$candidate" ]] && return
+  local existing
+  for existing in "${NODE_CANDIDATES[@]}"; do
+    [[ "$existing" == "$candidate" ]] && return
+  done
+  NODE_CANDIDATES+=("$candidate")
+}
+
+collect_node_candidates() {
+  append_node_candidate "${PERRY_BENCH_NODE:-}"
+  append_node_candidate "${PERRY_NODE_BIN:-}"
+  append_node_candidate "$NODE_BIN_ENV"
+  append_node_candidate "$ROOT/externals/node24/bin/node"
+  append_node_candidate "$ROOT/externals/node20/bin/node"
+  append_node_candidate "$ROOT/externals/node/bin/node"
+  append_node_candidate "/home/github-runner/actions-runner/externals/node24/bin/node"
+  append_node_candidate "/home/github-runner/actions-runner/externals/node20/bin/node"
+  append_node_candidate "/tmp/perry-node25-bin/node"
+
+  local path_node
+  path_node="$(command -v node 2>/dev/null || true)"
+  append_node_candidate "$path_node"
+}
+
+resolve_node_binary() {
+  collect_node_candidates
+  local node
+  for node in "${NODE_CANDIDATES[@]}"; do
+    NODE_RESOLUTION_TRIED+=("$node")
+    [[ -x "$node" ]] || continue
+    if "$node" --version >/dev/null 2>&1; then
+      NODE_RESOLVED_BIN="$node"
+      return 0
+    fi
+  done
+  NODE_RESOLUTION_ERROR="no usable Node.js runtime found for benchmark references"
+  return 1
+}
+
 git status --porcelain=v1 --untracked-files=all >"$SOURCE_STATUS"
 if ! git diff --binary HEAD -- >"$SOURCE_DIFF"; then
   : >"$SOURCE_DIFF"
@@ -172,6 +219,8 @@ elif [[ "$GATE" -eq 1 && "$ORIGINAL_HEAD_SHA" == "$CURRENT_HEAD_SHA" && -s "$SOU
   echo "gated evidence would ignore dirty current worktree changes; use --head-worktree-snapshot or commit the work first" >&2
   exit 2
 fi
+
+resolve_node_binary || true
 
 HEAD_TREE_SHA="$(git show -s --format=%T "$HEAD_SHA")"
 if [[ "$SOURCE_STATE_MODE" == "worktree-snapshot" ]]; then
@@ -242,8 +291,11 @@ PY
 }
 
 capture_tool_versions() {
-  python3 - "$METADATA" "$ROOT" <<'PY'
+  local tried
+  tried="$(printf '%s\n' "${NODE_RESOLUTION_TRIED[@]}")"
+  NODE_RESOLUTION_TRIED_TEXT="$tried" python3 - "$METADATA" "$ROOT" "$NODE_RESOLVED_BIN" "$NODE_RESOLUTION_ERROR" <<'PY'
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -251,6 +303,13 @@ from pathlib import Path
 
 metadata = Path(sys.argv[1])
 root = Path(sys.argv[2])
+node_bin = sys.argv[3]
+node_error = sys.argv[4]
+node_tried = [
+    line
+    for line in os.environ.get("NODE_RESOLUTION_TRIED_TEXT", "").splitlines()
+    if line
+]
 
 def run(cmd):
     try:
@@ -271,7 +330,15 @@ data["tool_versions"] = {
     "git": run(["git", "--version"]),
     "cargo": run(["cargo", "--version"]),
     "rustc": run(["rustc", "--version"]),
-    "node": run(["node", "--version"]),
+    "node": run([node_bin, "--version"]) if node_bin else {
+        "available": False,
+        "error": node_error or "no Node candidate selected",
+    },
+    "node_resolver": {
+        "path": node_bin or None,
+        "tried": node_tried,
+        "error": node_error or None,
+    },
     "sample": run(["/usr/bin/sample", "-h"]) if Path("/usr/bin/sample").exists() else {"available": False},
     "perf": run(["perf", "--version"]),
 }
@@ -487,7 +554,7 @@ run_required_benchmark_gc_traces() {
   local node_available=0
   local node_strip="suite-sed"
 
-  if command -v node >/dev/null 2>&1; then
+  if [[ -n "$NODE_RESOLVED_BIN" && -x "$NODE_RESOLVED_BIN" ]]; then
     node_available=1
   fi
   if command -v esbuild >/dev/null 2>&1; then
@@ -544,7 +611,7 @@ run_required_benchmark_gc_traces() {
         continue
       fi
       if [[ "$node_available" -ne 1 ]]; then
-        echo "node is required for traced benchmark reference output"
+        echo "Node is required for traced benchmark reference output: ${NODE_RESOLUTION_ERROR:-no Node candidate selected}"
         code=1
         continue
       fi
@@ -559,7 +626,7 @@ run_required_benchmark_gc_traces() {
         code=1
         continue
       fi
-      if ! env PERRY_GC_TRACE=1 node "$reference_input" >"$reference_stdout" 2>"$reference_stderr"; then
+      if ! env PERRY_GC_TRACE=1 "$NODE_RESOLVED_BIN" "$reference_input" >"$reference_stdout" 2>"$reference_stderr"; then
         echo "Node reference run failed: $reference_stderr"
         code=1
         continue
@@ -613,29 +680,64 @@ run_required_benchmark_gc_traces() {
 run_for_label() {
   local label="$1"
   local worktree="$2"
-  local perry_bin="$worktree/target/release/perry"
   local label_out="$OUT_ABS/$label"
   mkdir -p "$label_out/logs" "$label_out/benchmarks"
 
-  run_logged "$label" "build" "$worktree" "$label_out/logs/build.log" \
-    env "CARGO_TARGET_DIR=$worktree/target" cargo build --release -p perry
+  run_build_for_label "$label" "$worktree"
 
   if [[ "$(command_status "$label" build)" == "fail" ]]; then
-    record_command "$label" "memory_stability" "skipped" 0 "" "build failed"
-    record_command "$label" "benchmarks" "skipped" 0 "" "build failed"
-    record_command "$label" "benchmark_gc_traces" "skipped" 0 "" "build failed"
+    skip_label_runtime_after_build_failure "$label" "build failed"
     return
   fi
 
+  local perry_bin="$worktree/target/release/perry"
   run_logged "$label" "memory_stability" "$worktree" "$label_out/logs/memory-stability.command.log" \
     env "CARGO_TARGET_DIR=$worktree/target" "PERRY_BIN=$perry_bin" "PERRY_GC_EVIDENCE_DIR=$label_out/memory" scripts/run_memory_stability_tests.sh
 
   run_logged "$label" "benchmarks" "$worktree" "$label_out/logs/benchmarks-full-runs${RUNS}.log" \
-    env "PERRY_BIN=$perry_bin" benchmarks/compare.sh --full --runs "$RUNS" --json-out "$label_out/benchmarks/full.json"
+    env "PERRY_BIN=$perry_bin" "PERRY_BENCH_NODE=$NODE_RESOLVED_BIN" benchmarks/compare.sh --full --runs "$RUNS" --json-out "$label_out/benchmarks/full.json"
 
   run_required_benchmark_gc_traces "$label" "$worktree" "$label_out"
 
   run_perf_comprehensive "$label" "$worktree" "$label_out"
+}
+
+run_build_for_label() {
+  local label="$1"
+  local worktree="$2"
+  local label_out="$OUT_ABS/$label"
+  mkdir -p "$label_out/logs" "$label_out/benchmarks"
+  run_logged "$label" "build" "$worktree" "$label_out/logs/build.log" \
+    env "CARGO_TARGET_DIR=$worktree/target" cargo build --release -p perry
+}
+
+skip_label_runtime_after_build_failure() {
+  local label="$1"
+  local reason="$2"
+  record_command "$label" "memory_stability" "skipped" 0 "" "$reason"
+  record_command "$label" "benchmarks" "skipped" 0 "" "$reason"
+  record_command "$label" "benchmark_gc_traces" "skipped" 0 "" "$reason"
+  record_command "$label" "perf_comprehensive" "skipped" 0 "" "$reason"
+}
+
+finalize_packet_report() {
+  set +e
+  REPORT_ARGS=(
+    --root "$OUT_ABS"
+    --json-out "$OUT_ABS/gc-1090-packet.json"
+    --md-out "$OUT_ABS/gc-1090-packet.md"
+  )
+  if [[ "$GATE" -eq 1 ]]; then
+    REPORT_ARGS+=(--gate)
+  fi
+  python3 "$ROOT/scripts/gc_1090_evidence_report.py" "${REPORT_ARGS[@]}"
+  REPORT_EXIT=$?
+  set -e
+
+  echo ""
+  echo "packet markdown: $OUT_ABS/gc-1090-packet.md"
+  echo "packet json:     $OUT_ABS/gc-1090-packet.json"
+  exit "$REPORT_EXIT"
 }
 
 clean_label_target() {
@@ -1184,28 +1286,64 @@ run_gc_store_inventory() {
   echo "  $status (exit=$code, log=$log)"
 }
 
+run_type_lowering_evidence() {
+  local type_out="$OUT_ABS/type-lowering"
+  local log="$OUT_ABS/logs/type-lowering-evidence.log"
+  local perry_bin="$HEAD_WT/target/release/perry"
+  local code=0
+  local args=(
+    --out "$type_out"
+    --runs "$RUNS"
+    --compiler-runs 1
+    --benchmark-mode smoke
+    --perry "$perry_bin"
+  )
+  if [[ "$GATE" -eq 1 ]]; then
+    args+=(--gate)
+  fi
+  mkdir -p "$(dirname "$log")"
+  echo "=== packet: type_lowering ==="
+  set +e
+  (
+    cd "$HEAD_WT"
+    env "PERRY_BIN=$perry_bin" python3 scripts/type_lowering_evidence_packet.py "${args[@]}"
+  ) >"$log" 2>&1
+  code=$?
+  set -e
+  local status="pass"
+  if [[ "$code" -ne 0 ]]; then
+    status="fail"
+  fi
+  record_command "packet" "type_lowering" "$status" "$code" "$log" ""
+  echo "  $status (exit=$code, log=$log)"
+}
+
 run_for_label "base" "$BASE_WT"
+if [[ "$(command_status base build)" == "fail" ]]; then
+  echo "base build failed; running head build, then skipping comparison evidence that requires a runnable base"
+  run_build_for_label "head" "$HEAD_WT"
+  if [[ "$(command_status head build)" == "fail" ]]; then
+    skip_label_runtime_after_build_failure "head" "head build failed after base build failed"
+    record_command "packet" "type_lowering" "skipped" 0 "" "head build failed after base build failed"
+  else
+    skip_label_runtime_after_build_failure "head" "base build failed"
+    run_type_lowering_evidence
+  fi
+  record_command "packet" "old_page_policy" "skipped" 0 "" "base build failed"
+  record_command "packet" "gc_store_inventory" "skipped" 0 "" "base build failed"
+  record_command "packet" "perf_frontier" "skipped" 0 "" "base build failed"
+  record_command "packet" "early_abort" "fail" 1 "" "base build failed"
+  clean_label_target "base" "$BASE_WT"
+  clean_label_target "head" "$HEAD_WT"
+  finalize_packet_report
+fi
+
 run_for_label "head" "$HEAD_WT"
 run_old_page_policy_evidence
+run_type_lowering_evidence
 clean_label_target "base" "$BASE_WT"
 clean_label_target "head" "$HEAD_WT"
 run_gc_store_inventory
 run_perf_frontier
 
-set +e
-REPORT_ARGS=(
-  --root "$OUT_ABS"
-  --json-out "$OUT_ABS/gc-1090-packet.json"
-  --md-out "$OUT_ABS/gc-1090-packet.md"
-)
-if [[ "$GATE" -eq 1 ]]; then
-  REPORT_ARGS+=(--gate)
-fi
-python3 "$ROOT/scripts/gc_1090_evidence_report.py" "${REPORT_ARGS[@]}"
-REPORT_EXIT=$?
-set -e
-
-echo ""
-echo "packet markdown: $OUT_ABS/gc-1090-packet.md"
-echo "packet json:     $OUT_ABS/gc-1090-packet.json"
-exit "$REPORT_EXIT"
+finalize_packet_report

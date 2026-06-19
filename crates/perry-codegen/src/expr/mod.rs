@@ -106,9 +106,9 @@ pub(crate) use pod_record::{
 };
 pub(crate) use range_facts::{
     bounds_for_buffer_access, bounds_for_buffer_access_width, effective_alias_state_for_access,
-    guarded_buffer_indices_for_condition, int_range_expr, invalidate_local_write_facts,
-    record_int_facts_for_let, record_int_facts_for_local_set, record_int_facts_for_update,
-    while_condition_range_fact, IntRange, IntRangeFact,
+    emit_i32_index_span_inbounds_assume, guarded_buffer_indices_for_condition, int_range_expr,
+    invalidate_local_write_facts, record_int_facts_for_let, record_int_facts_for_local_set,
+    record_int_facts_for_update, while_condition_range_fact, IntRange, IntRangeFact,
 };
 pub(crate) use strings::emit_string_literal_global;
 pub(crate) use typed_feedback::{

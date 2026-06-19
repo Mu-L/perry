@@ -1,9 +1,11 @@
 use perry_hir::{BinaryOp, CompareOp, Expr, UpdateOp};
 
+use crate::block::LlBlock;
 use crate::native_value::{
     layout_decision_for_type, AliasState, BoundsProof, BoundsState, BufferViewSlot,
     GuardedBufferIndex, LengthSource, MaterializationReason, PodLayoutDecision,
 };
+use crate::types::{I1, I32, I64};
 
 use super::FnCtx;
 
@@ -525,6 +527,23 @@ pub(crate) fn bounds_for_buffer_access_width(
         }
     }
     range_bounds_for_buffer_access(ctx, buffer_local_id, index, bounds_width_units)
+}
+
+pub(crate) fn emit_i32_index_span_inbounds_assume(
+    blk: &mut LlBlock,
+    base_idx_i32: &str,
+    len_i32: &str,
+    bounds_width_units: u32,
+) {
+    let width = bounds_width_units.max(1).to_string();
+    let nonnegative = blk.icmp_sge(I32, base_idx_i32, "0");
+    blk.call_void("llvm.assume", &[(I1, &nonnegative)]);
+
+    let base_i64 = blk.sext(I32, base_idx_i32, I64);
+    let len_i64 = blk.zext(I32, len_i32, I64);
+    let end_i64 = blk.add(I64, &base_i64, &width);
+    let within_len = blk.icmp_ule(I64, &end_i64, &len_i64);
+    blk.call_void("llvm.assume", &[(I1, &within_len)]);
 }
 
 fn range_bounds_for_buffer_access(

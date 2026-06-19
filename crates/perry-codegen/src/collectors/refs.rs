@@ -479,7 +479,7 @@ pub fn collect_ref_ids_in_expr(e: &perry_hir::Expr, out: &mut HashSet<u32>) {
                 walk(a, out);
             }
         }
-        Expr::NewDynamicSpread { callee, args } => {
+        Expr::NewDynamicSpread { callee, args, .. } => {
             walk(callee, out);
             for a in args {
                 match a {

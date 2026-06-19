@@ -1133,6 +1133,15 @@ fn numeric_array_push_guard(arr: *const ArrayHeader, value: f64) -> bool {
         {
             return false;
         }
+        if (*header)._reserved
+            & (crate::gc::OBJ_FLAG_FROZEN
+                | crate::gc::OBJ_FLAG_SEALED
+                | crate::gc::OBJ_FLAG_NO_EXTEND
+                | crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS)
+            != 0
+        {
+            return false;
+        }
         let arr = raw_addr as *const ArrayHeader;
         let len = (*arr).length;
         let cap = (*arr).capacity;

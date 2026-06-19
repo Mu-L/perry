@@ -99,13 +99,6 @@ fn gc_collect_minor_with_trigger(trigger: GcTriggerSnapshot) -> GcCollectOutcome
         f.set(prev | GC_FLAG_IN_ALLOC);
         prev & GC_FLAG_IN_ALLOC
     });
-    if copied_minor_promotion_handoff_due(trigger.kind) {
-        let outcome = gc_collect_full_mark_sweep_with_trigger(GcTriggerSnapshot::capture(
-            GcTriggerKind::SurvivorPromotionBytes,
-        ));
-        restore_minor_in_alloc(prev_in_alloc);
-        return outcome;
-    }
     let mut trace = GcCycleTrace::new(GcCollectionKind::Minor, trigger);
     let start = Instant::now();
     crate::arena::old_pages_begin_gc_cycle();
@@ -123,7 +116,21 @@ fn gc_collect_minor_with_trigger(trigger: GcTriggerSnapshot) -> GcCollectOutcome
     // MARK_SEEDS persists across GC cycles. Clear before any try_mark
     // call so trace sees only this cycle's freshly-marked headers.
     clear_mark_seeds();
-    if let Some(fast_path) = gc_collect_minor_copying_fast_path(&mut trace, start, trigger.kind) {
+    let copied_minor_eligibility =
+        if old_page_defrag_selection_requires_minor_fallback(&old_page_selection, force_evacuation)
+        {
+            CopiedMinorEligibility::fallback(
+                CopiedMinorFallbackReason::OldPageDefragSelected,
+                copied_minor_malloc_sweep_due(trigger.kind),
+            )
+        } else {
+            CopiedMinorEligibility::evaluate(trigger.kind)
+        };
+    if let Some(fast_path) = gc_collect_minor_copying_fast_path_with_eligibility(
+        &mut trace,
+        start,
+        copied_minor_eligibility,
+    ) {
         let freed_bytes = fast_path.freed_bytes;
         let elapsed_us = start.elapsed().as_micros() as u64;
         GC_STATS.with(|stats| {
@@ -267,6 +274,11 @@ pub(crate) fn set_auto_gc_init_suppressed(suppressed: bool) -> bool {
     AUTO_GC_INIT_SUPPRESSED.with(|c| c.replace(suppressed))
 }
 
+#[cfg(test)]
+pub(super) fn test_set_gc_init_done(done: bool) -> bool {
+    GC_INIT_DONE.with(|c| c.replace(done))
+}
+
 /// Register the runtime root scanners on the current thread if they haven't been
 /// registered yet. Idempotent per thread; a no-op while auto-init is suppressed.
 ///
@@ -367,6 +379,7 @@ pub fn gc_init() {
     #[cfg(feature = "mod-dgram")]
     gc_register_mutable_root_scanner(crate::dgram_reactor::scan_roots_mut);
     gc_register_mutable_root_scanner(json_parse_mutable_root_scanner);
+    gc_register_mutable_root_scanner(json_stringify_mutable_root_scanner);
     gc_register_mutable_root_scanner(intern_table_mutable_root_scanner);
     gc_register_mutable_root_scanner(small_int_cache_mutable_root_scanner);
     gc_register_mutable_root_scanner(crate::builtins::scan_console_log_singleton_roots_mut);

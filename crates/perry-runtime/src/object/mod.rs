@@ -362,6 +362,7 @@ thread_local! {
 // in strict mode, which matches.
 thread_local! {
     static IMPLICIT_THIS: Cell<u64> = const { Cell::new(crate::value::TAG_UNDEFINED) };
+    static IMPLICIT_THIS_SAVED_STACK: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
     static NEW_TARGET: Cell<u64> = const { Cell::new(crate::value::TAG_UNDEFINED) };
     // One-shot receiver override for STATIC method bodies. A compiled static
     // method's `this` slot used to be a compile-time class-ref literal, so
@@ -488,12 +489,28 @@ pub extern "C" fn js_implicit_this_set(value: f64) -> f64 {
 
 #[inline]
 pub fn js_implicit_this_push(value: f64) -> f64 {
-    js_implicit_this_set(value)
+    IMPLICIT_THIS.with(|c| {
+        let previous = c.replace(value.to_bits());
+        IMPLICIT_THIS_SAVED_STACK.with(|s| s.borrow_mut().push(previous));
+        f64::from_bits(previous)
+    })
 }
 
 #[inline]
 pub fn js_implicit_this_restore(previous: f64) {
-    js_implicit_this_set(previous);
+    let previous_bits = previous.to_bits();
+    let restored_bits = IMPLICIT_THIS_SAVED_STACK.with(|s| {
+        let mut stack = s.borrow_mut();
+        let mut restored = None;
+        while let Some(saved) = stack.pop() {
+            restored = Some(saved);
+            if saved == previous_bits {
+                break;
+            }
+        }
+        restored.unwrap_or(previous_bits)
+    });
+    js_implicit_this_set(f64::from_bits(restored_bits));
 }
 
 /// Read the current `new.target` value for ordinary function bodies.
@@ -536,6 +553,11 @@ pub fn scan_implicit_this_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<
         let mut bits = c.get();
         if visitor.visit_nanbox_u64_slot(&mut bits) {
             c.set(bits);
+        }
+    });
+    IMPLICIT_THIS_SAVED_STACK.with(|s| {
+        for bits in s.borrow_mut().iter_mut() {
+            visitor.visit_nanbox_u64_slot(bits);
         }
     });
     NEW_TARGET.with(|c| {

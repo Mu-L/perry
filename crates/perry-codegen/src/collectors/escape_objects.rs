@@ -616,13 +616,13 @@ pub fn check_object_literal_escapes_in_expr(
                 check_object_literal_escapes_in_expr(a, candidates, escaped);
             }
         }
-        Expr::NewDynamic { callee, args } => {
+        Expr::NewDynamic { callee, args, .. } => {
             check_object_literal_escapes_in_expr(callee, candidates, escaped);
             for a in args {
                 check_object_literal_escapes_in_expr(a, candidates, escaped);
             }
         }
-        Expr::NewDynamicSpread { callee, args } => {
+        Expr::NewDynamicSpread { callee, args, .. } => {
             check_object_literal_escapes_in_expr(callee, candidates, escaped);
             for a in args {
                 match a {

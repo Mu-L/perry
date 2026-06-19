@@ -122,6 +122,10 @@ fn compile_ir_with_opts(name: &str, body: Vec<Stmt>, opts: CompileOptions) -> St
     String::from_utf8(compile_module(&module(name, body), opts).unwrap()).unwrap()
 }
 
+fn compile_ir_for_module_with_opts(module: Module, opts: CompileOptions) -> anyhow::Result<String> {
+    Ok(String::from_utf8(compile_module(&module, opts)?)?)
+}
+
 fn compile_artifact_json(name: &str, body: Vec<Stmt>) -> serde_json::Value {
     compile_artifact_json_for_module(module(name, body))
 }
@@ -928,6 +932,68 @@ fn typed_array_element_offset_uses_widened_gep_index() {
             && ir.contains("getelementptr inbounds i8, ptr")
             && ir.contains(", i64 "),
         "multi-byte typed-array raw access must widen the byte offset before inbounds GEP:\n{ir}"
+    );
+}
+
+#[test]
+fn typed_array_parameter_loop_uses_native_loads() {
+    let body = vec![
+        for_loop(2, length(1), vec![Stmt::Expr(index_get(1, local(2)))]),
+        Stmt::Return(Some(int(0))),
+    ];
+    let module = module_with_classes_and_params(
+        "typed_array_param_native_load.ts",
+        Vec::new(),
+        vec![param(1, "values", Type::Named("Float64Array".to_string()))],
+        Type::Number,
+        body.clone(),
+    );
+
+    let ir = compile_ir_for_module_with_opts(module.clone(), empty_opts()).unwrap();
+    assert!(
+        ir.contains("call ptr @js_typed_array_data_ptr")
+            && ir.contains("load double, ptr")
+            && !ir.contains("call double @js_typed_array_get"),
+        "Float64Array parameter loop should hoist view metadata and avoid per-element get helper:\n{ir}"
+    );
+
+    let artifact = compile_artifact_json_for_module(module);
+    let records = artifact["records"].as_array().unwrap();
+    assert!(
+        records.iter().any(|record| {
+            record["expr_kind"] == "TypedArrayGet"
+                && record["consumer"] == "TypedArrayGet.native_f64"
+                && record["access_mode"] == "unchecked_native"
+                && record["alias_state"] == "unknown"
+                && record["buffer_access"]["index_unit"] == "element"
+                && record["buffer_access"]["access_width_bytes"] == 8
+        }),
+        "expected unchecked native f64 typed-array parameter read record:\n{artifact:#}"
+    );
+}
+
+#[test]
+fn typed_array_parameter_buffer_materialization_disables_hoisted_native_loads() {
+    let body = vec![
+        Stmt::Expr(Expr::PropertyGet {
+            object: Box::new(local(1)),
+            property: "buffer".to_string(),
+        }),
+        for_loop(2, length(1), vec![Stmt::Expr(index_get(1, local(2)))]),
+        Stmt::Return(Some(int(0))),
+    ];
+    let module = module_with_classes_and_params(
+        "typed_array_param_buffer_escape.ts",
+        Vec::new(),
+        vec![param(1, "values", Type::Named("Float64Array".to_string()))],
+        Type::Number,
+        body,
+    );
+
+    let ir = compile_ir_for_module_with_opts(module, empty_opts()).unwrap();
+    assert!(
+        ir.contains("call double @js_typed_array_get"),
+        "touching .buffer can rebind backing storage, so later parameter reads must use the helper path:\n{ir}"
     );
 }
 
@@ -2004,7 +2070,7 @@ fn uint8_clamped_typed_array_store_records_runtime_fallback() {
 }
 
 #[test]
-fn typed_array_alias_read_records_runtime_fallback() {
+fn typed_array_alias_read_uses_native_load_without_noalias_claim() {
     let body = vec![
         typed_array_let(
             1,
@@ -2032,11 +2098,14 @@ fn typed_array_alias_read_records_runtime_fallback() {
             .iter()
             .any(|record| {
                 record["expr_kind"] == "TypedArrayGet"
-                    && record["consumer"] == "TypedArrayGet.slow_path"
-                    && record["access_mode"] == "dynamic_fallback"
-                    && !record["fallback_reason"].is_null()
+                    && record["consumer"] == "TypedArrayGet.native_u32"
+                    && record["access_mode"] == "unchecked_native"
+                    && record["alias_state"] == "may_alias"
+                    && record["emitted_inbounds"] == true
+                    && record["emitted_noalias"] == false
+                    && record["buffer_access"]["access_width_bytes"] == 2
             }),
-        "expected aliased typed-array read to record runtime fallback:\n{artifact:#}"
+        "expected aliased typed-array read to use native load without claiming noalias:\n{artifact:#}"
     );
 }
 

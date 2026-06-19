@@ -68,6 +68,7 @@ FALLBACK_REASONS = (
     "conservative_stack_unbounded",
     "unattributed_root_source",
     "malloc_registry_unavailable",
+    "old_page_defrag_selected",
     "pinned_young_root",
     "pinned_young_dirty_slot",
     "pinned_young_transitive",
@@ -103,6 +104,8 @@ OLD_PAGE_RSS_IMPROVEMENT_PCT = 20.0
 OLD_PAGE_RSS_IMPROVEMENT_KB = 10 * 1024
 OLD_PAGE_BASELINE_SMALL_KB = 64 * 1024
 OLD_GEN_CHURN_PLATEAU_ALLOWANCE_KB = 64 * 1024
+TYPE_LOWERING_MATERIAL_SPEEDUP_THRESHOLD = 8.0
+TYPE_LOWERING_MATERIAL_LOADS_PER_RUN = 100_000_000
 
 
 def load_json(path: Path, default: Any = None) -> Any:
@@ -338,6 +341,19 @@ def benchmark_entry(benchmarks: dict[str, Any], name: str) -> dict[str, Any]:
     return entry if isinstance(entry, dict) else {}
 
 
+def benchmark_node_unavailable(report: dict[str, Any]) -> str | None:
+    node_reference = report.get("node_reference") if isinstance(report, dict) else None
+    if not isinstance(node_reference, dict) or node_reference.get("available") is not False:
+        return None
+    error = node_reference.get("error")
+    if isinstance(error, str) and error:
+        return error
+    tried = node_reference.get("tried")
+    if isinstance(tried, list) and tried:
+        return f"no usable Node.js runtime found; tried {len(tried)} candidate(s)"
+    return "no usable Node.js runtime found"
+
+
 def validate_node_correctness_artifact(
     report_label: str,
     name: str,
@@ -502,12 +518,21 @@ def benchmark_matrix(
 
     for report_label, report in ((base_label, base), (head_label, head)):
         require_full_correctness = gate and report_label == head_label
+        node_unavailable_reason = benchmark_node_unavailable(report)
+        if node_unavailable_reason is not None:
+            target = errors if require_full_correctness else warnings
+            target.append(
+                f"{report_label}: benchmark Node reference unavailable: "
+                f"{node_unavailable_reason}"
+            )
         if not report:
             errors.append(f"{report_label}: benchmark JSON is missing")
             continue
         for name, entry in nested(report, "benchmarks", default={}).items():
             correctness = entry.get("correctness", {})
             status = correctness.get("status") if isinstance(correctness, dict) else None
+            if node_unavailable_reason is not None and status == "unchecked":
+                continue
             if require_full_correctness and not isinstance(correctness, dict):
                 errors.append(f"{report_label}:{name}: correctness output missing")
             elif require_full_correctness and status != "pass":
@@ -1460,6 +1485,136 @@ def perf_frontier_summary(root: Path, metadata: dict[str, Any], errors: list[str
     return summary
 
 
+def type_lowering_summary(
+    root: Path,
+    metadata: dict[str, Any],
+    errors: list[str],
+    warnings: list[str],
+    *,
+    gate: bool,
+) -> dict[str, Any]:
+    path = root / "type-lowering" / "type-lowering-evidence.json"
+    packet = load_json(path, {})
+    command = nested(metadata, "commands", "packet", "type_lowering", default={})
+    command_status_value = command.get("status") if isinstance(command, dict) else "missing"
+    summary = packet.get("summary", {}) if isinstance(packet, dict) else {}
+    result = {
+        "present": bool(packet),
+        "path": str(path),
+        "command": command if isinstance(command, dict) else {},
+        "status": packet.get("status") if isinstance(packet, dict) else "missing",
+        "errors": packet.get("errors", []) if isinstance(packet, dict) else [],
+        "summary": summary if isinstance(summary, dict) else {},
+    }
+
+    if gate and command_status_value != "pass":
+        errors.append(f"packet: type_lowering command status is {command_status_value}")
+    elif command_status_value not in ("pass", "skipped"):
+        warnings.append(f"packet: type_lowering command status is {command_status_value}")
+
+    if gate and not packet:
+        errors.append("type-lowering evidence packet is missing")
+        return result
+    if not packet:
+        warnings.append("type-lowering evidence packet is missing")
+        return result
+
+    if packet.get("status") != "pass":
+        message = f"type-lowering evidence packet status is {packet.get('status')}"
+        if gate:
+            errors.append(message)
+        else:
+            warnings.append(message)
+
+    if gate:
+        typed_summary = summary if isinstance(summary, dict) else {}
+        speedup = typed_summary.get("speedup_fast_vs_disabled")
+        speedup_threshold = typed_summary.get("speedup_threshold")
+        loads = typed_summary.get("loads_per_run")
+        fast_gc_cycles = typed_summary.get("fast_gc_cycles")
+        checksum = typed_summary.get("checksum")
+        offset_checksum = typed_summary.get("offset_subarray_checksum")
+        fast_slow_path_static = typed_summary.get("fast_buffer_slow_path_accesses_static")
+        disabled_slow_path_static = typed_summary.get(
+            "disabled_buffer_slow_path_accesses_static"
+        )
+        slow_path_reduction_static = typed_summary.get(
+            "typed_array_slow_path_reduction_static"
+        )
+        fast_element_helpers_static = typed_summary.get(
+            "fast_typed_array_element_helpers_static"
+        )
+        disabled_element_helpers_static = typed_summary.get(
+            "disabled_typed_array_element_helpers_static"
+        )
+        element_helper_reduction_static = typed_summary.get(
+            "typed_array_element_helper_reduction_static"
+        )
+        fast_boxed_allocations_static = typed_summary.get(
+            "fast_boxed_number_allocations_static"
+        )
+        if not isinstance(speedup_threshold, (int, float)):
+            errors.append("type-lowering speedup threshold metadata is missing")
+            effective_speedup_threshold = TYPE_LOWERING_MATERIAL_SPEEDUP_THRESHOLD
+        else:
+            effective_speedup_threshold = max(
+                TYPE_LOWERING_MATERIAL_SPEEDUP_THRESHOLD, float(speedup_threshold)
+            )
+            if speedup_threshold < TYPE_LOWERING_MATERIAL_SPEEDUP_THRESHOLD:
+                errors.append(
+                    "type-lowering packet speedup threshold below "
+                    f"{TYPE_LOWERING_MATERIAL_SPEEDUP_THRESHOLD:.1f}x: "
+                    f"{speedup_threshold}"
+                )
+        if not isinstance(speedup, (int, float)) or speedup < effective_speedup_threshold:
+            errors.append(
+                "type-lowering speedup below material threshold: "
+                f"speedup={speedup} threshold={effective_speedup_threshold:.1f}"
+            )
+        if not isinstance(loads, int) or loads < TYPE_LOWERING_MATERIAL_LOADS_PER_RUN:
+            errors.append(f"type-lowering loads/run below material threshold: {loads}")
+        if fast_gc_cycles != 0:
+            errors.append(f"type-lowering fast row GC cycles={fast_gc_cycles}, want 0")
+        if checksum is None:
+            errors.append("type-lowering checksum parity summary is missing")
+        if offset_checksum is None:
+            errors.append("type-lowering offset/subarray checksum parity summary is missing")
+        if not (
+            fast_slow_path_static == 0
+            and isinstance(disabled_slow_path_static, int)
+            and disabled_slow_path_static > 0
+            and isinstance(slow_path_reduction_static, int)
+            and slow_path_reduction_static > 0
+        ):
+            errors.append(
+                "type-lowering static slow-path helper pressure proof is missing "
+                "or not reduced: "
+                f"fast={fast_slow_path_static} disabled={disabled_slow_path_static} "
+                f"reduction={slow_path_reduction_static}"
+            )
+        if not (
+            fast_element_helpers_static == 0
+            and isinstance(disabled_element_helpers_static, int)
+            and disabled_element_helpers_static > 0
+            and isinstance(element_helper_reduction_static, int)
+            and element_helper_reduction_static > 0
+        ):
+            errors.append(
+                "type-lowering typed-array element helper proof is missing "
+                "or not eliminated: "
+                f"fast={fast_element_helpers_static} "
+                f"disabled={disabled_element_helpers_static} "
+                f"reduction={element_helper_reduction_static}"
+            )
+        if fast_boxed_allocations_static != 0:
+            errors.append(
+                "type-lowering fast row boxed-number allocations static="
+                f"{fast_boxed_allocations_static}, want 0"
+            )
+
+    return result
+
+
 def gc_store_inventory_summary(
     root: Path,
     metadata: dict[str, Any],
@@ -1811,6 +1966,13 @@ def collect_report(root: Path, base_label: str, head_label: str, *, gate: bool =
     metadata = load_json(root / "metadata.json", {})
     errors: list[str] = []
     warnings: list[str] = []
+    early_abort = nested(metadata, "commands", "packet", "early_abort", default={})
+    if isinstance(early_abort, dict) and early_abort.get("status") == "fail":
+        reason = early_abort.get("reason")
+        if isinstance(reason, str) and reason:
+            errors.append(f"packet: early abort: {reason}")
+        else:
+            errors.append("packet: early abort")
     source_state_raw = metadata.get("source_state")
     source_state = source_state_raw if isinstance(source_state_raw, dict) else {}
 
@@ -1949,6 +2111,7 @@ def collect_report(root: Path, base_label: str, head_label: str, *, gate: bool =
 
     perf = perf_summary(metadata, base_label, head_label)
     gc_store_inventory = gc_store_inventory_summary(root, metadata, errors, warnings, gate=gate)
+    type_lowering = type_lowering_summary(root, metadata, errors, warnings, gate=gate)
     perf_frontier = perf_frontier_summary(root, metadata, errors, warnings, gate=gate)
     old_page_policy = old_page_policy_summary(
         root,
@@ -1989,6 +2152,7 @@ def collect_report(root: Path, base_label: str, head_label: str, *, gate: bool =
         "strict_head_workloads": strict_workloads,
         "target_collector": target_collector,
         "gc_store_inventory": gc_store_inventory,
+        "type_lowering": type_lowering,
         "old_page_policy": old_page_policy,
         "perf_comprehensive": perf,
         "perf_frontier": perf_frontier,
@@ -2163,6 +2327,25 @@ def render_markdown(packet: dict[str, Any]) -> str:
             f"unaudited_sites={summary.get('unaudited_sites', 0) if isinstance(summary, dict) else 0} "
             f"missing_gc_type_metadata={summary.get('missing_gc_type_metadata', 0) if isinstance(summary, dict) else 0} "
             f"packet: `{inventory.get('path', '')}`"
+        )
+
+    type_lowering = packet.get("type_lowering", {})
+    lines.extend(["", "## Type-Lowering Evidence", ""])
+    if isinstance(type_lowering, dict):
+        summary = type_lowering.get("summary", {})
+        if not isinstance(summary, dict):
+            summary = {}
+        lines.append(
+            f"- Status: `{type_lowering.get('status', 'missing')}` "
+            f"packet: `{type_lowering.get('path', '')}`"
+        )
+        lines.append(
+            f"- Typed-array parameter row: speedup="
+            f"`{summary.get('speedup_fast_vs_disabled', 'missing')}` "
+            f"loads/run=`{summary.get('loads_per_run', 'missing')}` "
+            f"fast_gc_cycles=`{summary.get('fast_gc_cycles', 'missing')}` "
+            f"checksum=`{summary.get('checksum', 'missing')}` "
+            f"offset/subarray=`{summary.get('offset_subarray_checksum', 'missing')}`"
         )
 
     lines.extend(["", "## Perf-Comprehensive Outlier Check", ""])

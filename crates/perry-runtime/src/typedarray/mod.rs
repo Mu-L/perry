@@ -1145,6 +1145,26 @@ pub extern "C" fn js_typed_array_length(ta: *const TypedArrayHeader) -> i32 {
     }
 }
 
+/// Return the data pointer for a TypedArrayHeader-backed view.
+///
+/// Used by AOT codegen to hoist typed-array parameter metadata once at function
+/// entry, while preserving ArrayBuffer/subarray/native-arena view correctness.
+#[no_mangle]
+pub extern "C" fn js_typed_array_data_ptr(ta: *const TypedArrayHeader) -> *const u8 {
+    let ta = clean_ta_ptr(ta);
+    if ta.is_null() {
+        return std::ptr::null();
+    }
+    unsafe {
+        if crate::native_arena::is_native_typed_view(ta) {
+            crate::native_arena::validate_view_alive(
+                crate::native_arena::native_view_from_typed_array(ta),
+            );
+        }
+        data_ptr(ta)
+    }
+}
+
 /// `ta[i]` — returns plain f64 numeric value (NOT NaN-boxed).
 #[no_mangle]
 pub extern "C" fn js_typed_array_get(ta: *const TypedArrayHeader, index: i32) -> f64 {

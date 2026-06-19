@@ -34,8 +34,27 @@ assert metadata["source_state"]["current_head_sha"] == metadata["base_sha"], met
 assert metadata["source_state"]["tested_head_sha"] == metadata["head_sha"], metadata
 assert (root / "gc-1090-packet.md").exists()
 assert (root / "gc-1090-packet.json").exists()
+
+base_build = metadata["commands"].get("base", {}).get("build", {})
+if status != 0 and base_build.get("status") == "fail":
+    assert packet["status"] == "fail", packet
+    assert "base: release build failed" in packet["errors"], packet["errors"]
+    assert "packet: early abort: base build failed" in packet["errors"], packet["errors"]
+    assert metadata["commands"]["packet"]["early_abort"]["reason"] == "base build failed"
+    assert metadata["commands"]["head"]["build"]["status"] in ("pass", "fail")
+    assert metadata["commands"]["packet"]["old_page_policy"]["status"] == "skipped"
+    assert metadata["commands"]["packet"]["gc_store_inventory"]["status"] == "skipped"
+    assert metadata["commands"]["packet"]["perf_frontier"]["status"] == "skipped"
+    if metadata["commands"]["head"]["build"]["status"] == "pass":
+        assert metadata["commands"]["packet"]["type_lowering"]["status"] == "pass"
+        assert (root / "type-lowering" / "type-lowering-evidence.json").exists()
+    else:
+        assert metadata["commands"]["packet"]["type_lowering"]["status"] == "skipped"
+    raise SystemExit(0)
+
 assert (root / "old-page-policy.json").exists()
 assert (root / "perf-frontier" / "perf-frontier-packet.json").exists()
+assert (root / "type-lowering" / "type-lowering-evidence.json").exists()
 if status == 0:
     assert packet["status"] == "pass", packet["errors"]
 else:
@@ -60,4 +79,6 @@ assert "compiled_frame_conservative_pinned_bytes" in head
 assert "conservative_stack_truncated_cycles" in head
 assert "old_page_policy" in packet
 assert "bench_json_roundtrip" in packet["old_page_policy"]
+assert "type_lowering" in packet
+assert packet["type_lowering"]["summary"]["loads_per_run"] >= 100000000
 PY

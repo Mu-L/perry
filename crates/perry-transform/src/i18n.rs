@@ -415,7 +415,7 @@ fn collect_keys_from_expr(
         Expr::Closure { body, .. } => {
             collect_keys_from_stmts(body, key_to_idx, keys);
         }
-        Expr::NewDynamicSpread { callee, args } => {
+        Expr::NewDynamicSpread { callee, args, .. } => {
             collect_keys_from_expr(callee, key_to_idx, keys);
             for arg in args {
                 match arg {
@@ -690,7 +690,7 @@ fn replace_in_expr(
         Expr::Closure { body, .. } => {
             replace_in_stmts(body, key_to_idx, plural_info, plural_param_map);
         }
-        Expr::NewDynamicSpread { callee, args } => {
+        Expr::NewDynamicSpread { callee, args, .. } => {
             replace_in_expr(callee, key_to_idx, plural_info, plural_param_map);
             for arg in args.iter_mut() {
                 match arg {

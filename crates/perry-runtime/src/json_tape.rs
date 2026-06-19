@@ -633,9 +633,8 @@ unsafe fn materialize_object(
     idx: &mut usize,
     end_idx: usize,
 ) -> JSValue {
-    let obj = crate::object::js_object_alloc(0, 0);
-    let obj_handle = scope.root_raw_mut_ptr(obj);
-    json_tape_safepoint(JsonTapeSafepoint::MaterializeObjectRooted, obj as usize);
+    let mut key_handles: Vec<crate::gc::RuntimeHandle<'_>> = Vec::new();
+    let mut value_handles: Vec<crate::gc::RuntimeHandle<'_>> = Vec::new();
     while *idx < end_idx {
         let Some(key_entry) = source.entry(*idx) else {
             break;
@@ -643,23 +642,44 @@ unsafe fn materialize_object(
         debug_assert_eq!(key_entry.kind, KIND_KEY);
         *idx += 1;
         let key_ptr = decode_key_to_interned_string(source, key_entry.offset as usize);
-        let field_scope = crate::gc::RuntimeHandleScope::new();
-        let key_handle = field_scope.root_string_ptr(key_ptr);
-        let value = materialize_value_source(source, &field_scope, idx);
-        let value_handle = field_scope.root_nanbox_u64(value.bits());
-        let key_ptr =
-            key_handle.get_raw_const_ptr::<crate::StringHeader>() as *mut crate::StringHeader;
-        if !key_ptr.is_null() {
-            let obj = obj_handle.get_raw_mut_ptr::<crate::object::ObjectHeader>();
-            crate::object::js_object_set_field_by_name(
-                obj,
-                key_ptr,
-                f64::from_bits(value_handle.get_nanbox_u64()),
-            );
+        let key_handle = scope.root_string_ptr(key_ptr);
+        let value = materialize_value_source(source, scope, idx);
+        let value_handle = scope.root_nanbox_u64(value.bits());
+        let key_ptr = key_handle.get_raw_const_ptr::<crate::StringHeader>();
+        if key_ptr.is_null() {
+            continue;
+        }
+        if let Some(existing) = key_handles
+            .iter()
+            .position(|h: &crate::gc::RuntimeHandle<'_>| {
+                h.get_raw_const_ptr::<crate::StringHeader>() == key_ptr
+            })
+        {
+            value_handles[existing].set_nanbox_u64(value_handle.get_nanbox_u64());
+        } else {
+            key_handles.push(key_handle);
+            value_handles.push(value_handle);
         }
     }
     *idx = end_idx + 1;
+    let keys: Vec<*const crate::StringHeader> = key_handles
+        .iter()
+        .map(|h| h.get_raw_const_ptr::<crate::StringHeader>())
+        .collect();
+    let keys_arr = crate::json::parse_shape_keys_array(&keys);
+    let keys_arr_handle = scope.root_raw_mut_ptr(keys_arr);
+    let obj = crate::object::js_object_alloc_class_inline_keys(
+        0,
+        0,
+        value_handles.len() as u32,
+        keys_arr_handle.get_raw_mut_ptr::<crate::array::ArrayHeader>(),
+    );
+    let obj_handle = scope.root_raw_mut_ptr(obj);
+    json_tape_safepoint(JsonTapeSafepoint::MaterializeObjectRooted, obj as usize);
     let obj = obj_handle.get_raw_mut_ptr::<crate::object::ObjectHeader>();
+    for (i, value_handle) in value_handles.iter().enumerate() {
+        crate::object::store_object_field_slot(obj, i, value_handle.get_nanbox_u64());
+    }
     JSValue::object_ptr(obj as *mut u8)
 }
 

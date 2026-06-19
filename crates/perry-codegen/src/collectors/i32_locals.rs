@@ -1314,13 +1314,13 @@ pub fn collect_localset_ids_in_expr_filtered(
                 walk(a, out);
             }
         }
-        Expr::NewDynamic { callee, args } => {
+        Expr::NewDynamic { callee, args, .. } => {
             walk(callee, out);
             for a in args {
                 walk(a, out);
             }
         }
-        Expr::NewDynamicSpread { callee, args } => {
+        Expr::NewDynamicSpread { callee, args, .. } => {
             walk(callee, out);
             for a in args {
                 match a {

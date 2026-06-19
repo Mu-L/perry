@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Context, Result};
-use perry_hir::Function;
+use perry_hir::{Expr, Function, Stmt};
 
 use crate::expr::FnCtx;
 use crate::module::LlModule;
@@ -16,6 +16,336 @@ use crate::types::{LlvmType, DOUBLE, I32, I64, I8, PTR};
 
 use super::helpers::shadow_stack_enabled;
 use super::opts::CrossModuleCtx;
+
+fn typed_array_param_elem_width(ty: &perry_types::Type) -> Option<(BufferElem, u32)> {
+    let perry_types::Type::Named(name) = ty else {
+        return None;
+    };
+    match name.as_str() {
+        "Int8Array" => Some((BufferElem::I8, 1)),
+        "Uint8ClampedArray" => Some((BufferElem::U8Clamped, 1)),
+        "Int16Array" => Some((BufferElem::I16, 2)),
+        "Uint16Array" => Some((BufferElem::U16, 2)),
+        "Int32Array" => Some((BufferElem::I32, 4)),
+        "Uint32Array" => Some((BufferElem::U32, 4)),
+        "Float32Array" => Some((BufferElem::F32, 4)),
+        "Float64Array" => Some((BufferElem::F64, 8)),
+        _ => None,
+    }
+}
+
+fn stmts_have_typed_array_cache_safepoint(stmts: &[Stmt], id: u32) -> bool {
+    stmts
+        .iter()
+        .any(|stmt| stmt_has_typed_array_cache_safepoint(stmt, id))
+}
+
+fn stmt_has_typed_array_cache_safepoint(stmt: &Stmt, id: u32) -> bool {
+    match stmt {
+        Stmt::Let {
+            init: Some(init), ..
+        }
+        | Stmt::Expr(init)
+        | Stmt::Throw(init) => expr_has_typed_array_cache_safepoint(init, id),
+        Stmt::Return(Some(expr)) => expr_has_typed_array_cache_safepoint(expr, id),
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            expr_has_typed_array_cache_safepoint(condition, id)
+                || stmts_have_typed_array_cache_safepoint(then_branch, id)
+                || else_branch
+                    .as_deref()
+                    .is_some_and(|branch| stmts_have_typed_array_cache_safepoint(branch, id))
+        }
+        Stmt::While { condition, body } | Stmt::DoWhile { body, condition } => {
+            expr_has_typed_array_cache_safepoint(condition, id)
+                || stmts_have_typed_array_cache_safepoint(body, id)
+        }
+        Stmt::For {
+            init,
+            condition,
+            update,
+            body,
+        } => {
+            init.as_deref()
+                .is_some_and(|stmt| stmt_has_typed_array_cache_safepoint(stmt, id))
+                || condition
+                    .as_ref()
+                    .is_some_and(|expr| expr_has_typed_array_cache_safepoint(expr, id))
+                || update
+                    .as_ref()
+                    .is_some_and(|expr| expr_has_typed_array_cache_safepoint(expr, id))
+                || stmts_have_typed_array_cache_safepoint(body, id)
+        }
+        Stmt::Try {
+            body,
+            catch,
+            finally,
+        } => {
+            stmts_have_typed_array_cache_safepoint(body, id)
+                || catch
+                    .as_ref()
+                    .is_some_and(|catch| stmts_have_typed_array_cache_safepoint(&catch.body, id))
+                || finally
+                    .as_deref()
+                    .is_some_and(|stmts| stmts_have_typed_array_cache_safepoint(stmts, id))
+        }
+        Stmt::Switch {
+            discriminant,
+            cases,
+        } => {
+            expr_has_typed_array_cache_safepoint(discriminant, id)
+                || cases.iter().any(|case| {
+                    case.test
+                        .as_ref()
+                        .is_some_and(|expr| expr_has_typed_array_cache_safepoint(expr, id))
+                        || stmts_have_typed_array_cache_safepoint(&case.body, id)
+                })
+        }
+        Stmt::Labeled { body, .. } => stmt_has_typed_array_cache_safepoint(body, id),
+        _ => false,
+    }
+}
+
+fn expr_has_typed_array_cache_safepoint(expr: &Expr, id: u32) -> bool {
+    match expr {
+        Expr::Undefined
+        | Expr::Null
+        | Expr::Bool(_)
+        | Expr::Number(_)
+        | Expr::Integer(_)
+        | Expr::BigInt(_)
+        | Expr::String(_)
+        | Expr::WtfString(_)
+        | Expr::LocalGet(_)
+        | Expr::GlobalGet(_)
+        | Expr::FuncRef(_)
+        | Expr::ExternFuncRef { .. }
+        | Expr::NativeModuleRef(_)
+        | Expr::NewTarget
+        | Expr::ClassRef(_)
+        | Expr::EnumMember { .. }
+        | Expr::IterResultGetValue
+        | Expr::IterResultGetDone
+        | Expr::CurrentStepClosure => false,
+        Expr::Binary { left, right, .. }
+        | Expr::Compare { left, right, .. }
+        | Expr::Logical { left, right, .. } => {
+            expr_has_typed_array_cache_safepoint(left, id)
+                || expr_has_typed_array_cache_safepoint(right, id)
+        }
+        Expr::Unary { operand, .. }
+        | Expr::Void(operand)
+        | Expr::TypeOf(operand)
+        | Expr::Delete(operand) => expr_has_typed_array_cache_safepoint(operand, id),
+        Expr::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            expr_has_typed_array_cache_safepoint(condition, id)
+                || expr_has_typed_array_cache_safepoint(then_expr, id)
+                || expr_has_typed_array_cache_safepoint(else_expr, id)
+        }
+        Expr::PropertyGet { object, property }
+            if matches!(object.as_ref(), Expr::LocalGet(local_id) if *local_id == id)
+                && property == "length" =>
+        {
+            false
+        }
+        Expr::IndexGet { object, index } if matches!(object.as_ref(), Expr::LocalGet(local_id) if *local_id == id) => {
+            expr_has_typed_array_cache_safepoint(index, id)
+        }
+        Expr::IndexSet {
+            object,
+            index,
+            value,
+        } if matches!(object.as_ref(), Expr::LocalGet(local_id) if *local_id == id) => {
+            expr_has_typed_array_cache_safepoint(index, id)
+                || expr_has_typed_array_cache_safepoint(value, id)
+        }
+        Expr::IndexUpdate { object, index, .. } if matches!(object.as_ref(), Expr::LocalGet(local_id) if *local_id == id) => {
+            expr_has_typed_array_cache_safepoint(index, id)
+        }
+        Expr::LocalSet(_, value) => expr_has_typed_array_cache_safepoint(value, id),
+        Expr::Update { .. } => false,
+        Expr::Sequence(exprs) => exprs
+            .iter()
+            .any(|expr| expr_has_typed_array_cache_safepoint(expr, id)),
+        // Treat every unlisted HIR form as a potential runtime helper,
+        // allocation, or user-observable operation. The hoisted raw
+        // TypedArray view is only valid in tiny no-safepoint numeric loops.
+        _ => true,
+    }
+}
+
+fn expr_has_unsafe_typed_array_param_use(expr: &Expr, id: u32) -> bool {
+    match expr {
+        Expr::Undefined
+        | Expr::Null
+        | Expr::Bool(_)
+        | Expr::Number(_)
+        | Expr::Integer(_)
+        | Expr::BigInt(_)
+        | Expr::String(_)
+        | Expr::WtfString(_)
+        | Expr::GlobalGet(_)
+        | Expr::FuncRef(_)
+        | Expr::ExternFuncRef { .. }
+        | Expr::NativeModuleRef(_)
+        | Expr::NewTarget
+        | Expr::ClassRef(_)
+        | Expr::EnumMember { .. }
+        | Expr::IterResultGetValue
+        | Expr::IterResultGetDone
+        | Expr::CurrentStepClosure => false,
+        Expr::LocalGet(local_id) => *local_id == id,
+        Expr::LocalSet(local_id, value) => {
+            *local_id == id || expr_has_unsafe_typed_array_param_use(value, id)
+        }
+        Expr::Update { id: local_id, .. } => *local_id == id,
+        Expr::Binary { left, right, .. }
+        | Expr::Compare { left, right, .. }
+        | Expr::Logical { left, right, .. } => {
+            expr_has_unsafe_typed_array_param_use(left, id)
+                || expr_has_unsafe_typed_array_param_use(right, id)
+        }
+        Expr::Unary { operand, .. }
+        | Expr::Void(operand)
+        | Expr::TypeOf(operand)
+        | Expr::Delete(operand) => expr_has_unsafe_typed_array_param_use(operand, id),
+        Expr::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            expr_has_unsafe_typed_array_param_use(condition, id)
+                || expr_has_unsafe_typed_array_param_use(then_expr, id)
+                || expr_has_unsafe_typed_array_param_use(else_expr, id)
+        }
+        Expr::PropertyGet { object, property } => {
+            if matches!(object.as_ref(), Expr::LocalGet(local_id) if *local_id == id) {
+                return property != "length";
+            }
+            expr_has_unsafe_typed_array_param_use(object, id)
+        }
+        Expr::IndexGet { object, index } => {
+            if matches!(object.as_ref(), Expr::LocalGet(local_id) if *local_id == id) {
+                return expr_has_unsafe_typed_array_param_use(index, id);
+            }
+            expr_has_unsafe_typed_array_param_use(object, id)
+                || expr_has_unsafe_typed_array_param_use(index, id)
+        }
+        Expr::IndexSet {
+            object,
+            index,
+            value,
+        } => {
+            if matches!(object.as_ref(), Expr::LocalGet(local_id) if *local_id == id) {
+                return expr_has_unsafe_typed_array_param_use(index, id)
+                    || expr_has_unsafe_typed_array_param_use(value, id);
+            }
+            expr_has_unsafe_typed_array_param_use(object, id)
+                || expr_has_unsafe_typed_array_param_use(index, id)
+                || expr_has_unsafe_typed_array_param_use(value, id)
+        }
+        Expr::IndexUpdate { object, index, .. } => {
+            if matches!(object.as_ref(), Expr::LocalGet(local_id) if *local_id == id) {
+                return expr_has_unsafe_typed_array_param_use(index, id);
+            }
+            expr_has_unsafe_typed_array_param_use(object, id)
+                || expr_has_unsafe_typed_array_param_use(index, id)
+        }
+        Expr::Sequence(exprs) => exprs
+            .iter()
+            .any(|expr| expr_has_unsafe_typed_array_param_use(expr, id)),
+        // Unknown wrappers stay out of the raw-view fast path. Many HIR
+        // variants lower to runtime helpers even when they look expression-like.
+        _ => true,
+    }
+}
+
+fn stmts_have_unsafe_typed_array_param_use(stmts: &[Stmt], id: u32) -> bool {
+    stmts
+        .iter()
+        .any(|stmt| stmt_has_unsafe_typed_array_param_use(stmt, id))
+}
+
+fn stmt_has_unsafe_typed_array_param_use(stmt: &Stmt, id: u32) -> bool {
+    match stmt {
+        Stmt::Let {
+            init: Some(init), ..
+        }
+        | Stmt::Expr(init)
+        | Stmt::Throw(init) => expr_has_unsafe_typed_array_param_use(init, id),
+        Stmt::Return(Some(expr)) => expr_has_unsafe_typed_array_param_use(expr, id),
+        Stmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            expr_has_unsafe_typed_array_param_use(condition, id)
+                || stmts_have_unsafe_typed_array_param_use(then_branch, id)
+                || else_branch
+                    .as_deref()
+                    .is_some_and(|branch| stmts_have_unsafe_typed_array_param_use(branch, id))
+        }
+        Stmt::While { condition, body } | Stmt::DoWhile { body, condition } => {
+            expr_has_unsafe_typed_array_param_use(condition, id)
+                || stmts_have_unsafe_typed_array_param_use(body, id)
+        }
+        Stmt::For {
+            init,
+            condition,
+            update,
+            body,
+        } => {
+            init.as_deref()
+                .is_some_and(|stmt| stmt_has_unsafe_typed_array_param_use(stmt, id))
+                || condition
+                    .as_ref()
+                    .is_some_and(|expr| expr_has_unsafe_typed_array_param_use(expr, id))
+                || update
+                    .as_ref()
+                    .is_some_and(|expr| expr_has_unsafe_typed_array_param_use(expr, id))
+                || stmts_have_unsafe_typed_array_param_use(body, id)
+        }
+        Stmt::Try {
+            body,
+            catch,
+            finally,
+        } => {
+            stmts_have_unsafe_typed_array_param_use(body, id)
+                || catch
+                    .as_ref()
+                    .is_some_and(|catch| stmts_have_unsafe_typed_array_param_use(&catch.body, id))
+                || finally
+                    .as_deref()
+                    .is_some_and(|stmts| stmts_have_unsafe_typed_array_param_use(stmts, id))
+        }
+        Stmt::Switch {
+            discriminant,
+            cases,
+        } => {
+            expr_has_unsafe_typed_array_param_use(discriminant, id)
+                || cases.iter().any(|case| {
+                    case.test
+                        .as_ref()
+                        .is_some_and(|expr| expr_has_unsafe_typed_array_param_use(expr, id))
+                        || stmts_have_unsafe_typed_array_param_use(&case.body, id)
+                })
+        }
+        Stmt::Labeled { body, .. } => stmt_has_unsafe_typed_array_param_use(body, id),
+        _ => false,
+    }
+}
+
+fn typed_array_param_can_cache_view(f: &Function, id: u32) -> bool {
+    !stmts_have_typed_array_cache_safepoint(&f.body, id)
+        && !stmts_have_unsafe_typed_array_param_use(&f.body, id)
+}
 
 /// Compile a single user function into the module.
 pub(super) fn compile_function(
@@ -289,26 +619,23 @@ pub(super) fn compile_function(
         super::arguments::ArgumentsCallee::FunctionWrapper(&wrapper_name),
     );
 
-    // Issue #92 follow-up: pre-register `buffer_data_slots` entries for
-    // `Buffer`-typed function parameters so that the readInt32BE/etc.
-    // intrinsic fast path in `lower_call.rs` fires on
-    // `function decode(row: Buffer) { row.readInt32BE(off) }` — the real
-    // Postgres-driver hot-path shape, not just the `const buf = Buffer.alloc(N)`
-    // micro-benchmark. Skipped when the param is reassigned (has_any_mutation
-    // covers LocalSet/Update/ARRAY_MUTATORS — `buf = ...`, `buf.fill(...)` etc.)
-    // because a cached data_ptr would go stale, and skipped for boxed params
-    // (same reason via cross-closure mutation). Uint8Array-typed params are
-    // deliberately excluded: a pre-existing crash surfaces when the same
-    // program defines both a Buffer-param and a Uint8Array-param function and
-    // then invokes them in sequence (reproducible on main without any of
-    // this extension's changes). Tracked separately; Buffer coverage alone
-    // hits the Postgres decode path which is the target workload here.
+    // Issue #92 follow-up + typed-lowering core: pre-register
+    // `buffer_data_slots` entries for immutable Buffer / fixed-width
+    // TypedArray parameters so hot loops can use hoisted metadata plus raw
+    // loads/stores instead of per-element runtime helpers. Skipped when the
+    // param is reassigned (has_any_mutation covers LocalSet/Update/
+    // ARRAY_MUTATORS) because a cached data_ptr would go stale, and skipped
+    // for boxed params (same reason via cross-closure mutation). Uint8Array
+    // stays on its BufferHeader-specific path; the fixed-width classes here
+    // are TypedArrayHeader-backed and use `js_typed_array_data_ptr` so
+    // ArrayBuffer/subarray/native-arena views keep their correct backing ptr.
     for p in &f.params {
         let is_buffer_typed = matches!(
             &p.ty,
             perry_types::Type::Named(n) if n == "Buffer"
         );
-        if !is_buffer_typed {
+        let typed_array_elem = typed_array_param_elem_width(&p.ty);
+        if !is_buffer_typed && typed_array_elem.is_none() {
             continue;
         }
         if ctx.boxed_vars.contains(&p.id) {
@@ -317,30 +644,53 @@ pub(super) fn compile_function(
         if crate::collectors::has_any_mutation(&f.body, p.id) {
             continue;
         }
+        if typed_array_elem.is_some() && !typed_array_param_can_cache_view(f, p.id) {
+            continue;
+        }
         let Some(param_slot) = ctx.locals.get(&p.id).cloned() else {
             continue;
         };
         let blk = ctx.block();
         let arg_val = blk.load(DOUBLE, &param_slot);
         let handle = crate::expr::unbox_to_i64(blk, &arg_val);
-        let handle_ptr = blk.inttoptr(I64, &handle);
-        let data_ptr = blk.gep(I8, &handle_ptr, &[(I32, "8")]);
+        let data_ptr = if typed_array_elem.is_some() {
+            blk.call(PTR, "js_typed_array_data_ptr", &[(I64, &handle)])
+        } else {
+            let handle_ptr = blk.inttoptr(I64, &handle);
+            blk.gep(I8, &handle_ptr, &[(I32, "8")])
+        };
         let buf_slot = ctx.func.alloca_entry(PTR);
         ctx.block().store(PTR, &data_ptr, &buf_slot);
+        let length_slot = if typed_array_elem.is_some() {
+            let len_value = ctx
+                .block()
+                .call(I32, "js_typed_array_length", &[(I64, &handle)]);
+            let len_slot = ctx.func.alloca_entry(I32);
+            ctx.block().store(I32, &len_value, &len_slot);
+            Some(len_slot)
+        } else {
+            None
+        };
         let scope_idx = ctx.buffer_alias_base + ctx.buffer_data_slots.len() as u32;
         ctx.buffer_data_slots
             .insert(p.id, (buf_slot.clone(), scope_idx));
+        let (elem, element_width_bytes, index_unit, length_offset_from_data) =
+            if let Some((elem, width)) = typed_array_elem {
+                (elem, width, BufferIndexUnit::Element, -16)
+            } else {
+                (BufferElem::U8, 1, BufferIndexUnit::Byte, -8)
+            };
         ctx.buffer_view_slots.insert(
             p.id,
             BufferViewSlot {
                 data_slot: buf_slot,
-                length_slot: None,
+                length_slot,
                 scope_idx: Some(scope_idx),
-                elem: BufferElem::U8,
-                element_width_bytes: 1,
-                index_unit: BufferIndexUnit::Byte,
+                elem,
+                element_width_bytes,
+                index_unit,
                 view_byte_offset: Some(0),
-                length_offset_from_data: -8,
+                length_offset_from_data,
                 alias: AliasState::Unknown,
                 length_source: Some(LengthSource::Unknown),
                 native_owned: None,

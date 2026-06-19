@@ -183,6 +183,14 @@ pub(super) fn select_old_page_defrag_pages(force: bool) -> OldPageDefragSelectio
     select_old_page_defrag_pages_from_snapshot(&snapshot, force)
 }
 
+pub(super) fn old_page_defrag_selection_requires_minor_fallback(
+    selection: &OldPageDefragSelection,
+    force: bool,
+) -> bool {
+    selection.selected_pages > 0
+        && (force || selection.selected_reclaimable_bytes >= MIN_CANDIDATE_BYTES)
+}
+
 pub(super) fn evacuation_policy_initial_decision(
     tenured_still_in_nursery_bytes: usize,
     rss_bytes: u64,

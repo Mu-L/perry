@@ -23,6 +23,7 @@ KNOWN_FALLBACK_REASONS = (
     "conservative_stack_unbounded",
     "unattributed_root_source",
     "malloc_registry_unavailable",
+    "old_page_defrag_selected",
     "pinned_young_root",
     "pinned_young_dirty_slot",
     "pinned_young_transitive",

@@ -343,15 +343,6 @@ pub enum Expr {
         byte_offset: u32,
     },
 
-    /// Dynamic new expression with spread arguments.
-    /// e.g., new someVariable(...args)
-    NewDynamicSpread {
-        /// The expression that evaluates to a constructor
-        callee: Box<Expr>,
-        /// Positional and spread arguments in source order
-        args: Vec<CallArg>,
-    },
-
     /// Runtime `new.target` value for ordinary functions.
     NewTarget,
 

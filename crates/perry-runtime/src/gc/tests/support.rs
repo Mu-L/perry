@@ -414,6 +414,7 @@ impl Drop for GcTriggerThresholdTestGuard {
 }
 
 pub(super) fn collect_minor_trace(trigger_kind: GcTriggerKind) -> GcCycleTrace {
+    let _trace_guard = TestGcTraceCaptureGuard::force_enabled();
     gc_collect_minor_with_trigger(GcTriggerSnapshot {
         kind: trigger_kind,
         steps_before: Some(GcStepSnapshot::current()),

@@ -43,7 +43,7 @@ use super::{
     emit_typed_feedback_register_site, emit_v8_export_call, emit_v8_member_method_call,
     emit_write_barrier, emit_write_barrier_slot_on_block,
     expr_has_numeric_pointer_free_array_layout, expr_is_known_non_pointer_shadow_value,
-    extract_array_of_object_shape, i32_bool_to_nanbox, import_origin_suffix,
+    extract_array_of_object_shape, i32_bool_to_nanbox, import_origin_suffix, int_range_expr,
     is_global_this_builtin_function_name, is_global_this_builtin_name, is_known_finite,
     lower_array_literal, lower_channel_reduction, lower_expr, lower_expr_as_i32, lower_expr_native,
     lower_index_set_fast, lower_js_args_array, lower_object_literal, lower_stream_super_init,
@@ -110,12 +110,10 @@ fn numeric_index_needs_runtime_key(index: &Expr) -> bool {
     // non-finite values (`a[NaN]`/`a[Infinity]`). These become string-keyed
     // properties and must reach `js_array_*_index_or_string`.
     //
-    // Computed/dynamic numeric indices are deliberately NOT rerouted here:
-    // they keep flowing through the typed-feedback numeric-array guard path,
-    // which already carries its own out-of-range/non-integer fallback. Sending
-    // them to the runtime key helper would defeat the native numeric-array hot
-    // path and drop the index guard (regressing the native-region proof and
-    // the typed-feedback hot-path tests). (#4557/#4543)
+    // Computed/dynamic numeric indices are handled by the proof gate below:
+    // only indices proven to be clean non-negative array slots may reach raw
+    // stores. The literal-only check here catches obvious boundary property
+    // keys before the general fast-path tree.
     match index {
         Expr::Integer(i) => *i < 0 || *i > i32::MAX as i64,
         Expr::Number(n) => {
@@ -123,6 +121,40 @@ fn numeric_index_needs_runtime_key(index: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+fn numeric_index_is_extension_capable_array_index(ctx: &FnCtx<'_>, index: &Expr) -> bool {
+    match index {
+        Expr::Integer(i) => (0..=i32::MAX as i64).contains(i),
+        Expr::Number(n) => n.is_finite() && n.fract() == 0.0 && *n >= 0.0 && *n <= i32::MAX as f64,
+        Expr::LocalGet(id)
+            if ctx.nonnegative_integer_locals.contains(id)
+                && (ctx.i32_counter_slots.contains_key(id)
+                    || ctx.strictly_i32_bounded_locals.contains(id)) =>
+        {
+            true
+        }
+        _ => int_range_expr(ctx, index)
+            .is_some_and(|range| range.min >= 0 && range.max <= i32::MAX as i64),
+    }
+}
+
+fn bounded_loop_proves_fast_array_index(ctx: &FnCtx<'_>, object: &Expr, index: &Expr) -> bool {
+    let (Expr::LocalGet(arr_id), Expr::LocalGet(idx_id)) = (object, index) else {
+        return false;
+    };
+    ctx.bounded_index_pairs
+        .iter()
+        .any(|fact| fact.index_local_id == *idx_id && fact.array_local_id == *arr_id)
+}
+
+fn numeric_index_is_proven_fast_array_index_for_object(
+    ctx: &FnCtx<'_>,
+    object: &Expr,
+    index: &Expr,
+) -> bool {
+    numeric_index_is_extension_capable_array_index(ctx, index)
+        || bounded_loop_proves_fast_array_index(ctx, object, index)
 }
 
 pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
@@ -323,6 +355,41 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     ctx,
                     TypedFeedbackKind::ArrayElement,
                     "array[boundary_index]",
+                    TypedFeedbackContract::array_set_index(),
+                );
+                ctx.block().call(
+                    I64,
+                    "js_typed_feedback_array_set_index_or_string",
+                    &[
+                        (I64, &site_id),
+                        (I64, &arr_handle),
+                        (DOUBLE, &idx_double),
+                        (DOUBLE, &val_double),
+                    ],
+                );
+                if value_needs_barrier {
+                    let val_bits = ctx.block().bitcast_double_to_i64(&val_double);
+                    let arr_bits = ctx.block().bitcast_double_to_i64(&arr_box);
+                    emit_write_barrier(ctx, &arr_bits, &val_bits);
+                }
+                return Ok(val_double);
+            }
+            if is_array_expr(ctx, object)
+                && is_numeric_expr(ctx, index)
+                && !numeric_index_is_proven_fast_array_index_for_object(ctx, object, index)
+            {
+                let arr_box = lower_expr(ctx, object)?;
+                let idx_double = lower_expr(ctx, index)?;
+                let value_needs_barrier = array_store_needs_write_barrier(ctx, value);
+                let val_double = lower_expr(ctx, value)?;
+                let arr_handle = {
+                    let blk = ctx.block();
+                    unbox_to_i64(blk, &arr_box)
+                };
+                let site_id = emit_typed_feedback_register_site(
+                    ctx,
+                    TypedFeedbackKind::ArrayElement,
+                    "array[numeric_maybe_property_index]",
                     TypedFeedbackContract::array_set_index(),
                 );
                 ctx.block().call(

@@ -731,7 +731,7 @@ pub fn transform_expr(
         // Dynamic-spread constructor calls cannot be rewritten to JsNewFromHandle
         // without preserving spread semantics, but their children still need JS
         // interop transformation.
-        Expr::NewDynamicSpread { callee, args } => {
+        Expr::NewDynamicSpread { callee, args, .. } => {
             transform_expr(callee, js_imports, extern_func_to_js, local_name_to_js, tracker);
             for arg in args.iter_mut() {
                 match arg {

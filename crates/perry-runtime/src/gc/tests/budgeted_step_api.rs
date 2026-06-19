@@ -304,6 +304,11 @@ fn gc_init_default_scanners_do_not_block_automatic_budgeted_trigger() {
         event["copying_nursery"]["fallback_reason"].as_str(),
         Some("none")
     );
+    assert!(
+        event["root_sources"]["runtime_mutable_scanners"]["registered_scanners"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
 }
 
 #[test]

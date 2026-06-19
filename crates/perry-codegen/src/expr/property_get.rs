@@ -405,9 +405,39 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             //
             // Mirrors the v0.5.82 IC-receiver type-validation fix.
             let recv_box = lower_expr(ctx, object)?;
-            let blk = ctx.block();
-            let recv_bits = blk.bitcast_double_to_i64(&recv_box);
-            let recv_handle = blk.and(I64, &recv_bits, POINTER_MASK_I64);
+            let recv_bits = ctx.block().bitcast_double_to_i64(&recv_box);
+            let recv_handle = ctx.block().and(I64, &recv_bits, POINTER_MASK_I64);
+            let is_undef = ctx
+                .block()
+                .icmp_eq(I64, &recv_bits, crate::nanbox::TAG_UNDEFINED_I64);
+            let is_null = ctx
+                .block()
+                .icmp_eq(I64, &recv_bits, crate::nanbox::TAG_NULL_I64);
+            let is_nullish = ctx.block().or(I1, &is_undef, &is_null);
+            let nullish_throw_idx = ctx.new_block("plen.throw_nullish");
+            let nonnull_idx = ctx.new_block("plen.nonnull");
+            let nullish_throw_label = ctx.block_label(nullish_throw_idx);
+            let nonnull_label = ctx.block_label(nonnull_idx);
+            ctx.block()
+                .cond_br(&is_nullish, &nullish_throw_label, &nonnull_label);
+
+            ctx.current_block = nullish_throw_idx;
+            let prop_idx = ctx.strings.intern("length");
+            let prop_entry = ctx.strings.entry(prop_idx);
+            let prop_bytes_global = format!("@{}", prop_entry.bytes_global);
+            let prop_len_str = prop_entry.byte_len.to_string();
+            let is_null_i32 = ctx.block().zext(I1, &is_null, I32);
+            ctx.block().call_void(
+                "js_throw_type_error_property_access",
+                &[
+                    (I32, &is_null_i32),
+                    (PTR, &prop_bytes_global),
+                    (I64, &prop_len_str),
+                ],
+            );
+            ctx.block().unreachable();
+
+            ctx.current_block = nonnull_idx;
             // Tag-based guard: real heap references carry NaN-box tag
             // POINTER_TAG (0x7FFD) or STRING_TAG (0x7FFF) in the top
             // 16 bits. `AND 0xFFFD` collapses both to 0x7FFD; every
@@ -422,18 +452,18 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // was forced through `js_value_length_f64` (issue #128
             // follow-up — correctness-safe, but ~10x slower on the
             // `.length` hot path). Tag check is platform-independent.
-            let recv_tag = blk.lshr(I64, &recv_bits, "48");
-            let recv_tag_masked = blk.and(I64, &recv_tag, "65533"); // 0xFFFD
-            let handle_ok = blk.icmp_eq(I64, &recv_tag_masked, "32765"); // 0x7FFD
-                                                                         // SSO receivers fail this guard → route to slow path
-                                                                         // `js_value_length_f64` which has an SSO branch (reads
-                                                                         // length from the tag byte, no heap access). Accepting
-                                                                         // SSO here is safe because the fast path's
-                                                                         // `safe_load_i32_from_ptr(&recv_handle)` would read
-                                                                         // arbitrary bytes at the SSO "pointer" address, but
-                                                                         // the subsequent phi feeds the slow-path result when
-                                                                         // handle_ok is false — so SSO flow is correct via the
-                                                                         // slow path already, no widening needed.
+            let recv_tag = ctx.block().lshr(I64, &recv_bits, "48");
+            let recv_tag_masked = ctx.block().and(I64, &recv_tag, "65533"); // 0xFFFD
+            let handle_ok = ctx.block().icmp_eq(I64, &recv_tag_masked, "32765"); // 0x7FFD
+                                                                                 // SSO receivers fail this guard → route to slow path
+                                                                                 // `js_value_length_f64` which has an SSO branch (reads
+                                                                                 // length from the tag byte, no heap access). Accepting
+                                                                                 // SSO here is safe because the fast path's
+                                                                                 // `safe_load_i32_from_ptr(&recv_handle)` would read
+                                                                                 // arbitrary bytes at the SSO "pointer" address, but
+                                                                                 // the subsequent phi feeds the slow-path result when
+                                                                                 // handle_ok is false — so SSO flow is correct via the
+                                                                                 // slow path already, no widening needed.
 
             let check_gc_idx = ctx.new_block("plen.check_gc");
             let fast_idx = ctx.new_block("plen.fast");

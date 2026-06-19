@@ -261,6 +261,77 @@ detail = "numeric loop FP multiply/add shape"
 [workloads.loop_data_dependent.native_rep_checks]
 allow_materialization_reasons = ["runtime_api"]
 
+[workloads.typedarray_param_sum]
+source = "benchmarks/suite/bench_typedarray_param_sum.ts"
+kind = "typed_array_param_benchmark"
+allow_hot_loop_conversions = true
+allowed_hot_loop_runtime_calls = [
+  "js_shadow_frame_push",
+  "js_shadow_slot_bind",
+  "js_typed_array_data_ptr",
+  "js_typed_array_length",
+  "js_value_length_f64",
+]
+
+[workloads.typedarray_param_sum.vectorization]
+min_vectorized_loops = 0
+scalar_baseline = "allowed: this fixture gates typed-array parameter lowering, not vector width"
+allowed_missed_reason_kinds = [
+  "call_instruction",
+  "control_flow",
+  "generic_not_vectorized",
+  "not_beneficial",
+  "uncountable_loop",
+  "unknown_trip_count",
+  "unsupported_instruction",
+  "unsupported_reduction",
+]
+
+[workloads.typedarray_param_sum.runtime_budgets]
+allocations_traced = 32
+gc_collections_traced = 0
+write_barriers_static = 16
+write_barriers_traced = 16
+boxed_number_allocations_static = 0
+buffer_slow_path_accesses_static = 0
+
+[[workloads.typedarray_param_sum.ir_checks]]
+name = "typedarray_param_data_ptr_hoisted"
+contains = "@js_typed_array_data_ptr"
+detail = "typed-array parameter metadata is hoisted once for raw loop access"
+
+[[workloads.typedarray_param_sum.ir_checks]]
+name = "typedarray_param_direct_f64_load"
+function_contains = "perry_fn_bench_typedarray_param_sum_ts__sumTypedParam"
+contains = "load double, ptr"
+regex_none = ["@js_typed_array_get"]
+detail = "typed-array parameter loop uses direct f64 loads and elides per-element get helper"
+
+[[workloads.typedarray_param_sum.ir_checks]]
+name = "typedarray_param_inner_scan_loop_no_metadata_calls"
+function_contains = "perry_fn_bench_typedarray_param_sum_ts__sumTypedParam"
+regex_all = ["(?m)^for\\.body\\.2(?:\\.i[0-9]*)?:[\\s\\S]*?load double, ptr"]
+regex_none = [
+  "(?m)^for\\.body\\.2(?:\\.i[0-9]*)?:(?:(?!\\n[-$._A-Za-z0-9]+:)[\\s\\S])*@js_typed_array_data_ptr",
+  "(?m)^for\\.body\\.2(?:\\.i[0-9]*)?:(?:(?!\\n[-$._A-Za-z0-9]+:)[\\s\\S])*@js_typed_array_length",
+  "(?m)^for\\.body\\.2(?:\\.i[0-9]*)?:(?:(?!\\n[-$._A-Za-z0-9]+:)[\\s\\S])*@js_value_length_f64",
+  "(?m)^for\\.body\\.2(?:\\.i[0-9]*)?:(?:(?!\\n[-$._A-Za-z0-9]+:)[\\s\\S])*@js_typed_array_get",
+]
+detail = "inner typed-array scan loop has raw loads and no per-element metadata/helper calls"
+
+[workloads.typedarray_param_sum.native_rep_checks]
+allow_materialization_reasons = ["function_abi", "runtime_api"]
+
+[[workloads.typedarray_param_sum.native_rep_checks.require_records]]
+name = "typedarray_param_f64_read"
+source_function = "sumTypedParam"
+expr_kind = "TypedArrayGet"
+consumer = "TypedArrayGet.native_f64"
+native_rep_name = "f64"
+access_mode = "unchecked_native"
+bounds_state = "proven_or_guarded"
+alias_state = "unknown"
+
 [workloads.fma_contract]
 source = "benchmarks/compiler_output/fixtures/fma_contract.ts"
 kind = "fma_contract"

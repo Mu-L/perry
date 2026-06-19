@@ -616,6 +616,70 @@ fn bounded_integer_array_store_omits_layout_note_and_barrier() {
 }
 
 #[test]
+fn negative_entry_array_store_does_not_use_bounded_raw_store() {
+    let module = base_module(
+        "negative_entry_array_store.ts",
+        vec![
+            Stmt::Let {
+                id: 1,
+                name: "arr".to_string(),
+                ty: Type::Array(Box::new(Type::Number)),
+                mutable: true,
+                init: Some(Expr::Array(vec![
+                    Expr::Number(0.0),
+                    Expr::Number(0.0),
+                    Expr::Number(0.0),
+                ])),
+            },
+            Stmt::For {
+                init: Some(Box::new(Stmt::Let {
+                    id: 2,
+                    name: "i".to_string(),
+                    ty: Type::Number,
+                    mutable: true,
+                    init: Some(Expr::Integer(-1)),
+                })),
+                condition: Some(Expr::Compare {
+                    op: CompareOp::Lt,
+                    left: Box::new(Expr::LocalGet(2)),
+                    right: Box::new(Expr::PropertyGet {
+                        object: Box::new(Expr::LocalGet(1)),
+                        property: "length".to_string(),
+                    }),
+                }),
+                update: Some(Expr::Update {
+                    id: 2,
+                    op: UpdateOp::Increment,
+                    prefix: false,
+                }),
+                body: vec![Stmt::Expr(Expr::IndexSet {
+                    object: Box::new(Expr::LocalGet(1)),
+                    index: Box::new(Expr::LocalGet(2)),
+                    value: Box::new(Expr::Binary {
+                        op: BinaryOp::Add,
+                        left: Box::new(Expr::LocalGet(2)),
+                        right: Box::new(Expr::Integer(1)),
+                    }),
+                })],
+            },
+            Stmt::Return(Some(Expr::LocalGet(1))),
+        ],
+        Vec::new(),
+    );
+
+    let ir = ir_for(module);
+
+    assert!(
+        !ir.contains("idxset.bounded_numeric_fast"),
+        "an upper-bound-only loop proof must not inline raw array stores for negative indices"
+    );
+    assert!(
+        ir.contains("call i64 @js_typed_feedback_array_set_index_or_string"),
+        "possibly-negative numeric indices must preserve property-key semantics"
+    );
+}
+
+#[test]
 fn numeric_iota_fill_loop_uses_bulk_helper_without_barrier() {
     // #4957 lowers `for (let i = 0; i < arr.length; i++) arr[i] = i` over a
     // numeric array to a bulk iota fill instead of per-element guarded

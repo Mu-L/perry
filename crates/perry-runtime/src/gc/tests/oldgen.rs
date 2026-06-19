@@ -764,6 +764,97 @@ fn test_old_page_defrag_re_remembers_young_child_after_collection_clear() {
 }
 
 #[test]
+fn test_old_page_defrag_selection_gates_copied_minor_fast_path() {
+    struct ResetGcTestState;
+
+    impl Drop for ResetGcTestState {
+        fn drop(&mut self) {
+            reset_shadow_stack();
+            reset_global_roots();
+            reset_remembered_set();
+            clear_marks();
+            clear_mark_seeds();
+            CONS_PINNED.with(|s| s.borrow_mut().clear());
+        }
+    }
+
+    let _reset = ResetGcTestState;
+    let _scan = ConservativeScanAutoGuard::new();
+    let _isolation = copying_nursery_isolation_lock();
+    let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    let _force = EnvVarGuard::set("PERRY_GC_FORCE_EVACUATE", "1");
+    let _barrier_guard = GeneratedWriteBarrierTestGuard::active();
+    reset_shadow_stack();
+    reset_global_roots();
+    reset_remembered_set();
+    clear_marks();
+    clear_mark_seeds();
+    CONS_PINNED.with(|s| s.borrow_mut().clear());
+
+    let (parent, fields) = unsafe { alloc_old_test_object(1) };
+    let parent_user = parent as usize;
+    let parent_header = unsafe { header_from_user_ptr(parent as *const u8) };
+    let _dead = crate::arena::arena_alloc_gc_old(40, 8, GC_TYPE_STRING) as usize;
+    unsafe {
+        (*parent_header).gc_flags |= GC_FLAG_MARKED;
+    }
+    let _ = sweep_with_age_bump(false);
+
+    let selected_before = select_old_page_defrag_pages(true);
+    assert!(
+        selected_before.selected_pages > 0,
+        "forced old-page defrag policy should select a fragmented source page"
+    );
+
+    let frame = js_shadow_frame_push(2);
+    let child = crate::arena::arena_alloc_gc(40, 8, GC_TYPE_OBJECT) as usize;
+    unsafe {
+        *fields = ptr_bits(child);
+    }
+    js_write_barrier_slot(ptr_bits(parent_user), fields as u64, ptr_bits(child));
+    js_shadow_slot_set(0, ptr_bits(parent_user));
+    js_shadow_slot_set(1, ptr_bits(child));
+
+    let trace = collect_minor_trace(GcTriggerKind::Direct);
+
+    assert_eq!(
+        trace.copying_nursery.fallback_reason,
+        CopiedMinorFallbackReason::OldPageDefragSelected
+    );
+    assert!(!trace.copying_nursery.eligible);
+    assert!(
+        trace.evacuation.old_page_moved_objects >= 1,
+        "selected old pages must run through the moving fallback"
+    );
+    let parent_after = (js_shadow_slot_get(0) & POINTER_MASK) as usize;
+    assert_ne!(
+        parent_after, parent_user,
+        "moving fallback should rewrite the old parent root"
+    );
+    let child_after = (js_shadow_slot_get(1) & POINTER_MASK) as usize;
+    assert_ne!(child_after, 0);
+    let moved_parent_fields = unsafe {
+        (parent_after as *const u8).add(std::mem::size_of::<crate::object::ObjectHeader>())
+            as *const u64
+    };
+    assert_eq!(
+        unsafe { *moved_parent_fields } & POINTER_MASK,
+        child_after as u64,
+        "moving fallback should rewrite the moved parent's young child slot"
+    );
+    assert!(
+        remembered_set_size() > 0,
+        "moved old parent retaining a young child must be re-remembered"
+    );
+
+    if gc_trace_enabled() {
+        trace.emit(GcStepSnapshot::current());
+    }
+
+    js_shadow_frame_pop(frame);
+}
+
+#[test]
 fn test_old_page_defrag_target_gate_emits_trace() {
     struct ResetGcTestState;
 

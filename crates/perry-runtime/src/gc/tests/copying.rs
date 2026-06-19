@@ -208,6 +208,68 @@ fn test_copying_minor_relocates_managed_closure_and_rewrites_capture() {
 }
 
 #[test]
+fn test_copying_minor_treats_weakref_target_as_weak_remembered_edge() {
+    let _guard = CopyingNurseryTestGuard::new(1);
+    let _env_guard = EnvVarGuard::set("PERRY_GC_VERIFY_EVACUATION", "1");
+    let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+
+    let target = young_leaf();
+    let (weakref, fields) = unsafe { alloc_old_test_object(1) };
+    unsafe {
+        (*weakref).class_id = crate::weakref::CLASS_ID_WEAKREF;
+        layout_init_pointer_free(weakref as *mut u8);
+        crate::object::store_object_field_slot(weakref, 0, ptr_bits(target));
+    }
+    js_shadow_slot_set(0, ptr_bits(weakref as usize));
+    assert!(remembered_set_size() > 0);
+
+    let trace = collect_minor_trace(GcTriggerKind::Direct);
+
+    assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
+    unsafe {
+        assert_eq!(
+            *fields,
+            crate::value::TAG_UNDEFINED,
+            "weak target slot must be cleared rather than copied as a strong remembered-set edge"
+        );
+        assert_eq!(
+            (*header_from_user_ptr(target as *const u8)).gc_flags & GC_FLAG_FORWARDED,
+            0,
+            "weak-only target must not be evacuated by copied-minor"
+        );
+    }
+}
+
+#[test]
+fn test_copying_minor_rewrites_live_weakref_target_without_marking_dead_targets() {
+    let _guard = CopyingNurseryTestGuard::new(2);
+    let _env_guard = EnvVarGuard::set("PERRY_GC_VERIFY_EVACUATION", "1");
+    let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+
+    let target = young_leaf();
+    let (weakref, fields) = unsafe { alloc_old_test_object(1) };
+    unsafe {
+        (*weakref).class_id = crate::weakref::CLASS_ID_WEAKREF;
+        layout_init_pointer_free(weakref as *mut u8);
+        crate::object::store_object_field_slot(weakref, 0, ptr_bits(target));
+    }
+    js_shadow_slot_set(0, ptr_bits(weakref as usize));
+    js_shadow_slot_set(1, ptr_bits(target));
+
+    let trace = collect_minor_trace(GcTriggerKind::Direct);
+    let target_after = js_shadow_slot_get(1);
+
+    assert_copied_minor_trace(&trace, true, CopiedMinorFallbackReason::None, false);
+    unsafe {
+        assert_ne!(target_after, ptr_bits(target));
+        assert_eq!(
+            *fields, target_after,
+            "live weak target slot must be rewritten to the relocated target"
+        );
+    }
+}
+
+#[test]
 fn test_copying_minor_relocates_managed_map() {
     let _guard = CopyingNurseryTestGuard::new(1);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
@@ -340,7 +402,11 @@ fn test_copying_minor_rewrites_exact_object_pointer_slot_only() {
     assert_eq!(third, 33.0);
     assert!(crate::arena::pointer_in_nursery(obj_after));
     assert!(crate::arena::pointer_in_nursery(child_after));
-    assert_eq!(trace.layout_scans.masked_pointer_slots_read, 2);
+    let expected_masked_reads = if gc_verify_evacuation_enabled() { 3 } else { 2 };
+    assert_eq!(
+        trace.layout_scans.masked_pointer_slots_read,
+        expected_masked_reads
+    );
     assert_eq!(trace.layout_scans.unknown_layout_slots_read, 0);
 }
 
@@ -374,7 +440,11 @@ fn test_copying_minor_rewrites_exact_closure_pointer_capture_only() {
     assert_eq!(third, 30.0);
     assert!(crate::arena::pointer_in_nursery(closure_after));
     assert!(crate::arena::pointer_in_nursery(child_after));
-    assert_eq!(trace.layout_scans.masked_pointer_slots_read, 2);
+    let expected_masked_reads = if gc_verify_evacuation_enabled() { 3 } else { 2 };
+    assert_eq!(
+        trace.layout_scans.masked_pointer_slots_read,
+        expected_masked_reads
+    );
     assert_eq!(trace.layout_scans.unknown_layout_slots_read, 0);
 }
 

@@ -17,6 +17,7 @@ SUITE_DIR="$SCRIPT_DIR/suite"
 COMPILETS="$ROOT/target/release/perry"
 BASELINE="$SCRIPT_DIR/baseline.json"
 VERIFY_OUTPUT="$SCRIPT_DIR/verify_benchmark_output.py"
+NODE_INFO_FILE=""
 
 # Thresholds
 SPEED_THRESHOLD=15    # >15% slower = regression
@@ -86,38 +87,161 @@ else
   BENCHMARKS="02_loop_overhead.ts 03_array_write.ts 04_array_read.ts 05_fibonacci.ts 06_math_intensive.ts 07_object_create.ts 08_string_concat.ts 09_method_calls.ts 10_nested_loops.ts 11_prime_sieve.ts 12_binary_trees.ts 13_factorial.ts 14_closure.ts 15_mandelbrot.ts 16_matrix_multiply.ts"
 fi
 
-# Check for node
+# Check for Node reference runner. Prefer explicit/repo-bundled Node before
+# falling back to PATH. Older bundled Node builds cannot run .ts directly, so
+# keep the binary choice separate from the input preparation strategy.
 HAS_NODE=0
-NODE_CMD=(node)
+NODE_BIN_ENV="${NODE_BIN:-}"
+NODE_BIN=""
+NODE_CMD=()
+NODE_INPUT_MODE=""
+NODE_RESOLUTION_ERROR=""
+NODE_CANDIDATES=()
+NODE_RESOLUTION_TRIED=()
+
+append_node_candidate() {
+  local candidate="${1:-}"
+  [[ -z "$candidate" ]] && return
+  local existing
+  for existing in "${NODE_CANDIDATES[@]}"; do
+    [[ "$existing" == "$candidate" ]] && return
+  done
+  NODE_CANDIDATES+=("$candidate")
+}
+
+collect_node_candidates() {
+  append_node_candidate "${PERRY_BENCH_NODE:-}"
+  append_node_candidate "${PERRY_NODE_BIN:-}"
+  append_node_candidate "$NODE_BIN_ENV"
+  append_node_candidate "$ROOT/externals/node24/bin/node"
+  append_node_candidate "$ROOT/externals/node20/bin/node"
+  append_node_candidate "$ROOT/externals/node/bin/node"
+  append_node_candidate "/home/github-runner/actions-runner/externals/node24/bin/node"
+  append_node_candidate "/home/github-runner/actions-runner/externals/node20/bin/node"
+  append_node_candidate "/tmp/perry-node25-bin/node"
+
+  local path_node
+  path_node="$(command -v node 2>/dev/null || true)"
+  append_node_candidate "$path_node"
+}
+
+strip_suite_types_to_js() {
+  local src="$1"
+  local dst="$2"
+  local ts_type='number|string|boolean|any|void|Float64Array|Float32Array|Int32Array|Uint32Array|Int16Array|Uint16Array|Int8Array|Uint8Array|Uint8ClampedArray'
+  sed -E \
+    -e "s/: (${ts_type})(\\[\\])*//g" \
+    -e "s/\\): (${ts_type})(\\[\\])* \\{/) {/g" \
+    "$src" >"$dst"
+}
 
 detect_node_ts_runner() {
-  command -v node &>/dev/null || return 1
+  collect_node_candidates
 
   local probe
+  local probe_js
   probe=$(mktemp "${TMPDIR:-/tmp}/perry-node-ts-probe.XXXXXX.ts")
+  probe_js="${probe%.ts}.mjs"
   printf 'const x: number = 1;\nconsole.log("node_ts_probe:" + x);\n' >"$probe"
+  strip_suite_types_to_js "$probe" "$probe_js" || true
 
-  if node "$probe" >/dev/null 2>&1; then
-    NODE_CMD=(node)
-    rm -f "$probe"
-    return 0
-  fi
+  local node
+  for node in "${NODE_CANDIDATES[@]}"; do
+    NODE_RESOLUTION_TRIED+=("$node")
+    [[ -x "$node" ]] || continue
 
-  if node --experimental-strip-types "$probe" >/dev/null 2>&1; then
-    NODE_CMD=(node --experimental-strip-types)
-    rm -f "$probe"
-    return 0
-  fi
+    if "$node" "$probe" >/dev/null 2>&1; then
+      NODE_BIN="$node"
+      NODE_CMD=("$node")
+      NODE_INPUT_MODE="ts-direct"
+      rm -f "$probe" "$probe_js"
+      return 0
+    fi
 
-  rm -f "$probe"
+    if "$node" --experimental-strip-types "$probe" >/dev/null 2>&1; then
+      NODE_BIN="$node"
+      NODE_CMD=("$node" --experimental-strip-types)
+      NODE_INPUT_MODE="experimental-strip-types"
+      rm -f "$probe" "$probe_js"
+      return 0
+    fi
+
+    if [[ -f "$probe_js" ]] && "$node" "$probe_js" >/dev/null 2>&1; then
+      NODE_BIN="$node"
+      NODE_CMD=("$node")
+      NODE_INPUT_MODE="suite-sed"
+      rm -f "$probe" "$probe_js"
+      return 0
+    fi
+  done
+
+  rm -f "$probe" "$probe_js"
+  NODE_RESOLUTION_ERROR="no usable Node.js runtime found for benchmark references"
   return 1
+}
+
+prepare_node_input() {
+  local bench="$1"
+  local name="$2"
+  case "$NODE_INPUT_MODE" in
+    ts-direct|experimental-strip-types)
+      printf '%s\n' "$SUITE_DIR/$bench"
+      ;;
+    suite-sed)
+      local js_input="$RUN_OUTPUT_DIR/$name.node-input.mjs"
+      strip_suite_types_to_js "$SUITE_DIR/$bench" "$js_input"
+      printf '%s\n' "$js_input"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+write_node_reference_info() {
+  local output_file="$1"
+  local tried
+  tried="$(printf '%s\n' "${NODE_RESOLUTION_TRIED[@]}")"
+  NODE_RESOLUTION_TRIED_TEXT="$tried" python3 - \
+    "$output_file" \
+    "$HAS_NODE" \
+    "$NODE_BIN" \
+    "$NODE_INPUT_MODE" \
+    "$NODE_RESOLUTION_ERROR" \
+    "${NODE_CMD[@]}" <<'PY'
+import json
+import os
+import sys
+
+output_file, has_node, node_bin, input_mode, error, *cmd = sys.argv[1:]
+tried = [
+    line
+    for line in os.environ.get("NODE_RESOLUTION_TRIED_TEXT", "").splitlines()
+    if line
+]
+data = {
+    "available": has_node == "1",
+    "binary": node_bin or None,
+    "command": cmd,
+    "input_mode": input_mode or None,
+    "tried": tried,
+}
+if error:
+    data["error"] = error
+with open(output_file, "w", encoding="utf-8") as handle:
+    json.dump(data, handle, indent=2)
+    handle.write("\n")
+PY
 }
 
 if detect_node_ts_runner; then
   HAS_NODE=1
+  echo "Node.js reference: $NODE_BIN ($NODE_INPUT_MODE)" >&2
 else
-  echo "Node.js is unavailable for .ts benchmark inputs; Node columns and correctness checks will be skipped." >&2
+  echo "$NODE_RESOLUTION_ERROR; Node columns and correctness checks will fail closed." >&2
 fi
+NODE_INFO_FILE=$(mktemp)
+write_node_reference_info "$NODE_INFO_FILE"
 
 echo -e "${BOLD}${CYAN}Perry Performance Comparison (speed + RAM)${NC}"
 echo ""
@@ -246,23 +370,29 @@ for bench in $BENCHMARKS; do
   node_ms="-"
   node_rss=0
   n_out_samples=()
+  node_input_error=""
   if [[ $HAS_NODE -eq 1 ]]; then
     n_ms_samples=()
     n_rss_samples=()
-    for (( run=0; run<RUNS; run++ )); do
-      n_out="$RUN_OUTPUT_DIR/$name.node.$run.out"
-      n_out_samples+=("$n_out")
-      r_rss=$(measure_rss "$n_out" "${NODE_CMD[@]}" "$SUITE_DIR/$bench")
-      r_out=$(cat "$n_out")
-      r_ms=$(extract_time "$r_out")
-      [[ -n "$r_ms" ]] && n_ms_samples+=("$r_ms")
-      [[ "$r_rss" -gt 0 ]] 2>/dev/null && n_rss_samples+=("$r_rss")
-    done
-    if [[ ${#n_ms_samples[@]} -gt 0 ]]; then
-      node_ms=$(median "${n_ms_samples[@]}")
-    fi
-    if [[ ${#n_rss_samples[@]} -gt 0 ]]; then
-      node_rss=$(median "${n_rss_samples[@]}")
+    node_input="$(prepare_node_input "$bench" "$name" 2>/dev/null)"
+    if [[ -z "$node_input" || ! -f "$node_input" ]]; then
+      node_input_error="failed to prepare Node benchmark input for $bench"
+    else
+      for (( run=0; run<RUNS; run++ )); do
+        n_out="$RUN_OUTPUT_DIR/$name.node.$run.out"
+        n_out_samples+=("$n_out")
+        r_rss=$(measure_rss "$n_out" "${NODE_CMD[@]}" "$node_input")
+        r_out=$(cat "$n_out")
+        r_ms=$(extract_time "$r_out")
+        [[ -n "$r_ms" ]] && n_ms_samples+=("$r_ms")
+        [[ "$r_rss" -gt 0 ]] 2>/dev/null && n_rss_samples+=("$r_rss")
+      done
+      if [[ ${#n_ms_samples[@]} -gt 0 ]]; then
+        node_ms=$(median "${n_ms_samples[@]}")
+      fi
+      if [[ ${#n_rss_samples[@]} -gt 0 ]]; then
+        node_rss=$(median "${n_rss_samples[@]}")
+      fi
     fi
   fi
 
@@ -280,7 +410,9 @@ for bench in $BENCHMARKS; do
 
   correctness_json="$RUN_OUTPUT_DIR/$name.correctness.json"
   if [[ $HAS_NODE -ne 1 ]]; then
-    write_unchecked_correctness "$correctness_json" "none" "node unavailable"
+    write_unchecked_correctness "$correctness_json" "none" "$NODE_RESOLUTION_ERROR"
+  elif [[ -n "$node_input_error" ]]; then
+    write_unchecked_correctness "$correctness_json" "node" "$node_input_error"
   elif [[ ${#n_out_samples[@]} -eq 0 ]]; then
     write_unchecked_correctness "$correctness_json" "none" "node produced no stdout sample"
   else
@@ -383,9 +515,9 @@ if [[ -n "$JSON_OUT" ]]; then
 else
   CURRENT_JSON=$(mktemp)
 fi
-python3 - "$RESULTS_FILE" "$CURRENT_JSON" <<'PYEOF'
+python3 - "$RESULTS_FILE" "$CURRENT_JSON" "$NODE_INFO_FILE" <<'PYEOF'
 import json, sys
-results_file, output_file = sys.argv[1], sys.argv[2]
+results_file, output_file, node_info_file = sys.argv[1], sys.argv[2], sys.argv[3]
 from datetime import datetime, timezone
 import subprocess
 
@@ -425,6 +557,7 @@ with open(results_file) as f:
 result = {
     "commit": commit,
     "generated_at": datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+    "node_reference": json.load(open(node_info_file, encoding="utf-8")),
     "benchmarks": benchmarks
 }
 with open(output_file, 'w') as f:
@@ -600,8 +733,19 @@ PY
   fi
 fi
 
+if [[ $HAS_NODE -ne 1 ]]; then
+  echo -e "${RED}Benchmark correctness requires Node: $NODE_RESOLUTION_ERROR${NC}"
+  COMPARE_EXIT=1
+  if [[ $WARN_ONLY -eq 1 ]]; then
+    echo ""
+    echo "--warn-only: benchmark Node reference unavailable but not failing build"
+    COMPARE_EXIT=0
+  fi
+fi
+
 # Cleanup
 rm -f "$RESULTS_FILE"
+rm -f "$NODE_INFO_FILE"
 rm -rf "$RUN_OUTPUT_DIR"
 # Only remove CURRENT_JSON if it was a tempfile (not user-requested via --json-out)
 [[ -z "$JSON_OUT" ]] && rm -f "$CURRENT_JSON"

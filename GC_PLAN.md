@@ -13,6 +13,33 @@ Perry’s current GC is already on the right broad track: it has a nursery/old s
 
 The biggest gap from V8 is not “Perry uses mark-sweep.” The bigger gap is that V8 moved a lot of GC work off the main mutator pause: parallel young collection, concurrent major marking, concurrent sweeping, parallel compaction, and parallel pointer updates. V8’s own Orinoco writeup distinguishes parallel, incremental, and concurrent GC work, and describes V8’s current young collection as parallel scavenging and major GC as concurrent marking/sweeping plus parallel compaction/pointer updating. ([V8][1])
 
+## Current landing slice: typed-array lowering
+
+The first landable milestone from this plan is intentionally narrower than the full GC finish line:
+
+```text
+typed-array parameter lowering + correctness blockers + gated evidence integration
+```
+
+This slice reduces allocation/GC pressure by removing typed-array element helper exposure from a hot loop, while keeping the broader GC architecture work open. It is the template for future `GC_PLAN.md` rows: one owned surface, one correctness fixture, one fail-closed quantitative gate, and one source-hashed evidence packet.
+
+Evidence packet:
+
+```text
+tmp/type-lowering-evidence-20260619T141812Z-material-gate-v6/type-lowering-evidence.json
+```
+
+| Requirement | Current evidence | Status |
+|---|---|---|
+| Material throughput improvement | 131,072,000 loads/run; Perry fast 74 ms vs disabled 792 ms; 10.70x speedup vs 8.0x gate | PASS |
+| Reference correctness | Node/Perry checksum `6323324000`; offset/subarray checksum `98`; blocker fixture matches Node line-for-line | PASS |
+| Allocation/GC pressure | Fast row has 0 GC cycles, 0 typed-array slow-path helper calls, 0 typed-array element helpers, and 0 boxed-number allocations | PASS |
+| RSS guardrail | Fast vs disabled RSS delta -0.53%, with <=5% regression threshold | PASS |
+| Static proof | Native-rep record `typedarray_param_f64_read` is `TypedArrayGet.native_f64`, `unchecked_native`, `bounds_state=proven_or_guarded`, `alias_state=unknown` | PASS |
+| Source traceability | Head `be73b4f8d017af167d691f1a1b8f545e9da9b272`; dirty diff hash `5ad8637a458acafcfcc9f4263237632900b3bf2953b3ed9d857aef02c5545be7`; Perry binary hash `f967e1fa0e401508035f00c600e3ec972aedfaff30f80f3fefb55686c9144cbc` | PASS |
+
+Remaining GC work should follow this same landing pattern rather than reopening the whole architecture at once. For example, card tracking, precise runtime handles, copied-minor dominance, old-gen reclamation, and benchmark fail-closed behavior should each land only with their own correctness fixture and quantitative evidence packet.
+
 ## The most important recommendation
 
 Do **not** make “concurrent MinorMS” Perry’s first big target.

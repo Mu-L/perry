@@ -31,10 +31,49 @@ check_runtime() {
 # Strip TypeScript type annotations from a .ts file to produce valid JS
 # Handles: param types, return types, typed arrays, class property types
 strip_types() {
+    local ts_type='number|string|boolean|any|void|Float64Array|Float32Array|Int32Array|Uint32Array|Int16Array|Uint16Array|Int8Array|Uint8Array|Uint8ClampedArray'
     sed -E \
-        -e 's/: (number|string|boolean|any|void)(\[\])?//g' \
-        -e 's/\): (number|string|boolean|any|void)(\[\])? \{/) {/g' \
+        -e "s/: (${ts_type})(\\[\\])*//g" \
+        -e "s/\\): (${ts_type})(\\[\\])* \\{/) {/g" \
         "$1"
+}
+
+NODE_BIN_ENV="${NODE_BIN:-}"
+NODE_CMD=""
+NODE_CANDIDATES=()
+
+append_node_candidate() {
+    local candidate="${1:-}"
+    [ -z "$candidate" ] && return
+    local existing
+    for existing in "${NODE_CANDIDATES[@]}"; do
+        [ "$existing" = "$candidate" ] && return
+    done
+    NODE_CANDIDATES+=("$candidate")
+}
+
+detect_node() {
+    append_node_candidate "${PERRY_BENCH_NODE:-}"
+    append_node_candidate "${PERRY_NODE_BIN:-}"
+    append_node_candidate "$NODE_BIN_ENV"
+    append_node_candidate "${SCRIPT_DIR}/../../externals/node24/bin/node"
+    append_node_candidate "${SCRIPT_DIR}/../../externals/node20/bin/node"
+    append_node_candidate "${SCRIPT_DIR}/../../externals/node/bin/node"
+    append_node_candidate "/home/github-runner/actions-runner/externals/node24/bin/node"
+    append_node_candidate "/home/github-runner/actions-runner/externals/node20/bin/node"
+    append_node_candidate "/tmp/perry-node25-bin/node"
+    append_node_candidate "$(command -v node 2>/dev/null || true)"
+
+    local candidate
+    for candidate in "${NODE_CANDIDATES[@]}"; do
+        if [ -x "$candidate" ] && "$candidate" --version >/dev/null 2>&1; then
+            NODE_CMD="$candidate"
+            echo -e "${GREEN}✓${NC} node found: $NODE_CMD"
+            return 0
+        fi
+    done
+    echo -e "${YELLOW}✗${NC} node not found"
+    return 1
 }
 
 echo -e "${BOLD}${CYAN}═══════════════════════════════════════════════════════════════════════════${NC}"
@@ -48,7 +87,7 @@ HAS_BUN=0
 HAS_COMPILETS=0
 HAS_SHERMES=0
 
-check_runtime "node" && HAS_NODE=1
+detect_node && HAS_NODE=1
 check_runtime "bun" && HAS_BUN=1
 check_runtime "shermes" && HAS_SHERMES=1
 if [ -f "$COMPILETS" ]; then
@@ -64,7 +103,7 @@ echo ""
 
 # Get runtime versions
 echo -e "${BOLD}Runtime versions:${NC}"
-[ $HAS_NODE -eq 1 ] && echo "  Node.js: $(node --version)"
+[ $HAS_NODE -eq 1 ] && echo "  Node.js: $("$NODE_CMD" --version)"
 [ $HAS_BUN -eq 1 ] && echo "  Bun: $(bun --version)"
 [ $HAS_SHERMES -eq 1 ] && echo "  Static Hermes: $(shermes --version 2>&1 | head -1)"
 echo "  Perry: native binary"
@@ -85,7 +124,8 @@ BENCHMARKS="02_loop_overhead.ts
 13_factorial.ts
 14_closure.ts
 15_mandelbrot.ts
-16_matrix_multiply.ts"
+16_matrix_multiply.ts
+bench_typedarray_param_sum.ts"
 
 # Compile all benchmarks first
 echo -e "${BOLD}Compiling benchmarks with Perry...${NC}"
@@ -152,6 +192,11 @@ WINS_SHERMES=0
 LOSSES_SHERMES=0
 TIES_SHERMES=0
 
+NODE_TEMP="${SCRIPT_DIR}/.node_tmp"
+rm -rf "$NODE_TEMP"
+mkdir -p "$NODE_TEMP"
+trap 'rm -rf "$NODE_TEMP"' EXIT
+
 for bench in $BENCHMARKS; do
     name="${bench%.ts}"
     display_name=$(echo "$name" | sed 's/^[0-9]*_//')
@@ -166,7 +211,9 @@ for bench in $BENCHMARKS; do
 
     # Run Node.js
     if [ $HAS_NODE -eq 1 ]; then
-        output=$(node "$bench" 2>&1)
+        js_file="${NODE_TEMP}/${name}.js"
+        strip_types "$bench" > "$js_file"
+        output=$("$NODE_CMD" "$js_file" 2>&1)
         node_time=$(extract_time "$output")
     else
         node_time="-"
@@ -278,7 +325,14 @@ measure_startup() {
 }
 
 perry_startup=$(measure_startup "./01_startup")
-[ $HAS_NODE -eq 1 ] && node_startup=$(measure_startup "node 01_startup.ts") || node_startup="-"
+if [ $HAS_NODE -eq 1 ]; then
+    startup_js="${NODE_TEMP}/01_startup.js"
+    strip_types "01_startup.ts" > "$startup_js"
+    printf -v node_startup_cmd '%q %q' "$NODE_CMD" "$startup_js"
+    node_startup=$(measure_startup "$node_startup_cmd")
+else
+    node_startup="-"
+fi
 [ $HAS_BUN -eq 1 ] && bun_startup=$(measure_startup "bun run 01_startup.ts") || bun_startup="-"
 if [ $HAS_SHERMES -eq 1 ] && [ -f "./01_startup_shermes" ]; then
     shermes_startup=$(measure_startup "./01_startup_shermes")
@@ -299,8 +353,7 @@ echo -e "───────────────────────�
 
 perry_size=$(ls -lh 05_fibonacci 2>/dev/null | awk '{print $5}')
 if [ $HAS_NODE -eq 1 ]; then
-    node_bin=$(which node)
-    node_size=$(ls -lh "$node_bin" 2>/dev/null | awk '{print $5}')
+    node_size=$(ls -lh "$NODE_CMD" 2>/dev/null | awk '{print $5}')
 else
     node_size="-"
 fi
@@ -351,7 +404,9 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     fi
 
     if [ $HAS_NODE -eq 1 ]; then
-        result=$(/usr/bin/time -l node 12_binary_trees.ts 2>&1 | grep "maximum resident set size" | awk '{print $1}')
+        binary_trees_js="${NODE_TEMP}/12_binary_trees.js"
+        strip_types "12_binary_trees.ts" > "$binary_trees_js"
+        result=$(/usr/bin/time -l "$NODE_CMD" "$binary_trees_js" 2>&1 | grep "maximum resident set size" | awk '{print $1}')
         if [ -n "$result" ]; then
             node_mem="$((result / 1024 / 1024))MB"
         else

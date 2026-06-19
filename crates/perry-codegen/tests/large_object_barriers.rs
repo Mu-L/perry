@@ -243,7 +243,7 @@ fn large_array_literal_direct_stores_emit_precise_slot_barriers() {
 }
 
 #[test]
-fn large_local_array_push_inbounds_store_emits_precise_slot_barrier() {
+fn large_local_array_push_routes_through_runtime_helper() {
     const LARGE_LITERAL_ELEMENTS: usize = 2050;
     assert_default_barrier_env_not_disabled();
 
@@ -262,26 +262,14 @@ fn large_local_array_push_inbounds_store_emits_precise_slot_barrier() {
         "fixture should allocate a large local array outside the inline small-literal path"
     );
 
-    let inbounds_pos = ir
-        .find("\napush.inbounds.")
-        .expect("optimized local push should emit an in-bounds fast block");
-    let push_ir = &ir[inbounds_pos + 1..];
-    let inbounds_end = push_ir
-        .find("\napush.realloc.")
-        .expect("in-bounds push block should precede the realloc block");
-    let inbounds_ir = &push_ir[..inbounds_end];
-    let store_pos = inbounds_ir
-        .find("store double")
-        .expect("optimized push should emit a direct element store");
-    let layout_pos = inbounds_ir
-        .find("call void @js_gc_note_slot_layout")
-        .expect("optimized push store should keep slot layout notes");
-    let barrier_pos = inbounds_ir
-        .find("call void @js_write_barrier_slot")
-        .expect("optimized push direct store must remember old-born parent slots");
-
-    assert!(store_pos < layout_pos);
-    assert!(layout_pos < barrier_pos);
+    assert!(
+        !ir.contains("\napush.inbounds."),
+        "local push must not inline raw stores that bypass array extensibility/descriptors"
+    );
+    assert!(
+        ir.contains("call i64 @js_array_push_f64"),
+        "local push should fail closed through the runtime helper"
+    );
 }
 
 #[test]
