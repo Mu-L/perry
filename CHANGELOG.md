@@ -1,3 +1,28 @@
+## v0.5.1192 — fix(codegen): #5459 — store array head back to module-global GC root on push from a closure
+
+`arr.push(...)` whose `arr` is a module-level global accessed from inside a nested
+function (closure/IIFE) silently skipped the realloc write-back, so a relocated array
+head was never stored to the registered GC-root global slot. The old head was freed on
+the next GC and the global dangled — garbage `.length`, freed elements, SIGSEGV under
+allocation churn. Module-scope population of the same array was unaffected; the IIFE was
+the trigger. Reproduced with `PERRY_GEN_GC=0` (full mark-sweep) too, so it's a codegen
+root-write bug, not a GC-policy bug.
+
+Root cause: in `crates/perry-codegen/src/expr/array_push.rs` the `boxed_vars` write-back
+branch returned early after the captured/local-box cases. A module-global that is in
+`boxed_vars` (because a nested function references it) but has no box location in the
+callee context falls through both inner arms; the unconditional early return then skipped
+the module-global store-back entirely. The load path read the global directly, so reads
+saw the global but the grown head was never written there. Fix: only return early when a
+box location was actually written; otherwise fall through to the existing module-global
+store-back (`emit_root_nanbox_store_on_block`). Applied to both `ArrayPush` and
+`ArrayPushSpread`. Regression test:
+`crates/perry/tests/issue_5459_module_global_array_push_in_closure.rs`.
+
+Surfaced while investigating WeakMap/WeakSet weakness (#2656) but independent — plain
+`WeakRef`/`FinalizationRegistry` with live targets held in a module-global array hit the
+same UAF.
+
 ## v0.5.1191 — fix(native): chained fluent method calls keep their module identity (sharp pipelines)
 
 Real-world sharp usage chains: `sharp(input).resize(w, h).jpeg().toBuffer()`. Before
