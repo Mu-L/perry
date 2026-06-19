@@ -19,12 +19,18 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use crate::closure::{js_closure_call0, js_closure_call1, js_closure_call2, js_closure_call3};
+use crate::gc::RuntimeRootVisitor;
 
 mod invariants;
 mod put_value;
 pub use put_value::js_put_value_set;
 mod json;
 mod metadata;
+pub use metadata::{
+    js_reflect_define_metadata, js_reflect_delete_metadata, js_reflect_get_metadata,
+    js_reflect_get_metadata_keys, js_reflect_get_own_metadata, js_reflect_get_own_metadata_keys,
+    js_reflect_has_metadata, js_reflect_has_own_metadata,
+};
 mod own_keys;
 mod prototype;
 mod reflect;
@@ -80,6 +86,56 @@ struct MetadataKey {
     target_bits: u64,
     key: String,
     property_key: Option<String>,
+}
+
+fn rewrite_metadata_target_bits(visitor: &mut RuntimeRootVisitor<'_>, target_bits: u64) -> u64 {
+    if !visitor.is_metadata_rewrite_phase() {
+        return target_bits;
+    }
+    if (target_bits & !POINTER_MASK) != POINTER_TAG {
+        return target_bits;
+    }
+    let addr = (target_bits & POINTER_MASK) as usize;
+    match visitor.visit_metadata_raw_addr(addr) {
+        Some(new_addr) => POINTER_TAG | (new_addr as u64 & POINTER_MASK),
+        None => target_bits,
+    }
+}
+
+pub fn scan_proxy_roots_mut(visitor: &mut RuntimeRootVisitor<'_>) {
+    PROXIES.with(|proxies| {
+        for entry in proxies.borrow_mut().iter_mut().flatten() {
+            visitor.visit_nanbox_f64_slot(&mut entry.target);
+            visitor.visit_nanbox_f64_slot(&mut entry.handler);
+        }
+    });
+
+    REFLECT_METADATA.with(|store| {
+        let mut store = store.borrow_mut();
+        let needs_rebuild = store
+            .keys()
+            .any(|key| rewrite_metadata_target_bits(visitor, key.target_bits) != key.target_bits);
+        if needs_rebuild {
+            let old = std::mem::take(&mut *store);
+            for (mut key, mut value) in old {
+                visitor.visit_nanbox_f64_slot(&mut value);
+                key.target_bits = rewrite_metadata_target_bits(visitor, key.target_bits);
+                store.insert(key, value);
+            }
+        } else {
+            for value in store.values_mut() {
+                visitor.visit_nanbox_f64_slot(value);
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn test_clear_proxy_roots() {
+    PROXIES.with(|p| {
+        *p.borrow_mut() = vec![None];
+    });
+    REFLECT_METADATA.with(|store| store.borrow_mut().clear());
 }
 
 const TAG_UNDEFINED: u64 = 0x7FFC_0000_0000_0001;

@@ -909,6 +909,64 @@ pub(crate) fn clear_accessor_descriptor(obj: usize, key: &str) {
     });
 }
 
+fn rewrite_descriptor_owner(
+    visitor: &mut crate::gc::RuntimeRootVisitor<'_>,
+    owner: usize,
+) -> usize {
+    if !visitor.is_metadata_rewrite_phase() {
+        return owner;
+    }
+    visitor.visit_metadata_raw_addr(owner).unwrap_or(owner)
+}
+
+pub fn scan_descriptor_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
+    PROPERTY_DESCRIPTORS.with(|descriptors| {
+        let mut descriptors = descriptors.borrow_mut();
+        let needs_rebuild = descriptors
+            .keys()
+            .any(|(owner, _)| rewrite_descriptor_owner(visitor, *owner) != *owner);
+        if needs_rebuild {
+            let old = std::mem::take(&mut *descriptors);
+            for ((owner, key), attrs) in old {
+                let owner = rewrite_descriptor_owner(visitor, owner);
+                descriptors.insert((owner, key), attrs);
+            }
+        }
+    });
+
+    ACCESSOR_DESCRIPTORS.with(|descriptors| {
+        let mut descriptors = descriptors.borrow_mut();
+        let needs_rebuild = descriptors
+            .keys()
+            .any(|(owner, _)| rewrite_descriptor_owner(visitor, *owner) != *owner);
+        if needs_rebuild {
+            let old = std::mem::take(&mut *descriptors);
+            for ((owner, key), mut acc) in old {
+                visitor.visit_nanbox_u64_slot(&mut acc.get);
+                visitor.visit_nanbox_u64_slot(&mut acc.set);
+                let owner = rewrite_descriptor_owner(visitor, owner);
+                descriptors.insert((owner, key), acc);
+            }
+        } else {
+            for acc in descriptors.values_mut() {
+                visitor.visit_nanbox_u64_slot(&mut acc.get);
+                visitor.visit_nanbox_u64_slot(&mut acc.set);
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn test_clear_descriptor_roots() {
+    PROPERTY_DESCRIPTORS.with(|m| m.borrow_mut().clear());
+    ACCESSOR_DESCRIPTORS.with(|m| m.borrow_mut().clear());
+    PROPERTY_ATTRS_IN_USE.with(|c| c.set(false));
+    ACCESSORS_IN_USE.with(|c| c.set(false));
+    GLOBAL_DESCRIPTORS_IN_USE.store(false, Ordering::Relaxed);
+    OBJECT_PROTO_DESCRIPTORS.store(false, Ordering::Relaxed);
+    PERRY_CLASS_FIELD_INLINE_GUARD_DISABLED.store(0, Ordering::Relaxed);
+}
+
 /// Install a built-in *reflection-only* accessor descriptor for (obj, key)
 /// WITHOUT flipping the process-wide `GLOBAL_DESCRIPTORS_IN_USE` /
 /// `ACCESSORS_IN_USE` / `PROPERTY_ATTRS_IN_USE` hot-path gates.

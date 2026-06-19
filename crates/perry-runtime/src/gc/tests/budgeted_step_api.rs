@@ -1,5 +1,8 @@
 use super::super::*;
 use super::support::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static SYNCHRONOUS_ONLY_SCANNER_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 fn reset_old_reclaim_pressure() {
     let old_in_use = crate::arena::old_gen_in_use_bytes();
@@ -7,7 +10,9 @@ fn reset_old_reclaim_pressure() {
     GC_OLD_RECLAIM_PENDING.with(|pending| pending.set(false));
 }
 
-fn synchronous_only_test_root_scanner(_visitor: &mut RuntimeRootVisitor<'_>) {}
+fn synchronous_only_test_root_scanner(_visitor: &mut RuntimeRootVisitor<'_>) {
+    SYNCHRONOUS_ONLY_SCANNER_CALLS.fetch_add(1, Ordering::SeqCst);
+}
 
 #[test]
 fn no_pressure_budgeted_step_reports_idle_without_starting_cycle() {
@@ -308,6 +313,7 @@ fn synchronous_only_registered_scanner_allows_eligible_copied_minor() {
     let _barrier_guard = GeneratedWriteBarrierTestGuard::active();
     let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     reset_old_reclaim_pressure();
+    SYNCHRONOUS_ONLY_SCANNER_CALLS.store(0, Ordering::SeqCst);
     gc_register_mutable_root_scanner(synchronous_only_test_root_scanner);
 
     let live = young_leaf();
@@ -325,6 +331,10 @@ fn synchronous_only_registered_scanner_allows_eligible_copied_minor() {
         "eligible copied-minor should finish before synchronous scanner blocks fallback"
     );
     assert!(gc_collection_count() > before);
+    assert!(
+        SYNCHRONOUS_ONLY_SCANNER_CALLS.load(Ordering::SeqCst) > 0,
+        "eligible copied-minor should invoke the registered synchronous scanner"
+    );
     let after = (js_shadow_slot_get(0) & POINTER_MASK) as usize;
     assert_ne!(after, live);
 
@@ -339,6 +349,14 @@ fn synchronous_only_registered_scanner_allows_eligible_copied_minor() {
     assert_eq!(
         event["root_sources"]["runtime_mutable_scanners"]["registered_scanners"].as_u64(),
         Some(1)
+    );
+    assert_eq!(
+        event["progress_contract"]["kind"].as_str(),
+        Some("legacy_synchronous")
+    );
+    assert_eq!(
+        event["progress_contract"]["ordinary_budgeted"].as_bool(),
+        Some(false)
     );
 }
 

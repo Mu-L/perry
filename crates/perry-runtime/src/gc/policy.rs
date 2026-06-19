@@ -1490,11 +1490,22 @@ fn gc_start_budgeted_copied_minor_cycle(
     rebaseline: BudgetedGcRebaseline,
     progress_kind: GcProgressKind,
 ) -> BudgetedGcCycle {
+    let progress_kind = copied_minor_progress_kind_for_registered_scanners(progress_kind);
     BudgetedGcCycle {
         work: BudgetedGcWork::PendingCopiedMinor { progress_kind },
         trigger_kind,
         collection_kind: GcCollectionKind::Minor,
         rebaseline,
+    }
+}
+
+fn copied_minor_progress_kind_for_registered_scanners(
+    progress_kind: GcProgressKind,
+) -> GcProgressKind {
+    if progress_kind.is_budgeted() && registered_root_scanners_block_budgeted_gc() {
+        GcProgressKind::LegacySynchronous
+    } else {
+        progress_kind
     }
 }
 

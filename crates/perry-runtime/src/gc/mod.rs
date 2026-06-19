@@ -327,6 +327,7 @@ pub fn gc_init() {
     gc_register_mutable_root_scanner(crate::typedarray_props::scan_typed_array_own_props_roots_mut);
     gc_register_mutable_root_scanner(transition_cache_mutable_root_scanner);
     gc_register_mutable_root_scanner(crate::object::scan_object_cache_roots_mut);
+    gc_register_mutable_root_scanner(crate::object::scan_descriptor_roots_mut);
     gc_register_mutable_root_scanner(crate::object::scan_arguments_object_roots_mut);
     gc_register_budgeted_mutable_root_scanner_with_source(
         crate::object::scan_class_side_table_roots_mut,
@@ -359,6 +360,7 @@ pub fn gc_init() {
     // fire-and-forget spawn). Scan + rewrite them so a GC between ticks doesn't
     // reclaim the object whose `data`/`exit` handlers are still pending.
     gc_register_mutable_root_scanner(crate::child_process::reactor::cp_reactor_scan_roots_mut);
+    gc_register_mutable_root_scanner(crate::proxy::scan_proxy_roots_mut);
     // #4911: a bound node:dgram socket is reachable only from the dgram
     // reactor's registry while its recv thread runs; scan + rewrite it so a GC
     // between ticks doesn't reclaim the object whose `message` handlers fire.
