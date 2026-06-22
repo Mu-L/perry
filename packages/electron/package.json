@@ -1,0 +1,12 @@
+{
+  "name": "electron",
+  "version": "0.1.0",
+  "description": "Electron-compatible app shell for Perry — run existing Electron apps natively (Tauri-model internals, Electron API surface)",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "perry": {
+    "nativeModule": true
+  },
+  "keywords": ["perry", "electron", "desktop", "webview", "ipc"],
+  "license": "MIT"
+}

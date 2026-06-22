@@ -108,6 +108,7 @@ pub mod temporal;
 pub mod text;
 pub mod timer;
 pub mod typed_feedback;
+pub mod ui_loop;
 pub mod typedarray;
 pub mod typedarray_half;
 pub(crate) mod typedarray_props;

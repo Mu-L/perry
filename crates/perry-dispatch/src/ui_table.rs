@@ -655,6 +655,22 @@ pub const PERRY_UI_TABLE: &[MethodRow] = &[
         args: &[ArgKind::Widget, ArgKind::Closure],
         ret: ReturnKind::Void,
     },
+    // Electron-compat IPC bridge (renderer → main). `closure` receives the
+    // JSON string the page posts via the "perry" WKScriptMessageHandler.
+    MethodRow {
+        method: "webviewSetOnMessage",
+        runtime: "perry_ui_webview_set_on_message",
+        args: &[ArgKind::Widget, ArgKind::Closure],
+        ret: ReturnKind::Void,
+    },
+    // Inject a document-start user script (bridge runtime + app preload) before
+    // the page's own scripts run. Call before webviewLoadUrl.
+    MethodRow {
+        method: "webviewAddUserScript",
+        runtime: "perry_ui_webview_add_user_script",
+        args: &[ArgKind::Widget, ArgKind::Str],
+        ret: ReturnKind::Void,
+    },
     MethodRow {
         method: "webviewLoadUrl",
         runtime: "perry_ui_webview_load_url",
@@ -1787,6 +1803,28 @@ pub const PERRY_UI_TABLE: &[MethodRow] = &[
         ret: ReturnKind::I64AsF64,
     },
     // ---- App lifecycle hooks ----
+    // Electron-compat: body-less event loop. `appRunLoop(onReady)` blocks; the
+    // onReady closure resolves `app.whenReady()`. `appQuit()` terminates.
+    MethodRow {
+        method: "appRunLoop",
+        runtime: "perry_ui_app_run_loop",
+        args: &[ArgKind::Closure],
+        ret: ReturnKind::Void,
+    },
+    // Non-blocking: registers the top-level UI loop; generated main enters it
+    // after the user's top-level code (so windows from whenReady().then composite).
+    MethodRow {
+        method: "appRequestLoop",
+        runtime: "perry_ui_app_request_loop",
+        args: &[ArgKind::Closure],
+        ret: ReturnKind::Void,
+    },
+    MethodRow {
+        method: "appQuit",
+        runtime: "perry_ui_app_quit",
+        args: &[],
+        ret: ReturnKind::Void,
+    },
     MethodRow {
         method: "onTerminate",
         runtime: "perry_ui_app_on_terminate",
