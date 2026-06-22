@@ -71,7 +71,10 @@ fn module_default_wrapper_property_read_resolves_exports() {
         wrapper as *const crate::object::ObjectHeader,
         key_str,
     );
-    assert!(!post.is_undefined(), "registered wrapper must resolve exports");
+    assert!(
+        !post.is_undefined(),
+        "registered wrapper must resolve exports"
+    );
     assert_eq!(post.to_number(), 7.0);
 
     // A non-closure value passed to the registrar is returned untouched and not

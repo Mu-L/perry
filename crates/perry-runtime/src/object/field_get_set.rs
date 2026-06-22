@@ -3867,13 +3867,12 @@ pub extern "C" fn js_object_get_field_by_name(
                         // recurse) or undefined/null (nothing to read from).
                         let exports_jsv = JSValue::from_bits(exports_bits);
                         if exports_bits != (obj as u64)
-                            && exports_bits
-                                != crate::value::js_nanbox_pointer(obj as i64).to_bits()
+                            && exports_bits != crate::value::js_nanbox_pointer(obj as i64).to_bits()
                             && !exports_jsv.is_undefined()
                             && !exports_jsv.is_null()
                         {
-                            let exports_ptr = crate::value::js_nanbox_get_pointer(exports)
-                                as *const ObjectHeader;
+                            let exports_ptr =
+                                crate::value::js_nanbox_get_pointer(exports) as *const ObjectHeader;
                             if !exports_ptr.is_null() {
                                 let result = js_object_get_field_by_name(exports_ptr, key);
                                 if !result.is_undefined() {
