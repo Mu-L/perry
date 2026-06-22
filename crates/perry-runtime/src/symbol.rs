@@ -2311,6 +2311,26 @@ pub extern "C" fn js_get_iterator(val_f64: f64) -> f64 {
             }
         }
     }
+    // We reach here only when NO `[Symbol.iterator]` method resolved. A
+    // pointer-tagged value whose payload lies in the small-handle band
+    // (`< HANDLE_BAND_MAX`, e.g. a near-null `POINTER_TAG | 1`) is NOT a
+    // dereferenceable heap object, and with no iterator method it cannot be
+    // iterable. Returning it `val_f64` below would manufacture the bogus value
+    // as its own "iterator"; the lazy for-of then calls `.next()` on it, gets
+    // `undefined`, and throws a misleading late "Iterator result is not an
+    // object" far from the real fault. Throw the correct "not iterable" here
+    // instead. Genuinely-iterable handle-backed values (fetch `Headers`,
+    // proxies, …) resolve their `@@iterator` via the small-handle dispatch in
+    // `js_object_get_symbol_property` above and already returned — only a
+    // corrupt/non-iterable handle reaches this point.
+    {
+        let jsv = crate::value::JSValue::from_bits(val_f64.to_bits());
+        if jsv.is_pointer()
+            && crate::value::addr_class::is_handle_band(jsv.as_pointer::<u8>() as usize)
+        {
+            throw_value_not_iterable();
+        }
+    }
     val_f64
 }
 
