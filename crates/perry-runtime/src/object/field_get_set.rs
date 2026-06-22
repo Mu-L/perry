@@ -3864,12 +3864,15 @@ pub extern "C" fn js_object_get_field_by_name(
                     {
                         let exports_bits = exports.to_bits();
                         // Guard against the wrapper returning itself (would
-                        // recurse) or undefined/null (nothing to read from).
+                        // recurse). Require an actual heap pointer before
+                        // extracting one: a primitive `module.exports` (number,
+                        // string, bool, undefined/null) has no object to read a
+                        // named field from, and blindly `js_nanbox_get_pointer`-
+                        // ing then dereferencing it would read unmapped memory.
                         let exports_jsv = JSValue::from_bits(exports_bits);
                         if exports_bits != (obj as u64)
                             && exports_bits != crate::value::js_nanbox_pointer(obj as i64).to_bits()
-                            && !exports_jsv.is_undefined()
-                            && !exports_jsv.is_null()
+                            && exports_jsv.is_pointer()
                         {
                             let exports_ptr =
                                 crate::value::js_nanbox_get_pointer(exports) as *const ObjectHeader;
