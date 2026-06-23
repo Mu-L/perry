@@ -35,7 +35,47 @@ IPC transport on macOS:
 - **`ipcRenderer.invoke` ↔ `ipcMain.handle`**: request/response correlated by a
   monotonic id; the renderer parks a Promise until the main side replies.
 
+## Install
+
+This package intentionally keeps the npm name **`electron`** so your app's
+existing `import … from "electron"` resolves to it with zero code changes. npm
+won't let anyone publish a package literally named `electron`, and it doesn't
+support installing a single subdirectory straight from a GitHub repo, so install
+it one of these two ways:
+
+**A. Clone + install by path (works today):**
+
+```bash
+git clone https://github.com/PerryTS/perry
+# in your app, install the compat package from the checkout:
+npm install /absolute/path/to/perry/packages/electron
+```
+
+> `npm install github:PerryTS/perry#feat/electron-compat` installs the whole
+> Perry repo, not just this package — the repo root now carries `name`/`version`
+> so that no longer crashes npm's arborist, but you still want the subdirectory.
+
+**B. Scoped npm package + alias (once published):** the package is also
+published as **`@perryts/electron`**. Because it must keep importing as
+`electron`, point Perry's resolver at the scoped install with a `packageAlias`:
+
+```jsonc
+// your-app/package.json
+{
+  "dependencies": { "@perryts/electron": "^0.1.0" },
+  "perry": {
+    "packageAliases": { "electron": "@perryts/electron" }
+  }
+}
+```
+
+`perry init` mirrors `packageAliases` into `tsconfig.json` `compilerOptions.paths`,
+so your IDE's tsc resolves `electron` to the compat types too.
+
 ## Use it
+
+If the package resolves under the bare name `electron` (install option A, or a
+plain `node_modules/electron`), your app needs no Perry config at all:
 
 ```jsonc
 // your-app/package.json — no code changes to your app

@@ -7,6 +7,22 @@
   "perry": {
     "nativeModule": true
   },
+  "files": [
+    "src",
+    "bridge",
+    "README.md",
+    "DESIGN.md"
+  ],
   "keywords": ["perry", "electron", "desktop", "webview", "ipc"],
-  "license": "MIT"
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/PerryTS/perry.git",
+    "directory": "packages/electron"
+  },
+  "homepage": "https://github.com/PerryTS/perry/tree/main/packages/electron#readme",
+  "bugs": "https://github.com/PerryTS/perry/issues",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
 }

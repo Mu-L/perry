@@ -1,3 +1,57 @@
+## v0.5.1204 — electron-compat contributor feedback: DX fixes + ext-events warm-cache link fix
+
+Eight items of feedback from a contributor trying the `feat/electron-compat`
+branch end-to-end. Most are packaging/DX; one is a real linker bug.
+
+- **`perry/ui` + `events` apps failed to link from source with `Undefined
+  symbols: _js_event_emitter_*`** (the headline bug). Root cause: the
+  auto-optimize lib resolver has two well-known-binding categories — CPU-only
+  wrappers (e.g. `events` → `perry-ext-events.a`) resolved immediately, and
+  tokio-using wrappers resolved after the cargo rebuild. The **warm-cache
+  early-return path** in `build_optimized_libs` (`optimized_libs.rs`)
+  reconstructed `well_known_libs` from the tokio-using set **alone**, silently
+  dropping every CPU-only wrapper from the link line — while the matching stdlib
+  feature (`bundled-events`) was still stripped from the cached stdlib. The
+  result: a stdlib that calls `js_event_emitter_*` with no provider on the link
+  line. Only bit on a **warm** auto-optimize cache (a cold cache took the
+  fresh-rebuild path, which appends to the same list and linked fine) — which is
+  exactly the intermittent "can't compile from source as documented" report.
+  Fix: the cached path now `extend()`s the already-resolved CPU-only
+  `well_known_libs` with the tokio-resolved ones, mirroring the fresh path
+  (#466). Reproduced with the `system-explorer` electron example (perry/ui +
+  EventEmitter) and confirmed the link now includes `libperry_ext_events.a`.
+- **`perry run .` rejected a directory** with "Is a directory". `resolve_entry_file`
+  returned the directory as-is because it `exists()`. Now a directory argument
+  (and the no-arg default) resolves an entry *inside* it — `perry.toml` `entry`,
+  then `src/main.ts`, then `main.ts` — so the project-level form works.
+- **`perry init` now mirrors `perry.packageAliases` into `tsconfig.json`
+  `compilerOptions.paths`.** `packageAliases` was compiler-only, so the IDE's tsc
+  resolved aliased imports differently from what Perry compiles. init now emits
+  matching `paths` (with `baseUrl`) on create, and merges them into an existing
+  tsconfig (best-effort; prints the block to paste if the file isn't plain JSON).
+- **New `packages/perry-react` (`@perryts/react`)** — a types package for Perry's
+  React support. It depends on `@types/react` / `@types/react-dom` (so users
+  don't add them by hand) and augments `react-dom/client` with Perry's
+  native-window overload `createRoot(null, { title, width, height })`
+  (`PerryRootOptions`). Validated with real `tsc` under `moduleResolution`
+  `bundler` (Perry's default) and `node`. NOTE: the augmentation must live in the
+  file the user loads (`types: ["@perryts/react"]` or a direct import) — TS drops
+  module augmentations reached only via a re-export from another `.d.ts`, and a
+  stray `export {}` next to the `declare module` also suppresses it.
+- **Root `package.json` now carries `name`/`version`** (+ `private`) so
+  `npm install` straight from the git repo no longer crashes npm's arborist with
+  `Cannot read properties of undefined (reading 'spec')`.
+- **`packages/electron` install is documented.** npm can't publish a package
+  named `electron` or install a repo subdirectory, so the README now covers the
+  two real paths: clone + `npm install /path/to/packages/electron` (keeps the
+  bare `electron` import working), or the scoped `@perryts/electron` + a
+  `packageAliases` entry. Added distribution metadata (`files`, `repository`,
+  `homepage`, `publishConfig`).
+- **`webviewAddUserScript`** was reported missing from the npm binary; verified
+  it is fully implemented and wired on this branch (real `WKUserScript`
+  injection in perry-ui-macos + `perry-dispatch` table row) — it predates npm
+  0.5.1182 and ships with this branch.
+
 ## v0.5.1199 — feat(ui): BloomView live-render plumbing on every backend (#5519)
 
 Perry-UI side of #5519 (live `BloomView` rendering on all platforms; the engine

@@ -748,13 +748,28 @@ pub(super) fn build_optimized_libs(
             &build_stamp,
         )
     {
-        let well_known_libs = resolve_auto_well_known_libs(
+        // A warm auto-optimize cache returns here WITHOUT running the
+        // fresh-rebuild path below — which is the only place the tokio-using
+        // well-known libs get appended to `well_known_libs`. Mirror that here,
+        // but crucially keep the CPU-only well-known libs already resolved into
+        // `well_known_libs` at the routing step above (e.g. `events` →
+        // perry-ext-events.a, decimal.js → perry-ext-decimal.a). The previous
+        // code SHADOWED `well_known_libs` with the tokio-only result, silently
+        // dropping every CPU-only wrapper from the link line. Because the
+        // matching stdlib feature was still stripped from the (cached) stdlib
+        // rebuild, an EventEmitter / electron app then linked a stdlib that
+        // calls `js_event_emitter_*` with no provider — failing with
+        // `Undefined symbols: _js_event_emitter_*`. This only bit when the
+        // auto-optimize archives were already fresh (warm cache); a cold cache
+        // took the fresh path and linked fine, which is exactly the
+        // intermittent "can't compile from source" report. #466.
+        well_known_libs.extend(resolve_auto_well_known_libs(
             &workspace_root,
             &release_dir,
             &tokio_using_bindings,
             target,
             format,
-        );
+        ));
         return OptimizedLibs {
             runtime: Some(runtime_path),
             stdlib: Some(stdlib_path),
