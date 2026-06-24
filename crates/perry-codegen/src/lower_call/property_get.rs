@@ -1546,8 +1546,7 @@ pub fn try_lower_property_get_method_call(
                     for ((cls, mname), reg_fname) in ctx.methods.iter() {
                         if reg_fname == fname && mname == property {
                             let key = (cls.clone(), mname.clone());
-                            let has_rest =
-                                matches!(ctx.method_has_rest.get(&key), Some(&true));
+                            let has_rest = matches!(ctx.method_has_rest.get(&key), Some(&true));
                             let decl = ctx.method_param_counts.get(&key).copied().unwrap_or(0);
                             return (has_rest, decl);
                         }
@@ -1757,12 +1756,14 @@ pub fn try_lower_property_get_method_call(
                         }
                         let rest_count = static_user_args.len().saturating_sub(fixed_user);
                         let cap = (rest_count as u32).to_string();
-                        let mut rest_arr =
-                            ctx.block().call(I64, "js_array_alloc", &[(I32, &cap)]);
+                        let mut rest_arr = ctx.block().call(I64, "js_array_alloc", &[(I32, &cap)]);
                         for v in static_user_args.iter().skip(fixed_user) {
                             let blk = ctx.block();
-                            rest_arr =
-                                blk.call(I64, "js_array_push_f64", &[(I64, &rest_arr), (DOUBLE, v)]);
+                            rest_arr = blk.call(
+                                I64,
+                                "js_array_push_f64",
+                                &[(I64, &rest_arr), (DOUBLE, v)],
+                            );
                         }
                         let rest_box = nanbox_pointer_inline(ctx.block(), &rest_arr);
                         case_args.push(rest_box);
