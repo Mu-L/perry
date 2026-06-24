@@ -1488,6 +1488,10 @@ pub fn try_lower_property_get_method_call(
         // C's parent chain and find the FIRST class that has `property`
         // in `ctx.methods`. Register (C's id → that ancestor's fn_name).
         let mut implementors: Vec<(u32, String)> = Vec::new();
+        // #5437: (has_rest, decl_param_count) per implementor, built in the
+        // discovery loop below (aligned 1:1 with `implementors`) so each case
+        // block can build its own per-arity args without rescanning `ctx.methods`.
+        let mut impl_meta: Vec<(bool, usize)> = Vec::new();
         let mut seen_pairs: std::collections::HashSet<(u32, String)> =
             std::collections::HashSet::new();
         for (start_cls, &start_cid) in ctx.class_ids.iter() {
@@ -1496,7 +1500,12 @@ pub fn try_lower_property_get_method_call(
                 let key = (c.clone(), property.clone());
                 if let Some(fname) = ctx.methods.get(&key).cloned() {
                     if seen_pairs.insert((start_cid, fname.clone())) {
+                        // `key` is the exact (defining-class, property) where the
+                        // method resolved, so its arity metadata is available now.
+                        let has_rest = matches!(ctx.method_has_rest.get(&key), Some(&true));
+                        let decl = ctx.method_param_counts.get(&key).copied().unwrap_or(0);
                         implementors.push((start_cid, fname));
+                        impl_meta.push((has_rest, decl));
                     }
                     break;
                 }
@@ -1538,22 +1547,9 @@ pub fn try_lower_property_get_method_call(
             // 1/2/3), so the global rest-bundle truncated `nh.get`'s 3 args into
             // one array passed as arg0 → `context` (the 3rd param) read 0.0.
             //
-            // Precompute (has_rest, decl_param_count) per implementor, aligned
-            // with `implementors`; each case block builds its own args below.
-            let impl_meta: Vec<(bool, usize)> = implementors
-                .iter()
-                .map(|(_, fname)| {
-                    for ((cls, mname), reg_fname) in ctx.methods.iter() {
-                        if reg_fname == fname && mname == property {
-                            let key = (cls.clone(), mname.clone());
-                            let has_rest = matches!(ctx.method_has_rest.get(&key), Some(&true));
-                            let decl = ctx.method_param_counts.get(&key).copied().unwrap_or(0);
-                            return (has_rest, decl);
-                        }
-                    }
-                    (false, 0)
-                })
-                .collect();
+            // (has_rest, decl_param_count) per implementor was built in the
+            // discovery loop above (`impl_meta`, aligned 1:1 with `implementors`);
+            // each case block builds its own per-arity args below.
             let undefined_lit = double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
 
             // Issue #628 followup (#620 in dynamic-dispatch shape): probe
