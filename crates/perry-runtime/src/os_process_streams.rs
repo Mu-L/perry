@@ -140,6 +140,195 @@ pub fn mark_process_stdin_destroyed() {
     set_stdin_bool_field(b"isRaw", false);
 }
 
+// ── #input: process.stdin as a functional raw-mode Readable ──────────────
+// Node TUIs read the keyboard via `process.stdin` — real `ink` uses
+// `setRawMode(true)` + `on("data", …)`, and the bundle uses
+// `setRawMode(!0); on("readable", () => { let c = stdin.read(); while (c !==
+// null) { …; c = stdin.read() } })`. Previously `on`/`read`/`resume` were
+// no-op stubs ("encoding-aware reads remain future work"), so input was dead
+// even though `perry/tui` had its own working reader. A dedicated reader
+// thread reads fd 0, buffers the bytes and wakes the event loop; the loop
+// pump (`pump_process_stdin`, called each tick from `js_callback_timer_tick`)
+// drains the buffer and fires the registered `data`/`readable` listeners.
+static STDIN_BUFFER: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+static STDIN_DATA_LISTENERS: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+static STDIN_READABLE_LISTENERS: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+static STDIN_READER_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn ensure_stdin_reader() {
+    use std::sync::atomic::Ordering;
+    if STDIN_READER_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        std::thread::spawn(|| {
+            use std::io::Read;
+            let stdin = std::io::stdin();
+            let mut handle = stdin.lock();
+            let mut byte = [0u8; 1];
+            loop {
+                if stdin_is_detached() {
+                    break;
+                }
+                match handle.read(&mut byte) {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
+                        if let Ok(mut q) = STDIN_BUFFER.lock() {
+                            q.push(byte[0]);
+                        }
+                        crate::event_pump::js_notify_main_thread();
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+}
+
+fn stdin_event_name(value: f64) -> Option<String> {
+    let ptr = crate::value::js_get_string_pointer_unified(value) as *const StringHeader;
+    if ptr.is_null() {
+        return None;
+    }
+    unsafe {
+        let header = &*ptr;
+        let len = header.byte_len as usize;
+        let data = (ptr as *const u8).add(std::mem::size_of::<StringHeader>());
+        Some(String::from_utf8_lossy(std::slice::from_raw_parts(data, len)).into_owned())
+    }
+}
+
+fn stdin_callback_ptr(value: f64) -> i64 {
+    let jsval = crate::value::JSValue::from_bits(value.to_bits());
+    if !jsval.is_pointer() {
+        return 0;
+    }
+    (value.to_bits() & crate::value::POINTER_MASK) as i64
+}
+
+/// `process.stdin.on(event, cb)` — registers `data`/`readable` listeners and
+/// starts the reader. Returns `this` so callers can chain.
+extern "C" fn process_stdin_on(
+    _closure: *const crate::closure::ClosureHeader,
+    event: f64,
+    callback: f64,
+) -> f64 {
+    let cb = stdin_callback_ptr(callback);
+    if cb != 0 {
+        match stdin_event_name(event).as_deref() {
+            Some("data") => {
+                if let Ok(mut l) = STDIN_DATA_LISTENERS.lock() {
+                    if !l.contains(&cb) {
+                        l.push(cb);
+                    }
+                }
+                ensure_stdin_reader();
+            }
+            Some("readable") => {
+                if let Ok(mut l) = STDIN_READABLE_LISTENERS.lock() {
+                    if !l.contains(&cb) {
+                        l.push(cb);
+                    }
+                }
+                ensure_stdin_reader();
+            }
+            _ => {}
+        }
+    }
+    crate::object::js_implicit_this_get()
+}
+
+/// `process.stdin.read([size])` — returns buffered input as a string (stdin is
+/// `setEncoding("utf8")` in practice) or `null` when nothing is buffered, per
+/// Node's `Readable.read()` contract.
+extern "C" fn process_stdin_read(_closure: *const crate::closure::ClosureHeader, _arg: f64) -> f64 {
+    let bytes = match STDIN_BUFFER.lock() {
+        Ok(mut b) => std::mem::take(&mut *b),
+        Err(_) => return f64::from_bits(crate::value::TAG_NULL),
+    };
+    if bytes.is_empty() {
+        return f64::from_bits(crate::value::TAG_NULL);
+    }
+    let s = String::from_utf8_lossy(&bytes);
+    let sh = crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32);
+    // Nanbox as a STRING value (not a generic object pointer) so JS sees a
+    // real string from `read()` — `typeof` / `+` / `!== null` all rely on this.
+    f64::from_bits(crate::value::STRING_TAG | (sh as u64 & crate::value::POINTER_MASK))
+}
+
+/// `process.stdin.resume()` — flowing mode; ensures the reader is running.
+extern "C" fn process_stdin_resume(
+    _closure: *const crate::closure::ClosureHeader,
+    _arg: f64,
+) -> f64 {
+    ensure_stdin_reader();
+    crate::object::js_implicit_this_get()
+}
+
+/// Drain buffered stdin and fire `data`/`readable` listeners. Called once per
+/// event-loop iteration from `js_callback_timer_tick` — a safe JS-execution
+/// point (the same place timer callbacks fire), NOT from `js_wait_for_event`
+/// (calling JS from the wait primitive reenters and wedges the runtime). Each
+/// listener call is wrapped in a GC handle scope that roots the closure (and
+/// any string arg) across the call, mirroring the timer dispatch. `data`
+/// listeners (ink's flowing path) get the bytes directly; otherwise `readable`
+/// listeners are notified and pull via `read()`.
+pub fn pump_process_stdin() {
+    let has_bytes = STDIN_BUFFER.lock().map(|b| !b.is_empty()).unwrap_or(false);
+    if !has_bytes {
+        return;
+    }
+    let data_listeners: Vec<i64> = STDIN_DATA_LISTENERS
+        .lock()
+        .map(|l| l.clone())
+        .unwrap_or_default();
+    if !data_listeners.is_empty() {
+        let bytes = STDIN_BUFFER
+            .lock()
+            .map(|mut b| std::mem::take(&mut *b))
+            .unwrap_or_default();
+        if bytes.is_empty() {
+            return;
+        }
+        let s = String::from_utf8_lossy(&bytes);
+        for cb in data_listeners {
+            let scope = crate::gc::RuntimeHandleScope::new();
+            let cb_handle = scope.root_raw_const_ptr(cb as *const crate::closure::ClosureHeader);
+            // Allocate the arg string inside the scope so GC during the call
+            // can't free or move it out from under the callback.
+            let sh = crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32);
+            let arg =
+                f64::from_bits(crate::value::STRING_TAG | (sh as u64 & crate::value::POINTER_MASK));
+            let arg_handles = scope.root_nanbox_f64_slice(&[arg]);
+            let a = crate::gc::RuntimeHandleScope::refreshed_nanbox_f64_slice(&arg_handles);
+            let closure = cb_handle.get_raw_const_ptr::<crate::closure::ClosureHeader>();
+            crate::closure::js_closure_call1(closure, a[0]);
+        }
+        return;
+    }
+    let readable_listeners: Vec<i64> = STDIN_READABLE_LISTENERS
+        .lock()
+        .map(|l| l.clone())
+        .unwrap_or_default();
+    for cb in readable_listeners {
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let cb_handle = scope.root_raw_const_ptr(cb as *const crate::closure::ClosureHeader);
+        let closure = cb_handle.get_raw_const_ptr::<crate::closure::ClosureHeader>();
+        crate::closure::js_closure_call0(closure);
+    }
+}
+
+/// Make a native-method closure value with the given arity registered, so the
+/// dispatch path forwards the right number of arguments.
+fn stdin_native_method(func_ptr: *const u8, name: &str, arity: u32) -> f64 {
+    crate::closure::js_register_closure_arity(func_ptr, arity);
+    let closure = crate::closure::js_closure_alloc_singleton(func_ptr);
+    crate::object::set_bound_native_closure_name(closure, name);
+    crate::object::set_builtin_closure_length(closure as usize, arity);
+    crate::value::js_nanbox_pointer(closure as i64)
+}
+
 pub fn scan_process_stream_singleton_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
     let mut visit_slot = |slot: &RefCell<usize>| {
         let mut value = slot.borrow_mut();
@@ -197,6 +386,7 @@ fn build_stream_object_with_write(
         if is_stdin {
             let mut keys = b"write\0fd\0emit\0on\0once\0writable\0readable\0readableEnded\0destroyed\0closed\0isRaw\0isTTY\0".to_vec();
             keys.extend_from_slice(STDIN_TEARDOWN_KEYS);
+            keys.extend_from_slice(b"read\0"); // field 22: Readable.read()
             (
                 if is_tty {
                     crate::tty::CLASS_ID_TTY_READ_STREAM
@@ -204,7 +394,7 @@ fn build_stream_object_with_write(
                     0
                 },
                 keys,
-                22,
+                23,
                 Some(12),
             )
         } else if is_tty {
@@ -253,6 +443,13 @@ fn build_stream_object_with_write(
             4,
             JSValue::from_bits(crate::tty::tty_listener_on_value().to_bits()),
         );
+    } else if is_stdin {
+        // Real `on(event, cb)` so `process.stdin.on("data"/"readable", …)`
+        // registers a keyboard listener instead of dropping it (#input).
+        let on = stdin_native_method(process_stdin_on as *const u8, "on", 2);
+        js_object_set_field(obj, 3, JSValue::from_bits(on.to_bits()));
+        let once = stdin_native_method(process_stdin_on as *const u8, "once", 2);
+        js_object_set_field(obj, 4, JSValue::from_bits(once.to_bits()));
     } else {
         let on = js_closure_alloc(process_stream_on_once_stub as *const u8, 0);
         js_object_set_field(obj, 3, JSValue::pointer(on as *const u8));
@@ -319,12 +516,23 @@ fn build_stream_object_with_write(
         set_field_with_stub(start + 2, process_stream_on_once_stub); // off
         set_field_with_stub(start + 3, process_stream_on_once_stub); // removeAllListeners
         set_field_with_stub(start + 4, lifecycle); // pause
-        set_field_with_stub(start + 5, process_stream_on_once_stub); // resume
+                                                   // resume: real flowing-mode start on stdin, no-op on stdout/stderr.
+        set_field_with_stub(
+            start + 5,
+            if is_stdin {
+                process_stdin_resume
+            } else {
+                process_stream_on_once_stub
+            },
+        ); // resume
         set_field_with_stub(start + 6, lifecycle); // unref
         if is_stdin {
             set_field_with_stub(start + 7, process_stream_on_once_stub); // ref
             set_field_with_stub(start + 8, lifecycle); // destroy
             set_field_with_stub(start + 9, process_stream_set_encoding_stub); // setEncoding
+                                                                              // field 22: Readable.read() returns buffered keyboard input.
+            let read = stdin_native_method(process_stdin_read as *const u8, "read", 1);
+            js_object_set_field(obj, 22, JSValue::from_bits(read.to_bits()));
         } else {
             set_field_with_stub(start + 7, lifecycle); // destroy
         }
