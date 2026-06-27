@@ -153,17 +153,31 @@ pub fn mark_process_stdin_destroyed() {
 static STDIN_BUFFER: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
 static STDIN_DATA_LISTENERS: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
 static STDIN_READABLE_LISTENERS: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+// `once()` listeners — fired exactly once then cleared, per EventEmitter.
+static STDIN_DATA_ONCE: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
+static STDIN_READABLE_ONCE: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
 static STDIN_READER_STARTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 fn ensure_stdin_reader() {
     use std::sync::atomic::Ordering;
+    // A previous reader may have exited (EOF, error, or detach via
+    // `pause`/`unref`); its drop guard resets `STDIN_READER_STARTED` to false,
+    // so a later `resume()`/`on(...)` can spin up a fresh reader.
     if STDIN_READER_STARTED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {
         std::thread::spawn(|| {
             use std::io::Read;
+            // On exit, clear STARTED so the reader can be restarted later.
+            struct ReaderGuard;
+            impl Drop for ReaderGuard {
+                fn drop(&mut self) {
+                    STDIN_READER_STARTED.store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
+            let _guard = ReaderGuard;
             let stdin = std::io::stdin();
             let mut handle = stdin.lock();
             let mut byte = [0u8; 1];
@@ -184,6 +198,19 @@ fn ensure_stdin_reader() {
             }
         });
     }
+}
+
+/// The `process.stdin` stream object as a JS value, for `this`-binding during
+/// listener dispatch (Node calls stream listeners with `this === stream`).
+fn stdin_this_value() -> f64 {
+    STDIN_STREAM_SINGLETON.with(|slot| {
+        let obj = *slot.borrow();
+        if obj == 0 {
+            f64::from_bits(crate::value::TAG_UNDEFINED)
+        } else {
+            f64::from_bits(crate::value::JSValue::pointer(obj as *const u8).bits())
+        }
+    })
 }
 
 fn stdin_event_name(value: f64) -> Option<String> {
@@ -207,9 +234,69 @@ fn stdin_callback_ptr(value: f64) -> i64 {
     (value.to_bits() & crate::value::POINTER_MASK) as i64
 }
 
-/// `process.stdin.on(event, cb)` — registers `data`/`readable` listeners and
-/// starts the reader. Returns `this` so callers can chain.
+fn register_stdin_listener(
+    event: f64,
+    callback: f64,
+    persistent: &std::sync::Mutex<Vec<i64>>,
+    once: &std::sync::Mutex<Vec<i64>>,
+    is_once: bool,
+) {
+    let cb = stdin_callback_ptr(callback);
+    if cb == 0 {
+        return;
+    }
+    let target = if is_once { once } else { persistent };
+    match stdin_event_name(event).as_deref() {
+        Some("data") | Some("readable") => {
+            if let Ok(mut l) = target.lock() {
+                // EventEmitter allows the same listener registered multiple
+                // times; only `on` callers dedupe in practice, but each
+                // `once` registration must fire independently, so don't dedupe
+                // there.
+                if is_once || !l.contains(&cb) {
+                    l.push(cb);
+                }
+            }
+            ensure_stdin_reader();
+        }
+        _ => {}
+    }
+}
+
+/// `process.stdin.on(event, cb)` — registers a persistent `data`/`readable`
+/// listener and starts the reader. Returns `this` so callers can chain.
 extern "C" fn process_stdin_on(
+    _closure: *const crate::closure::ClosureHeader,
+    event: f64,
+    callback: f64,
+) -> f64 {
+    // `data` vs `readable` is selected inside the helper by event name; both
+    // persistent registries are passed and the helper picks per event.
+    let cb = stdin_callback_ptr(callback);
+    if cb != 0 {
+        match stdin_event_name(event).as_deref() {
+            Some("data") => register_stdin_listener(
+                event,
+                callback,
+                &STDIN_DATA_LISTENERS,
+                &STDIN_DATA_ONCE,
+                false,
+            ),
+            Some("readable") => register_stdin_listener(
+                event,
+                callback,
+                &STDIN_READABLE_LISTENERS,
+                &STDIN_READABLE_ONCE,
+                false,
+            ),
+            _ => {}
+        }
+    }
+    crate::object::js_implicit_this_get()
+}
+
+/// `process.stdin.once(event, cb)` — fires the listener exactly once.
+extern "C" fn process_stdin_once(
     _closure: *const crate::closure::ClosureHeader,
     event: f64,
     callback: f64,
@@ -217,22 +304,20 @@ extern "C" fn process_stdin_on(
     let cb = stdin_callback_ptr(callback);
     if cb != 0 {
         match stdin_event_name(event).as_deref() {
-            Some("data") => {
-                if let Ok(mut l) = STDIN_DATA_LISTENERS.lock() {
-                    if !l.contains(&cb) {
-                        l.push(cb);
-                    }
-                }
-                ensure_stdin_reader();
-            }
-            Some("readable") => {
-                if let Ok(mut l) = STDIN_READABLE_LISTENERS.lock() {
-                    if !l.contains(&cb) {
-                        l.push(cb);
-                    }
-                }
-                ensure_stdin_reader();
-            }
+            Some("data") => register_stdin_listener(
+                event,
+                callback,
+                &STDIN_DATA_LISTENERS,
+                &STDIN_DATA_ONCE,
+                true,
+            ),
+            Some("readable") => register_stdin_listener(
+                event,
+                callback,
+                &STDIN_READABLE_LISTENERS,
+                &STDIN_READABLE_ONCE,
+                true,
+            ),
             _ => {}
         }
     }
@@ -257,11 +342,13 @@ extern "C" fn process_stdin_read(_closure: *const crate::closure::ClosureHeader,
     f64::from_bits(crate::value::STRING_TAG | (sh as u64 & crate::value::POINTER_MASK))
 }
 
-/// `process.stdin.resume()` — flowing mode; ensures the reader is running.
+/// `process.stdin.resume()` — flowing mode. Clears any prior detach (from
+/// `pause`/`unref`) and (re)starts the reader, so a paused stdin can resume.
 extern "C" fn process_stdin_resume(
     _closure: *const crate::closure::ClosureHeader,
     _arg: f64,
 ) -> f64 {
+    STDIN_DETACHED.store(false, std::sync::atomic::Ordering::Release);
     ensure_stdin_reader();
     crate::object::js_implicit_this_get()
 }
@@ -279,10 +366,17 @@ pub fn pump_process_stdin() {
     if !has_bytes {
         return;
     }
-    let data_listeners: Vec<i64> = STDIN_DATA_LISTENERS
+    // `data` (flowing) takes precedence: a `data` listener consumes the bytes.
+    // `once` listeners are drained so they fire exactly once.
+    let mut data_listeners: Vec<i64> = STDIN_DATA_LISTENERS
         .lock()
         .map(|l| l.clone())
         .unwrap_or_default();
+    let data_once: Vec<i64> = STDIN_DATA_ONCE
+        .lock()
+        .map(|mut l| std::mem::take(&mut *l))
+        .unwrap_or_default();
+    data_listeners.extend(&data_once);
     if !data_listeners.is_empty() {
         let bytes = STDIN_BUFFER
             .lock()
@@ -291,6 +385,7 @@ pub fn pump_process_stdin() {
         if bytes.is_empty() {
             return;
         }
+        let this = stdin_this_value();
         let s = String::from_utf8_lossy(&bytes);
         for cb in data_listeners {
             let scope = crate::gc::RuntimeHandleScope::new();
@@ -303,19 +398,30 @@ pub fn pump_process_stdin() {
             let arg_handles = scope.root_nanbox_f64_slice(&[arg]);
             let a = crate::gc::RuntimeHandleScope::refreshed_nanbox_f64_slice(&arg_handles);
             let closure = cb_handle.get_raw_const_ptr::<crate::closure::ClosureHeader>();
+            // Node calls stream listeners with `this === stream`.
+            let prev_this = crate::object::js_implicit_this_set(this);
             crate::closure::js_closure_call1(closure, a[0]);
+            crate::object::js_implicit_this_set(prev_this);
         }
         return;
     }
-    let readable_listeners: Vec<i64> = STDIN_READABLE_LISTENERS
+    let mut readable_listeners: Vec<i64> = STDIN_READABLE_LISTENERS
         .lock()
         .map(|l| l.clone())
         .unwrap_or_default();
+    let readable_once: Vec<i64> = STDIN_READABLE_ONCE
+        .lock()
+        .map(|mut l| std::mem::take(&mut *l))
+        .unwrap_or_default();
+    readable_listeners.extend(&readable_once);
+    let this = stdin_this_value();
     for cb in readable_listeners {
         let scope = crate::gc::RuntimeHandleScope::new();
         let cb_handle = scope.root_raw_const_ptr(cb as *const crate::closure::ClosureHeader);
         let closure = cb_handle.get_raw_const_ptr::<crate::closure::ClosureHeader>();
+        let prev_this = crate::object::js_implicit_this_set(this);
         crate::closure::js_closure_call0(closure);
+        crate::object::js_implicit_this_set(prev_this);
     }
 }
 
@@ -330,18 +436,41 @@ fn stdin_native_method(func_ptr: *const u8, name: &str, arity: u32) -> f64 {
 }
 
 pub fn scan_process_stream_singleton_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
-    let mut visit_slot = |slot: &RefCell<usize>| {
-        let mut value = slot.borrow_mut();
-        if *value != 0 {
-            let mut ptr = *value as *mut crate::object::ObjectHeader;
-            if visitor.visit_raw_mut_ptr_slot(&mut ptr) {
-                *value = ptr as usize;
+    {
+        let mut visit_slot = |slot: &RefCell<usize>| {
+            let mut value = slot.borrow_mut();
+            if *value != 0 {
+                let mut ptr = *value as *mut crate::object::ObjectHeader;
+                if visitor.visit_raw_mut_ptr_slot(&mut ptr) {
+                    *value = ptr as usize;
+                }
+            }
+        };
+        STDIN_STREAM_SINGLETON.with(&mut visit_slot);
+        STDOUT_STREAM_SINGLETON.with(&mut visit_slot);
+        STDERR_STREAM_SINGLETON.with(&mut visit_slot);
+    }
+    // The registered stdin listeners (raw closure addresses) are GC roots:
+    // a TUI that registers an anonymous handler and drops its only JS
+    // reference must not have that closure swept or relocated out from under
+    // us before the next keypress fires it.
+    for registry in [
+        &STDIN_DATA_LISTENERS,
+        &STDIN_READABLE_LISTENERS,
+        &STDIN_DATA_ONCE,
+        &STDIN_READABLE_ONCE,
+    ] {
+        if let Ok(mut listeners) = registry.lock() {
+            for cb in listeners.iter_mut() {
+                if *cb != 0 {
+                    let mut ptr = *cb as *mut crate::object::ObjectHeader;
+                    if visitor.visit_raw_mut_ptr_slot(&mut ptr) {
+                        *cb = ptr as i64;
+                    }
+                }
             }
         }
-    };
-    STDIN_STREAM_SINGLETON.with(&mut visit_slot);
-    STDOUT_STREAM_SINGLETON.with(&mut visit_slot);
-    STDERR_STREAM_SINGLETON.with(&mut visit_slot);
+    }
 }
 
 /// Build a stream object with a `write` field bound to the given stub.
@@ -448,7 +577,7 @@ fn build_stream_object_with_write(
         // registers a keyboard listener instead of dropping it (#input).
         let on = stdin_native_method(process_stdin_on as *const u8, "on", 2);
         js_object_set_field(obj, 3, JSValue::from_bits(on.to_bits()));
-        let once = stdin_native_method(process_stdin_on as *const u8, "once", 2);
+        let once = stdin_native_method(process_stdin_once as *const u8, "once", 2);
         js_object_set_field(obj, 4, JSValue::from_bits(once.to_bits()));
     } else {
         let on = js_closure_alloc(process_stream_on_once_stub as *const u8, 0);
