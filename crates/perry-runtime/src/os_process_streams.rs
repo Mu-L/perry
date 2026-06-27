@@ -324,6 +324,55 @@ extern "C" fn process_stdin_once(
     crate::object::js_implicit_this_get()
 }
 
+/// `process.stdin.removeListener(event, cb)` / `off(event, cb)` — drops a
+/// previously registered `data`/`readable` listener. `ink` calls this on raw-
+/// mode teardown (`removeListener("readable", handleReadable)`).
+extern "C" fn process_stdin_remove_listener(
+    _closure: *const crate::closure::ClosureHeader,
+    event: f64,
+    callback: f64,
+) -> f64 {
+    let cb = stdin_callback_ptr(callback);
+    if cb != 0 {
+        let registries: &[&std::sync::Mutex<Vec<i64>>] = match stdin_event_name(event).as_deref() {
+            Some("data") => &[&STDIN_DATA_LISTENERS, &STDIN_DATA_ONCE],
+            Some("readable") => &[&STDIN_READABLE_LISTENERS, &STDIN_READABLE_ONCE],
+            _ => &[],
+        };
+        for r in registries {
+            if let Ok(mut l) = r.lock() {
+                l.retain(|&x| x != cb);
+            }
+        }
+    }
+    crate::object::js_implicit_this_get()
+}
+
+/// `process.stdin.removeAllListeners([event])` — clears `data`/`readable`
+/// listeners (both, when no event is given).
+extern "C" fn process_stdin_remove_all_listeners(
+    _closure: *const crate::closure::ClosureHeader,
+    event: f64,
+) -> f64 {
+    let registries: &[&std::sync::Mutex<Vec<i64>>] = match stdin_event_name(event).as_deref() {
+        Some("data") => &[&STDIN_DATA_LISTENERS, &STDIN_DATA_ONCE],
+        Some("readable") => &[&STDIN_READABLE_LISTENERS, &STDIN_READABLE_ONCE],
+        // No (or unknown) event name → clear everything, per Node.
+        _ => &[
+            &STDIN_DATA_LISTENERS,
+            &STDIN_DATA_ONCE,
+            &STDIN_READABLE_LISTENERS,
+            &STDIN_READABLE_ONCE,
+        ],
+    };
+    for r in registries {
+        if let Ok(mut l) = r.lock() {
+            l.clear();
+        }
+    }
+    crate::object::js_implicit_this_get()
+}
+
 /// `process.stdin.read([size])` — returns buffered input as a string (stdin is
 /// `setEncoding("utf8")` in practice) or `null` when nothing is buffered, per
 /// Node's `Readable.read()` contract.
@@ -640,10 +689,32 @@ fn build_stream_object_with_write(
         } else {
             process_stream_on_once_stub
         };
-        set_field_with_stub(start, process_stream_on_once_stub); // addListener
-        set_field_with_stub(start + 1, process_stream_on_once_stub); // removeListener
-        set_field_with_stub(start + 2, process_stream_on_once_stub); // off
-        set_field_with_stub(start + 3, process_stream_on_once_stub); // removeAllListeners
+        if is_stdin {
+            // `ink` registers/unregisters keyboard input via
+            // `addListener("readable", …)` / `removeListener("readable", …)`
+            // (aliases of `on`/`off`), so these must be functional, not stubs.
+            let add = stdin_native_method(process_stdin_on as *const u8, "addListener", 2);
+            js_object_set_field(obj, start, JSValue::from_bits(add.to_bits()));
+            let rm = stdin_native_method(
+                process_stdin_remove_listener as *const u8,
+                "removeListener",
+                2,
+            );
+            js_object_set_field(obj, start + 1, JSValue::from_bits(rm.to_bits()));
+            let off = stdin_native_method(process_stdin_remove_listener as *const u8, "off", 2);
+            js_object_set_field(obj, start + 2, JSValue::from_bits(off.to_bits()));
+            let rm_all = stdin_native_method(
+                process_stdin_remove_all_listeners as *const u8,
+                "removeAllListeners",
+                1,
+            );
+            js_object_set_field(obj, start + 3, JSValue::from_bits(rm_all.to_bits()));
+        } else {
+            set_field_with_stub(start, process_stream_on_once_stub); // addListener
+            set_field_with_stub(start + 1, process_stream_on_once_stub); // removeListener
+            set_field_with_stub(start + 2, process_stream_on_once_stub); // off
+            set_field_with_stub(start + 3, process_stream_on_once_stub); // removeAllListeners
+        }
         set_field_with_stub(start + 4, lifecycle); // pause
                                                    // resume: real flowing-mode start on stdin, no-op on stdout/stderr.
         set_field_with_stub(
