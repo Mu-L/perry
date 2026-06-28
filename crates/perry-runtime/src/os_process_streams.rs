@@ -161,6 +161,13 @@ static STDIN_READER_STARTED: std::sync::atomic::AtomicBool =
 
 fn ensure_stdin_reader() {
     use std::sync::atomic::Ordering;
+    // Registering a listener / resuming means the app wants input again, so
+    // clear any prior detach (`pause`/`unref`/`destroy`). Without this, a TUI
+    // that paused or destroyed stdin during startup (e.g. ink calls
+    // `stdin.pause()`/`destroy()` while wiring up raw mode) would leave
+    // `STDIN_DETACHED` set, and the reader thread below would observe it on its
+    // first loop iteration and exit before reading a single byte — input dead.
+    STDIN_DETACHED.store(false, Ordering::Release);
     // A previous reader may have exited (EOF, error, or detach via
     // `pause`/`unref`); its drop guard resets `STDIN_READER_STARTED` to false,
     // so a later `resume()`/`on(...)` can spin up a fresh reader.
