@@ -696,77 +696,85 @@ fn ensure_reader_started() {
     {
         return;
     }
-    std::thread::spawn(move || {
-        let stdin = io::stdin();
-        let mut reader = stdin.lock();
-        let mut byte = [0u8; 1];
-        let mut line_buf: Vec<u8> = Vec::with_capacity(256);
-        loop {
-            match reader.read(&mut byte) {
-                Ok(0) => break, // EOF
-                Ok(_) => {
-                    if STDIN_DESTROYED.load(Ordering::Acquire) {
-                        break;
-                    }
-                    if RAW_MODE.load(Ordering::Acquire) {
-                        // In raw mode, queue a single-byte chunk. Multi-byte
-                        // escape sequences (e.g. arrow keys = "\x1b[A")
-                        // arrive as three separate chunks; the keypress
-                        // parser on the drain side reassembles them.
-                        if let Ok(mut q) = PENDING_DATA.lock() {
-                            q.push(vec![byte[0]]);
-                        }
-                    } else if STDIN_DATA_FLOWING.load(Ordering::Acquire) {
-                        // Cooked flowing mode (#5227): a `process.stdin.on('data')`
-                        // listener is attached but raw mode is off. Deliver input
-                        // as 'data' chunks (newline INCLUDED, matching Node's
-                        // line-buffered cooked tty / piped-stream chunks) rather
-                        // than routing it to the readline 'line' queue.
-                        line_buf.push(byte[0]);
-                        if byte[0] == b'\n' {
-                            let chunk = std::mem::take(&mut line_buf);
-                            if let Ok(mut q) = PENDING_DATA.lock() {
-                                q.push(chunk);
-                            }
-                            line_buf = Vec::with_capacity(256);
-                        }
-                    } else if byte[0] == b'\n' {
-                        // Strip trailing CR for Windows CRLF input.
-                        if line_buf.last() == Some(&b'\r') {
-                            line_buf.pop();
-                        }
-                        let line = String::from_utf8_lossy(&line_buf).into_owned();
-                        line_buf.clear();
-                        if let Ok(mut q) = PENDING_LINES.lock() {
-                            q.push(line);
-                        }
-                    } else {
-                        line_buf.push(byte[0]);
-                    }
-                }
-                Err(_) => break,
-            }
+    // Multiplex off perry-runtime's single fd-0 reader instead of opening our
+    // own `std::io::stdin().lock()` reader: Rust's stdin is a single-holder
+    // `ReentrantMutex`, so a second reader here would deadlock against (or steal
+    // bytes from) `process.stdin`'s reader, breaking keyboard input in ink-based
+    // TUIs that read via `process.stdin.addListener("readable", …)`. We register
+    // pure-Rust byte/EOF consumers that get a copy of every stdin byte.
+    perry_runtime::os::register_stdin_byte_consumer(readline_consume_stdin_byte);
+    perry_runtime::os::register_stdin_eof_consumer(readline_consume_stdin_eof);
+    perry_runtime::os::ensure_stdin_reader_started();
+}
+
+/// Accumulates partial cooked-mode line/data bytes between `readline_consume_stdin_byte`
+/// calls (the consumer is invoked once per byte on the shared reader thread).
+static READLINE_LINE_BUF: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// Per-byte stdin consumer, registered with perry-runtime's shared fd-0 reader.
+/// Mirrors the previous in-line reader logic (raw chunk / cooked flowing 'data'
+/// / cooked 'line').
+fn readline_consume_stdin_byte(byte: u8) {
+    if STDIN_DESTROYED.load(Ordering::Acquire) {
+        return;
+    }
+    if RAW_MODE.load(Ordering::Acquire) {
+        // Raw mode: queue a single-byte chunk. Multi-byte escape sequences
+        // (arrow keys = "\x1b[A") arrive as separate chunks; the keypress
+        // parser on the drain side reassembles them.
+        if let Ok(mut q) = PENDING_DATA.lock() {
+            q.push(vec![byte]);
         }
-        // Flush any trailing bytes not terminated by a newline. In cooked
-        // flowing mode this is the last 'data' chunk for input like
-        // `printf "abc"` (no final newline); otherwise it's a final 'line'.
-        if !line_buf.is_empty() && !STDIN_DESTROYED.load(Ordering::Acquire) {
-            if STDIN_DATA_FLOWING.load(Ordering::Acquire) && !RAW_MODE.load(Ordering::Acquire) {
+    } else if STDIN_DATA_FLOWING.load(Ordering::Acquire) {
+        // Cooked flowing mode (#5227): deliver 'data' chunks split on newline.
+        if let Ok(mut lb) = READLINE_LINE_BUF.lock() {
+            lb.push(byte);
+            if byte == b'\n' {
+                let chunk = std::mem::take(&mut *lb);
                 if let Ok(mut q) = PENDING_DATA.lock() {
-                    q.push(std::mem::take(&mut line_buf));
-                }
-            } else if !RAW_MODE.load(Ordering::Acquire) {
-                if line_buf.last() == Some(&b'\r') {
-                    line_buf.pop();
-                }
-                let line = String::from_utf8_lossy(&line_buf).into_owned();
-                if let Ok(mut q) = PENDING_LINES.lock() {
-                    q.push(line);
+                    q.push(chunk);
                 }
             }
         }
-        EOF_REACHED.store(true, Ordering::Release);
-    });
+    } else if byte == b'\n' {
+        if let Ok(mut lb) = READLINE_LINE_BUF.lock() {
+            if lb.last() == Some(&b'\r') {
+                lb.pop(); // strip CR for Windows CRLF
+            }
+            let line = String::from_utf8_lossy(&lb).into_owned();
+            lb.clear();
+            if let Ok(mut q) = PENDING_LINES.lock() {
+                q.push(line);
+            }
+        }
+    } else if let Ok(mut lb) = READLINE_LINE_BUF.lock() {
+        lb.push(byte);
+    }
+}
+
+/// EOF consumer: flush any trailing partial line/data, then mark EOF.
+fn readline_consume_stdin_eof() {
+    if !STDIN_DESTROYED.load(Ordering::Acquire) {
+        if let Ok(mut lb) = READLINE_LINE_BUF.lock() {
+            if !lb.is_empty() {
+                if STDIN_DATA_FLOWING.load(Ordering::Acquire) && !RAW_MODE.load(Ordering::Acquire) {
+                    if let Ok(mut q) = PENDING_DATA.lock() {
+                        q.push(std::mem::take(&mut *lb));
+                    }
+                } else if !RAW_MODE.load(Ordering::Acquire) {
+                    if lb.last() == Some(&b'\r') {
+                        lb.pop();
+                    }
+                    let line = String::from_utf8_lossy(&lb).into_owned();
+                    lb.clear();
+                    if let Ok(mut q) = PENDING_LINES.lock() {
+                        q.push(line);
+                    }
+                }
+            }
+        }
+    }
+    EOF_REACHED.store(true, Ordering::Release);
 }
 
 // ---------------------------------------------------------------------------

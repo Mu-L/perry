@@ -158,6 +158,55 @@ static STDIN_DATA_ONCE: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::
 static STDIN_READABLE_ONCE: std::sync::Mutex<Vec<i64>> = std::sync::Mutex::new(Vec::new());
 static STDIN_READER_STARTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+// Secondary byte/EOF consumers: perry-stdlib's readline (`createInterface`)
+// and worker_threads stdin paths register here instead of opening their own
+// competing `std::io::stdin().lock()` reader (Rust's stdin is a single-holder
+// `ReentrantMutex`, and parallel fd-0 readers steal each other's bytes). The
+// one reader below broadcasts every byte (and EOF) to them.
+static STDIN_BYTE_CONSUMERS: std::sync::Mutex<Vec<fn(u8)>> = std::sync::Mutex::new(Vec::new());
+static STDIN_EOF_CONSUMERS: std::sync::Mutex<Vec<fn()>> = std::sync::Mutex::new(Vec::new());
+
+/// Register a pure-Rust per-byte stdin consumer (called on the reader thread
+/// for every byte). Used by perry-stdlib so its readline/worker stdin readers
+/// multiplex off the single fd-0 reader instead of competing for it.
+pub fn register_stdin_byte_consumer(f: fn(u8)) {
+    if let Ok(mut v) = STDIN_BYTE_CONSUMERS.lock() {
+        v.push(f);
+    }
+}
+
+/// Register a stdin-EOF consumer (called once when the fd-0 reader sees EOF).
+pub fn register_stdin_eof_consumer(f: fn()) {
+    if let Ok(mut v) = STDIN_EOF_CONSUMERS.lock() {
+        v.push(f);
+    }
+}
+
+/// Start the single shared fd-0 reader (idempotent). Public so perry-stdlib
+/// stdin consumers can ensure it is running without spawning their own.
+pub fn ensure_stdin_reader_started() {
+    ensure_stdin_reader();
+}
+
+fn broadcast_stdin_byte(b: u8) {
+    let consumers: Vec<fn(u8)> = STDIN_BYTE_CONSUMERS
+        .lock()
+        .map(|v| v.clone())
+        .unwrap_or_default();
+    for f in consumers {
+        f(b);
+    }
+}
+
+fn broadcast_stdin_eof() {
+    let consumers: Vec<fn()> = STDIN_EOF_CONSUMERS
+        .lock()
+        .map(|v| v.clone())
+        .unwrap_or_default();
+    for f in consumers {
+        f();
+    }
+}
 
 fn ensure_stdin_reader() {
     use std::sync::atomic::Ordering;
@@ -176,7 +225,6 @@ fn ensure_stdin_reader() {
         .is_ok()
     {
         std::thread::spawn(|| {
-            use std::io::Read;
             // On exit, clear STARTED so the reader can be restarted later.
             struct ReaderGuard;
             impl Drop for ReaderGuard {
@@ -185,22 +233,38 @@ fn ensure_stdin_reader() {
                 }
             }
             let _guard = ReaderGuard;
-            let stdin = std::io::stdin();
-            let mut handle = stdin.lock();
+            // Read fd 0 DIRECTLY via libc, NOT via `std::io::stdin().lock()`:
+            // Rust's `Stdin` is a process-wide `ReentrantMutex`, and perry's
+            // other stdin consumers (readline `createInterface`, worker_threads
+            // message reader) hold that lock in their own reader threads. Going
+            // through `stdin().lock()` here would block forever behind them —
+            // which is exactly what killed keyboard input in ink-based TUIs.
             let mut byte = [0u8; 1];
             loop {
                 if stdin_is_detached() {
                     break;
                 }
-                match handle.read(&mut byte) {
-                    Ok(0) => break, // EOF
-                    Ok(_) => {
-                        if let Ok(mut q) = STDIN_BUFFER.lock() {
-                            q.push(byte[0]);
-                        }
-                        crate::event_pump::js_notify_main_thread();
+                let n = unsafe { libc::read(0, byte.as_mut_ptr() as *mut libc::c_void, 1) };
+                if n == 1 {
+                    if let Ok(mut q) = STDIN_BUFFER.lock() {
+                        q.push(byte[0]);
                     }
-                    Err(_) => break,
+                    // Fan the byte out to readline/worker consumers too, so they
+                    // don't need their own (lock-stealing) fd-0 reader.
+                    broadcast_stdin_byte(byte[0]);
+                    crate::event_pump::js_notify_main_thread();
+                } else if n == 0 {
+                    broadcast_stdin_eof();
+                    break;
+                } else {
+                    // n < 0: errno. Retry on EINTR/EAGAIN; bail otherwise.
+                    let err = std::io::Error::last_os_error();
+                    match err.kind() {
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock => {
+                            continue
+                        }
+                        _ => break,
+                    }
                 }
             }
         });
