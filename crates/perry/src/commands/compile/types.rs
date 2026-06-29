@@ -121,6 +121,15 @@ pub struct CompileArgs {
     #[arg(long)]
     pub libc: Option<String>,
 
+    /// Web engine for the WebView widget on macOS: `system` (default,
+    /// WKWebView) or `servo` (experimental in-process Servo engine). `servo`
+    /// links the Servo-enabled UI library variant (`libperry_ui_macos_servo.a`,
+    /// built with `--features servo-webview`); the app then defaults to Servo
+    /// and can still be overridden at runtime via `PERRY_WEBVIEW`. Ignored on
+    /// non-macOS targets.
+    #[arg(long, default_value = "system")]
+    pub webview: String,
+
     /// App bundle identifier (required for widget targets)
     #[arg(long)]
     pub app_bundle_id: Option<String>,
