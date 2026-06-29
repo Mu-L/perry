@@ -445,3 +445,9 @@ perry-codegen-wasm = { path = "crates/perry-codegen-wasm" }
 perry-ui-testkit = { path = "crates/perry-ui-testkit" }
 perry-audio-miniaudio = { path = "crates/perry-audio-miniaudio" }
 perry-updater = { path = "crates/perry-updater" }
+
+# Experimental: fork of servo-script migrated from ml-kem 0.2 -> 0.3.2 so its
+# WebCrypto ML-KEM coexists with perry's ml-kem 0.3.2 (pkcs8). Enables the
+# in-process Servo webview (servo-webview feature). See servo-forks/servo-script.
+[patch.crates-io]
+servo-script = { path = "../servo-forks/servo-script" }
