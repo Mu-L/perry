@@ -24,12 +24,15 @@ use std::rc::Rc;
 use dpi::PhysicalSize;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject};
-use objc2::{msg_send, MainThreadOnly};
-use objc2_app_kit::{NSImageView, NSView};
+use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly};
+use objc2_app_kit::{NSEvent, NSImageView, NSView};
+use objc2_core_foundation::{CGPoint, CGSize};
 use objc2_foundation::{MainThreadMarker, NSString};
 use servo::{
-    DeviceIntRect, DeviceIntSize, LoadStatus, RenderingContext, Servo, ServoBuilder,
-    SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate,
+    DeviceIntRect, DeviceIntSize, DevicePoint, InputEvent, LoadStatus, MouseButton,
+    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, RenderingContext, Servo, ServoBuilder,
+    SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta,
+    WheelEvent, WheelMode,
 };
 use url::Url;
 
@@ -37,8 +40,6 @@ extern "C" {
     fn js_closure_call0(closure: *const u8) -> f64;
     fn js_closure_call1(closure: *const u8, arg: f64) -> f64;
     fn js_nanbox_get_pointer(value: f64) -> i64;
-    fn js_string_from_bytes(ptr: *const u8, len: i64) -> *const u8;
-    fn js_nanbox_string(ptr: i64) -> f64;
 }
 
 thread_local! {
@@ -123,6 +124,143 @@ impl ServoEngine {
     }
 }
 
+struct ServoViewIvars {
+    /// Perry widget handle this view belongs to (looked up in `ENGINES` to
+    /// route input/resize to the right Servo engine). `0` until registered.
+    handle: Cell<i64>,
+}
+
+define_class!(
+    /// Flipped, first-responder `NSView` that captures mouse/scroll/resize and
+    /// forwards them to its Servo engine. Holds an `NSImageView` subview that
+    /// displays the rendered frames.
+    #[unsafe(super(NSView))]
+    #[name = "PerryServoView"]
+    #[ivars = ServoViewIvars]
+    struct PerryServoView;
+
+    impl PerryServoView {
+        // Flipped → the view's coords share Servo's top-left device origin.
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(acceptsFirstResponder))]
+        fn accepts_first_responder(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            self.send_button(event, MouseButtonAction::Down, MouseButton::Left);
+        }
+
+        #[unsafe(method(mouseUp:))]
+        fn mouse_up(&self, event: &NSEvent) {
+            self.send_button(event, MouseButtonAction::Up, MouseButton::Left);
+        }
+
+        #[unsafe(method(rightMouseDown:))]
+        fn right_mouse_down(&self, event: &NSEvent) {
+            self.send_button(event, MouseButtonAction::Down, MouseButton::Right);
+        }
+
+        #[unsafe(method(rightMouseUp:))]
+        fn right_mouse_up(&self, event: &NSEvent) {
+            self.send_button(event, MouseButtonAction::Up, MouseButton::Right);
+        }
+
+        #[unsafe(method(mouseDragged:))]
+        fn mouse_dragged(&self, event: &NSEvent) {
+            self.send_move(event);
+        }
+
+        #[unsafe(method(mouseMoved:))]
+        fn mouse_moved(&self, event: &NSEvent) {
+            self.send_move(event);
+        }
+
+        #[unsafe(method(scrollWheel:))]
+        fn scroll_wheel(&self, event: &NSEvent) {
+            let pt = self.point_of(event);
+            let (dx, dy) = (event.scrollingDeltaX(), event.scrollingDeltaY());
+            let delta = WheelDelta {
+                x: dx,
+                y: dy,
+                z: 0.0,
+                mode: WheelMode::DeltaPixel,
+            };
+            engine_notify(
+                self.ivars().handle.get(),
+                InputEvent::Wheel(WheelEvent::new(delta, pt)),
+            );
+        }
+
+        #[unsafe(method(setFrameSize:))]
+        fn set_frame_size(&self, size: CGSize) {
+            let _: () = unsafe { msg_send![super(self), setFrameSize: size] };
+            engine_resize(
+                self.ivars().handle.get(),
+                size.width as u32,
+                size.height as u32,
+            );
+        }
+    }
+);
+
+impl PerryServoView {
+    /// Window-relative event point → Servo device-pixel point.
+    fn point_of(&self, event: &NSEvent) -> WebViewPoint {
+        let win = event.locationInWindow();
+        let local: CGPoint =
+            unsafe { msg_send![self, convertPoint: win, fromView: std::ptr::null::<NSView>()] };
+        WebViewPoint::Device(DevicePoint::new(local.x as f32, local.y as f32))
+    }
+
+    fn send_button(&self, event: &NSEvent, action: MouseButtonAction, button: MouseButton) {
+        let pt = self.point_of(event);
+        engine_notify(
+            self.ivars().handle.get(),
+            InputEvent::MouseButton(MouseButtonEvent::new(action, button, pt)),
+        );
+    }
+
+    fn send_move(&self, event: &NSEvent) {
+        let pt = self.point_of(event);
+        engine_notify(
+            self.ivars().handle.get(),
+            InputEvent::MouseMove(MouseMoveEvent::new(pt)),
+        );
+    }
+}
+
+/// Forward an input event to the Servo engine backing `handle`, if any.
+fn engine_notify(handle: i64, event: InputEvent) {
+    ENGINES.with(|e| {
+        if let Some(engine) = e.borrow().get(&handle) {
+            engine.webview.notify_input_event(event);
+        }
+    });
+}
+
+/// Resize the Servo engine backing `handle` to (w, h) logical pixels — the
+/// rendering context, the WebView, and the cached readback size all move
+/// together so the next frame fills the new bounds.
+fn engine_resize(handle: i64, w: u32, h: u32) {
+    if w == 0 || h == 0 {
+        return;
+    }
+    ENGINES.with(|e| {
+        if let Some(engine) = e.borrow().get(&handle) {
+            let size = PhysicalSize::new(w, h);
+            engine.rc.resize(size);
+            engine.webview.resize(size);
+            engine.size.set((w, h));
+        }
+    });
+}
+
 /// Create a Servo-backed WebView widget. Returns the Perry widget handle (the
 /// same contract as the WKWebView `create`). Falls back to handle `0` on
 /// engine-construction failure so the caller can degrade gracefully.
@@ -157,28 +295,39 @@ pub fn create(url: &str, width: f64, height: f64) -> i64 {
     webview.focus();
     webview.resize(PhysicalSize::new(w, h));
 
-    // The displayed surface: a layer-backed NSImageView sized to the widget.
+    // The widget view: a PerryServoView (captures input + resize) holding an
+    // NSImageView subview that displays the rendered frames (autoresized to fill).
     let frame = objc2_core_foundation::CGRect::new(
         objc2_core_foundation::CGPoint::new(0.0, 0.0),
-        objc2_core_foundation::CGSize::new(w as f64, h as f64),
+        CGSize::new(w as f64, h as f64),
     );
-    let view: Retained<NSImageView> =
+    let container: Retained<PerryServoView> = {
+        let this = PerryServoView::alloc(mtm).set_ivars(ServoViewIvars {
+            handle: Cell::new(0),
+        });
+        unsafe { msg_send![super(this), initWithFrame: frame] }
+    };
+    let image_view: Retained<NSImageView> =
         unsafe { msg_send![NSImageView::alloc(mtm), initWithFrame: frame] };
     unsafe {
-        let _: () = msg_send![&*view, setWantsLayer: true];
+        let _: () = msg_send![&*image_view, setWantsLayer: true];
         // NSImageScaleAxesIndependently = 3 — stretch to fill the widget box.
-        let _: () = msg_send![&*view, setImageScaling: 3usize];
+        let _: () = msg_send![&*image_view, setImageScaling: 3usize];
+        // NSViewWidthSizable (2) | NSViewHeightSizable (16) — track the container.
+        let _: () = msg_send![&*image_view, setAutoresizingMask: 18usize];
+        let _: () = msg_send![&*container, addSubview: &*image_view];
     }
 
-    let view_ns: Retained<NSView> = unsafe { Retained::cast_unchecked(view.clone()) };
+    let view_ns: Retained<NSView> = unsafe { Retained::cast_unchecked(container.clone()) };
     let handle = super::register_widget(view_ns);
+    container.ivars().handle.set(handle);
 
     let engine = Rc::new(ServoEngine {
         servo,
         webview,
         rc,
         state,
-        view,
+        view: image_view,
         size: Cell::new((w, h)),
     });
     // Paint the first frame immediately so the view isn't blank pre-load.
@@ -228,9 +377,8 @@ pub fn evaluate_js(handle: i64, js: &str, callback: f64) {
                     Err(_) => String::new(),
                 };
                 if callback != 0.0 {
+                    let boxed = super::webview::nanbox_str(&s);
                     crate::catch_callback_panic("servo webview evaluateJs callback", || unsafe {
-                        let js_str = js_string_from_bytes(s.as_ptr(), s.len() as i64);
-                        let boxed = js_nanbox_string(js_str as i64);
                         js_closure_call1(js_nanbox_get_pointer(callback) as *const u8, boxed);
                     });
                 }

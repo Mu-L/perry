@@ -47,6 +47,34 @@ servo-script = { path = "../servo-forks/servo-script" }
 For a landable PR the fork needs a permanent home (git fork/submodule or in-tree
 vendor) rather than the local path above.
 
+## Selecting the Servo backend
+
+- **At build time:** `perry compile app.ts --webview servo -o app` — links the
+  Servo-enabled UI lib variant (`libperry_ui_macos_servo.a`) so the app defaults
+  to Servo. Build that variant with
+  `cargo build --release -p perry-ui-macos --features servo-webview` and place it
+  alongside `libperry_ui_macos.a` (cargo emits the same filename regardless of
+  features, so rename/scope it as the `_servo` variant). If it's missing, the
+  compiler warns and falls back to the WKWebView lib.
+- **At runtime:** `PERRY_WEBVIEW=servo` selects Servo for a build that linked the
+  variant; anything else uses the system WKWebView.
+
+## Engine capabilities & limitations
+
+The `ServoEngine` (`servo_webview.rs`) drives the WebView widget through the same
+FFI surface as WKWebView:
+
+- ✅ Navigation (`loadUrl` / `reload`), `evaluateJavaScript` → string callback,
+  `onLoaded` on `LoadStatus::Complete`.
+- ✅ Rendering — offscreen software render blitted into a layer-backed
+  `NSImageView` at ~60 Hz.
+- ✅ Interaction — a `PerryServoView` (flipped, first-responder `NSView`) forwards
+  mouse down/up/drag, left/right buttons, and scroll wheel to Servo, and resizes
+  the engine (rendering context + WebView) on layout via `setFrameSize:`.
+- ⏳ Follow-ups: keyboard input (key-code → `KeyboardEvent` translation), hover
+  (`mouseMoved` needs an `NSTrackingArea`), and HiDPI backing-scale (the software
+  context renders at logical pixels today).
+
 ## ML-KEM migration: correctness note
 
 The migration is **type-correct** (the full Servo stack compiles). Behavioral

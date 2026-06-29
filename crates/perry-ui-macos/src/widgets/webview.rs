@@ -84,7 +84,7 @@ fn str_from_header(ptr: *const u8) -> &'static str {
     }
 }
 
-fn nanbox_str(s: &str) -> f64 {
+pub(super) fn nanbox_str(s: &str) -> f64 {
     let bytes = s.as_bytes();
     unsafe {
         let p = js_string_from_bytes(bytes.as_ptr(), bytes.len() as i64);
