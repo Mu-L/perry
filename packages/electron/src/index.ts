@@ -20,6 +20,27 @@ import {
   webviewAddUserScript,
   appRequestLoop,
   appQuit,
+  clipboardRead,
+  clipboardWrite,
+  trayCreate,
+  traySetIcon,
+  traySetTooltip,
+  trayAttachMenu,
+  trayOnClick,
+  trayDestroy,
+  menuCreate,
+  menuAddItem,
+  menuAddSeparator,
+  menuAddSubmenu,
+  menuAddItemWithShortcut,
+  menuAddStandardAction,
+  menuBarCreate,
+  menuBarAddMenu,
+  menuBarAttach,
+  openFileDialog,
+  openFolderDialog,
+  saveFileDialog,
+  onActivate,
 } from "perry/ui";
 import * as os from "os";
 import * as path from "path";
@@ -209,6 +230,13 @@ const openWindows: BrowserWindow[] = [];
 // Keeps the app-ready closure passed to appRequestLoop alive from module init
 // until the native loop fires it after main top-level (GC root).
 let rootedOnReady: (() => void) | null = null;
+// Same GC-root rationale for the dock-activate closure handed to the native
+// onActivate hook — held until the user clicks the dock icon.
+let rootedOnActivate: (() => void) | null = null;
+// Native-held menubar/tray handles + their click closures. The native side
+// stores these; rooting them here keeps the menubar/tray and every menu-item
+// callback alive for the app's lifetime (otherwise GC could reclaim them).
+const rootedNativeUi: any[] = [];
 
 class BrowserWindow extends EventEmitter {
   // perry/ui window operations, captured as closures over the LOCAL `win` in
@@ -390,6 +418,12 @@ class App extends EventEmitter {
       for (let i = 0; i < resolvers.length; i++) resolvers[i]();
     };
     appRequestLoop(rootedOnReady);
+    // macOS 'activate' — fired when the dock icon is clicked (incl. after all
+    // windows are closed). Electron apps reopen their window from here.
+    rootedOnActivate = () => {
+      self.emit("activate", {}, openWindows.length > 0);
+    };
+    onActivate(rootedOnActivate);
   }
 
   whenReady(): Promise<void> {
@@ -457,9 +491,104 @@ class App extends EventEmitter {
 export const app = new App();
 
 // ---------------------------------------------------------------------------
-// Menu / MenuItem  (v1: template is accepted; native menubar wiring is a
-// follow-up. setApplicationMenu(null) hides — accepted as a no-op so apps run.)
+// Menu / MenuItem
+//
+// Menu.buildFromTemplate accepts the Electron template; setApplicationMenu wires
+// it into the native macOS menubar (perry/ui menuBar*). Items with a `click`
+// callback fire it; `role` items map to the standard AppKit selector
+// (copy/paste/undo/quit/…) sent to the first responder; `type: "separator"`
+// and nested `submenu` are supported. Accelerators ("CmdOrCtrl+S") are
+// normalized to perry/ui's "Cmd+Shift+S" syntax.
 // ---------------------------------------------------------------------------
+
+// Electron accelerator → perry/ui shortcut. CmdOrCtrl collapses to Cmd on
+// macOS; Super/Meta → Cmd; everything else passes through to parse_shortcut.
+function normalizeAccelerator(accel: string): string {
+  return accel
+    .replace(/CommandOrControl/gi, "Cmd")
+    .replace(/CmdOrCtrl/gi, "Cmd")
+    .replace(/Command/gi, "Cmd")
+    .replace(/Control/gi, "Ctrl")
+    .replace(/Option/gi, "Alt")
+    .replace(/Super/gi, "Cmd")
+    .replace(/Meta/gi, "Cmd");
+}
+
+// Electron menu role → AppKit first-responder selector (so copy/paste/etc.
+// act on the focused webview). Roles without a standard selector fall through
+// to a plain labeled item.
+const ROLE_SELECTORS: { [role: string]: string } = {
+  undo: "undo:",
+  redo: "redo:",
+  cut: "cut:",
+  copy: "copy:",
+  paste: "paste:",
+  pasteandmatchstyle: "pasteAsPlainText:",
+  delete: "delete:",
+  selectall: "selectAll:",
+  quit: "terminate:",
+  minimize: "performMiniaturize:",
+  close: "performClose:",
+  togglefullscreen: "toggleFullScreen:",
+  hide: "hide:",
+  hideothers: "hideOtherApplications:",
+  unhide: "unhideAllApplications:",
+};
+
+const ROLE_LABELS: { [role: string]: string } = {
+  undo: "Undo", redo: "Redo", cut: "Cut", copy: "Copy", paste: "Paste",
+  pasteandmatchstyle: "Paste and Match Style", delete: "Delete",
+  selectall: "Select All", quit: "Quit", minimize: "Minimize", close: "Close",
+  togglefullscreen: "Toggle Full Screen", hide: "Hide", hideothers: "Hide Others",
+  unhide: "Show All",
+};
+
+// A Menu instance carries `.items`; a raw template submenu is an array. (The
+// shim's buildFromTemplate only wraps the top level, so nested submenus arrive
+// as raw template objects — read fields generically.)
+function menuItemList(submenu: any): any[] {
+  if (!submenu) return [];
+  if (Array.isArray(submenu)) return submenu;
+  if (submenu.items && Array.isArray(submenu.items)) return submenu.items;
+  return [];
+}
+
+// Build a native perry/ui menu handle from a list of Electron menu items.
+function buildNativeMenu(items: any[]): any {
+  const native = menuCreate();
+  rootedNativeUi.push(native);
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    if (item.type === "separator") {
+      menuAddSeparator(native);
+      continue;
+    }
+    if (item.submenu) {
+      const child = buildNativeMenu(menuItemList(item.submenu));
+      menuAddSubmenu(native, item.label || "", child);
+      continue;
+    }
+    const role = item.role ? String(item.role).toLowerCase() : "";
+    if (role && ROLE_SELECTORS[role]) {
+      const label = item.label || ROLE_LABELS[role] || "";
+      const accel = item.accelerator ? normalizeAccelerator(item.accelerator) : "";
+      menuAddStandardAction(native, label, ROLE_SELECTORS[role], accel);
+      continue;
+    }
+    const label = item.label || ROLE_LABELS[role] || "";
+    const click = item.click;
+    const cb = () => {
+      if (typeof click === "function") click();
+    };
+    rootedNativeUi.push(cb);
+    if (item.accelerator) {
+      menuAddItemWithShortcut(native, label, normalizeAccelerator(item.accelerator), cb);
+    } else {
+      menuAddItem(native, label, cb);
+    }
+  }
+  return native;
+}
 
 class MenuItem {
   label: string;
@@ -478,6 +607,8 @@ class MenuItem {
   }
 }
 
+let appMenu: Menu | null = null;
+
 class Menu {
   items: MenuItem[];
   constructor() {
@@ -487,6 +618,20 @@ class Menu {
     this.items.push(item);
   }
   popup(_options?: any): void {}
+
+  // Build the native menubar this Menu represents: each top-level item becomes
+  // a bar menu whose contents are that item's submenu.
+  _buildNativeMenuBar(): any {
+    const bar = menuBarCreate();
+    rootedNativeUi.push(bar);
+    for (let i = 0; i < this.items.length; i++) {
+      const top = this.items[i];
+      const sub = buildNativeMenu(menuItemList(top.submenu));
+      menuBarAddMenu(bar, top.label || "", sub);
+    }
+    return bar;
+  }
+
   static buildFromTemplate(template: any[]): Menu {
     const menu = new Menu();
     for (let i = 0; i < template.length; i++) {
@@ -494,29 +639,61 @@ class Menu {
     }
     return menu;
   }
-  static setApplicationMenu(_menu: Menu | null): void {
-    /* v1: native menubar already provides standard Cmd+Q etc. */
+  static setApplicationMenu(menu: Menu | null): void {
+    appMenu = menu;
+    if (!menu) return; // removing the native menubar isn't supported in v1
+    menuBarAttach(menu._buildNativeMenuBar());
   }
   static getApplicationMenu(): Menu | null {
-    return null;
+    return appMenu;
   }
 }
 
 export { Menu, MenuItem, BrowserWindow, WebContents };
 
 // ---------------------------------------------------------------------------
-// dialog  (v1: returns canceled; native NSOpenPanel/NSSavePanel wiring is a
-// follow-up. Apps that gate on `canceled` keep running.)
+// dialog — native NSOpenPanel/NSSavePanel via perry/ui. The native dialogs are
+// single-selection; `properties: ["openDirectory"]` picks the folder panel.
+// Both options-only and (window, options) call signatures are accepted.
 // ---------------------------------------------------------------------------
 
+// dialog calls come as showXxx(options) or showXxx(browserWindow, options).
+function dialogOptions(a?: any, b?: any): any {
+  if (b !== undefined) return b || {};
+  // Single arg: a BrowserWindow has no dialog option keys, so treat an object
+  // with `properties`/`defaultPath`/`filters`/`title` as the options bag.
+  if (a && (a.properties || a.defaultPath || a.filters || a.title)) return a;
+  return a && !(a instanceof BrowserWindow) ? a : {};
+}
+
 export const dialog = {
-  showOpenDialog(_window?: any, _options?: any): Promise<{ canceled: boolean; filePaths: string[] }> {
-    console.warn("[electron] dialog.showOpenDialog is a v1 stub (returns canceled)");
-    return Promise.resolve({ canceled: true, filePaths: [] });
+  showOpenDialog(a?: any, b?: any): Promise<{ canceled: boolean; filePaths: string[] }> {
+    const options = dialogOptions(a, b);
+    const props: string[] = options.properties || [];
+    const wantDir = props.indexOf("openDirectory") >= 0;
+    return new Promise((resolve) => {
+      const cb = (selected: string) => {
+        if (!selected) resolve({ canceled: true, filePaths: [] });
+        else resolve({ canceled: false, filePaths: [selected] });
+      };
+      rootedNativeUi.push(cb);
+      if (wantDir) openFolderDialog(cb);
+      else openFileDialog(cb);
+    });
   },
-  showSaveDialog(_window?: any, _options?: any): Promise<{ canceled: boolean; filePath: string }> {
-    console.warn("[electron] dialog.showSaveDialog is a v1 stub (returns canceled)");
-    return Promise.resolve({ canceled: true, filePath: "" });
+  showSaveDialog(a?: any, b?: any): Promise<{ canceled: boolean; filePath: string }> {
+    const options = dialogOptions(a, b);
+    const defaultPath: string = options.defaultPath || "";
+    const base = defaultPath ? path.basename(defaultPath) : "untitled";
+    const ext = path.extname(base).replace(/^\./, "");
+    return new Promise((resolve) => {
+      const cb = (selected: string) => {
+        if (!selected) resolve({ canceled: true, filePath: "" });
+        else resolve({ canceled: false, filePath: selected });
+      };
+      rootedNativeUi.push(cb);
+      saveFileDialog(cb, base, ext);
+    });
   },
   showMessageBox(_window?: any, _options?: any): Promise<{ response: number; checkboxChecked: boolean }> {
     return Promise.resolve({ response: 0, checkboxChecked: false });
@@ -548,6 +725,113 @@ export const shell = {
   showItemInFolder(_p: string): void {},
   beep(): void {},
 };
+
+// ---------------------------------------------------------------------------
+// clipboard — system pasteboard via perry/ui (text in v1).
+// ---------------------------------------------------------------------------
+
+export const clipboard = {
+  readText(_type?: string): string {
+    return clipboardRead();
+  },
+  writeText(text: string, _type?: string): void {
+    clipboardWrite(text);
+  },
+  clear(_type?: string): void {
+    clipboardWrite("");
+  },
+  availableFormats(_type?: string): string[] {
+    return ["text/plain"];
+  },
+};
+
+// ---------------------------------------------------------------------------
+// nativeImage — thin wrapper carrying the source path (Tray/dock icons read it).
+// ---------------------------------------------------------------------------
+
+class NativeImage {
+  // Source file path ("" for empty / unsupported sources).
+  _path: string;
+  constructor(p: string) {
+    this._path = p;
+  }
+  isEmpty(): boolean {
+    return this._path === "";
+  }
+  getSize(): { width: number; height: number } {
+    return { width: 0, height: 0 };
+  }
+  toDataURL(): string {
+    return "";
+  }
+}
+
+// Accept a path string or a NativeImage anywhere Electron takes an "image".
+function iconToPath(icon: any): string {
+  if (typeof icon === "string") return icon;
+  if (icon && typeof icon._path === "string") return icon._path;
+  return "";
+}
+
+export const nativeImage = {
+  createFromPath(p: string): NativeImage {
+    return new NativeImage(p);
+  },
+  createEmpty(): NativeImage {
+    return new NativeImage("");
+  },
+  createFromDataURL(_dataUrl: string): NativeImage {
+    return new NativeImage("");
+  },
+  createFromBuffer(_buffer: any, _options?: any): NativeImage {
+    return new NativeImage("");
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Tray — system menu-bar status item via perry/ui tray*.
+// ---------------------------------------------------------------------------
+
+class Tray extends EventEmitter {
+  private _handle: any;
+  private _destroyed: boolean;
+
+  constructor(image: string | NativeImage) {
+    super();
+    this._destroyed = false;
+    this._handle = trayCreate(iconToPath(image));
+    rootedNativeUi.push(this._handle);
+    const self = this;
+    const onClick = () => self.emit("click");
+    rootedNativeUi.push(onClick);
+    trayOnClick(this._handle, onClick);
+  }
+
+  setImage(image: string | NativeImage): void {
+    traySetIcon(this._handle, iconToPath(image));
+  }
+  setToolTip(toolTip: string): void {
+    traySetTooltip(this._handle, toolTip);
+  }
+  setTitle(_title: string, _options?: any): void {
+    /* status-item title text — not wired in v1 */
+  }
+  setContextMenu(menu: Menu | null): void {
+    if (menu) trayAttachMenu(this._handle, buildNativeMenu(menuItemList(menu)));
+  }
+  setPressedImage(_image: string | NativeImage): void {}
+  popUpContextMenu(_menu?: any, _position?: any): void {}
+  isDestroyed(): boolean {
+    return this._destroyed;
+  }
+  destroy(): void {
+    if (this._destroyed) return;
+    trayDestroy(this._handle);
+    this._destroyed = true;
+  }
+}
+
+export { Tray };
 
 // ---------------------------------------------------------------------------
 // ipcRenderer / contextBridge — renderer-only in Electron. Provided here so a
@@ -597,6 +881,9 @@ export default {
   MenuItem,
   dialog,
   shell,
+  clipboard,
+  nativeImage,
+  Tray,
   nativeTheme,
   WebContents,
 };
