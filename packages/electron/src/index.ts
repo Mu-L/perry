@@ -227,6 +227,22 @@ interface BrowserWindowOptions {
 let nextWebContentsId = 1;
 const openWindows: BrowserWindow[] = [];
 
+// True if any open window is currently visible (for the 'activate' event's
+// hasVisibleWindows arg — a hidden window must not count).
+function anyWindowVisible(): boolean {
+  for (let i = 0; i < openWindows.length; i++) {
+    if (openWindows[i].isVisible()) return true;
+  }
+  return false;
+}
+
+// Drop a one-shot native callback from the GC-root array once it has fired
+// (dialog completion handlers only need to live until the native side replies).
+function unrootNativeUi(cb: any): void {
+  const i = rootedNativeUi.indexOf(cb);
+  if (i >= 0) rootedNativeUi.splice(i, 1);
+}
+
 // Keeps the app-ready closure passed to appRequestLoop alive from module init
 // until the native loop fires it after main top-level (GC root).
 let rootedOnReady: (() => void) | null = null;
@@ -251,11 +267,13 @@ class BrowserWindow extends EventEmitter {
   private _setSize: (w: number, h: number) => void;
   webContents: WebContents;
   private destroyed: boolean;
+  private _visible: boolean;
   private preloadPath: string | undefined;
 
   constructor(options?: BrowserWindowOptions) {
     super();
     this.destroyed = false;
+    this._visible = false;
     const opts = options || {};
     const width = opts.width || 800;
     const height = opts.height || 600;
@@ -309,6 +327,7 @@ class BrowserWindow extends EventEmitter {
     win.setBody(wv);
     if (opts.show !== false) {
       win.show();
+      this._visible = true;
     }
     openWindows.push(this);
   }
@@ -327,15 +346,21 @@ class BrowserWindow extends EventEmitter {
 
   show(): void {
     this._show();
+    this._visible = true;
   }
   hide(): void {
     this._hide();
+    this._visible = false;
+  }
+  isVisible(): boolean {
+    return this._visible && !this.destroyed;
   }
   close(): void {
     if (this.destroyed) return;
     this.emit("close");
     this._close();
     this.destroyed = true;
+    this._visible = false;
     const idx = openWindows.indexOf(this);
     if (idx >= 0) openWindows.splice(idx, 1);
     this.emit("closed");
@@ -420,8 +445,10 @@ class App extends EventEmitter {
     appRequestLoop(rootedOnReady);
     // macOS 'activate' — fired when the dock icon is clicked (incl. after all
     // windows are closed). Electron apps reopen their window from here.
+    // hasVisibleWindows must reflect *visible* windows, not merely open ones
+    // (a hidden window must not suppress the reopen pattern).
     rootedOnActivate = () => {
-      self.emit("activate", {}, openWindows.length > 0);
+      self.emit("activate", {}, anyWindowVisible());
     };
     onActivate(rootedOnActivate);
   }
@@ -641,8 +668,16 @@ class Menu {
   }
   static setApplicationMenu(menu: Menu | null): void {
     appMenu = menu;
-    if (!menu) return; // removing the native menubar isn't supported in v1
-    menuBarAttach(menu._buildNativeMenuBar());
+    if (menu) {
+      menuBarAttach(menu._buildNativeMenuBar());
+    } else {
+      // No native "remove menubar" API; attach a fresh empty bar so the app's
+      // custom menus are cleared rather than left live (keeps the native state
+      // consistent with getApplicationMenu() === null).
+      const empty = menuBarCreate();
+      rootedNativeUi.push(empty);
+      menuBarAttach(empty);
+    }
   }
   static getApplicationMenu(): Menu | null {
     return appMenu;
@@ -673,6 +708,7 @@ export const dialog = {
     const wantDir = props.indexOf("openDirectory") >= 0;
     return new Promise((resolve) => {
       const cb = (selected: string) => {
+        unrootNativeUi(cb);
         if (!selected) resolve({ canceled: true, filePaths: [] });
         else resolve({ canceled: false, filePaths: [selected] });
       };
@@ -688,6 +724,7 @@ export const dialog = {
     const ext = path.extname(base).replace(/^\./, "");
     return new Promise((resolve) => {
       const cb = (selected: string) => {
+        unrootNativeUi(cb);
         if (!selected) resolve({ canceled: true, filePath: "" });
         else resolve({ canceled: false, filePath: selected });
       };
@@ -781,9 +818,13 @@ export const nativeImage = {
     return new NativeImage("");
   },
   createFromDataURL(_dataUrl: string): NativeImage {
+    // v1 supports path-backed images only; data-URL/buffer sources return an
+    // empty image. Warn so a missing Tray/dock icon isn't a silent surprise.
+    console.warn("[electron] nativeImage.createFromDataURL is unsupported (returns an empty image)");
     return new NativeImage("");
   },
   createFromBuffer(_buffer: any, _options?: any): NativeImage {
+    console.warn("[electron] nativeImage.createFromBuffer is unsupported (returns an empty image)");
     return new NativeImage("");
   },
 };
@@ -808,16 +849,23 @@ class Tray extends EventEmitter {
   }
 
   setImage(image: string | NativeImage): void {
+    if (this._destroyed) return;
     traySetIcon(this._handle, iconToPath(image));
   }
   setToolTip(toolTip: string): void {
+    if (this._destroyed) return;
     traySetTooltip(this._handle, toolTip);
   }
   setTitle(_title: string, _options?: any): void {
     /* status-item title text — not wired in v1 */
   }
   setContextMenu(menu: Menu | null): void {
-    if (menu) trayAttachMenu(this._handle, buildNativeMenu(menuItemList(menu)));
+    if (this._destroyed) return;
+    // `null` detaches the current menu — attach a fresh empty native menu so
+    // the previous context menu doesn't linger.
+    const native = menu ? buildNativeMenu(menuItemList(menu)) : menuCreate();
+    if (!menu) rootedNativeUi.push(native);
+    trayAttachMenu(this._handle, native);
   }
   setPressedImage(_image: string | NativeImage): void {}
   popUpContextMenu(_menu?: any, _position?: any): void {}
