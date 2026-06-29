@@ -8101,6 +8101,7 @@ version = "0.5.1208"
 dependencies = [
  "base64 0.22.1",
  "block2",
+ "dpi",
  "libc",
  "objc2",
  "objc2-app-kit",
@@ -8109,6 +8110,7 @@ dependencies = [
  "perry-ui",
  "perry-ui-testkit",
  "servo",
+ "url",
 ]
 
 [[package]]

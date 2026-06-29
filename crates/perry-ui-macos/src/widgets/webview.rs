@@ -557,6 +557,16 @@ pub fn create(url_ptr: *const u8, width: f64, height: f64, ephemeral_hint: f64) 
     let url = str_from_header(url_ptr).to_string();
     let mtm = MainThreadMarker::new().expect("perry/ui must run on the main thread");
 
+    // Experimental Servo backend (PERRY_WEBVIEW=servo). On engine-construction
+    // failure we fall through to the system WKWebView below.
+    #[cfg(feature = "servo-webview")]
+    if super::servo_webview::is_servo_requested() {
+        let handle = super::servo_webview::create(&url, width, height);
+        if handle != 0 {
+            return handle;
+        }
+    }
+
     // Preflight macOS TCC for camera + microphone. WKUIDelegate grants the
     // web-origin permission later, but the process still needs OS-level access.
     request_av_capture_access_once();
@@ -683,6 +693,11 @@ pub fn load_url(handle: i64, url_ptr: *const u8) {
     if url.is_empty() {
         return;
     }
+    #[cfg(feature = "servo-webview")]
+    if super::servo_webview::has(handle) {
+        super::servo_webview::load_url(handle, &url);
+        return;
+    }
     if let Some(wv) = webview_for_handle(handle) {
         unsafe { load_url_on_webview(wv, &url) };
     }
@@ -715,6 +730,11 @@ unsafe fn load_url_on_webview(webview: *mut AnyObject, url: &str) {
 }
 
 pub fn reload(handle: i64) {
+    #[cfg(feature = "servo-webview")]
+    if super::servo_webview::has(handle) {
+        super::servo_webview::reload(handle);
+        return;
+    }
     if let Some(wv) = webview_for_handle(handle) {
         unsafe {
             let _: *mut AnyObject = msg_send![wv, reload];
@@ -753,6 +773,11 @@ pub fn can_go_back(handle: i64) -> i64 {
 /// string for predictable user code (matches `localStorage.getItem` shape).
 pub fn evaluate_js(handle: i64, js_ptr: *const u8, callback: f64) {
     let js = str_from_header(js_ptr).to_string();
+    #[cfg(feature = "servo-webview")]
+    if super::servo_webview::has(handle) {
+        super::servo_webview::evaluate_js(handle, &js, callback);
+        return;
+    }
     let wv = match webview_for_handle(handle) {
         Some(w) => w,
         None => return,
@@ -894,6 +919,11 @@ pub fn set_on_should_navigate(handle: i64, closure: f64) {
 }
 
 pub fn set_on_loaded(handle: i64, closure: f64) {
+    #[cfg(feature = "servo-webview")]
+    if super::servo_webview::has(handle) {
+        super::servo_webview::set_on_loaded(handle, closure);
+        return;
+    }
     if let Some(key) = HANDLE_TO_KEY.with(|m| m.borrow().get(&handle).copied()) {
         WEBVIEW_STATES.with(|s| {
             if let Some(st) = s.borrow_mut().get_mut(&key) {
