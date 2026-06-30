@@ -70,9 +70,49 @@ FFI surface as WKWebView:
 - ✅ Interaction — a `PerryServoView` (flipped, first-responder `NSView`) forwards
   mouse down/up/drag, left/right buttons, and scroll wheel to Servo, and resizes
   the engine (rendering context + WebView) on layout via `setFrameSize:`.
-- ⏳ Follow-ups: keyboard input (key-code → `KeyboardEvent` translation), hover
-  (`mouseMoved` needs an `NSTrackingArea`), and HiDPI backing-scale (the software
-  context renders at logical pixels today).
+- ✅ **Electron-compat IPC** — full renderer↔main round-trip (`ipcRenderer.invoke`,
+  console forwarding), so Electron-shim apps *run*, not just render. See below.
+- ⏳ Follow-ups: keyboard input (key-code → `KeyboardEvent` translation) and hover
+  (`mouseMoved` needs an `NSTrackingArea`).
+
+### Two non-obvious embedding gotchas
+
+1. **`loadUrl` must rebuild the webview.** Servo's imperative `WebView::load(url)`
+   navigates and reaches `LoadStatus::Complete`, but in this offscreen
+   software-rendering setup it does **not** re-composite — the first page's frame
+   persists. Only `WebViewBuilder::url(...)` produces a fresh composited frame, so
+   `set_url` tears down and rebuilds the `WebView` (carrying the
+   `UserContentManager`) on every navigation. Tom's app loads via
+   `BrowserWindow` → `about:blank` then `loadFile`, so without this the window
+   stays on the blank initial frame.
+2. **The tick must `make_current` + spin hard.** Painting runs from the `NSTimer`
+   callback (a different call stack than where the rendering context was first
+   made current), and the layout/compositor pipeline needs many spins per frame —
+   so `tick` calls `rc.make_current()` then `spin_event_loop` ×10 before paint.
+   A no-op `EventLoopWaker` is correct here; driving spins from the waker starved
+   the pipeline in testing.
+
+### Renderer→main IPC (no `messageHandlers`)
+
+WKWebView gives the Electron shim a built-in `window.webkit.messageHandlers`
+channel; Servo 0.1.x has **no** JS→embedder message primitive. The shim's bridge
+already exposes a `window.__perryNativePost(json)` fallback hook, so on Servo we
+wire that to a host-drained **outbox**:
+
+- A document-start `UserContentManager` script defines
+  `window.__perryNativePost = j => window.__perryOutbox.push(j)` (injected ahead
+  of the app's preload, alongside the bridge and app scripts).
+- Each `tick`, the host drains the outbox via `evaluate_javascript` (frames joined
+  by `U+0002`, which JSON escapes) and hands each frame to the registered
+  `onMessage` closure — the exact payload WKWebView delivers via `messageHandlers`.
+- main→renderer replies use `evaluate_javascript(window.__perryResolve(...))`,
+  which already worked.
+
+A `console.log` side-channel is tempting but **wrong**: the bridge wraps every
+`console.*` method to forward renderer logs, so posting through console
+re-captures our own IPC frames and recurses infinitely. The outbox avoids console
+entirely. (A *proper* `window.perryHost.postMessage` API could be added to the
+`servo-script` fork later; the outbox needs zero Servo changes.)
 
 ## ML-KEM migration: correctness note
 

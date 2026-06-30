@@ -946,6 +946,11 @@ pub fn set_on_error(handle: i64, closure: f64) {
 /// Electron-compat IPC: register the TS closure that receives JSON strings the
 /// page posts through the "perry" script message handler (renderer → main).
 pub fn set_on_message(handle: i64, closure: f64) {
+    #[cfg(feature = "servo-webview")]
+    if super::servo_webview::has(handle) {
+        super::servo_webview::set_on_message(handle, closure);
+        return;
+    }
     if let Some(key) = HANDLE_TO_KEY.with(|m| m.borrow().get(&handle).copied()) {
         WEBVIEW_STATES.with(|s| {
             if let Some(st) = s.borrow_mut().get_mut(&key) {
@@ -962,6 +967,11 @@ pub fn set_on_message(handle: i64, closure: f64) {
 pub fn add_user_script(handle: i64, src_ptr: *const u8) {
     let src = str_from_header(src_ptr).to_string();
     if src.is_empty() {
+        return;
+    }
+    #[cfg(feature = "servo-webview")]
+    if super::servo_webview::has(handle) {
+        super::servo_webview::add_user_script(handle, &src);
         return;
     }
     if let Some(wv) = webview_for_handle(handle) {

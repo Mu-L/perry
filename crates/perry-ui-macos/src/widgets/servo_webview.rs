@@ -28,13 +28,30 @@ use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{NSEvent, NSImageView, NSView};
 use objc2_core_foundation::{CGPoint, CGSize};
 use objc2_foundation::{MainThreadMarker, NSString};
+use euclid::Scale;
 use servo::{
-    DeviceIntRect, DeviceIntSize, DevicePoint, InputEvent, LoadStatus, MouseButton,
-    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, RenderingContext, Servo, ServoBuilder,
-    SoftwareRenderingContext, WebView, WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta,
-    WheelEvent, WheelMode,
+    DeviceIndependentPixel, DeviceIntRect, DeviceIntSize, DevicePixel, DevicePoint, InputEvent,
+    LoadStatus, MouseButton, MouseButtonAction, MouseButtonEvent, MouseMoveEvent, RenderingContext,
+    Servo, ServoBuilder, SoftwareRenderingContext, UserContentManager, UserScript, WebView,
+    WebViewBuilder, WebViewDelegate, WebViewPoint, WheelDelta, WheelEvent, WheelMode,
 };
 use url::Url;
+
+/// Document-start shim providing the Electron-compat bridge's renderer→main
+/// transport on Servo (which has no WKWebView `messageHandlers`). The bridge's
+/// `window.__perryNativePost` fallback pushes each frame into an outbox array
+/// that the host drains via `evaluate_javascript` (see `drain_ipc`). A console
+/// side-channel can't work here: the bridge wraps every `console.*` method to
+/// forward logs, so posting through console would re-capture our frames forever.
+const PERRY_SERVO_IPC_SHIM: &str =
+    "window.__perryOutbox=window.__perryOutbox||[];\
+     window.__perryNativePost=function(j){try{window.__perryOutbox.push(j);}catch(e){}};";
+
+/// Reads and clears the outbox, returning the queued frames joined by U+0002
+/// (a control char JSON escapes, so it never appears inside a frame), or "".
+const PERRY_DRAIN_OUTBOX: &str =
+    "(function(){var o=window.__perryOutbox;\
+     if(!o||!o.length)return '';window.__perryOutbox=[];return o.join('\u{2}');})()";
 
 extern "C" {
     fn js_closure_call0(closure: *const u8) -> f64;
@@ -61,8 +78,9 @@ pub fn has(handle: i64) -> bool {
     ENGINES.with(|e| e.borrow().contains_key(&handle))
 }
 
-/// Servo's wake signal. We drive painting from a periodic timer, so this only
-/// needs to ensure the main run loop wakes; the timer does the spinning.
+/// Servo's wake signal. Painting is driven by the periodic `NSTimer` (which
+/// spins aggressively in `tick`), so this is intentionally inert — dispatching a
+/// tick from here instead starved the compositor pipeline in testing.
 #[derive(Clone)]
 struct TimerWaker;
 impl servo::EventLoopWaker for TimerWaker {
@@ -77,6 +95,11 @@ struct ServoState {
     loaded: Cell<bool>,
     /// NaN-boxed `onLoaded` TS closure, or `0.0` if unset.
     on_loaded: Cell<f64>,
+    /// NaN-boxed `onMessage` TS closure (renderer→main IPC), or `0.0` if unset.
+    on_message: Cell<f64>,
+    /// True while an outbox-drain `evaluate_javascript` is in flight, so ticks
+    /// don't pile up overlapping drains.
+    ipc_inflight: Cell<bool>,
     /// Set by `notify_new_frame_ready`; cleared after a blit.
     dirty: Cell<bool>,
 }
@@ -98,22 +121,56 @@ impl WebViewDelegate for ServoState {
     }
 }
 
+impl ServoState {
+    /// Deliver one renderer→main frame to the `onMessage` closure (the same
+    /// payload WKWebView delivers via `messageHandlers`).
+    fn deliver_message(&self, json: &str) {
+        let cb = self.on_message.get();
+        if cb == 0.0 {
+            return;
+        }
+        let nb = super::webview::nanbox_str(json);
+        crate::catch_callback_panic("servo webview onMessage", || unsafe {
+            let ptr = js_nanbox_get_pointer(cb) as *const u8;
+            if !ptr.is_null() {
+                js_closure_call1(ptr, nb);
+            }
+        });
+    }
+}
+
 /// A live Servo engine bound to one Perry widget view.
 struct ServoEngine {
     servo: Servo,
-    webview: WebView,
+    /// Replaceable: `load_url` rebuilds the webview with the new URL (imperative
+    /// `WebView::load` navigates but doesn't re-composite in this embedded
+    /// software-rendering setup; rebuilding with `WebViewBuilder::url` does).
+    webview: RefCell<WebView>,
     rc: Rc<SoftwareRenderingContext>,
     state: Rc<ServoState>,
     /// Layer-backed `NSImageView` that displays the rendered frames.
     view: Retained<NSImageView>,
     size: Cell<(u32, u32)>,
+    /// Document-start user scripts (the Electron-compat bridge + the app's
+    /// preload), accumulated before navigation and re-applied via a
+    /// `UserContentManager` each time `set_url` rebuilds the webview.
+    user_scripts: RefCell<Vec<String>>,
 }
 
 impl ServoEngine {
     /// One driver step: advance Servo, paint, present, and blit the frame.
     fn tick(&self) {
-        self.servo.spin_event_loop();
-        self.webview.paint();
+        // Bind the rendering context for this call stack — `tick` runs from the
+        // NSTimer callback, a different stack than where it was first made
+        // current, so `paint` would otherwise composite into an unbound context.
+        let _ = self.rc.make_current();
+        // Spin hard: the standalone probe pumped thousands of spins to let the
+        // layout/compositor pipeline produce a frame for the loaded page; one
+        // spin per 16 ms tick starves it.
+        for _ in 0..10 {
+            self.servo.spin_event_loop();
+        }
+        self.webview.borrow().paint();
         self.rc.present();
         let (w, h) = self.size.get();
         let rect = DeviceIntRect::from_size(DeviceIntSize::new(w as i32, h as i32));
@@ -121,6 +178,54 @@ impl ServoEngine {
             blit_rgba_to_image_view(&self.view, img.as_raw(), img.width(), img.height());
         }
         self.state.dirty.set(false);
+        self.drain_ipc();
+    }
+
+    /// Pump the renderer→main IPC: read and clear the page's outbox, then hand
+    /// each queued frame to the `onMessage` closure. One drain in flight at a
+    /// time (the eval is async); replies go back via `evaluate_javascript`.
+    fn drain_ipc(&self) {
+        if self.state.on_message.get() == 0.0 || self.state.ipc_inflight.replace(true) {
+            return;
+        }
+        let state = self.state.clone();
+        self.webview
+            .borrow()
+            .evaluate_javascript(PERRY_DRAIN_OUTBOX.to_string(), move |result| {
+                state.ipc_inflight.set(false);
+                let Ok(value) = result else { return };
+                let joined = servo_jsvalue_to_string(&value);
+                for frame in joined.split('\u{2}').filter(|f| !f.is_empty()) {
+                    state.deliver_message(frame);
+                }
+            });
+    }
+
+    /// Navigate by rebuilding the webview with `url` (the path that actually
+    /// re-composites; see the `webview` field note).
+    fn set_url(&self, url: Url) {
+        self.state.loaded.set(false);
+        let (w, h) = self.size.get();
+        let scale: Scale<f32, DeviceIndependentPixel, DevicePixel> = Scale::new(1.0);
+        // Inject the IPC shim first, then the accumulated bridge/preload scripts,
+        // so they all run at document-start for the page we're about to load.
+        let ucm = UserContentManager::new(&self.servo);
+        ucm.add_script(Rc::new(UserScript::new(
+            PERRY_SERVO_IPC_SHIM.to_string(),
+            None,
+        )));
+        for script in self.user_scripts.borrow().iter() {
+            ucm.add_script(Rc::new(UserScript::new(script.clone(), None)));
+        }
+        let webview = WebViewBuilder::new(&self.servo, self.rc.clone())
+            .delegate(self.state.clone())
+            .hidpi_scale_factor(scale)
+            .user_content_manager(Rc::new(ucm))
+            .url(url)
+            .build();
+        webview.focus();
+        webview.resize(PhysicalSize::new(w, h));
+        *self.webview.borrow_mut() = webview;
     }
 }
 
@@ -239,7 +344,7 @@ impl PerryServoView {
 fn engine_notify(handle: i64, event: InputEvent) {
     ENGINES.with(|e| {
         if let Some(engine) = e.borrow().get(&handle) {
-            engine.webview.notify_input_event(event);
+            engine.webview.borrow().notify_input_event(event);
         }
     });
 }
@@ -255,7 +360,7 @@ fn engine_resize(handle: i64, w: u32, h: u32) {
         if let Some(engine) = e.borrow().get(&handle) {
             let size = PhysicalSize::new(w, h);
             engine.rc.resize(size);
-            engine.webview.resize(size);
+            engine.webview.borrow().resize(size);
             engine.size.set((w, h));
         }
     });
@@ -282,10 +387,18 @@ pub fn create(url: &str, width: f64, height: f64) -> i64 {
     let state = Rc::new(ServoState {
         loaded: Cell::new(false),
         on_loaded: Cell::new(0.0),
+        on_message: Cell::new(0.0),
+        ipc_inflight: Cell::new(false),
         dirty: Cell::new(true),
     });
 
-    let mut builder = WebViewBuilder::new(&servo, rc.clone()).delegate(state.clone());
+    // Render at 1× to match the software rendering context, which is sized in
+    // device pixels (w, h). Without this, an embedded webview on a Retina screen
+    // defaults to 2×, rendering into a surface twice the context size → blank.
+    let scale: Scale<f32, DeviceIndependentPixel, DevicePixel> = Scale::new(1.0);
+    let mut builder = WebViewBuilder::new(&servo, rc.clone())
+        .delegate(state.clone())
+        .hidpi_scale_factor(scale);
     if !url.is_empty() {
         if let Ok(parsed) = Url::parse(url) {
             builder = builder.url(parsed);
@@ -324,11 +437,12 @@ pub fn create(url: &str, width: f64, height: f64) -> i64 {
 
     let engine = Rc::new(ServoEngine {
         servo,
-        webview,
+        webview: RefCell::new(webview),
         rc,
         state,
         view: image_view,
         size: Cell::new((w, h)),
+        user_scripts: RefCell::new(Vec::new()),
     });
     // Paint the first frame immediately so the view isn't blank pre-load.
     engine.tick();
@@ -346,8 +460,7 @@ pub fn load_url(handle: i64, url: &str) {
     if let Ok(parsed) = Url::parse(url) {
         ENGINES.with(|e| {
             if let Some(engine) = e.borrow().get(&handle) {
-                engine.state.loaded.set(false);
-                engine.webview.load(parsed);
+                engine.set_url(parsed);
             }
         });
     }
@@ -356,7 +469,7 @@ pub fn load_url(handle: i64, url: &str) {
 pub fn reload(handle: i64) {
     ENGINES.with(|e| {
         if let Some(engine) = e.borrow().get(&handle) {
-            engine.webview.reload();
+            engine.webview.borrow().reload();
         }
     });
 }
@@ -371,6 +484,7 @@ pub fn evaluate_js(handle: i64, js: &str, callback: f64) {
         };
         engine
             .webview
+            .borrow()
             .evaluate_javascript(js.to_string(), move |result| {
                 let s = match result {
                     Ok(v) => servo_jsvalue_to_string(&v),
@@ -391,6 +505,25 @@ pub fn set_on_loaded(handle: i64, closure: f64) {
     ENGINES.with(|e| {
         if let Some(engine) = e.borrow().get(&handle) {
             engine.state.on_loaded.set(closure);
+        }
+    });
+}
+
+/// Register the user's `onMessage` closure (renderer→main IPC) for a handle.
+pub fn set_on_message(handle: i64, closure: f64) {
+    ENGINES.with(|e| {
+        if let Some(engine) = e.borrow().get(&handle) {
+            engine.state.on_message.set(closure);
+        }
+    });
+}
+
+/// Queue a document-start user script. Applied to the next navigation (the
+/// Electron-compat bridge + app preload are added before `loadUrl`/`loadFile`).
+pub fn add_user_script(handle: i64, script: &str) {
+    ENGINES.with(|e| {
+        if let Some(engine) = e.borrow().get(&handle) {
+            engine.user_scripts.borrow_mut().push(script.to_string());
         }
     });
 }
