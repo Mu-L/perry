@@ -10974,6 +10974,7 @@ dependencies = [
 [[package]]
 name = "servo-script"
 version = "0.1.0"
+source = "git+https://github.com/PerryTS/servo-script-mlkem?rev=e4dc40a54366ac327845c8dd5013a3fb068d19b5#e4dc40a54366ac327845c8dd5013a3fb068d19b5"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm",

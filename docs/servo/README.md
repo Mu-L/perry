@@ -28,24 +28,23 @@ hard version conflicts had to be resolved:
    `ml-dsa` (the sibling ML-DSA/Dilithium crate Servo also uses) is **not** a
    conflict — perry doesn't depend on it.
 
-## Reproducing the fork
+## The fork
 
-```sh
-# 1. Vendor servo-script from the registry into a sibling dir:
-cp -R ~/.cargo/registry/src/*/servo-script-0.1.0 ../servo-forks/servo-script
-chmod -R u+w ../servo-forks/servo-script
-# 2. Apply the ml-kem 0.3.2 migration:
-cd ../servo-forks/servo-script && patch -p0 < .../docs/servo/servo-script-ml-kem-0.3.2.patch
-```
+The migrated `servo-script` is hosted at
+**https://github.com/PerryTS/servo-script-mlkem** — a vendored copy of crates.io
+`servo-script 0.1.0` whose *only* change vs upstream is the ML-KEM migration
+(captured in `servo-script-ml-kem-0.3.2.patch`). The workspace `Cargo.toml`
+patches it in by git rev, so the branch resolves on any machine (incl. CI):
 
-The workspace `Cargo.toml` then carries:
 ```toml
 [patch.crates-io]
-servo-script = { path = "../servo-forks/servo-script" }
+servo-script = { git = "https://github.com/PerryTS/servo-script-mlkem", rev = "<sha>" }
 ```
 
-For a landable PR the fork needs a permanent home (git fork/submodule or in-tree
-vendor) rather than the local path above.
+To regenerate the fork from scratch (e.g. to bump the servo version): vendor a
+fresh `servo-script-0.1.0` from the registry, apply
+`servo-script-ml-kem-0.3.2.patch`, and push to the fork repo, then update the
+`rev` above.
 
 ## Selecting the Servo backend
 
