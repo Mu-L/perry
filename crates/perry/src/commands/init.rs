@@ -162,20 +162,20 @@ fn merge_paths_into_existing(
     existing: &str,
     paths: &serde_json::Map<String, serde_json::Value>,
 ) -> std::result::Result<Option<String>, String> {
-    let mut root: serde_json::Value = serde_json::from_str(existing)
-        .map_err(|_| render_paths_block(paths))?;
+    let mut root: serde_json::Value =
+        serde_json::from_str(existing).map_err(|_| render_paths_block(paths))?;
     let obj = root
         .as_object_mut()
         .ok_or_else(|| render_paths_block(paths))?;
     let co = obj
         .entry("compilerOptions")
         .or_insert_with(|| serde_json::json!({}));
-    let co = co.as_object_mut().ok_or_else(|| render_paths_block(paths))?;
+    let co = co
+        .as_object_mut()
+        .ok_or_else(|| render_paths_block(paths))?;
     co.entry("baseUrl")
         .or_insert_with(|| serde_json::json!("."));
-    let existing_paths = co
-        .entry("paths")
-        .or_insert_with(|| serde_json::json!({}));
+    let existing_paths = co.entry("paths").or_insert_with(|| serde_json::json!({}));
     let existing_paths = existing_paths
         .as_object_mut()
         .ok_or_else(|| render_paths_block(paths))?;
