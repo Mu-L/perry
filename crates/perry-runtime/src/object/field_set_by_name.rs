@@ -607,6 +607,19 @@ pub extern "C" fn js_object_set_field_by_name(
                         }
                     } else if matches!(name_str, "name" | "length") {
                         return;
+                    } else if !crate::closure::closure_has_own_dynamic_prop(obj as usize, name_str)
+                        && crate::closure::closure_set_via_function_prototype_accessor(
+                            obj as usize,
+                            name_str,
+                            value,
+                            crate::value::js_nanbox_pointer(obj as i64),
+                        )
+                    {
+                        // Handled by an inherited %Function.prototype%
+                        // accessor (`Object.defineProperty(Function.prototype,
+                        // k, {get,set})`) — the setter ran (or threw for a
+                        // getter-only accessor); no own property is created.
+                        return;
                     }
                     crate::closure::closure_set_dynamic_prop(obj as usize, name_str, value);
                 }
@@ -653,6 +666,19 @@ pub extern "C" fn js_object_set_field_by_name(
                             return;
                         }
                     } else if matches!(name_str, "name" | "length") {
+                        return;
+                    } else if !crate::closure::closure_has_own_dynamic_prop(obj as usize, name_str)
+                        && crate::closure::closure_set_via_function_prototype_accessor(
+                            obj as usize,
+                            name_str,
+                            value,
+                            crate::value::js_nanbox_pointer(obj as i64),
+                        )
+                    {
+                        // Handled by an inherited %Function.prototype%
+                        // accessor (`Object.defineProperty(Function.prototype,
+                        // k, {get,set})`) — the setter ran (or threw for a
+                        // getter-only accessor); no own property is created.
                         return;
                     }
                     crate::closure::closure_set_dynamic_prop(obj as usize, name_str, value);
