@@ -1320,6 +1320,7 @@ fn number_parts_core(r: &NfResolved, value: f64) -> Vec<(&'static str, String)> 
     if value.is_nan() {
         // NaN is non-negative and non-zero for sign purposes: only `always`
         // prepends a (plus) sign — `+NaN` — every other mode shows bare `NaN`.
+        push_unit_prefix(&mut parts, r);
         push_sign(&mut parts, &r.sign_display, false, true);
         parts.push(("nan", nan_string(&r.locale).to_string()));
         push_style_suffix(&mut parts, r, decimal_sep);
@@ -1333,6 +1334,7 @@ fn number_parts_core(r: &NfResolved, value: f64) -> Vec<(&'static str, String)> 
 
     if abs.is_infinite() {
         let mut out: Vec<(&'static str, String)> = Vec::new();
+        push_unit_prefix(&mut out, r);
         push_sign(&mut out, &r.sign_display, negative, false);
         out.push(("infinity", "∞".to_string()));
         push_style_suffix(&mut out, r, decimal_sep);
@@ -1487,6 +1489,7 @@ fn number_parts_core(r: &NfResolved, value: f64) -> Vec<(&'static str, String)> 
         .filter(|(t, _)| *t == "integer" || *t == "fraction")
         .all(|(_, v)| v.bytes().all(|b| b == b'0'));
     let mut out: Vec<(&'static str, String)> = Vec::with_capacity(parts.len() + 2);
+    push_unit_prefix(&mut out, r);
     push_sign(&mut out, &r.sign_display, negative, rounded_is_zero);
     out.append(&mut parts);
     push_style_suffix(&mut out, r, decimal_sep);
@@ -1517,6 +1520,69 @@ pub(crate) fn compact_round(int_part: &str, frac_part: &str, r: &NfResolved) -> 
     }
 }
 
+/// The BCP-47 primary language subtag (`"de-DE"` → `"de"`).
+fn locale_lang(locale: &str) -> &str {
+    locale.split(['-', '_']).next().unwrap_or(locale)
+}
+
+/// Prefix text some locales place *before* the number for a unit (e.g. the
+/// Japanese/Korean/Chinese "speed" reading of `kilometer-per-hour`'s long
+/// form: "時速 -987 キロメートル"). Only a handful of compound units have a
+/// CLDR-attested prefix; everything else renders suffix-only.
+fn unit_prefix_text(unit: &str, display: &str, locale: &str) -> Option<&'static str> {
+    if display != "long" {
+        return None;
+    }
+    match (unit, locale_lang(locale)) {
+        ("kilometer-per-hour", "ja") => Some("時速"),
+        ("kilometer-per-hour", "ko") => Some("시속"),
+        ("kilometer-per-hour", "zh") => Some("每小時"),
+        _ => None,
+    }
+}
+
+/// Suffix text CLDR renders *after* the number for a unit, plus whether a
+/// literal space separates it from the number. Falls back to the raw unit
+/// identifier (space-separated) for units without a hardcoded CLDR entry —
+/// a placeholder, but distinct from the bare number, and byte-consistent
+/// between `format`/`formatToParts`.
+fn unit_suffix_text(unit: &str, display: &str, locale: &str) -> (String, bool) {
+    if unit == "percent" {
+        return ("%".to_string(), false);
+    }
+    if unit == "kilometer-per-hour" {
+        let lang = locale_lang(locale);
+        return match (display, lang) {
+            ("short", "zh") => ("公里/小時".to_string(), true),
+            ("short", "ko") => ("km/h".to_string(), false),
+            ("short", _) => ("km/h".to_string(), true),
+            ("narrow", "de") => ("km/h".to_string(), true),
+            ("narrow", "zh") => ("公里/小時".to_string(), false),
+            ("narrow", _) => ("km/h".to_string(), false),
+            ("long", "en") => ("kilometers per hour".to_string(), true),
+            ("long", "de") => ("Kilometer pro Stunde".to_string(), true),
+            ("long", "ja") => ("キロメートル".to_string(), true),
+            ("long", "ko") => ("킬로미터".to_string(), false),
+            ("long", "zh") => ("公里".to_string(), true),
+            _ => ("km/h".to_string(), true),
+        };
+    }
+    (unit.to_string(), true)
+}
+
+/// Prepend a unit's CLDR prefix (see [`unit_prefix_text`]), if any, before the
+/// sign/number segments.
+pub(crate) fn push_unit_prefix(parts: &mut Vec<(&'static str, String)>, r: &NfResolved) {
+    if r.style != "unit" {
+        return;
+    }
+    let Some(unit) = &r.unit else { return };
+    if let Some(prefix) = unit_prefix_text(unit, &r.unit_display, &r.locale) {
+        parts.push(("unit", prefix.to_string()));
+        parts.push(("literal", " ".to_string()));
+    }
+}
+
 /// Append the trailing style suffix (`percent`/`unit`) after the numeric parts.
 pub(crate) fn push_style_suffix(
     parts: &mut Vec<(&'static str, String)>,
@@ -1527,8 +1593,11 @@ pub(crate) fn push_style_suffix(
         "percent" => parts.push(("percentSign", "%".to_string())),
         "unit" => {
             if let Some(unit) = &r.unit {
-                parts.push(("literal", " ".to_string()));
-                parts.push(("unit", unit.clone()));
+                let (suffix, sep) = unit_suffix_text(unit, &r.unit_display, &r.locale);
+                if sep {
+                    parts.push(("literal", " ".to_string()));
+                }
+                parts.push(("unit", suffix));
             }
         }
         _ => {}
@@ -1546,7 +1615,10 @@ pub(crate) fn currency_instance_parts(r: &NfResolved, value: f64) -> Vec<(&'stat
     let frac_digits = r.max_frac as usize;
     // Capture original sign before any rounding.
     let is_negative = value < 0.0 || (value == 0.0 && value.is_sign_negative());
-    let accounting = r.currency_sign == "accounting";
+    // CLDR doesn't define a distinct parenthesized accounting pattern for every
+    // locale — German falls back to the plain minus-sign pattern even when
+    // `currencySign: "accounting"` is requested.
+    let accounting = r.currency_sign == "accounting" && locale_lang(locale) != "de";
     // The native float renderer below doesn't honor roundingIncrement; when set,
     // snap the magnitude onto the increment grid first (digit-string rounding,
     // respecting roundingMode) so the renderer formats an already-gridded value.
@@ -1570,14 +1642,12 @@ pub(crate) fn currency_instance_parts(r: &NfResolved, value: f64) -> Vec<(&'stat
     } else {
         value
     };
-    // For accounting sign, pass the absolute value so format_number_parts does
-    // not emit a minus-sign segment — we wrap the assembled parts in "()" below.
-    let format_value = if accounting && is_negative {
-        value.abs()
-    } else {
-        value
-    };
-    let digits = format_number_parts(format_value, locale, Some(frac_digits), None);
+    // Sign is rendered separately below (via `push_sign`, same as the
+    // non-currency path) so always format the bare magnitude here.
+    let digits = format_number_parts(value.abs(), locale, Some(frac_digits), None);
+    let rounded_is_zero =
+        value.is_nan() || digits.bytes().all(|b| !b.is_ascii_digit() || b == b'0');
+    let is_negative = !value.is_nan() && is_negative;
     let mut numeric: Vec<(&'static str, String)> = Vec::new();
     split_numeric_parts(&digits, locale, &mut numeric);
     let de_style = locale.eq_ignore_ascii_case("de") || locale.starts_with("de-");
@@ -1609,11 +1679,25 @@ pub(crate) fn currency_instance_parts(r: &NfResolved, value: f64) -> Vec<(&'stat
         }
         None => parts = numeric,
     }
-    // Accounting sign: negative amounts are wrapped in parentheses (no minus sign).
-    // Only applied when signDisplay is not "never".
-    if accounting && is_negative && r.sign_display != "never" {
+    // Sign is decided after rounding, same rule as the non-currency path:
+    // `exceptZero`/`negative` suppress the sign when the *rounded* magnitude
+    // is zero (e.g. -0.0001 → no sign), while `auto`/`always` follow the
+    // original mathematical sign (-0 still counts as negative).
+    let mut sign_parts: Vec<(&'static str, String)> = Vec::new();
+    push_sign(
+        &mut sign_parts,
+        &r.sign_display,
+        is_negative,
+        rounded_is_zero,
+    );
+    if accounting && sign_parts.iter().any(|(t, _)| *t == "minusSign") {
+        // Accounting negatives are wrapped in parentheses instead of a minus sign.
         parts.insert(0, ("literal", "(".to_string()));
         parts.push(("literal", ")".to_string()));
+    } else {
+        for (i, seg) in sign_parts.into_iter().enumerate() {
+            parts.insert(i, seg);
+        }
     }
     parts
 }

@@ -169,13 +169,17 @@ pub(crate) fn configure_number_format(obj: *mut ObjectHeader, locale: &str, opti
 
     set_internal_field(obj, KEY_NF_MIN_INT, min_int);
 
-    let (default_min_frac, default_max_frac) = match style.as_str() {
-        "currency" => {
-            let d = currency.as_deref().map_or(2, currency_fraction_digits);
-            (d, d)
-        }
-        "percent" => (0, 0),
-        _ => (0, 3),
+    // The currency-specific digit defaults only apply to "standard" notation
+    // (ECMA-402 SetNumberFormatDigitOptions step 19-20) — compact/engineering/
+    // scientific currency values fall back to the generic 0/3 (or 0/0 for
+    // percent) defaults, same as any other style.
+    let (default_min_frac, default_max_frac) = if style == "currency" && notation == "standard" {
+        let d = currency.as_deref().map_or(2, currency_fraction_digits);
+        (d, d)
+    } else if style == "percent" {
+        (0, 0)
+    } else {
+        (0, 3)
     };
 
     let has_sd = min_sig_opt.is_some() || max_sig_opt.is_some();
@@ -183,11 +187,35 @@ pub(crate) fn configure_number_format(obj: *mut ObjectHeader, locale: &str, opti
 
     let min_sig = min_sig_opt.unwrap_or(1.0) as u32;
     let max_sig = (max_sig_opt.unwrap_or(21.0) as u32).max(min_sig);
-    let min_frac = min_frac_opt.unwrap_or(default_min_frac as f64) as u32;
-    let max_frac = max_frac_opt
-        .map(|m| m as u32)
-        .unwrap_or_else(|| (min_frac).max(default_max_frac))
-        .max(min_frac);
+    // Resolve minimumFractionDigits/maximumFractionDigits per FractionDigitDefaults:
+    // an explicit value on one side is never widened by the *other* side's
+    // default — only a missing side falls back, clamped against the side that
+    // was actually given (e.g. `{currency: "USD", maximumFractionDigits: 1}`
+    // must resolve to `1`, not be pulled back up to USD's default of `2`).
+    let (min_frac, max_frac) = if has_fd {
+        match (min_frac_opt, max_frac_opt) {
+            (Some(mn), Some(mx)) => {
+                let (mn, mx) = (mn as u32, mx as u32);
+                if mn > mx {
+                    throw_range_error(&format!(
+                        "Value {mx} is out of range for Intl.NumberFormat options property maximumFractionDigits"
+                    ));
+                }
+                (mn, mx)
+            }
+            (Some(mn), None) => {
+                let mn = mn as u32;
+                (mn, mn.max(default_max_frac))
+            }
+            (None, Some(mx)) => {
+                let mx = mx as u32;
+                (default_min_frac.min(mx), mx)
+            }
+            (None, None) => unreachable!("has_fd implies at least one is Some"),
+        }
+    } else {
+        (default_min_frac, default_max_frac)
+    };
 
     // A roundingIncrement other than 1 constrains the rounding type to fraction
     // digits with a fixed fraction width (ECMA-402 SetNumberFormatDigitOptions):
