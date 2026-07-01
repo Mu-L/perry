@@ -174,7 +174,12 @@ pub(crate) fn configure_number_format(obj: *mut ObjectHeader, locale: &str, opti
     // scientific currency values fall back to the generic 0/3 (or 0/0 for
     // percent) defaults, same as any other style.
     let (default_min_frac, default_max_frac) = if style == "currency" && notation == "standard" {
-        let d = currency.as_deref().map_or(2, currency_fraction_digits);
+        // `currency` is the raw (possibly lowercase) option value — the
+        // internal field is uppercased separately above — but
+        // `currency_fraction_digits` only matches uppercase ISO codes.
+        let d = currency
+            .as_deref()
+            .map_or(2, |c| currency_fraction_digits(&c.to_ascii_uppercase()));
         (d, d)
     } else if style == "percent" {
         (0, 0)
@@ -185,8 +190,30 @@ pub(crate) fn configure_number_format(obj: *mut ObjectHeader, locale: &str, opti
     let has_sd = min_sig_opt.is_some() || max_sig_opt.is_some();
     let has_fd = min_frac_opt.is_some() || max_frac_opt.is_some();
 
-    let min_sig = min_sig_opt.unwrap_or(1.0) as u32;
-    let max_sig = (max_sig_opt.unwrap_or(21.0) as u32).max(min_sig);
+    // Same FractionDigitDefaults-style resolution as fraction digits below: an
+    // explicit maximumSignificantDigits below an explicit minimum is a
+    // RangeError, not a silent widen.
+    let (min_sig, max_sig) = if has_sd {
+        match (min_sig_opt, max_sig_opt) {
+            (Some(mn), Some(mx)) => {
+                let (mn, mx) = (mn as u32, mx as u32);
+                if mn > mx {
+                    throw_range_error(&format!(
+                        "Value {mx} is out of range for Intl.NumberFormat options property maximumSignificantDigits"
+                    ));
+                }
+                (mn, mx)
+            }
+            (Some(mn), None) => {
+                let mn = mn as u32;
+                (mn, mn.max(21))
+            }
+            (None, Some(mx)) => (1, mx as u32),
+            (None, None) => unreachable!("has_sd implies at least one is Some"),
+        }
+    } else {
+        (1, 21)
+    };
     // Resolve minimumFractionDigits/maximumFractionDigits per FractionDigitDefaults:
     // an explicit value on one side is never widened by the *other* side's
     // default — only a missing side falls back, clamped against the side that

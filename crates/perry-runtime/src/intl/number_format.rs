@@ -1547,7 +1547,9 @@ fn unit_prefix_text(unit: &str, display: &str, locale: &str) -> Option<&'static 
 /// a placeholder, but distinct from the bare number, and byte-consistent
 /// between `format`/`formatToParts`.
 fn unit_suffix_text(unit: &str, display: &str, locale: &str) -> (String, bool) {
-    if unit == "percent" {
+    if unit == "percent" && display != "long" {
+        // The "%" glyph is the short/narrow CLDR form; long falls through to
+        // the raw-identifier placeholder below like any other untabulated unit.
         return ("%".to_string(), false);
     }
     if unit == "kilometer-per-hour" {
@@ -1645,8 +1647,8 @@ pub(crate) fn currency_instance_parts(r: &NfResolved, value: f64) -> Vec<(&'stat
     // Sign is rendered separately below (via `push_sign`, same as the
     // non-currency path) so always format the bare magnitude here.
     let digits = format_number_parts(value.abs(), locale, Some(frac_digits), None);
-    let rounded_is_zero =
-        value.is_nan() || digits.bytes().all(|b| !b.is_ascii_digit() || b == b'0');
+    let rounded_is_zero = value.is_nan()
+        || (value.is_finite() && digits.bytes().all(|b| !b.is_ascii_digit() || b == b'0'));
     let is_negative = !value.is_nan() && is_negative;
     let mut numeric: Vec<(&'static str, String)> = Vec::new();
     split_numeric_parts(&digits, locale, &mut numeric);
