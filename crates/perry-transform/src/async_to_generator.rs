@@ -131,6 +131,39 @@ pub fn transform_async_to_generator(module: &mut Module) {
         }
     }
 
+    // #5437: async CLASS METHODS were never rewritten — only top-level
+    // functions above and async *closures* below. Every async method in a
+    // bundle (Next.js's whole request chain: Server.handleRequest →
+    // renderPageComponent → ...) therefore lowered to codegen's synchronous
+    // busy-wait await loop, keeping the entire render chain on the stack and
+    // deadlocking Next 16's staged prerender. The generator transform already
+    // supports method state machines (`transform_generator_function_with_
+    // extra_captures` with the owning class name), so flipping the flags here
+    // is all that's needed; the same conservative capturing-closure skip
+    // applies.
+    for class in &mut module.classes {
+        for m in class
+            .methods
+            .iter_mut()
+            .chain(class.static_methods.iter_mut())
+        {
+            if m.is_async && !m.is_generator {
+                if body_has_capturing_closure(&m.body) {
+                    continue;
+                }
+                let mut had_await = false;
+                strip_redundant_promise_resolve_in_func(m);
+                hoist_awaits_in_stmts(&mut m.body, &mut next_local_id);
+                rewrite_stmts(&mut m.body, &mut had_await);
+                if had_await {
+                    m.is_async = false;
+                    m.is_generator = true;
+                    m.was_plain_async = true;
+                }
+            }
+        }
+    }
+
     // Issue #1021 phase 2: rewrite async closures (`Expr::Closure {
     // is_async: true }` with awaits) into state machines. Without this,
     // `app.listen(port, async () => { await fetch(self) })` callbacks
