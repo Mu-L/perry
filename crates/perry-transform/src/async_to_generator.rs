@@ -209,6 +209,49 @@ pub fn transform_async_to_generator(module: &mut Module) {
                     &mut next_func_id,
                 );
             }
+            // #5437: mirror the collector — fields, computed members.
+            for field in class
+                .fields
+                .iter_mut()
+                .chain(class.static_fields.iter_mut())
+            {
+                if let Some(init) = field.init.as_mut() {
+                    rewrite_async_closures_in_expr(
+                        init,
+                        &work,
+                        &mut next_local_id,
+                        &mut next_func_id,
+                    );
+                }
+                if let Some(key_expr) = field.key_expr.as_mut() {
+                    rewrite_async_closures_in_expr(
+                        key_expr,
+                        &work,
+                        &mut next_local_id,
+                        &mut next_func_id,
+                    );
+                }
+            }
+            for member in &mut class.computed_members {
+                rewrite_async_closures_in_expr(
+                    &mut member.key_expr,
+                    &work,
+                    &mut next_local_id,
+                    &mut next_func_id,
+                );
+                rewrite_async_closures_in_stmts(
+                    &mut member.function.body,
+                    &work,
+                    &mut next_local_id,
+                    &mut next_func_id,
+                );
+            }
+        }
+        // #5437: module GLOBAL initializers, mirroring the collector.
+        for global in &mut module.globals {
+            if let Some(init) = global.init.as_mut() {
+                rewrite_async_closures_in_expr(init, &work, &mut next_local_id, &mut next_func_id);
+            }
         }
     }
 }
@@ -1268,6 +1311,28 @@ fn collect_async_step_closures(module: &mut Module) {
         }
         for setter in &class.setters {
             scan_stmts_for_async_closures(&setter.1.body, &mut found);
+        }
+        // #5437: class FIELD initializers and computed members hold closures
+        // too (the #5143 under-scan family) — a bundle's async export
+        // factories live exactly there.
+        for field in class.fields.iter().chain(class.static_fields.iter()) {
+            if let Some(init) = &field.init {
+                scan_expr_for_async_closures(init, &mut found);
+            }
+            if let Some(key_expr) = &field.key_expr {
+                scan_expr_for_async_closures(key_expr, &mut found);
+            }
+        }
+        for member in &class.computed_members {
+            scan_expr_for_async_closures(&member.key_expr, &mut found);
+            scan_stmts_for_async_closures(&member.function.body, &mut found);
+        }
+    }
+    // #5437: module GLOBAL initializers (`const handler = async () => ...` at
+    // module top level) hold async closures the walks above never reach.
+    for global in &module.globals {
+        if let Some(init) = &global.init {
+            scan_expr_for_async_closures(init, &mut found);
         }
     }
     module.async_step_closures = found;
