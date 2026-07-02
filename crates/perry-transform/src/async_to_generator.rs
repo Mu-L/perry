@@ -457,6 +457,18 @@ fn rewrite_async_closures_in_expr(
         }
     }
     // Otherwise descend into children.
+    //
+    // #5437: `walk_expr_children_mut`'s Closure arm visits param DEFAULTS
+    // only — never the body statements — so an async closure nested inside a
+    // plain (non-candidate) closure was collected as a candidate but never
+    // reached by this rewriter. A bundle's module factories are plain
+    // closures wrapping everything, so ~3450 awaits in the Next.js app
+    // bundle stayed untransformed and lowered to the synchronous busy-wait
+    // loop. Recurse into non-candidate closure bodies explicitly (the
+    // candidate path already does its own body recursion above).
+    if let Expr::Closure { body, .. } = expr {
+        rewrite_async_closures_in_stmts(body, work, next_local_id, next_func_id);
+    }
     perry_hir::walker::walk_expr_children_mut(expr, &mut |child| {
         rewrite_async_closures_in_expr(child, work, next_local_id, next_func_id);
     });
