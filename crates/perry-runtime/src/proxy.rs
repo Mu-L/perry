@@ -1410,13 +1410,14 @@ fn ordinary_set_with_receiver(target: f64, key: f64, value: f64, receiver: f64) 
                 {
                     throw_type_error("Restricted function property assignment");
                 }
-                // Every function's [[Prototype]] is %Function.prototype% — an
-                // accessor installed there via `Object.defineProperty(Function.
-                // prototype, k, {get,set})` must intercept a plain `boundFn.k =
-                // v` write (invoke the setter, or throw for a getter-only
-                // accessor) instead of silently shadowing it with a new own
+                // Every function's [[Prototype]] is %Function.prototype% — a
+                // descriptor installed there via `Object.defineProperty(
+                // Function.prototype, k, {...})` must intercept a plain
+                // `boundFn.k = v` write (invoke an accessor's setter, throw
+                // for a getter-only accessor, or block a non-writable data
+                // property) instead of silently shadowing it with a new own
                 // data property on the receiver.
-                if crate::closure::closure_set_via_function_prototype_accessor(
+                if crate::closure::closure_set_via_function_prototype_descriptor(
                     cur_ptr, &name, value, receiver,
                 ) {
                     return true;

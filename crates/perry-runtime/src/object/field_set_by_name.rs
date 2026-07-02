@@ -175,9 +175,9 @@ unsafe fn string_key_eq(key: *const crate::StringHeader, expected: &[u8]) -> boo
 /// GcHeader-typed pointer, and the raw `CLOSURE_MAGIC`-tagged fallback for a
 /// pointer reached without a full GC header). #3143: honors a non-writable
 /// registered descriptor (a built-in method's `.name`/`.length` are spec'd
-/// `writable: false`); `Object.defineProperty(Function.prototype, k,
-/// {get,set})` round-trips via `closure_set_via_function_prototype_accessor`
-/// before falling back to a plain own-property write.
+/// `writable: false`); `Object.defineProperty(Function.prototype, k, {...})`
+/// round-trips via `closure_set_via_function_prototype_descriptor` before
+/// falling back to a plain own-property write.
 unsafe fn closure_set_field_by_name(
     obj: *mut ObjectHeader,
     key: *const crate::StringHeader,
@@ -213,17 +213,18 @@ unsafe fn closure_set_field_by_name(
     } else if matches!(name_str, "name" | "length") {
         return;
     } else if !crate::closure::closure_has_own_dynamic_prop(obj as usize, name_str)
-        && crate::closure::closure_set_via_function_prototype_accessor(
+        && crate::closure::closure_set_via_function_prototype_descriptor(
             obj as usize,
             name_str,
             value,
             crate::value::js_nanbox_pointer(obj as i64),
         )
     {
-        // Handled by an inherited %Function.prototype% accessor
-        // (`Object.defineProperty(Function.prototype, k, {get,set})`) — the
-        // setter ran (or threw for a getter-only accessor); no own property
-        // is created.
+        // Handled by an inherited %Function.prototype% descriptor
+        // (`Object.defineProperty(Function.prototype, k, {...})`) — an
+        // accessor's setter ran (or threw for a getter-only accessor), or a
+        // non-writable data property blocked the write; no own property is
+        // created.
         return;
     }
     crate::closure::closure_set_dynamic_prop(obj as usize, name_str, value);

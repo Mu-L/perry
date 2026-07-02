@@ -570,18 +570,21 @@ pub(crate) fn function_prototype_fallback_target(ptr: usize, prop: &str) -> Opti
 }
 
 /// SET-side analog of `closure_get_dynamic_prop`'s inherited-accessor read:
-/// if `prop` resolves to an ACCESSOR installed on the real
+/// if `prop` resolves to a descriptor installed on the real
 /// `%Function.prototype%` object (`Object.defineProperty(Function.prototype,
-/// k, {get,set})`), invoke its setter (if any) with `receiver` as `this` and
-/// report the write handled. Returns `false` for a plain inherited DATA
-/// property — an ordinary `[[Set]]` on a writable inherited data property
-/// creates a new OWN property on the receiver, which the caller's existing
-/// own-dynamic-prop fallback already does correctly. `ptr` is the closure
-/// being checked against (used only to reject the Function.prototype
-/// self-reference); `receiver` is the spec `[[Set]]` receiver — ordinarily
-/// the same object, but callers reached via `Reflect.set(target, k, v, R)`
-/// pass a distinct `R`.
-pub(crate) fn closure_set_via_function_prototype_accessor(
+/// k, {...})`), apply spec `[[Set]]` semantics for it and report the write
+/// handled — an ACCESSOR invokes its setter (if any) with `receiver` as
+/// `this`; a non-writable DATA property blocks the write (matches the
+/// silent-no-op convention this file already uses for a non-writable OWN
+/// attrs record, just above this function's callers). Returns `false` when
+/// there's no inherited descriptor at all, or it's a writable DATA property —
+/// an ordinary `[[Set]]` on those creates a new OWN property on the receiver,
+/// which the caller's existing own-dynamic-prop fallback already does
+/// correctly. `ptr` is the closure being checked against (used only to
+/// reject the Function.prototype self-reference); `receiver` is the spec
+/// `[[Set]]` receiver — ordinarily the same object, but callers reached via
+/// `Reflect.set(target, k, v, R)` pass a distinct `R`.
+pub(crate) fn closure_set_via_function_prototype_descriptor(
     ptr: usize,
     prop: &str,
     value: f64,
@@ -590,19 +593,24 @@ pub(crate) fn closure_set_via_function_prototype_accessor(
     let Some(proto_ptr) = function_prototype_fallback_target(ptr, prop) else {
         return false;
     };
-    let Some(acc) = crate::object::get_accessor_descriptor(proto_ptr, prop) else {
-        return false;
-    };
-    if acc.set == 0 {
-        // Getter-only: matches `al_set_length`'s getter-only `length` throw
-        // (array/generic.rs) — a strict-mode write to an accessor with no
-        // setter is a TypeError, not a silent no-op.
-        crate::collection_iter::throw_type_error(&format!(
-            "Cannot set property {prop} of #<Function> which has only a getter"
-        ));
+    if let Some(acc) = crate::object::get_accessor_descriptor(proto_ptr, prop) {
+        if acc.set == 0 {
+            // Getter-only: matches `al_set_length`'s getter-only `length` throw
+            // (array/generic.rs) — a strict-mode write to an accessor with no
+            // setter is a TypeError, not a silent no-op.
+            crate::collection_iter::throw_type_error(&format!(
+                "Cannot set property {prop} of #<Function> which has only a getter"
+            ));
+        }
+        unsafe { crate::object::invoke_accessor_setter(acc.set, receiver, value) };
+        return true;
     }
-    unsafe { crate::object::invoke_accessor_setter(acc.set, receiver, value) };
-    true
+    if let Some(attrs) = crate::object::get_property_attrs(proto_ptr, prop) {
+        if !attrs.writable() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Set a dynamic property on a closure.
