@@ -78,6 +78,27 @@ use std::collections::HashSet;
 // the canonical exhaustive-walker implementations in `generator::id_scan`.
 use crate::generator::{compute_max_func_id, compute_max_local_id};
 
+/// #5437 experiment gate: when PERRY_ASYNC_CAPTURING=1, async functions and
+/// methods whose bodies contain capturing closures are transformed too
+/// (the conservative v0.5.866-era skip is lifted). Mutable captures lower
+/// through PreallocateBoxes box pointers since #1029, so cross-await
+/// mutation visibility — the original reason for the skip — is believed
+/// handled; this gate lets the full-bundle Next.js matrix and the gap
+/// suite validate that before flipping the default.
+/// #5437 experiment gate for the non-candidate closure-body recursion (see
+/// rewrite_async_closures_in_expr).
+fn async_deep_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PERRY_ASYNC_DEEP").as_deref() == Ok("1"))
+}
+
+fn async_capturing_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("PERRY_ASYNC_CAPTURING").as_deref() == Ok("1"))
+}
+
 /// Run the pre-pass on every async function in the module.
 pub fn transform_async_to_generator(module: &mut Module) {
     // Historical note (#212 / v0.5.323): this pass used to bail on the WHOLE
@@ -466,8 +487,15 @@ fn rewrite_async_closures_in_expr(
     // bundle stayed untransformed and lowered to the synchronous busy-wait
     // loop. Recurse into non-candidate closure bodies explicitly (the
     // candidate path already does its own body recursion above).
-    if let Expr::Closure { body, .. } = expr {
-        rewrite_async_closures_in_stmts(body, work, next_local_id, next_func_id);
+    // Gated PERRY_ASYNC_DEEP=1 while the bundle-scale state-machine shapes
+    // are validated: with the recursion unconditionally on, the Next.js
+    // bundle's transformed init-closures regressed ALL routes to hangs
+    // (statics included), so the default stays scanner-parity-off until the
+    // mis-lowered shape is found.
+    if async_deep_enabled() {
+        if let Expr::Closure { body, .. } = expr {
+            rewrite_async_closures_in_stmts(body, work, next_local_id, next_func_id);
+        }
     }
     perry_hir::walker::walk_expr_children_mut(expr, &mut |child| {
         rewrite_async_closures_in_expr(child, work, next_local_id, next_func_id);
