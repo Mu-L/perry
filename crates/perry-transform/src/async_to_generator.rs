@@ -80,22 +80,20 @@ use crate::generator::{compute_max_func_id, compute_max_local_id};
 
 /// Run the pre-pass on every async function in the module.
 pub fn transform_async_to_generator(module: &mut Module) {
-    // Conservative module-level scope: skip the rewrite ENTIRELY if the
-    // module has classes with __perry_cap_* fields (the v0.5.323 issue
-    // #212 capture rewrite). The async-step driver's fresh LocalId
-    // allocations can collide with the v0.5.323 method-local rebind
-    // ids — manifests as `[PERRY WARN] js_box_set: null box pointer`
-    // when the colliding LocalGet for the async-step's `__iter` returns
-    // the captured-by-class-method box pointer instead of the iter
-    // object. The collision is path-dependent on which ids `next_local_id`
-    // happened to land on; safer to bail on the whole module than to
-    // ship a coin-flip fix. Issue #212-style capturing classes are the
-    // ONLY known trigger, so this scope is tight enough that the issue
-    // #256 microtask-ordering reproducer (no classes) still gets the
-    // fix.
-    if module_has_capturing_classes(module) {
-        return;
-    }
+    // Historical note (#212 / v0.5.323): this pass used to bail on the WHOLE
+    // module when it contained classes with `__perry_cap_*` fields, because
+    // the async-step driver's fresh LocalId allocations could collide with
+    // the method-local rebind ids (`[PERRY WARN] js_box_set: null box
+    // pointer`). The collision was only possible while `compute_max_local_id`
+    // under-scanned: it now folds in every class member body, field/computed
+    // initializer, and `extends` expression (the #5143-parallel LocalId scan),
+    // so fresh ids always start above every id in the module and the bail is
+    // dead weight. Worse, it was load-bearing HARMFUL at bundle scale: the
+    // Next.js app-page bundle module has capturing classes, so ALL of its
+    // ~2300 async functions escaped the transform and lowered to the codegen
+    // busy-wait await loop — nested synchronous waits inside the request path
+    // that deadlocked Next 16's staged prerender (dynamic-SSR routes hung
+    // with zero bytes, #5437).
     let mut next_local_id = compute_max_local_id(module) + 1;
     for func in &mut module.functions {
         if func.is_async && !func.is_generator {
@@ -386,22 +384,6 @@ fn rewrite_async_closures_in_expr(
     perry_hir::walker::walk_expr_children_mut(expr, &mut |child| {
         rewrite_async_closures_in_expr(child, work, next_local_id, next_func_id);
     });
-}
-
-/// Detect if the module has any classes with `__perry_cap_*` instance
-/// fields — the marker that the v0.5.323 issue #212 capture rewrite was
-/// applied. These classes have method bodies with method-local rebind
-/// LocalIds that share the global LocalId namespace; my pre-pass's
-/// fresh-id allocations can collide with them.
-fn module_has_capturing_classes(module: &Module) -> bool {
-    for class in &module.classes {
-        for field in &class.fields {
-            if field.name.starts_with("__perry_cap_") {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 // ─── Conservative scope: detect nested capturing closures ────────────────
