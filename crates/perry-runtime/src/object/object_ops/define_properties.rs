@@ -227,13 +227,21 @@ pub extern "C" fn js_object_set_prototype_of(obj_value: f64, proto: f64) -> f64 
             if tortoise == TAG_NULL_U64 {
                 break;
             }
-            // Advance tortoise one step, hare two steps.  Guard the second
-            // advance: if the first step lands on null, calling advance(null)
-            // would invoke js_object_get_prototype_of(null) which throws
-            // "Cannot convert undefined or null to object" (test262
-            // setPrototypeOf/success.js — plain object proto chain ends at null).
+            // Advance tortoise one step, hare two steps. Guard *every* advance
+            // against a `hare` that already reached null: the inner guard below
+            // only covered the second hop within an iteration, but `hare` can
+            // just as well already be null coming into this iteration (hare
+            // moves 2 steps/tortoise's 1, so it reaches null first on chains
+            // with an even hop count) — advancing a null hare calls
+            // `js_object_get_prototype_of(null)`, which throws "Cannot convert
+            // undefined or null to object" (previously surfaced as a spurious
+            // TypeError on `Object.setPrototypeOf`/`__proto__` writes with a
+            // short-but-even prototype chain, e.g. `new MessageChannel()`
+            // delegating through the worker_threads factory, #4873).
             tortoise = advance(tortoise);
-            hare = {
+            hare = if hare == TAG_NULL_U64 {
+                TAG_NULL_U64
+            } else {
                 let h1 = advance(hare);
                 if h1 == TAG_NULL_U64 {
                     TAG_NULL_U64
