@@ -1,15 +1,12 @@
 name: Hang Lab 5892
 
-# Round 5: confirm + fix in one run.
-# Round-4 lesson: main_bin links archives from target/, so the wrapper/ext
-# staticlib crates must be rebuilt from THIS tree for instrumentation (and the
-# fix) to reach the binary. Phases:
-#   1. Build wrappers + ext libs (instrumented tree, shims UNGATED = bug state)
-#   2. CONFIRM: PERRY_LINK_MAP names the archive member providing
-#      perry_ffi_spawn_blocking_with_reactor; run repro once (expect hang)
-#   3. FIX: gate test_async_shims with #[cfg(test)] in ext-http + ext-http-server
-#      (ext-net already gated), rebuild, re-map, re-run (expect clean), then
-#      4x the exact cargo-test loop (expect no hang)
+# Round 7: the shim gate (merged, #5911) did NOT fix the real-recipe hang —
+# the v0.5.1219 gate run still hit the 180-min cargo-test timeout. All prior
+# lab rounds that built ext staticlibs were testing a DIFFERENT configuration:
+# test.yml's cargo-test job never builds the ext .a files (and even
+# `cargo clean -p`'s the ext crates), so the harness-compiled binaries resolve
+# node:http differently. This round replicates test.yml's build recipe exactly
+# and captures the linker map of the hanging binary.
 on:
   push:
     branches: [debug/5892-hang-lab]
@@ -52,131 +49,59 @@ jobs:
           shared-key: "${{ runner.os }}-perry"
           save-if: "false"
 
-      - name: Build perry + wrappers + ext libs (bug state)
+      - name: Install gdb
         run: |
-          cargo build -p perry -p perry-runtime-static -p perry-stdlib-static
-          cargo build -p perry-ext-http-server -p perry-ext-http -p perry-ext-net -p perry-ext-ws
+          sudo apt-get update -qq && sudo apt-get install -y -qq gdb
+          sudo sysctl -w kernel.yama.ptrace_scope=0 || true
+
+      - name: Build exactly what test.yml builds (wrappers, NO ext staticlibs)
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C linker-features=-lld"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+        run: |
+          cargo build -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static
           cargo test -p perry --test issue_4903_listen_callback_deferred --no-run
+          echo "==== .a files present in target/debug ===="
+          ls target/debug/*.a 2>/dev/null || echo "(none)"
 
-      - name: Prepare repro program
-        run: |
-          mkdir -p /tmp/lab
-          cat > /tmp/lab/main.ts <<'TS'
-          const http = require('http');
-          const server = http.createServer(function (req: any, res: any) {
-            console.log('handler-this-port-matches', (this as any).address().port === server.address().port);
-            res.end('ok');
-          }).listen(0, function () {
-            console.log('cb-sees-server', typeof server);
-            const addr = server.address();
-            console.log('addr', typeof addr, addr.family, typeof addr.port, addr.port > 0);
-            console.log('cb-this-port-matches', (this as any).address().port === addr.port);
-            http.get({ port: addr.port, path: '/' }, (res: any) => {
-              let body = '';
-              res.on('data', (c: any) => { body += c; });
-              res.on('end', () => {
-                console.log('body', body);
-                server.close();
-              });
-            });
-          });
-          console.log('sync-after-listen');
-          TS
-
-      - name: "CONFIRM phase: link map + single run (bug state)"
+      - name: Real-recipe repro with link map
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C linker-features=-lld"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          PERRY_LINK_MAP: /tmp/map.txt
         run: |
           set +e
-          cd /tmp/lab
-          PERRY_LINK_MAP=/tmp/lab/map.txt "$GITHUB_WORKSPACE/target/debug/perry" compile main.ts -o main_bin 2>&1 | tail -3
-          echo "==== who provides the perry_ffi async bridge (BUG state) ===="
-          grep -E 'perry_ffi_spawn_blocking_with_reactor|perry_ffi_spawn_async' /tmp/lab/map.txt | head -6
-          grep -E 'test_async_shims|perry_ffi_async' /tmp/lab/map.txt | head -8
-          echo "==== single run, 40s watchdog ===="
-          ./main_bin > out.txt 2>&1 &
-          pid=$!
-          deadline=$(( SECONDS + 40 )); hung=1
-          while [ $SECONDS -lt $deadline ]; do kill -0 $pid 2>/dev/null || { hung=""; break; }; sleep 1; done
-          if [ -n "$hung" ]; then echo "BUG-STATE: HANG (as expected)"; kill -9 $pid; else echo "BUG-STATE: exited (no hang this time)"; fi
-          cat out.txt
-          exit 0
-
-      - name: "BUG-state cargo-test loop x4 (A of the A/B)"
-        run: |
-          set +e
-          cd "$GITHUB_WORKSPACE"
-          bug_hangs=0
+          export CARGO_BUILD_JOBS=1
           for i in $(seq 1 4); do
-            echo "=== bug-state cargo-test iteration $i ==="
-            cargo test -p perry --test issue_4903_listen_callback_deferred -- --nocapture > /tmp/ct.out 2>&1 &
+            echo "=== real-recipe iteration $i (serial threads) ==="
+            rm -f /tmp/map.txt
+            cargo test -p perry --test issue_4903_listen_callback_deferred -- --test-threads=1 --nocapture > /tmp/ct.out 2>&1 &
             cpid=$!
-            deadline=$(( SECONDS + 240 )); hung=1
+            deadline=$(( SECONDS + 300 )); hung=1
             while [ $SECONDS -lt $deadline ]; do kill -0 $cpid 2>/dev/null || { hung=""; break; }; sleep 1; done
             if [ -n "$hung" ]; then
-              bug_hangs=$((bug_hangs+1))
-              echo "!!! bug-state HANG on iteration $i (expected)"
-              pkill -9 -x main_bin; sleep 3
-              grep -m2 "5892-diag" /tmp/ct.out || echo "(no diag in ct.out)"
-              pkill -9 -f issue_4903; kill -9 $cpid 2>/dev/null
-            else
-              tail -2 /tmp/ct.out
-            fi
-          done
-          echo "BUG_HANGS=$bug_hangs" > /tmp/bug_hangs.txt
-          cat /tmp/bug_hangs.txt
-
-      - name: "FIX phase: gate the shims, rebuild, re-verify"
-        run: |
-          set -e
-          cd "$GITHUB_WORKSPACE"
-          for f in crates/perry-ext-http/src/lib.rs crates/perry-ext-http-server/src/lib.rs; do
-            python3 - "$f" <<'PY'
-          import sys
-          p = sys.argv[1]
-          s = open(p).read()
-          old = "\nmod test_async_shims;"
-          new = "\n#[cfg(test)]\nmod test_async_shims;"
-          assert s.count(old) == 1, p
-          open(p, "w").write(s.replace(old, new))
-          print("gated", p)
-          PY
-          done
-          cargo build -p perry-ext-http-server -p perry-ext-http
-          cd /tmp/lab
-          rm -f main_bin map.txt
-          PERRY_LINK_MAP=/tmp/lab/map.txt "$GITHUB_WORKSPACE/target/debug/perry" compile main.ts -o main_bin --no-cache 2>&1 | tail -3
-          echo "==== who provides the perry_ffi async bridge (FIXED state) ===="
-          grep -E 'perry_ffi_spawn_blocking_with_reactor|perry_ffi_spawn_async' /tmp/lab/map.txt | head -6
-          echo "==== single run, 40s watchdog ===="
-          set +e
-          ./main_bin > out.txt 2>&1 &
-          pid=$!
-          deadline=$(( SECONDS + 40 )); hung=1
-          while [ $SECONDS -lt $deadline ]; do kill -0 $pid 2>/dev/null || { hung=""; break; }; sleep 1; done
-          if [ -n "$hung" ]; then echo "FIXED-STATE: STILL HANGS — fix insufficient"; kill -9 $pid; cat out.txt; exit 1; fi
-          echo "FIXED-STATE: clean exit"; cat out.txt
-
-      - name: "FIX phase: exact cargo-test loop x6"
-        run: |
-          set +e
-          cd "$GITHUB_WORKSPACE"
-          for i in $(seq 1 6); do
-            echo "=== fixed cargo-test iteration $i ==="
-            cargo test -p perry --test issue_4903_listen_callback_deferred -- --nocapture > /tmp/ct.out 2>&1 &
-            cpid=$!
-            deadline=$(( SECONDS + 240 )); hung=1
-            while [ $SECONDS -lt $deadline ]; do kill -0 $cpid 2>/dev/null || { hung=""; break; }; sleep 1; done
-            if [ -n "$hung" ]; then
-              echo "!!! STILL HANGS with fix on iteration $i"
-              pkill -9 -x main_bin; sleep 3; tail -60 /tmp/ct.out
+              echo "!!! HANG on iteration $i — capturing evidence"
+              mb=$(pgrep -x main_bin | head -1)
+              if [ -n "$mb" ]; then
+                echo "---- /proc/$mb/syscall ----"; cat /proc/$mb/syscall
+                echo "---- gdb bt ----"
+                sudo gdb -p $mb -batch -ex 'set pagination off' -ex 'thread apply all bt' 2>&1 | sed -n '1,60p'
+              fi
+              echo "---- who provided the perry_ffi bridge (map) ----"
+              grep -B2 -A1 -E '^ \.text\.perry_ffi_spawn_(async|blocking_with_reactor)$' /tmp/map.txt | head -20
+              echo "---- archives pulled into the link ----"
+              grep -oE '[^ /]+\.a\([^)]+\)' /tmp/map.txt | cut -d'(' -f1 | sort | uniq -c | sort -rn | head -15
+              echo "---- ext vs stdlib members providing perry_ffi/test shims ----"
+              grep -E 'test_async_shims|perry_ffi_async' /tmp/map.txt | head -10
+              echo "---- event_pump provider (which archive has js_wait_for_event) ----"
+              grep -B2 -A1 -E '^ \.text\.js_wait_for_event$' /tmp/map.txt | head -8
+              echo "---- ct.out tail ----"
+              pkill -9 -x main_bin; sleep 4; tail -50 /tmp/ct.out; grep -m4 '5892-diag' /tmp/ct.out
               pkill -9 -f issue_4903; kill -9 $cpid 2>/dev/null
               exit 1
             fi
-            tail -3 /tmp/ct.out
+            tail -3 /tmp/ct.out; grep -m4 '5892-diag' /tmp/ct.out || true
           done
-          bug_hangs=$(grep -oE "[0-9]+" /tmp/bug_hangs.txt | head -1)
-          echo "VERDICT: bug-state hangs=$bug_hangs, fixed-state 6/6 clean"
-          if [ "${bug_hangs:-0}" -eq 0 ]; then
-            echo "WARNING: bug state did not hang in this run — A/B inconclusive"
-            exit 1
-          fi
-          echo "A/B CONCLUSIVE: same archives, hang before gate, clean after gate"
+          echo "no hang in 4 real-recipe iterations (fix may hold in this env after all)"
