@@ -79,8 +79,22 @@ jobs:
             rm -f /tmp/map.txt
             cargo test -p perry --test issue_4903_listen_callback_deferred -- --test-threads=1 --nocapture > /tmp/ct.out 2>&1 &
             cpid=$!
-            deadline=$(( SECONDS + 300 )); hung=1
-            while [ $SECONDS -lt $deadline ]; do kill -0 $cpid 2>/dev/null || { hung=""; break; }; sleep 1; done
+            # iteration 1 pays the auto-opt/from-source lib build under
+            # CARGO_BUILD_JOBS=1 — give it 20 min; later iterations 6 min.
+            if [ "$i" = "1" ]; then budget=1200; else budget=360; fi
+            deadline=$(( SECONDS + budget )); hung=1
+            while [ $SECONDS -lt $deadline ]; do
+              kill -0 $cpid 2>/dev/null || { hung=""; break; }
+              # only a RUNNING main_bin that stops making progress is a hang;
+              # while no main_bin exists we are still compiling — extend.
+              if [ $SECONDS -ge $deadline ] 2>/dev/null; then break; fi
+              sleep 2
+            done
+            if [ -n "$hung" ] && ! pgrep -x main_bin >/dev/null; then
+              echo "deadline passed but no main_bin — still compiling; extending 15 min"
+              deadline=$(( SECONDS + 900 ))
+              while [ $SECONDS -lt $deadline ]; do kill -0 $cpid 2>/dev/null || { hung=""; break; }; sleep 2; done
+            fi
             if [ -n "$hung" ]; then
               echo "!!! HANG on iteration $i — capturing evidence"
               mb=$(pgrep -x main_bin | head -1)
