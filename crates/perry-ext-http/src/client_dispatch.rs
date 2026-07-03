@@ -4,12 +4,26 @@
 //! client-side TLS selection added at the top of `dispatch_request`.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 
 use perry_ffi::{spawn_blocking_with_reactor as spawn_blocking, Handle};
 
 use crate::{
-    agent, dispatch_plain_http_request, push_event, tls_client, PendingHttpEvent, HTTP_CLIENT,
+    agent, dispatch_plain_http_request, push_event, tls_client, PendingHttpEvent,
+    CLIENT_REQUESTS_INFLIGHT, HTTP_CLIENT,
 };
+
+/// #4909: holds the [`CLIENT_REQUESTS_INFLIGHT`] ref for the request's whole
+/// dispatched-but-unresolved window. Moved into the detached tokio task so
+/// it drops (decrementing) no matter which branch/early-return the task
+/// exits through.
+struct InflightGuard;
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        CLIENT_REQUESTS_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Spawn the actual reqwest send. The `spawn_blocking_with_reactor`
 /// shim runs the closure inside `runtime().spawn(async { ... })`, so
@@ -68,7 +82,9 @@ pub(crate) fn dispatch_request(
             return;
         }
         let handle = tokio::runtime::Handle::current();
+        CLIENT_REQUESTS_INFLIGHT.fetch_add(1, Ordering::AcqRel);
         let jh = handle.spawn(async move {
+            let _inflight_guard = InflightGuard;
             if let Some(result) = dispatch_plain_http_request(
                 request_handle,
                 method.as_str(),

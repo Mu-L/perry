@@ -105,6 +105,7 @@ use perry_ffi::{
     Handle, JsClosure, JsString, JsValue, ObjectHeader, RawClosureHeader, StringHeader,
 };
 use std::collections::HashMap;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Mutex, Once};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -186,6 +187,19 @@ pub(crate) enum PendingHttpEvent {
     /// a late `Expect` — reaches the wire. No-op for non-continue/sent requests.
     DeferredArmContinue { request_handle: Handle },
 }
+
+/// #4909: number of client requests dispatched but not yet resolved to a
+/// terminal event (`ResponseEnd`/`Error`/`TransportError`/`Timeout`). The
+/// actual network exchange runs as a *detached* tokio task (`client_dispatch`
+/// forgets its `JoinHandle` so it can return before the request completes),
+/// so `EXT_BLOCKING_TASKS_INFLIGHT` only covers the near-instant dispatch
+/// closure, not the request/response round-trip itself. Without this, the
+/// event loop can decide there's no more work and exit mid-flight — the
+/// in-flight request was only "kept alive" by incidental overlap with some
+/// other subsystem's ref (e.g. the peer server's own in-flight-request
+/// tracking), a race lost consistently on some platforms/CI runners.
+/// `js_http_has_pending` below folds this in alongside the event queue.
+pub(crate) static CLIENT_REQUESTS_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 lazy_static! {
     static ref HTTP_PENDING_EVENTS: Mutex<Vec<PendingHttpEvent>> = Mutex::new(Vec::new());
@@ -1632,10 +1646,17 @@ pub extern "C" fn js_http_has_pending() -> i32 {
             js_http_process_pending();
         }
     }
-    HTTP_PENDING_EVENTS
+    let still_queued = HTTP_PENDING_EVENTS
         .lock()
-        .map(|q| if q.is_empty() { 0 } else { 1 })
-        .unwrap_or(0)
+        .map(|q| !q.is_empty())
+        .unwrap_or(false);
+    // #4909: a dispatched-but-unresolved client request must keep the loop
+    // alive even with an empty event queue (see CLIENT_REQUESTS_INFLIGHT).
+    if still_queued || CLIENT_REQUESTS_INFLIGHT.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        1
+    } else {
+        0
+    }
 }
 
 /// Drain the pending HTTP-event queue and fire user callbacks. Called
