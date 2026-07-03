@@ -1,0 +1,140 @@
+name: Hang Lab 5892
+
+# Diagnostic lab for issue #5892: full cargo-test hangs in
+# issue_4903_listen_callback_deferred on SHAs containing #5831. Runs the two
+# test programs from that file concurrently (like the libtest harness does),
+# through pipes (like Command::output does), under a watchdog. On hang it
+# attaches gdb and dumps every thread's backtrace, which is the evidence the
+# 180-min timeout kill never leaves behind. Delete this workflow with the
+# branch once #5892 is fixed.
+
+on:
+  push:
+    branches: [debug/5892-hang-lab]
+  workflow_dispatch:
+
+concurrency:
+  group: hang-lab
+  cancel-in-progress: false
+
+env:
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "false"
+  SCCACHE_DIR: ${{ github.workspace }}/.sccache
+  SCCACHE_CACHE_SIZE: "12G"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  lab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Cache sccache objects
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: sccache-${{ runner.os }}-perry-hang-lab-${{ github.run_id }}
+          restore-keys: |
+            sccache-${{ runner.os }}-perry-
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "${{ runner.os }}-perry"
+          save-if: "false"
+
+      - name: Build perry (perry-dev profile)
+        run: cargo build --profile perry-dev -p perry
+
+      - name: Prepare repro programs
+        run: |
+          mkdir -p /tmp/labA /tmp/labB
+          cat > /tmp/labA/main.ts <<'TS'
+          const http = require('http');
+          const server = http.createServer(function (req: any, res: any) {
+            console.log('handler-this-port-matches', (this as any).address().port === server.address().port);
+            res.end('ok');
+          }).listen(0, function () {
+            console.log('cb-sees-server', typeof server);
+            const addr = server.address();
+            console.log('addr', typeof addr, addr.family, typeof addr.port, addr.port > 0);
+            console.log('cb-this-port-matches', (this as any).address().port === addr.port);
+            http.get({ port: addr.port, path: '/' }, (res: any) => {
+              let body = '';
+              res.on('data', (c: any) => { body += c; });
+              res.on('end', () => {
+                console.log('body', body);
+                server.close();
+              });
+            });
+          });
+          console.log('sync-after-listen');
+          TS
+          cat > /tmp/labB/main.ts <<'TS'
+          const http = require('http');
+          const server = http.createServer();
+          server.on('listening', () => console.log('pre-listener'));
+          server.listen(0, () => {
+            console.log('listen-cb');
+          });
+          server.on('listening', () => {
+            console.log('late-listener');
+            server.close();
+          });
+          console.log('sync-tail');
+          TS
+
+      - name: Compile repro programs
+        run: |
+          cd /tmp/labA && PERRY_DEBUG_SYMBOLS=1 "$GITHUB_WORKSPACE/target/perry-dev/perry" compile main.ts -o main_bin
+          cd /tmp/labB && PERRY_DEBUG_SYMBOLS=1 "$GITHUB_WORKSPACE/target/perry-dev/perry" compile main.ts -o main_bin
+
+      - name: Install gdb + open ptrace
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq gdb
+          sudo sysctl -w kernel.yama.ptrace_scope=0 || true
+
+      - name: Repro loop (concurrent, piped, watchdogged)
+        run: |
+          set +e
+          hangs=0
+          for i in $(seq 1 40); do
+            echo "=== iteration $i ==="
+            (cd /tmp/labA && ./main_bin | cat > out 2>&1) & pa=$!
+            (cd /tmp/labB && ./main_bin | cat > out 2>&1) & pb=$!
+            deadline=$(( SECONDS + 45 ))
+            while kill -0 $pa 2>/dev/null || kill -0 $pb 2>/dev/null; do
+              if [ $SECONDS -ge $deadline ]; then break; fi
+              sleep 0.2
+            done
+            for p in $pa $pb; do
+              if kill -0 $p 2>/dev/null; then
+                hangs=$((hangs+1))
+                # the shell job pid is the subshell; find the real main_bin child
+                mb=$(pgrep -P $p -f main_bin || pgrep -f 'main_bin' | head -1)
+                echo "!!! HANG iteration $i (job $p, main_bin ${mb:-unknown})"
+                for t in ${mb:-}; do
+                  echo "--- /proc/$t/status ---"; head -12 /proc/$t/status || true
+                  echo "--- wchan ---"; cat /proc/$t/wchan 2>/dev/null; echo
+                  echo "--- gdb thread apply all bt ---"
+                  sudo gdb -p $t -batch -ex 'set pagination off' -ex 'thread apply all bt' 2>&1 | sed -n '1,220p'
+                done
+                pkill -9 -f main_bin || true
+                kill -9 $p 2>/dev/null
+              fi
+            done
+            echo "--- outA ---"; cat /tmp/labA/out 2>/dev/null
+            echo "--- outB ---"; cat /tmp/labB/out 2>/dev/null
+            if [ $hangs -ge 1 ]; then
+              echo "hang captured — stopping loop"
+              exit 1
+            fi
+          done
+          echo "no hang in 40 iterations"
