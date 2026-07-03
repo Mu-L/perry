@@ -167,6 +167,7 @@ pub extern "C" fn js_object_set_prototype_of(obj_value: f64, proto: f64) -> f64 
     let proto_is_null = proto_bits == TAG_NULL;
     let proto_is_symbol = unsafe { crate::symbol::js_is_symbol(proto) != 0 };
     let proto_ok = proto_is_null
+        || crate::proxy::js_proxy_is_proxy(proto) != 0
         || (!proto_is_symbol
             && (unsafe { value_is_object_like(proto) }
                 || super::super::class_ref_id(proto).is_some()));
@@ -206,11 +207,31 @@ pub extern "C" fn js_object_set_prototype_of(obj_value: f64, proto: f64) -> f64 
     // can't form a fresh cycle by setting obj's proto to `proto`.
     if !proto_is_null {
         const TAG_NULL_U64: u64 = 0x7FFC_0000_0000_0002;
+        const TAG_UNDEFINED_U64: u64 = 0x7FFC_0000_0000_0001;
         let advance = |bits: u64| -> u64 {
             let val = f64::from_bits(bits);
+            // OrdinarySetPrototypeOf step 7.b.ii.1: if `p`'s [[GetPrototypeOf]]
+            // is not the ordinary internal method (a Proxy's is exotic — it may
+            // run arbitrary trap code), the walk stops here without invoking it.
+            // Without this guard the cycle-detection walk called the target's
+            // `getPrototypeOf` trap as a side effect of unrelated cycle-safety
+            // bookkeeping (test262 has/call-in-prototype-index.js,
+            // set/call-parameters-prototype-index.js observe a `getPrototypeOf`
+            // trap the test handler never installs).
+            if crate::proxy::js_proxy_is_proxy(val) != 0 {
+                return TAG_NULL_U64;
+            }
             let next = js_object_get_prototype_of(val);
             let nb = next.to_bits();
-            if nb == TAG_NULL_U64 {
+            // Treat undefined as chain-end like null: `js_object_get_prototype_of`
+            // returns undefined (not spec's object-or-null) for some exotic
+            // receivers, and feeding that back into the next advance would call
+            // `js_object_get_prototype_of(undefined)`, which throws "Cannot
+            // convert undefined or null to object". comment-json's `__extends`
+            // feature-test `{__proto__: []}` hit this at Next.js server boot. A
+            // genuine cycle can never contain undefined, so ending the walk is
+            // sound.
+            if nb == TAG_NULL_U64 || nb == TAG_UNDEFINED_U64 {
                 TAG_NULL_U64
             } else {
                 nb
@@ -227,18 +248,17 @@ pub extern "C" fn js_object_set_prototype_of(obj_value: f64, proto: f64) -> f64 
             if tortoise == TAG_NULL_U64 {
                 break;
             }
-            // Advance tortoise one step, hare two steps. Guard *every* advance
-            // against a `hare` that already reached null: the inner guard below
-            // only covered the second hop within an iteration, but `hare` can
-            // just as well already be null coming into this iteration (hare
-            // moves 2 steps/tortoise's 1, so it reaches null first on chains
-            // with an even hop count) — advancing a null hare calls
-            // `js_object_get_prototype_of(null)`, which throws "Cannot convert
-            // undefined or null to object" (previously surfaced as a spurious
-            // TypeError on `Object.setPrototypeOf`/`__proto__` writes with a
-            // short-but-even prototype chain, e.g. `new MessageChannel()`
-            // delegating through the worker_threads factory, #4873).
+            // Advance tortoise one step, hare two steps.
             tortoise = advance(tortoise);
+            // The hare reaches the chain end (null) before the tortoise on any
+            // acyclic chain longer than one link (e.g. a function proto:
+            // fn → Function.prototype → Object.prototype → null). Freeze it at
+            // null instead of advancing again — advance(null) would call
+            // js_object_get_prototype_of(null), which throws "Cannot convert
+            // undefined or null to object". comment-json's `__extends` hit this
+            // on every transpiled subclass at Next.js server boot. The tortoise
+            // still walks the remaining chain alone, so the obj-membership
+            // (cycle) check stays complete.
             hare = if hare == TAG_NULL_U64 {
                 TAG_NULL_U64
             } else {

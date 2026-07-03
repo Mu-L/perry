@@ -105,7 +105,6 @@ use perry_ffi::{
     Handle, JsClosure, JsString, JsValue, ObjectHeader, RawClosureHeader, StringHeader,
 };
 use std::collections::HashMap;
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Mutex, Once};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -188,18 +187,49 @@ pub(crate) enum PendingHttpEvent {
     DeferredArmContinue { request_handle: Handle },
 }
 
-/// #4909: number of client requests dispatched but not yet resolved to a
-/// terminal event (`ResponseEnd`/`Error`/`TransportError`/`Timeout`). The
-/// actual network exchange runs as a *detached* tokio task (`client_dispatch`
-/// forgets its `JoinHandle` so it can return before the request completes),
-/// so `EXT_BLOCKING_TASKS_INFLIGHT` only covers the near-instant dispatch
-/// closure, not the request/response round-trip itself. Without this, the
-/// event loop can decide there's no more work and exit mid-flight — the
-/// in-flight request was only "kept alive" by incidental overlap with some
-/// other subsystem's ref (e.g. the peer server's own in-flight-request
-/// tracking), a race lost consistently on some platforms/CI runners.
-/// `js_http_has_pending` below folds this in alongside the event queue.
-pub(crate) static CLIENT_REQUESTS_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+/// #5779 follow-up — count of in-flight HTTP/HTTPS CLIENT requests (the detached
+/// reqwest task spawned per `http.request`/`http.get`, from dispatch until the
+/// response fully streams or errors).
+///
+/// `EXT_BLOCKING_TASKS_INFLIGHT` (perry-stdlib's idle-kick / active-handle gate)
+/// only stays up for the SHORT outer `spawn_blocking` closure that *launches* the
+/// reqwest task and returns; it drops to 0 while the actual fetch is still in
+/// flight. So the runtime's idle-kick never fires during a fetch, and a lost
+/// tokio worker-unpark for the reqwest task (the canonical failure under a
+/// `Promise.all` burst of fetches) is never recovered — the main thread parks
+/// forever with the responses received but undelivered. This counter, exposed via
+/// [`js_ext_http_client_inflight`], lets the idle-kick + active-handle gate honor
+/// a fetch's TRUE lifetime so a stranded reqwest task gets roused.
+static CLIENT_REQUESTS_INFLIGHT: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+/// RAII in-flight marker. Created right before the reqwest task is spawned and
+/// MOVED INTO the task, so the count tracks the task's full lifetime — including
+/// a task scheduled-but-stranded by a lost worker-unpark (its future, holding the
+/// guard, is never dropped while stranded). Drop wakes the main loop so its
+/// active-handle gate re-evaluates promptly.
+pub(crate) struct ClientInflightGuard;
+impl ClientInflightGuard {
+    pub(crate) fn new() -> Self {
+        CLIENT_REQUESTS_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        ClientInflightGuard
+    }
+}
+impl Drop for ClientInflightGuard {
+    fn drop(&mut self) {
+        CLIENT_REQUESTS_INFLIGHT.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        notify_main_thread();
+    }
+}
+
+/// Exposed for perry-stdlib's idle-kick + active-handle gate (#5779 follow-up):
+/// returns nonzero while any HTTP client fetch is outstanding.
+#[no_mangle]
+pub extern "C" fn js_ext_http_client_inflight() -> i32 {
+    CLIENT_REQUESTS_INFLIGHT
+        .load(std::sync::atomic::Ordering::Acquire)
+        .clamp(0, i32::MAX as i64) as i32
+}
 
 lazy_static! {
     static ref HTTP_PENDING_EVENTS: Mutex<Vec<PendingHttpEvent>> = Mutex::new(Vec::new());
@@ -662,7 +692,11 @@ fn dispatch_request_over_socket(
             return;
         }
         let handle = tokio::runtime::Handle::current();
+        // #5779 follow-up: keep this fetch counted in-flight for its whole
+        // lifetime so the idle-kick recovers a lost worker-unpark.
+        let inflight_guard = ClientInflightGuard::new();
         let jh = handle.spawn(async move {
+            let _inflight = inflight_guard;
             let vtable = match perry_ffi::raw_net() {
                 Some(v) => v,
                 None => {
@@ -1646,31 +1680,46 @@ pub extern "C" fn js_http_has_pending() -> i32 {
             js_http_process_pending();
         }
     }
-    let still_queued = HTTP_PENDING_EVENTS
+    HTTP_PENDING_EVENTS
         .lock()
-        .map(|q| !q.is_empty())
-        .unwrap_or(false);
-    // #4909: a dispatched-but-unresolved client request must keep the loop
-    // alive even with an empty event queue (see CLIENT_REQUESTS_INFLIGHT).
-    if still_queued || CLIENT_REQUESTS_INFLIGHT.load(std::sync::atomic::Ordering::Acquire) > 0 {
-        1
-    } else {
-        0
-    }
+        .map(|q| if q.is_empty() { 0 } else { 1 })
+        .unwrap_or(0)
 }
 
 /// Drain the pending HTTP-event queue and fire user callbacks. Called
 /// from codegen's event-loop tick. Returns count of events drained.
 #[no_mangle]
 pub unsafe extern "C" fn js_http_process_pending() -> i32 {
-    let events: Vec<PendingHttpEvent> = match HTTP_PENDING_EVENTS.lock() {
-        Ok(mut q) => q.drain(..).collect(),
-        Err(_) => return 0,
-    };
-
-    let count = events.len() as i32;
-
-    for ev in events {
+    // Process events ONE AT A TIME, re-reading the shared queue each iteration
+    // rather than draining the whole batch into a local Vec up front.
+    //
+    // Why (#5783 follow-up): a response handler may RE-ENTER the event loop —
+    // e.g. a `ResponseHead` invokes an async response callback that drives a
+    // `for await` / `.toArray()` over a `res.pipe(PassThrough())` body. That
+    // consumer's `await` block-waits, pumping the loop (which re-enters this
+    // function), and its resolution depends on the body arriving via the LATER
+    // `ResponseChunk`/`ResponseEnd` events of this same batch. If those were
+    // already drained into a local Vec, the re-entrant pump would find an empty
+    // `HTTP_PENDING_EVENTS` and the consumer would deadlock (empty body / hang).
+    // Keeping unprocessed events in the shared queue lets the re-entrant drain
+    // deliver them. FIFO `remove(0)` preserves event order; each event is taken
+    // by exactly one (outer or re-entrant) frame, so there is no double-dispatch.
+    let mut count = 0i32;
+    loop {
+        let ev = match HTTP_PENDING_EVENTS.lock() {
+            Ok(mut q) => {
+                if q.is_empty() {
+                    None
+                } else {
+                    Some(q.remove(0))
+                }
+            }
+            Err(_) => return count,
+        };
+        let Some(ev) = ev else {
+            break;
+        };
+        count += 1;
         match ev {
             PendingHttpEvent::Response {
                 request_handle,
