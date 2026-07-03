@@ -17,6 +17,8 @@ use crate::StringHeader;
 #[cfg(feature = "intl-segmenter")]
 use unicode_segmentation::UnicodeSegmentation;
 
+mod ctor_guard;
+use ctor_guard::{constructor_target_prototype, require_new_target};
 mod display_names;
 mod duration_format;
 mod locale;
@@ -27,6 +29,7 @@ mod install;
 use install::install_constructor;
 mod list_relative_plural;
 mod number_format;
+mod number_format_digits;
 mod number_format_options;
 mod segmenter;
 
@@ -60,9 +63,9 @@ pub(crate) use list_relative_plural::{
     rtf_singular_unit, rtf_to_parts_thunk,
 };
 pub(crate) use number_format::{
-    captured_intl_object, compact_round, compact_suffix, currency_instance_parts,
-    decimal_msd_exponent, format_number_instance, grouping_enabled, increment_decimal,
-    intl_object_from_value, nf_coerce_number, nf_load, nf_resolved_default,
+    bigint_to_locale_string, captured_intl_object, compact_round, compact_suffix,
+    currency_instance_parts, decimal_msd_exponent, format_number_instance, grouping_enabled,
+    increment_decimal, intl_object_from_value, nf_coerce_number, nf_load, nf_resolved_default,
     number_format_bound_format_thunk, number_format_bound_resolved_options_thunk,
     number_format_bound_to_parts_thunk, number_format_format_getter_thunk,
     number_format_format_object, number_format_range_thunk, number_format_range_to_parts_thunk,
@@ -1600,7 +1603,7 @@ fn make_instance(closure: *const ClosureHeader, kind: &str, locales: f64, option
         _ => {}
     }
 
-    let proto = crate::closure::closure_get_dynamic_prop(closure as usize, "prototype");
+    let proto = constructor_target_prototype(closure);
     if JSValue::from_bits(proto.to_bits()).is_pointer() {
         crate::object::prototype_chain::object_set_static_prototype(obj as usize, proto.to_bits());
     }
@@ -1654,6 +1657,7 @@ extern "C" fn collator_constructor_thunk(closure: *const ClosureHeader, rest: f6
 }
 
 extern "C" fn segmenter_constructor_thunk(closure: *const ClosureHeader, rest: f64) -> f64 {
+    require_new_target("Segmenter");
     make_instance(
         closure,
         KIND_SEGMENTER,
@@ -1663,6 +1667,7 @@ extern "C" fn segmenter_constructor_thunk(closure: *const ClosureHeader, rest: f
 }
 
 extern "C" fn list_format_constructor_thunk(closure: *const ClosureHeader, rest: f64) -> f64 {
+    require_new_target("ListFormat");
     make_instance(
         closure,
         KIND_LIST_FORMAT,
@@ -1675,6 +1680,7 @@ extern "C" fn relative_time_format_constructor_thunk(
     closure: *const ClosureHeader,
     rest: f64,
 ) -> f64 {
+    require_new_target("RelativeTimeFormat");
     make_instance(
         closure,
         KIND_RELATIVE_TIME,
@@ -1684,6 +1690,7 @@ extern "C" fn relative_time_format_constructor_thunk(
 }
 
 extern "C" fn plural_rules_constructor_thunk(closure: *const ClosureHeader, rest: f64) -> f64 {
+    require_new_target("PluralRules");
     make_instance(
         closure,
         KIND_PLURAL_RULES,
