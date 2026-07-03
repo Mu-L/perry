@@ -5,6 +5,14 @@
 
 use super::*;
 
+// STEP-TRACE PROBE (#5437, exp/async-capturing-on-main): gate helper.
+fn step_trace_on() -> bool {
+    thread_local! {
+        static ON: bool = std::env::var("PERRY_STEP_TRACE").as_deref() == Ok("1");
+    }
+    ON.with(|b| *b)
+}
+
 /// Inverse of `then::arg_to_closure` — reboxes an already-unboxed
 /// `ClosurePtr` handler arg back into a boxed `f64` JS value so it can be
 /// forwarded to `js_promise_then_checked`. Null (the "no handler" sentinel)
@@ -226,6 +234,22 @@ pub extern "C" fn js_async_step_chain(value: f64, step_closure: ClosurePtr) -> *
     let trap = INLINE_TRAP.with(|c| c.get());
     let can_reuse = !trap.trap_next.is_null() && trap.current_step == step_closure as usize;
     let trap_next = trap.trap_next;
+
+    // STEP-TRACE PROBE (#5437, exp/async-capturing-on-main): capped log of EVERY
+    // chain entry + reuse decision so we can see whether the render machine even
+    // reaches its first await. Gated + capped; REVERT before ship.
+    if step_trace_on() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static STEP_TRACE_N: AtomicUsize = AtomicUsize::new(0);
+        let n = STEP_TRACE_N.fetch_add(1, Ordering::Relaxed);
+        if n < 40000 {
+            let vprim = is_definitely_primitive(value);
+            eprintln!(
+                "[CHAIN] step={:#x} cur={:#x} trap_next={:#x} reuse={} vprim={}",
+                step_closure as usize, trap.current_step, trap_next as usize, can_reuse, vprim
+            );
+        }
+    }
 
     let (next, queued_value, is_error) = if is_definitely_primitive(value) {
         // Primitive value: enqueue Task::AsyncStep directly.
@@ -467,6 +491,9 @@ pub extern "C" fn js_async_first_call(step_closure_nanbox: f64) -> f64 {
     // `trap_next` untouched. The outer's chain reuse on its OWN
     // resumption is unaffected (this restore at function exit puts
     // `prev` back).
+    if step_trace_on() {
+        eprintln!("[FIRST] step={:#x}", ptr as usize);
+    }
     let prev = INLINE_TRAP.with(|c| {
         let old = c.get();
         c.set(InlineTrap {
@@ -483,6 +510,13 @@ pub extern "C" fn js_async_first_call(step_closure_nanbox: f64) -> f64 {
         )
     };
     INLINE_TRAP.with(|c| c.set(prev));
+    if step_trace_on() {
+        eprintln!(
+            "[FIRSTRET] step={:#x} ret={:#x}",
+            ptr as usize,
+            result.to_bits()
+        );
+    }
     result
 }
 
