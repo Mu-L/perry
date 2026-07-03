@@ -141,6 +141,12 @@ pub extern "C" fn js_register_wait_driver(
     WAIT_DRIVER_FAST.store(fast_ptr, Ordering::Release);
     let sleep_ptr = sleep.map(|f| f as *mut ()).unwrap_or(std::ptr::null_mut());
     WAIT_DRIVER_SLEEP.store(sleep_ptr, Ordering::Release);
+    // #5892 diagnostic (debug branch only): prove which copy of this static the
+    // registration writes, and that the write happened at all.
+    eprintln!(
+        "[5892-diag] js_register_wait_driver: slot@{:p} sleep={:p}",
+        &WAIT_DRIVER_SLEEP, sleep_ptr
+    );
 }
 
 /// Run one bounded tick of the registered wait-driver. Returns `true` if a
@@ -545,6 +551,21 @@ pub extern "C" fn js_wait_for_event() {
     if wait_driver_sleep(budget_ms) {
         spin_streak_reset();
         return;
+    }
+    // #5892 diagnostic (debug branch only): the condvar fallback should be
+    // unreachable in an async program — if we get here, report which copy of
+    // the slot static we read and what it contained. One-shot.
+    {
+        use std::sync::atomic::AtomicBool;
+        static FALLBACK_REPORTED: AtomicBool = AtomicBool::new(false);
+        if !FALLBACK_REPORTED.swap(true, Ordering::AcqRel) {
+            eprintln!(
+                "[5892-diag] condvar FALLBACK: slot@{:p} sleep={:p} budget_ms={}",
+                &WAIT_DRIVER_SLEEP,
+                WAIT_DRIVER_SLEEP.load(Ordering::Acquire),
+                budget_ms
+            );
+        }
     }
     // Fallback (no async runtime registered — non-async programs / embedders):
     // the original condvar park (#84).

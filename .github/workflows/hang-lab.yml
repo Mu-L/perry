@@ -98,10 +98,16 @@ jobs:
                 echo "!!! [$label] HANG on iteration $i"
                 mb=$(pgrep -x main_bin | head -1)
                 if [ -n "$mb" ]; then probe_hung $mb; else echo "(no main_bin process?)"; ps -ef | grep -E 'issue_4903|perry' | grep -v grep; fi
-                pkill -9 -f issue_4903; pkill -9 -x main_bin; kill -9 $cpid 2>/dev/null
+                pkill -9 -x main_bin
+                # let the harness observe the kill and print stdout/stderr (the 5892-diag lines)
+                sleep 5
+                echo "-------- ct.out tail (diag lines) --------"
+                tail -80 /tmp/ct.out
+                grep -n '5892-diag' /tmp/ct.out || echo "(no 5892-diag lines in ct.out)"
+                pkill -9 -f issue_4903; kill -9 $cpid 2>/dev/null
                 return 1
               fi
-              tail -3 /tmp/ct.out
+              tail -3 /tmp/ct.out; grep -m4 "5892-diag" /tmp/ct.out || true
             done
             echo "[$label] no hang in 6 iterations"
             return 0
