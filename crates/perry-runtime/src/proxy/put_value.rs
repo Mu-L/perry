@@ -5,9 +5,9 @@
 
 use super::*;
 
-/// `proxy[key] = value` — if handler.set exists, call it with
-/// (target, key, value) and return TAG_TRUE (the trap's return value is
-/// ignored by the default test semantics since we echo `value`). Otherwise
+/// `proxy[key] = value` — if handler.set exists, call it with `(target, key,
+/// value, receiver)` and return its coerced boolean result (#2756: observable
+/// through `Reflect.set(proxy, …)` and strict-mode assignment). Otherwise
 /// forward to the target directly.
 #[no_mangle]
 pub extern "C" fn js_proxy_set(proxy_boxed: f64, key: f64, value: f64) -> f64 {
