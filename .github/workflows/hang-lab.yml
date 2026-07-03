@@ -1,12 +1,15 @@
 name: Hang Lab 5892
 
-# Round 3: round 2 caught the hang (iteration 1, parallel test-threads).
-# Hung main_bin: SINGLE thread parked on futex (not epoll), server LISTENing,
-# zero established connections. Three hypotheses to discriminate:
-#  (a) condvar-fallback cycling (wait-driver never registered)  -> timed futex, wakes every ~1s
-#  (b) single-thread Mutex self-deadlock                        -> infinite futex, zero wakes
-#  (c) concurrent-perry-compile corrupted binary                -> hash differs from clean recompile,
-#                                                                  and serial test-threads never hang
+# Round 5: confirm + fix in one run.
+# Round-4 lesson: main_bin links archives from target/, so the wrapper/ext
+# staticlib crates must be rebuilt from THIS tree for instrumentation (and the
+# fix) to reach the binary. Phases:
+#   1. Build wrappers + ext libs (instrumented tree, shims UNGATED = bug state)
+#   2. CONFIRM: PERRY_LINK_MAP names the archive member providing
+#      perry_ffi_spawn_blocking_with_reactor; run repro once (expect hang)
+#   3. FIX: gate test_async_shims with #[cfg(test)] in ext-http + ext-http-server
+#      (ext-net already gated), rebuild, re-map, re-run (expect clean), then
+#      4x the exact cargo-test loop (expect no hang)
 on:
   push:
     branches: [debug/5892-hang-lab]
@@ -49,76 +52,101 @@ jobs:
           shared-key: "${{ runner.os }}-perry"
           save-if: "false"
 
-      - name: Install tooling
+      - name: Build perry + wrappers + ext libs (bug state)
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq gdb strace
-          sudo sysctl -w kernel.yama.ptrace_scope=0 || true
+          cargo build -p perry -p perry-runtime-static -p perry-stdlib-static
+          cargo build -p perry-ext-http-server -p perry-ext-http -p perry-ext-net -p perry-ext-ws
+          cargo test -p perry --test issue_4903_listen_callback_deferred --no-run
 
-      - name: Build the test (no run)
-        run: cargo test -p perry --test issue_4903_listen_callback_deferred --no-run
+      - name: Prepare repro program
+        run: |
+          mkdir -p /tmp/lab
+          cat > /tmp/lab/main.ts <<'TS'
+          const http = require('http');
+          const server = http.createServer(function (req: any, res: any) {
+            console.log('handler-this-port-matches', (this as any).address().port === server.address().port);
+            res.end('ok');
+          }).listen(0, function () {
+            console.log('cb-sees-server', typeof server);
+            const addr = server.address();
+            console.log('addr', typeof addr, addr.family, typeof addr.port, addr.port > 0);
+            console.log('cb-this-port-matches', (this as any).address().port === addr.port);
+            http.get({ port: addr.port, path: '/' }, (res: any) => {
+              let body = '';
+              res.on('data', (c: any) => { body += c; });
+              res.on('end', () => {
+                console.log('body', body);
+                server.close();
+              });
+            });
+          });
+          console.log('sync-after-listen');
+          TS
 
-      - name: Repro + discriminate
+      - name: "CONFIRM phase: link map + single run (bug state)"
         run: |
           set +e
-          probe_hung() {
-            local mb=$1
-            echo "==== /proc/$mb/syscall (futex arg 4 = timeout ptr; 0x0 => INFINITE) ===="
-            cat /proc/$mb/syscall
-            echo "==== 6s strace sample (wake pattern) ===="
-            sudo timeout 6 strace -f -p $mb -e trace=futex,epoll_wait,epoll_pwait,poll,clock_nanosleep 2>&1 | head -40
-            echo "==== /proc/$mb/stat utime/stime twice, 3s apart (CPU?) ===="
-            awk '{print "utime="$14" stime="$15}' /proc/$mb/stat
-            sleep 3
-            awk '{print "utime="$14" stime="$15}' /proc/$mb/stat
-            echo "==== corruption check: rehash + clean sequential recompile ===="
-            local dir=$(dirname $(readlink -f /proc/$mb/exe))
-            echo "hung binary: $(md5sum /proc/$mb/exe | cut -d' ' -f1)"
-            cp /proc/$mb/exe /tmp/hung_main_bin
-            if [ -f "$dir/main.ts" ]; then
-              (cd "$dir" && "$GITHUB_WORKSPACE/target/debug/perry" compile main.ts -o main_bin_clean >/dev/null 2>&1 \
-                 && echo "clean recompile: $(md5sum main_bin_clean | cut -d' ' -f1)")
-            fi
-            echo "==== gdb all-thread bt (for the record) ===="
-            sudo gdb -p $mb -batch -ex 'set pagination off' -ex 'thread apply all bt' 2>&1 | sed -n '1,40p'
-          }
-          run_phase() {
-            local label=$1; shift
-            local extra="$1"
-            for i in $(seq 1 6); do
-              echo "=== [$label] iteration $i ==="
-              cargo test -p perry --test issue_4903_listen_callback_deferred -- --nocapture $extra > /tmp/ct.out 2>&1 &
-              cpid=$!
-              deadline=$(( SECONDS + 240 ))
-              hung=1
-              while [ $SECONDS -lt $deadline ]; do
-                if ! kill -0 $cpid 2>/dev/null; then hung=""; break; fi
-                sleep 1
-              done
-              if [ -n "$hung" ]; then
-                echo "!!! [$label] HANG on iteration $i"
-                mb=$(pgrep -x main_bin | head -1)
-                if [ -n "$mb" ]; then probe_hung $mb; else echo "(no main_bin process?)"; ps -ef | grep -E 'issue_4903|perry' | grep -v grep; fi
-                pkill -9 -x main_bin
-                # let the harness observe the kill and print stdout/stderr (the 5892-diag lines)
-                sleep 5
-                echo "-------- ct.out tail (diag lines) --------"
-                tail -80 /tmp/ct.out
-                grep -n '5892-diag' /tmp/ct.out || echo "(no 5892-diag lines in ct.out)"
-                pkill -9 -f issue_4903; kill -9 $cpid 2>/dev/null
-                return 1
-              fi
-              tail -3 /tmp/ct.out; grep -m4 "5892-diag" /tmp/ct.out || true
-            done
-            echo "[$label] no hang in 6 iterations"
-            return 0
-          }
-          echo "############ PHASE 1: default (parallel) test threads ############"
-          run_phase parallel ""
-          p1=$?
-          echo "############ PHASE 2: --test-threads=1 (serial: no concurrent perry compiles) ############"
-          run_phase serial "--test-threads=1"
-          p2=$?
-          echo "RESULT: parallel_hang=$p1 serial_hang=$p2 (1=hang captured)"
-          # exit 1 only if we captured evidence, so the log is easy to spot
-          [ $p1 -eq 1 -o $p2 -eq 1 ] && exit 1
+          cd /tmp/lab
+          PERRY_LINK_MAP=/tmp/lab/map.txt "$GITHUB_WORKSPACE/target/debug/perry" compile main.ts -o main_bin 2>&1 | tail -3
+          echo "==== who provides the perry_ffi async bridge (BUG state) ===="
+          grep -E 'perry_ffi_spawn_blocking_with_reactor|perry_ffi_spawn_async' /tmp/lab/map.txt | head -6
+          grep -E 'test_async_shims|perry_ffi_async' /tmp/lab/map.txt | head -8
+          echo "==== single run, 40s watchdog ===="
+          ./main_bin > out.txt 2>&1 &
+          pid=$!
+          deadline=$(( SECONDS + 40 )); hung=1
+          while [ $SECONDS -lt $deadline ]; do kill -0 $pid 2>/dev/null || { hung=""; break; }; sleep 1; done
+          if [ -n "$hung" ]; then echo "BUG-STATE: HANG (as expected)"; kill -9 $pid; else echo "BUG-STATE: exited (no hang this time)"; fi
+          cat out.txt
           exit 0
+
+      - name: "FIX phase: gate the shims, rebuild, re-verify"
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          for f in crates/perry-ext-http/src/lib.rs crates/perry-ext-http-server/src/lib.rs; do
+            python3 - "$f" <<'PY'
+          import sys
+          p = sys.argv[1]
+          s = open(p).read()
+          old = "\nmod test_async_shims;"
+          new = "\n#[cfg(test)]\nmod test_async_shims;"
+          assert s.count(old) == 1, p
+          open(p, "w").write(s.replace(old, new))
+          print("gated", p)
+          PY
+          done
+          cargo build -p perry-ext-http-server -p perry-ext-http
+          cd /tmp/lab
+          rm -f main_bin map.txt
+          PERRY_LINK_MAP=/tmp/lab/map.txt "$GITHUB_WORKSPACE/target/debug/perry" compile main.ts -o main_bin --no-cache 2>&1 | tail -3
+          echo "==== who provides the perry_ffi async bridge (FIXED state) ===="
+          grep -E 'perry_ffi_spawn_blocking_with_reactor|perry_ffi_spawn_async' /tmp/lab/map.txt | head -6
+          echo "==== single run, 40s watchdog ===="
+          set +e
+          ./main_bin > out.txt 2>&1 &
+          pid=$!
+          deadline=$(( SECONDS + 40 )); hung=1
+          while [ $SECONDS -lt $deadline ]; do kill -0 $pid 2>/dev/null || { hung=""; break; }; sleep 1; done
+          if [ -n "$hung" ]; then echo "FIXED-STATE: STILL HANGS — fix insufficient"; kill -9 $pid; cat out.txt; exit 1; fi
+          echo "FIXED-STATE: clean exit"; cat out.txt
+
+      - name: "FIX phase: exact cargo-test loop x6"
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE"
+          for i in $(seq 1 6); do
+            echo "=== fixed cargo-test iteration $i ==="
+            cargo test -p perry --test issue_4903_listen_callback_deferred -- --nocapture > /tmp/ct.out 2>&1 &
+            cpid=$!
+            deadline=$(( SECONDS + 240 )); hung=1
+            while [ $SECONDS -lt $deadline ]; do kill -0 $cpid 2>/dev/null || { hung=""; break; }; sleep 1; done
+            if [ -n "$hung" ]; then
+              echo "!!! STILL HANGS with fix on iteration $i"
+              pkill -9 -x main_bin; sleep 3; tail -60 /tmp/ct.out
+              pkill -9 -f issue_4903; kill -9 $cpid 2>/dev/null
+              exit 1
+            fi
+            tail -3 /tmp/ct.out
+          done
+          echo "VERDICT: fix eliminates the hang (6/6 clean)"
