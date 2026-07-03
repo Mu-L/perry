@@ -1,12 +1,12 @@
 name: Hang Lab 5892
 
-# Diagnostic lab for issue #5892. Round 2: the standalone concurrent repro was
-# clean over 40 iterations, so this round runs the EXACT failing cargo test
-# (debug-profile perry driver, Command::output() pipes, libtest harness) in a
-# loop under a watchdog. On hang it gdb-dumps every process in the tree
-# (harness, perry, main_bin) — the evidence the 180-min timeout never leaves.
-# Delete this workflow with the branch once #5892 is fixed.
-
+# Round 3: round 2 caught the hang (iteration 1, parallel test-threads).
+# Hung main_bin: SINGLE thread parked on futex (not epoll), server LISTENing,
+# zero established connections. Three hypotheses to discriminate:
+#  (a) condvar-fallback cycling (wait-driver never registered)  -> timed futex, wakes every ~1s
+#  (b) single-thread Mutex self-deadlock                        -> infinite futex, zero wakes
+#  (c) concurrent-perry-compile corrupted binary                -> hash differs from clean recompile,
+#                                                                  and serial test-threads never hang
 on:
   push:
     branches: [debug/5892-hang-lab]
@@ -49,49 +49,70 @@ jobs:
           shared-key: "${{ runner.os }}-perry"
           save-if: "false"
 
-      - name: Install gdb + open ptrace
+      - name: Install tooling
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq gdb
+          sudo apt-get update -qq && sudo apt-get install -y -qq gdb strace
           sudo sysctl -w kernel.yama.ptrace_scope=0 || true
 
-      - name: Build the test (no run) so the loop below is pure runtime
+      - name: Build the test (no run)
         run: cargo test -p perry --test issue_4903_listen_callback_deferred --no-run
 
-      - name: Exact cargo-test repro loop with gdb-on-hang
+      - name: Repro + discriminate
         run: |
           set +e
-          dump_tree() {
-            echo "######## HANG DUMP ########"
-            ps -ef | grep -E 'issue_4903|main_bin|perry' | grep -v grep
-            echo "-------- sockets --------"
-            ss -tanp 2>/dev/null | head -40
-            for pat in 'issue_4903' 'main_bin' '/perry compile'; do
-              for p in $(pgrep -f "$pat"); do
-                echo "======== $pat pid $p ========"
-                head -8 /proc/$p/status 2>/dev/null
-                echo "wchan: $(cat /proc/$p/wchan 2>/dev/null)"
-                sudo gdb -p $p -batch -ex 'set pagination off' -ex 'thread apply all bt' 2>&1 | sed -n '1,250p'
-              done
-            done
-            echo "######## END DUMP ########"
-          }
-          for i in $(seq 1 8); do
-            echo "=== cargo-test iteration $i ==="
-            cargo test -p perry --test issue_4903_listen_callback_deferred -- --nocapture > /tmp/ct.out 2>&1 &
-            cpid=$!
-            deadline=$(( SECONDS + 300 ))
-            hung=1
-            while [ $SECONDS -lt $deadline ]; do
-              if ! kill -0 $cpid 2>/dev/null; then hung=""; break; fi
-              sleep 1
-            done
-            if [ -n "$hung" ]; then
-              echo "!!! HANG on iteration $i (cargo pid $cpid alive after 300s)"
-              dump_tree
-              pkill -9 -f issue_4903; pkill -9 -f main_bin; kill -9 $cpid 2>/dev/null
-              tail -40 /tmp/ct.out
-              exit 1
+          probe_hung() {
+            local mb=$1
+            echo "==== /proc/$mb/syscall (futex arg 4 = timeout ptr; 0x0 => INFINITE) ===="
+            cat /proc/$mb/syscall
+            echo "==== 6s strace sample (wake pattern) ===="
+            sudo timeout 6 strace -f -p $mb -e trace=futex,epoll_wait,epoll_pwait,poll,clock_nanosleep 2>&1 | head -40
+            echo "==== /proc/$mb/stat utime/stime twice, 3s apart (CPU?) ===="
+            awk '{print "utime="$14" stime="$15}' /proc/$mb/stat
+            sleep 3
+            awk '{print "utime="$14" stime="$15}' /proc/$mb/stat
+            echo "==== corruption check: rehash + clean sequential recompile ===="
+            local dir=$(dirname $(readlink -f /proc/$mb/exe))
+            echo "hung binary: $(md5sum /proc/$mb/exe | cut -d' ' -f1)"
+            cp /proc/$mb/exe /tmp/hung_main_bin
+            if [ -f "$dir/main.ts" ]; then
+              (cd "$dir" && "$GITHUB_WORKSPACE/target/debug/perry" compile main.ts -o main_bin_clean >/dev/null 2>&1 \
+                 && echo "clean recompile: $(md5sum main_bin_clean | cut -d' ' -f1)")
             fi
-            tail -5 /tmp/ct.out
-          done
-          echo "no hang in 8 exact cargo-test iterations"
+            echo "==== gdb all-thread bt (for the record) ===="
+            sudo gdb -p $mb -batch -ex 'set pagination off' -ex 'thread apply all bt' 2>&1 | sed -n '1,40p'
+          }
+          run_phase() {
+            local label=$1; shift
+            local extra="$1"
+            for i in $(seq 1 6); do
+              echo "=== [$label] iteration $i ==="
+              cargo test -p perry --test issue_4903_listen_callback_deferred -- --nocapture $extra > /tmp/ct.out 2>&1 &
+              cpid=$!
+              deadline=$(( SECONDS + 240 ))
+              hung=1
+              while [ $SECONDS -lt $deadline ]; do
+                if ! kill -0 $cpid 2>/dev/null; then hung=""; break; fi
+                sleep 1
+              done
+              if [ -n "$hung" ]; then
+                echo "!!! [$label] HANG on iteration $i"
+                mb=$(pgrep -x main_bin | head -1)
+                if [ -n "$mb" ]; then probe_hung $mb; else echo "(no main_bin process?)"; ps -ef | grep -E 'issue_4903|perry' | grep -v grep; fi
+                pkill -9 -f issue_4903; pkill -9 -x main_bin; kill -9 $cpid 2>/dev/null
+                return 1
+              fi
+              tail -3 /tmp/ct.out
+            done
+            echo "[$label] no hang in 6 iterations"
+            return 0
+          }
+          echo "############ PHASE 1: default (parallel) test threads ############"
+          run_phase parallel ""
+          p1=$?
+          echo "############ PHASE 2: --test-threads=1 (serial: no concurrent perry compiles) ############"
+          run_phase serial "--test-threads=1"
+          p2=$?
+          echo "RESULT: parallel_hang=$p1 serial_hang=$p2 (1=hang captured)"
+          # exit 1 only if we captured evidence, so the log is easy to spot
+          [ $p1 -eq 1 -o $p2 -eq 1 ] && exit 1
+          exit 0
