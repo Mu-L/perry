@@ -100,6 +100,30 @@ jobs:
           cat out.txt
           exit 0
 
+      - name: "BUG-state cargo-test loop x4 (A of the A/B)"
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE"
+          bug_hangs=0
+          for i in $(seq 1 4); do
+            echo "=== bug-state cargo-test iteration $i ==="
+            cargo test -p perry --test issue_4903_listen_callback_deferred -- --nocapture > /tmp/ct.out 2>&1 &
+            cpid=$!
+            deadline=$(( SECONDS + 240 )); hung=1
+            while [ $SECONDS -lt $deadline ]; do kill -0 $cpid 2>/dev/null || { hung=""; break; }; sleep 1; done
+            if [ -n "$hung" ]; then
+              bug_hangs=$((bug_hangs+1))
+              echo "!!! bug-state HANG on iteration $i (expected)"
+              pkill -9 -x main_bin; sleep 3
+              grep -m2 "5892-diag" /tmp/ct.out || echo "(no diag in ct.out)"
+              pkill -9 -f issue_4903; kill -9 $cpid 2>/dev/null
+            else
+              tail -2 /tmp/ct.out
+            fi
+          done
+          echo "BUG_HANGS=$bug_hangs" > /tmp/bug_hangs.txt
+          cat /tmp/bug_hangs.txt
+
       - name: "FIX phase: gate the shims, rebuild, re-verify"
         run: |
           set -e
@@ -149,4 +173,10 @@ jobs:
             fi
             tail -3 /tmp/ct.out
           done
-          echo "VERDICT: fix eliminates the hang (6/6 clean)"
+          bug_hangs=$(grep -oE "[0-9]+" /tmp/bug_hangs.txt | head -1)
+          echo "VERDICT: bug-state hangs=$bug_hangs, fixed-state 6/6 clean"
+          if [ "${bug_hangs:-0}" -eq 0 ]; then
+            echo "WARNING: bug state did not hang in this run — A/B inconclusive"
+            exit 1
+          fi
+          echo "A/B CONCLUSIVE: same archives, hang before gate, clean after gate"
