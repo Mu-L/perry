@@ -677,6 +677,10 @@ extern "C" fn async_step_fulfill_thunk(
     });
     let result = crate::closure::js_closure_call2(step, value, false_bits);
     INLINE_TRAP.with(|c| c.set(prev));
+    // #5941 diagnostic (inert unless PERRY_STUCK_DUMP=1). Strip before PR.
+    if super::stuck_dump::enabled() {
+        super::stuck_dump::note_thunk_return(step as usize);
+    }
     result
 }
 
@@ -706,6 +710,10 @@ extern "C" fn async_step_reject_thunk(
     });
     let result = crate::closure::js_closure_call2(step, value, true_bits);
     INLINE_TRAP.with(|c| c.set(prev));
+    // #5941 diagnostic (inert unless PERRY_STUCK_DUMP=1). Strip before PR.
+    if super::stuck_dump::enabled() {
+        super::stuck_dump::note_thunk_return(step as usize);
+    }
     result
 }
 

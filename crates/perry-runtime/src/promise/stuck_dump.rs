@@ -52,6 +52,7 @@ struct Machine {
     done_promise: usize,
     chains: u32,
     thunk_fires: u32,
+    thunk_returns: u32,
     first_calls: u32,
 }
 
@@ -279,6 +280,14 @@ pub(crate) fn note_thunk_fire(step: usize) {
     });
 }
 
+/// The resume thunk's step call RETURNED (fires < returns ⇒ a step is
+/// blocked mid-execution — the residual block-wait signature).
+pub(crate) fn note_thunk_return(step: usize) {
+    with_machines(|m| {
+        m.entry(step).or_default().thunk_returns += 1;
+    });
+}
+
 fn decode_pointer(bits: u64) -> usize {
     const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
     const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
@@ -394,11 +403,12 @@ fn dump() {
             // func_ptr; the header is alive while the machine is live.
             let func_ptr = unsafe { *(*step as *const *const u8) } as usize;
             eprintln!(
-                "[STUCK] step={:#x} fn={:#x} chains={} thunks={} fc={} await={:#x}({}) result={:#x} -> {}",
+                "[STUCK] step={:#x} fn={:#x} chains={} thunks={}/{} fc={} await={:#x}({}) result={:#x} -> {}",
                 step,
                 func_ptr,
                 st.chains,
                 st.thunk_fires,
+                st.thunk_returns,
                 st.first_calls,
                 st.last_await_bits,
                 classify(st.last_await_bits),
