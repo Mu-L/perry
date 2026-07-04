@@ -718,6 +718,17 @@ fn forward_swallowed_rejection(result: f64, trap_next: *mut Promise) {
             return;
         }
         let reason = (*ret).reason;
+        // #5941 diagnostic (inert unless PERRY_STUCK_DUMP=1): name the
+        // previously-swallowed rejection. Runs on the main thread, so
+        // stringifying is safe. Strip before PR.
+        if super::stuck_dump::enabled() {
+            let s = crate::string::string_as_str(crate::value::js_jsvalue_to_string(reason));
+            eprintln!(
+                "[SWALLOWED] step-resume rejection forwarded to result {:#x}: {}",
+                trap_next as usize,
+                &s[..s.len().min(300)]
+            );
+        }
         // The rejection is consumed by forwarding it into the result —
         // the discarded wrapper must not be reported as unhandled.
         crate::promise::mark_rejection_handled(ret);
