@@ -293,6 +293,36 @@ fn dump() {
             }
         }
         eprintln!("[STUCK] ---- {} live async-step machines ----", live.len());
+        // Inventory of every DONE machine whose promises appear in a live
+        // walk — the done-orphan check: done_promise != result_promise
+        // means `js_async_step_done` settled a promise nobody holds.
+        let mut printed_owners: Vec<usize> = Vec::new();
+        for (_, st) in live.iter() {
+            let mut cur = decode_pointer(st.last_await_bits);
+            for _ in 0..8 {
+                if cur == 0 {
+                    break;
+                }
+                if let Some((owner, true)) = result_owner.get(&cur) {
+                    if !printed_owners.contains(owner) {
+                        printed_owners.push(*owner);
+                        if let Some(o) = m.get(owner) {
+                            let func_ptr = unsafe { *(*owner as *const *const u8) } as usize;
+                            eprintln!(
+                                "[DONE-OWNER] step={:#x} fn={:#x} chains={} thunks={} fc={} result={:#x} done_promise={:#x} owned={:x?}",
+                                owner, func_ptr, o.chains, o.thunk_fires, o.first_calls,
+                                o.result_promise, o.done_promise, o.owned
+                            );
+                        }
+                    }
+                    break;
+                }
+                match parent_of(cur) {
+                    Some(p) if p != 0 => cur = p,
+                    _ => break,
+                }
+            }
+        }
         for (step, st) in live.iter().take(48) {
             let awaited = decode_pointer(st.last_await_bits);
             let link = if awaited == 0 {
