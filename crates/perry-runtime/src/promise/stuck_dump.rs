@@ -78,6 +78,69 @@ fn executor_of(promise: usize) -> Option<usize> {
     guard.as_ref().and_then(|m| m.get(&promise).copied())
 }
 
+/// child promise → (parent promise, creation-site tag) for every
+/// `js_promise_new_with_parent` (the `.then`/`.finally`/await chain
+/// intermediary constructor). Lets the dumper walk an EXTERNAL awaited
+/// promise up its chain to the true root.
+static PARENTS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+pub(crate) fn note_parent(child: usize, parent: usize) {
+    if child == 0 {
+        return;
+    }
+    let mut guard = PARENTS.lock().unwrap_or_else(|e| e.into_inner());
+    guard.get_or_insert_with(HashMap::new).insert(child, parent);
+}
+
+fn parent_of(promise: usize) -> Option<usize> {
+    let guard = PARENTS.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().and_then(|m| m.get(&promise).copied())
+}
+
+/// Describe a promise for the dump: machine-owned / executor-created /
+/// then-chain child (walking up to 8 ancestors) / untracked root.
+fn describe_promise(
+    p: usize,
+    result_owner: &HashMap<usize, (usize, bool)>,
+) -> String {
+    let mut out = String::new();
+    let mut cur = p;
+    for hop in 0..8 {
+        if hop > 0 {
+            out.push_str(" <- ");
+        }
+        if let Some((owner, done)) = result_owner.get(&cur) {
+            out.push_str(&format!(
+                "{:#x}[machine {:#x}{}]",
+                cur,
+                owner,
+                if *done { " DONE" } else { " STUCK" }
+            ));
+            return out;
+        }
+        if let Some(exec_fn) = executor_of(cur) {
+            out.push_str(&format!("{:#x}[executor fn={:#x}]", cur, exec_fn));
+            return out;
+        }
+        match parent_of(cur) {
+            Some(0) => {
+                out.push_str(&format!("{:#x}[then-child of NULL-parent]", cur));
+                return out;
+            }
+            Some(parent) => {
+                out.push_str(&format!("{:#x}[then-child]", cur));
+                cur = parent;
+            }
+            None => {
+                out.push_str(&format!("{:#x}[UNTRACKED root]", cur));
+                return out;
+            }
+        }
+    }
+    out.push_str("...");
+    out
+}
+
 fn with_machines<R>(f: impl FnOnce(&mut HashMap<usize, Machine>) -> R) -> R {
     let mut guard = MACHINES.lock().unwrap_or_else(|e| e.into_inner());
     f(guard.get_or_insert_with(HashMap::new))
@@ -235,16 +298,7 @@ fn dump() {
             let link = if awaited == 0 {
                 "non-ptr".to_string()
             } else {
-                match result_owner.get(&awaited) {
-                    Some((owner, true)) => format!("awaits DONE-machine {:#x}", owner),
-                    Some((owner, false)) => format!("awaits STUCK-machine {:#x}", owner),
-                    None => match executor_of(awaited) {
-                        Some(exec_fn) => {
-                            format!("awaits EXTERNAL executor-promise exec_fn={:#x}", exec_fn)
-                        }
-                        None => "awaits EXTERNAL promise (no executor record)".to_string(),
-                    },
-                }
+                format!("awaits {}", describe_promise(awaited, &result_owner))
             };
             // Diagnostic-only cross-thread read of the closure header's
             // func_ptr so `atos` can name the stuck JS function on a

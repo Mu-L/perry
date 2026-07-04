@@ -431,6 +431,8 @@ pub extern "C" fn js_promise_new() -> *mut Promise {
 /// callbacks (#3139) receive the parent promise.
 pub(crate) fn js_promise_new_with_parent(parent: *mut Promise) -> *mut Promise {
     bump(&MT_PROMISE_NEW_COUNT);
+    // #5941 diagnostic (inert unless PERRY_STUCK_DUMP=1): the child->parent
+    // edge is recorded at the tail of this fn. Strip before PR.
     let async_hooks_active = crate::async_hooks::hooks_active();
     let lifecycle_hooks_active = async_hooks_active || crate::v8::promise_hooks_active();
     let raw = if lifecycle_hooks_active {
@@ -467,6 +469,12 @@ pub(crate) fn js_promise_new_with_parent(parent: *mut Promise) -> *mut Promise {
     // #5142: a recycled address may carry expando properties (`p.status = …`)
     // left by a previously-collected promise; a fresh promise must start clean.
     crate::object::exotic_expando::expando_clear_on_alloc(promise as usize);
+    if super::stuck_dump::enabled() {
+        super::stuck_dump::note_parent(
+            promise as usize,
+            parent_handle.get_raw_mut_ptr::<Promise>() as usize,
+        );
+    }
     promise
 }
 
