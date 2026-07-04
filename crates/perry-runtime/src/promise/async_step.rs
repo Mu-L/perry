@@ -42,6 +42,10 @@ pub extern "C" fn js_promise_resolved(value: f64) -> *mut Promise {
             (*promise).state = PromiseState::Fulfilled;
             (*promise).value = value;
         }
+        // #5941 diagnostic (inert unless PERRY_STUCK_DUMP=1). Strip before PR.
+        if super::stuck_dump::enabled() {
+            super::stuck_dump::note_settled(promise as usize);
+        }
         return promise;
     }
     // Issue #2823: `Promise.resolve(p)` MUST return `p` itself when `p` is

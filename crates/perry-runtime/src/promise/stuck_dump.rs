@@ -97,6 +97,27 @@ fn parent_of(promise: usize) -> Option<usize> {
     guard.as_ref().and_then(|m| m.get(&promise).copied())
 }
 
+/// Every promise that ever settled (js_promise_resolve / js_promise_reject
+/// / the born-settled fast path). Lets the dumper annotate walk nodes
+/// PENDING/SETTLED without dereferencing cross-thread. A SETTLED parent
+/// under a PENDING child marks the exact propagation break.
+static SETTLED: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+
+pub(crate) fn note_settled(promise: usize) {
+    if promise == 0 {
+        return;
+    }
+    let mut guard = SETTLED.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(promise);
+}
+
+fn is_settled(promise: usize) -> bool {
+    let guard = SETTLED.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().is_some_and(|s| s.contains(&promise))
+}
+
 /// Describe a promise for the dump: machine-owned / executor-created /
 /// then-chain child (walking up to 8 ancestors) / untracked root.
 fn describe_promise(
@@ -105,14 +126,22 @@ fn describe_promise(
 ) -> String {
     let mut out = String::new();
     let mut cur = p;
+    let mut visited: Vec<usize> = Vec::new();
     for hop in 0..8 {
         if hop > 0 {
             out.push_str(" <- ");
         }
+        if visited.contains(&cur) {
+            out.push_str(&format!("{:#x}[ADOPTION-CYCLE]", cur));
+            return out;
+        }
+        visited.push(cur);
+        let settled = if is_settled(cur) { "SETTLED" } else { "PENDING" };
         if let Some((owner, done)) = result_owner.get(&cur) {
             out.push_str(&format!(
-                "{:#x}[machine {:#x}{}]",
+                "{:#x}[{} machine {:#x}{}]",
                 cur,
+                settled,
                 owner,
                 if *done { " DONE" } else { " STUCK" }
             ));
@@ -130,20 +159,23 @@ fn describe_promise(
             return out;
         }
         if let Some(exec_fn) = executor_of(cur) {
-            out.push_str(&format!("{:#x}[executor fn={:#x}]", cur, exec_fn));
+            out.push_str(&format!(
+                "{:#x}[{} executor fn={:#x}]",
+                cur, settled, exec_fn
+            ));
             return out;
         }
         match parent_of(cur) {
             Some(0) => {
-                out.push_str(&format!("{:#x}[then-child of NULL-parent]", cur));
+                out.push_str(&format!("{:#x}[{} then-child of NULL-parent]", cur, settled));
                 return out;
             }
             Some(parent) => {
-                out.push_str(&format!("{:#x}[then-child]", cur));
+                out.push_str(&format!("{:#x}[{} then-child]", cur, settled));
                 cur = parent;
             }
             None => {
-                out.push_str(&format!("{:#x}[UNTRACKED root]", cur));
+                out.push_str(&format!("{:#x}[{} UNTRACKED root]", cur, settled));
                 return out;
             }
         }
