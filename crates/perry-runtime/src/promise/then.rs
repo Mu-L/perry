@@ -784,6 +784,7 @@ pub extern "C" fn js_promise_reject(promise: *mut Promise, reason: f64) {
                 !(*promise).on_rejected.is_null(),
                 !(*promise).next.is_null(),
             );
+            super::stuck_dump::note_rejection(promise as usize, reason);
         }
         crate::async_hooks::promise_resolve((*promise).async_id);
         crate::v8::promise_hook_settled(promise);

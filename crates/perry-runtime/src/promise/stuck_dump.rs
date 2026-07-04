@@ -131,6 +131,24 @@ fn is_settled(promise: usize) -> bool {
     settled_info(promise).is_some()
 }
 
+/// Cap for [REJECT] reason logging — the first rejections in a request
+/// window include the PRIMARY error that started an error cascade.
+static REJECT_LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub(crate) fn note_rejection(promise: usize, reason: f64) {
+    let n = REJECT_LOGGED.fetch_add(1, Ordering::Relaxed);
+    if n >= 40 {
+        return;
+    }
+    // Main-thread only (called from js_promise_reject) — stringify is safe.
+    let s = crate::string::string_as_str(crate::value::js_jsvalue_to_string(reason));
+    eprintln!(
+        "[REJECT#{n}] p={:#x}: {}",
+        promise,
+        &s[..s.len().min(220)]
+    );
+}
+
 /// Describe a promise for the dump: machine-owned / executor-created /
 /// then-chain child (walking up to 8 ancestors) / untracked root.
 fn describe_promise(
