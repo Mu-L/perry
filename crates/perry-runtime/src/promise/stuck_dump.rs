@@ -57,6 +57,27 @@ struct Machine {
 
 static MACHINES: Mutex<Option<HashMap<usize, Machine>>> = Mutex::new(None);
 
+/// promise → executor closure func_ptr, for every `new Promise(executor)`
+/// (`js_promise_new_with_executor`). Lets the dumper name the CREATION
+/// SITE of an EXTERNAL awaited promise via atos on a
+/// PERRY_DEBUG_SYMBOLS build.
+static EXEC_PROMISES: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+
+pub(crate) fn note_executor_promise(promise: usize, executor_func_ptr: usize) {
+    if promise == 0 {
+        return;
+    }
+    let mut guard = EXEC_PROMISES.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .get_or_insert_with(HashMap::new)
+        .insert(promise, executor_func_ptr);
+}
+
+fn executor_of(promise: usize) -> Option<usize> {
+    let guard = EXEC_PROMISES.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().and_then(|m| m.get(&promise).copied())
+}
+
 fn with_machines<R>(f: impl FnOnce(&mut HashMap<usize, Machine>) -> R) -> R {
     let mut guard = MACHINES.lock().unwrap_or_else(|e| e.into_inner());
     f(guard.get_or_insert_with(HashMap::new))
@@ -217,7 +238,12 @@ fn dump() {
                 match result_owner.get(&awaited) {
                     Some((owner, true)) => format!("awaits DONE-machine {:#x}", owner),
                     Some((owner, false)) => format!("awaits STUCK-machine {:#x}", owner),
-                    None => "awaits EXTERNAL promise".to_string(),
+                    None => match executor_of(awaited) {
+                        Some(exec_fn) => {
+                            format!("awaits EXTERNAL executor-promise exec_fn={:#x}", exec_fn)
+                        }
+                        None => "awaits EXTERNAL promise (no executor record)".to_string(),
+                    },
                 }
             };
             // Diagnostic-only cross-thread read of the closure header's

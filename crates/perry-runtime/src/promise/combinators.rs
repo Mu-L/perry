@@ -525,6 +525,14 @@ pub extern "C" fn js_promise_new_with_executor(
 
     let promise = js_promise_new();
 
+    // #5941 diagnostic (inert unless PERRY_STUCK_DUMP=1): record the
+    // executor's func_ptr so the stuck dumper can name the creation site
+    // of an awaited-but-never-settled promise. Strip before PR.
+    if super::stuck_dump::enabled() && crate::closure::is_closure_ptr(executor as usize) {
+        let exec_fn = unsafe { (*executor).func_ptr } as usize;
+        super::stuck_dump::note_executor_promise(promise as usize, exec_fn);
+    }
+
     // Create the resolve/reject pair sharing a [[AlreadyResolved]] guard, so
     // calling one disables the other (27.2.1.3 CreateResolvingFunctions). The
     // resolve fn also assimilates thenables/promises and rejects self-resolution.
