@@ -101,21 +101,33 @@ fn parent_of(promise: usize) -> Option<usize> {
 /// / the born-settled fast path). Lets the dumper annotate walk nodes
 /// PENDING/SETTLED without dereferencing cross-thread. A SETTLED parent
 /// under a PENDING child marks the exact propagation break.
-static SETTLED: Mutex<Option<std::collections::HashSet<usize>>> = Mutex::new(None);
+static SETTLED: Mutex<Option<HashMap<usize, (bool, bool)>>> = Mutex::new(None);
 
+/// `(had_on_fulfilled, had_next)` observed at the settle moment — tells
+/// the dumper whether dependents were registered before settlement (the
+/// dispatch lost them) or after (the settled-arm re-enqueue lost them).
 pub(crate) fn note_settled(promise: usize) {
+    note_settled_with(promise, false, false);
+}
+
+pub(crate) fn note_settled_with(promise: usize, had_onful: bool, had_next: bool) {
     if promise == 0 {
         return;
     }
     let mut guard = SETTLED.lock().unwrap_or_else(|e| e.into_inner());
     guard
-        .get_or_insert_with(std::collections::HashSet::new)
-        .insert(promise);
+        .get_or_insert_with(HashMap::new)
+        .entry(promise)
+        .or_insert((had_onful, had_next));
+}
+
+fn settled_info(promise: usize) -> Option<(bool, bool)> {
+    let guard = SETTLED.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().and_then(|s| s.get(&promise).copied())
 }
 
 fn is_settled(promise: usize) -> bool {
-    let guard = SETTLED.lock().unwrap_or_else(|e| e.into_inner());
-    guard.as_ref().is_some_and(|s| s.contains(&promise))
+    settled_info(promise).is_some()
 }
 
 /// Describe a promise for the dump: machine-owned / executor-created /
@@ -136,7 +148,10 @@ fn describe_promise(
             return out;
         }
         visited.push(cur);
-        let settled = if is_settled(cur) { "SETTLED" } else { "PENDING" };
+        let settled = match settled_info(cur) {
+            Some((onful, next)) => format!("SETTLED(onful={},next={})", onful, next),
+            None => "PENDING".to_string(),
+        };
         if let Some((owner, done)) = result_owner.get(&cur) {
             out.push_str(&format!(
                 "{:#x}[{} machine {:#x}{}]",

@@ -555,7 +555,11 @@ pub extern "C" fn js_promise_resolve(promise: *mut Promise, value: f64) {
         store_promise_jsvalue_slot(promise, std::ptr::addr_of_mut!((*promise).value), value);
         // #5941 diagnostic (inert unless PERRY_STUCK_DUMP=1). Strip before PR.
         if super::stuck_dump::enabled() {
-            super::stuck_dump::note_settled(promise as usize);
+            super::stuck_dump::note_settled_with(
+                promise as usize,
+                !(*promise).on_fulfilled.is_null(),
+                !(*promise).next.is_null(),
+            );
         }
         crate::async_hooks::promise_resolve((*promise).async_id);
         crate::v8::promise_hook_settled(promise);
@@ -765,7 +769,11 @@ pub extern "C" fn js_promise_reject(promise: *mut Promise, reason: f64) {
         store_promise_jsvalue_slot(promise, std::ptr::addr_of_mut!((*promise).reason), reason);
         // #5941 diagnostic (inert unless PERRY_STUCK_DUMP=1). Strip before PR.
         if super::stuck_dump::enabled() {
-            super::stuck_dump::note_settled(promise as usize);
+            super::stuck_dump::note_settled_with(
+                promise as usize,
+                !(*promise).on_rejected.is_null(),
+                !(*promise).next.is_null(),
+            );
         }
         crate::async_hooks::promise_resolve((*promise).async_id);
         crate::v8::promise_hook_settled(promise);
