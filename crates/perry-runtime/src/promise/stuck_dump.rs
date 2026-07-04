@@ -34,7 +34,7 @@ pub(crate) fn enabled() -> bool {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct Machine {
     /// NaN-boxed bits of the value most recently passed to
     /// `js_async_step_chain` for this step (the awaited value).
@@ -42,6 +42,11 @@ struct Machine {
     /// The machine's result promise as returned to its first caller
     /// (from `js_async_first_call`) — what outer awaiters wait on.
     result_promise: usize,
+    /// Every continuation promise this machine has minted/reused across
+    /// its awaits (chain `next`, backpatched thunk results). An awaiter
+    /// parked on any of these is awaiting THIS machine, not an external
+    /// promise. Capped; the steady state reuses one promise.
+    owned: Vec<usize>,
     /// The promise `js_async_step_done` settled (reuse path) or minted
     /// (non-reuse path). Non-zero implies the machine finished.
     done_promise: usize,
@@ -92,11 +97,14 @@ pub(crate) fn note_first_call_result(step: usize, result_bits: u64) {
 
 /// `js_async_step_chain` ran for `step` with awaited value `value_bits`,
 /// yielding `next` as the machine's continuation promise.
-pub(crate) fn note_chain(step: usize, value_bits: u64, _next: usize) {
+pub(crate) fn note_chain(step: usize, value_bits: u64, next: usize) {
     with_machines(|m| {
         let entry = m.entry(step).or_default();
         entry.chains += 1;
         entry.last_await_bits = value_bits;
+        if next != 0 && !entry.owned.contains(&next) && entry.owned.len() < 16 {
+            entry.owned.push(next);
+        }
     });
 }
 
@@ -105,6 +113,20 @@ pub(crate) fn note_done(step: usize, done_promise: usize) {
     with_machines(|m| {
         let entry = m.entry(step).or_default();
         entry.done_promise = if done_promise == 0 { 1 } else { done_promise };
+    });
+}
+
+/// A promise was created/registered on behalf of `step`'s activation
+/// (e.g. the backpatched result on the pending-await thunk path).
+pub(crate) fn note_owned(step: usize, promise: usize) {
+    if step == 0 || promise == 0 {
+        return;
+    }
+    with_machines(|m| {
+        let entry = m.entry(step).or_default();
+        if !entry.owned.contains(&promise) && entry.owned.len() < 16 {
+            entry.owned.push(promise);
+        }
     });
 }
 
@@ -159,26 +181,33 @@ fn dump() {
         let live: Vec<(usize, Machine)> = m
             .iter()
             .filter(|(_, st)| st.done_promise == 0 && st.chains > 0)
-            .map(|(k, v)| (*k, *v))
+            .map(|(k, v)| (*k, v.clone()))
             .collect();
         if live.is_empty() {
             return;
         }
-        // Await-graph: awaited pointer vs every machine's result/done promise.
-        let result_owner: HashMap<usize, (usize, bool)> = m
-            .iter()
-            .flat_map(|(step, st)| {
-                let done = st.done_promise != 0;
-                let mut edges = Vec::new();
-                if st.result_promise != 0 {
-                    edges.push((st.result_promise, (*step, done)));
+        // Await-graph: awaited pointer vs every promise any machine has
+        // owned (first_call result, chain nexts, done settlement). LIVE
+        // owners are inserted last so a live owner wins over a done
+        // machine that merely adopted the same promise.
+        let mut result_owner: HashMap<usize, (usize, bool)> = HashMap::new();
+        for (step, st) in m.iter().filter(|(_, st)| st.done_promise != 0) {
+            for p in std::iter::once(st.result_promise)
+                .chain(st.owned.iter().copied())
+                .chain(std::iter::once(st.done_promise))
+            {
+                if p > 1 {
+                    result_owner.insert(p, (*step, true));
                 }
-                if st.done_promise > 1 {
-                    edges.push((st.done_promise, (*step, done)));
+            }
+        }
+        for (step, st) in m.iter().filter(|(_, st)| st.done_promise == 0) {
+            for p in std::iter::once(st.result_promise).chain(st.owned.iter().copied()) {
+                if p > 1 {
+                    result_owner.insert(p, (*step, false));
                 }
-                edges
-            })
-            .collect();
+            }
+        }
         eprintln!("[STUCK] ---- {} live async-step machines ----", live.len());
         for (step, st) in live.iter().take(48) {
             let awaited = decode_pointer(st.last_await_bits);
@@ -191,9 +220,15 @@ fn dump() {
                     None => "awaits EXTERNAL promise".to_string(),
                 }
             };
+            // Diagnostic-only cross-thread read of the closure header's
+            // func_ptr so `atos` can name the stuck JS function on a
+            // PERRY_DEBUG_SYMBOLS build. Closures never carry a null
+            // func_ptr; the header is alive while the machine is live.
+            let func_ptr = unsafe { *(*step as *const *const u8) } as usize;
             eprintln!(
-                "[STUCK] step={:#x} chains={} thunks={} fc={} await={:#x}({}) result={:#x} -> {}",
+                "[STUCK] step={:#x} fn={:#x} chains={} thunks={} fc={} await={:#x}({}) result={:#x} -> {}",
                 step,
+                func_ptr,
                 st.chains,
                 st.thunk_fires,
                 st.first_calls,

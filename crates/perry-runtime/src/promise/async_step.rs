@@ -226,9 +226,26 @@ fn then_backpatch_result(
             result as i64,
         );
         super::then::js_promise_attach_handlers(awaited, fulfill, reject);
+        // #5941 diagnostic (inert unless PERRY_STUCK_DUMP=1). Strip before PR.
+        if super::stuck_dump::enabled() {
+            let step = crate::closure::js_closure_get_capture_ptr(
+                fulfill as *const crate::closure::ClosureHeader,
+                0,
+            ) as usize;
+            super::stuck_dump::note_owned(step, result as usize);
+        }
         result
     } else {
-        js_promise_then(awaited, fulfill, reject)
+        let result = js_promise_then(awaited, fulfill, reject);
+        // #5941 diagnostic (inert unless PERRY_STUCK_DUMP=1). Strip before PR.
+        if super::stuck_dump::enabled() {
+            let step = crate::closure::js_closure_get_capture_ptr(
+                fulfill as *const crate::closure::ClosureHeader,
+                0,
+            ) as usize;
+            super::stuck_dump::note_owned(step, result as usize);
+        }
+        result
     }
 }
 
