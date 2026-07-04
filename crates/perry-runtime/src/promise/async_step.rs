@@ -681,7 +681,48 @@ extern "C" fn async_step_fulfill_thunk(
     if super::stuck_dump::enabled() {
         super::stuck_dump::note_thunk_return(step as usize);
     }
+    forward_swallowed_rejection(result, captured_trap_next);
     result
+}
+
+/// #5941 layer 2: a thunk-resumed step that exits through its internal
+/// catch arm returns a FRESH rejected promise (`return Promise.reject(e)`
+/// in the step body's catch) — historically DISCARDED by the thunks, so
+/// the machine's real result promise (the captured per-activation
+/// `trap_next`, #5485) stayed Pending and every awaiter of the async fn
+/// hung instead of observing the throw. On the first_call path the
+/// wrapper returns that rejected promise to the caller directly, so only
+/// the resumed path leaks. Forward the rejection into the activation's
+/// result. The normal resume paths return `trap_next` itself (chain/done
+/// reuse) and are skipped by the identity check; `js_async_step_done`'s
+/// non-reuse arm returning a user `return <rejected promise>` also lands
+/// here, which matches spec (the async fn's result rejects with the
+/// inner reason).
+fn forward_swallowed_rejection(result: f64, trap_next: *mut Promise) {
+    if trap_next.is_null() {
+        return;
+    }
+    let bits = result.to_bits();
+    if bits & 0xFFFF_0000_0000_0000 != 0x7FFD_0000_0000_0000 {
+        return;
+    }
+    if js_value_is_promise(result) == 0 {
+        return;
+    }
+    let ret = (bits & 0x0000_FFFF_FFFF_FFFF) as *mut Promise;
+    if ret.is_null() || ret == trap_next {
+        return;
+    }
+    unsafe {
+        if (*ret).state != PromiseState::Rejected || (*trap_next).state != PromiseState::Pending {
+            return;
+        }
+        let reason = (*ret).reason;
+        // The rejection is consumed by forwarding it into the result —
+        // the discarded wrapper must not be reported as unhandled.
+        crate::promise::mark_rejection_handled(ret);
+        js_promise_reject(trap_next, reason);
+    }
 }
 
 extern "C" fn async_step_reject_thunk(
@@ -714,6 +755,7 @@ extern "C" fn async_step_reject_thunk(
     if super::stuck_dump::enabled() {
         super::stuck_dump::note_thunk_return(step as usize);
     }
+    forward_swallowed_rejection(result, captured_trap_next);
     result
 }
 
