@@ -135,7 +135,32 @@ fn is_settled(promise: usize) -> bool {
 /// window include the PRIMARY error that started an error cascade.
 static REJECT_LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// Cap for [THROW] logging (synchronous throws via js_throw, before any
+/// promise machinery is involved).
+static THROW_LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub(crate) fn note_throw(value: f64) {
+    if !armed() {
+        return;
+    }
+    let n = THROW_LOGGED.fetch_add(1, Ordering::Relaxed);
+    if n >= 60 {
+        return;
+    }
+    let s = crate::string::string_as_str(crate::value::js_jsvalue_to_string(value));
+    eprintln!("[THROW#{n}]: {}", &s[..s.len().min(200)]);
+}
+
+/// Arm switch for the reason/throw loggers: create `/tmp/perry-arm-throw`
+/// right before issuing the request so boot-time noise is skipped.
+fn armed() -> bool {
+    std::path::Path::new("/tmp/perry-arm-throw").exists()
+}
+
 pub(crate) fn note_rejection(promise: usize, reason: f64) {
+    if !armed() {
+        return;
+    }
     let n = REJECT_LOGGED.fetch_add(1, Ordering::Relaxed);
     if n >= 40 {
         return;

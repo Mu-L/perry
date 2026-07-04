@@ -137,6 +137,12 @@ pub(crate) fn current_try_depth() -> usize {
 /// Throw an exception with the given value
 #[no_mangle]
 pub extern "C" fn js_throw(value: f64) -> ! {
+    // #5941 diagnostic (inert unless PERRY_STUCK_DUMP=1): log the first
+    // throws so a synchronous primary error that never becomes a promise
+    // rejection is visible. Strip before PR.
+    if crate::promise::stuck_dump::enabled() {
+        crate::promise::stuck_dump::note_throw(value);
+    }
     // Pull the jmp_buf pointer out under the TLS borrow, then drop the
     // borrow before calling longjmp (longjmp doesn't return, so leaving
     // the TLS access "open" would leave the cell permanently borrowed
