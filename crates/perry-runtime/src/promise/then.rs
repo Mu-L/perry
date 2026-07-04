@@ -625,6 +625,12 @@ pub extern "C" fn js_promise_resolve_with_promise(outer: *mut Promise, inner: *m
     if outer.is_null() || inner.is_null() {
         return;
     }
+    // #5941 diagnostic (inert unless PERRY_STUCK_DUMP=1): `outer` now waits
+    // on `inner` — record the adoption edge so the stuck-dump walk can
+    // follow `return <promise>` chains. Strip before PR.
+    if super::stuck_dump::enabled() {
+        super::stuck_dump::note_parent(outer as usize, inner as usize);
+    }
     // `outer` is adopting `inner`'s eventual state — `inner`'s rejection (now or
     // later) is consumed by `outer`, so `inner` is no longer an unhandled
     // rejection (HostPromiseRejectionTracker "handle"). Without this, a thenable

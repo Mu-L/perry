@@ -116,6 +116,17 @@ fn describe_promise(
                 owner,
                 if *done { " DONE" } else { " STUCK" }
             ));
+            // A DONE machine's result that carries an adoption/parent edge
+            // is itself waiting on that parent (`return <promise>`) — keep
+            // walking to find what actually never settles.
+            if *done {
+                if let Some(parent) = parent_of(cur) {
+                    if parent != 0 && parent != cur {
+                        cur = parent;
+                        continue;
+                    }
+                }
+            }
             return out;
         }
         if let Some(exec_fn) = executor_of(cur) {
