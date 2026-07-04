@@ -1,0 +1,207 @@
+//! #5941 diagnostic toolkit — perturbation-proof stuck-async-step-machine
+//! dumper. Fully inert unless the process runs with `PERRY_STUCK_DUMP=1`
+//! (one relaxed atomic load per hook call otherwise). DIAGNOSTIC ONLY:
+//! strip before shipping a PR.
+//!
+//! Design constraints (learned across the #5437/#5941 sessions):
+//!  - JS-level or env-gated *behavioral* probes perturb the deadlock;
+//!    this toolkit only RECORDS (global mutex map) and prints from a
+//!    background thread, so timing on the main thread is unchanged.
+//!  - The background dumper must not dereference heap values (they live
+//!    in the per-thread arena) — awaited values are classified by
+//!    NaN-tag bits only, and graph edges are computed by pointer
+//!    equality against recorded machine-result pointers.
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Mutex;
+
+static ENABLED: AtomicU8 = AtomicU8::new(2); // 2 = unresolved, 1 = on, 0 = off
+
+#[inline]
+pub(crate) fn enabled() -> bool {
+    match ENABLED.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var("PERRY_STUCK_DUMP").is_ok_and(|v| v == "1");
+            ENABLED.store(u8::from(on), Ordering::Relaxed);
+            if on {
+                start_dumper();
+            }
+            on
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Machine {
+    /// NaN-boxed bits of the value most recently passed to
+    /// `js_async_step_chain` for this step (the awaited value).
+    last_await_bits: u64,
+    /// The machine's result promise as returned to its first caller
+    /// (from `js_async_first_call`) — what outer awaiters wait on.
+    result_promise: usize,
+    /// The promise `js_async_step_done` settled (reuse path) or minted
+    /// (non-reuse path). Non-zero implies the machine finished.
+    done_promise: usize,
+    chains: u32,
+    thunk_fires: u32,
+    first_calls: u32,
+}
+
+static MACHINES: Mutex<Option<HashMap<usize, Machine>>> = Mutex::new(None);
+
+fn with_machines<R>(f: impl FnOnce(&mut HashMap<usize, Machine>) -> R) -> R {
+    let mut guard = MACHINES.lock().unwrap_or_else(|e| e.into_inner());
+    f(guard.get_or_insert_with(HashMap::new))
+}
+
+/// A step closure is entering `js_async_first_call`. If the same pointer
+/// is already tracked as a LIVE (not-done, has-awaited) activation, two
+/// activations share one step closure — the #5941 identity-collision
+/// smoking gun. (Caveat: a false positive is possible if a dead-but-
+/// never-done machine's closure was GC-recycled into a new closure at
+/// the same address; treat repeated hits as the signal, not one.)
+pub(crate) fn note_first_call(step: usize) {
+    with_machines(|m| {
+        let entry = m.entry(step).or_default();
+        if entry.done_promise == 0 && entry.chains > 0 {
+            eprintln!(
+                "[COLLIDE] step {:#x} re-entered first_call while LIVE (chains={} thunks={} first_calls={} last_await={:#x})",
+                step, entry.chains, entry.thunk_fires, entry.first_calls, entry.last_await_bits
+            );
+        }
+        if entry.done_promise != 0 {
+            // Completed machine re-invoked (or address recycled): fresh activation.
+            *entry = Machine::default();
+        }
+        entry.first_calls += 1;
+    });
+}
+
+/// Record the result promise the first caller receives (NaN-boxed bits).
+pub(crate) fn note_first_call_result(step: usize, result_bits: u64) {
+    let ptr = decode_pointer(result_bits);
+    if ptr != 0 {
+        with_machines(|m| {
+            m.entry(step).or_default().result_promise = ptr;
+        });
+    }
+}
+
+/// `js_async_step_chain` ran for `step` with awaited value `value_bits`,
+/// yielding `next` as the machine's continuation promise.
+pub(crate) fn note_chain(step: usize, value_bits: u64, _next: usize) {
+    with_machines(|m| {
+        let entry = m.entry(step).or_default();
+        entry.chains += 1;
+        entry.last_await_bits = value_bits;
+    });
+}
+
+/// `js_async_step_done` ran for `step`, settling/minting `done_promise`.
+pub(crate) fn note_done(step: usize, done_promise: usize) {
+    with_machines(|m| {
+        let entry = m.entry(step).or_default();
+        entry.done_promise = if done_promise == 0 { 1 } else { done_promise };
+    });
+}
+
+/// A resume thunk fired for `step`.
+pub(crate) fn note_thunk_fire(step: usize) {
+    with_machines(|m| {
+        m.entry(step).or_default().thunk_fires += 1;
+    });
+}
+
+fn decode_pointer(bits: u64) -> usize {
+    const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
+    const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
+    const PTR_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+    if bits & TAG_MASK == POINTER_TAG {
+        (bits & PTR_MASK) as usize
+    } else {
+        0
+    }
+}
+
+fn classify(bits: u64) -> &'static str {
+    const TAG_MASK: u64 = 0xFFFF_0000_0000_0000;
+    match bits & TAG_MASK {
+        0x7FFD_0000_0000_0000 => "ptr/promise?",
+        0x7FFF_0000_0000_0000 => "string",
+        0x7FFE_0000_0000_0000 => "int32",
+        0x7FFA_0000_0000_0000 => "bigint",
+        0x7FFC_0000_0000_0000 => match bits {
+            0x7FFC_0000_0000_0001 => "undefined",
+            0x7FFC_0000_0000_0002 => "null",
+            0x7FFC_0000_0000_0003 => "false",
+            0x7FFC_0000_0000_0004 => "true",
+            _ => "special",
+        },
+        _ => "number",
+    }
+}
+
+fn start_dumper() {
+    std::thread::Builder::new()
+        .name("perry-stuck-dump".into())
+        .spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(6));
+            dump();
+        })
+        .ok();
+}
+
+fn dump() {
+    with_machines(|m| {
+        let live: Vec<(usize, Machine)> = m
+            .iter()
+            .filter(|(_, st)| st.done_promise == 0 && st.chains > 0)
+            .map(|(k, v)| (*k, *v))
+            .collect();
+        if live.is_empty() {
+            return;
+        }
+        // Await-graph: awaited pointer vs every machine's result/done promise.
+        let result_owner: HashMap<usize, (usize, bool)> = m
+            .iter()
+            .flat_map(|(step, st)| {
+                let done = st.done_promise != 0;
+                let mut edges = Vec::new();
+                if st.result_promise != 0 {
+                    edges.push((st.result_promise, (*step, done)));
+                }
+                if st.done_promise > 1 {
+                    edges.push((st.done_promise, (*step, done)));
+                }
+                edges
+            })
+            .collect();
+        eprintln!("[STUCK] ---- {} live async-step machines ----", live.len());
+        for (step, st) in live.iter().take(48) {
+            let awaited = decode_pointer(st.last_await_bits);
+            let link = if awaited == 0 {
+                "non-ptr".to_string()
+            } else {
+                match result_owner.get(&awaited) {
+                    Some((owner, true)) => format!("awaits DONE-machine {:#x}", owner),
+                    Some((owner, false)) => format!("awaits STUCK-machine {:#x}", owner),
+                    None => "awaits EXTERNAL promise".to_string(),
+                }
+            };
+            eprintln!(
+                "[STUCK] step={:#x} chains={} thunks={} fc={} await={:#x}({}) result={:#x} -> {}",
+                step,
+                st.chains,
+                st.thunk_fires,
+                st.first_calls,
+                st.last_await_bits,
+                classify(st.last_await_bits),
+                st.result_promise,
+                link
+            );
+        }
+    });
+}

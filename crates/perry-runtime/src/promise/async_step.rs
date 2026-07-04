@@ -234,6 +234,19 @@ fn then_backpatch_result(
 
 #[no_mangle]
 pub extern "C" fn js_async_step_chain(value: f64, step_closure: ClosurePtr) -> *mut Promise {
+    // #5941 diagnostic (inert unless PERRY_STUCK_DUMP=1): record the awaited
+    // value + continuation per machine so the background dumper can print the
+    // stuck await-graph. Strip before PR.
+    if super::stuck_dump::enabled() {
+        let next = async_step_chain_impl(value, step_closure);
+        super::stuck_dump::note_chain(step_closure as usize, value.to_bits(), next as usize);
+        return next;
+    }
+    async_step_chain_impl(value, step_closure)
+}
+
+#[inline(always)]
+fn async_step_chain_impl(value: f64, step_closure: ClosurePtr) -> *mut Promise {
     // PR #1004 followup: if `value` is a JS_HANDLE_TAG handle to a V8
     // Promise (the common case for `await <V8-fallback-call>(...)` —
     // e.g. `await new SignJWT(...).sign(key)` in jose), convert it to
@@ -382,6 +395,17 @@ pub extern "C" fn js_async_step_chain(value: f64, step_closure: ClosurePtr) -> *
 /// Fall back to `js_promise_resolved(value)`.
 #[no_mangle]
 pub extern "C" fn js_async_step_done(value: f64, step_closure: ClosurePtr) -> *mut Promise {
+    // #5941 diagnostic (inert unless PERRY_STUCK_DUMP=1). Strip before PR.
+    if super::stuck_dump::enabled() {
+        let done = async_step_done_impl(value, step_closure);
+        super::stuck_dump::note_done(step_closure as usize, done as usize);
+        return done;
+    }
+    async_step_done_impl(value, step_closure)
+}
+
+#[inline(always)]
+fn async_step_done_impl(value: f64, step_closure: ClosurePtr) -> *mut Promise {
     // PR #1004 followup (sibling to js_async_step_chain): adapt a
     // JS_HANDLE_TAG V8 Promise into a native Promise before storing it
     // as the resolution value, so `async function f() { return
@@ -479,6 +503,13 @@ pub extern "C" fn js_get_current_step_closure() -> *mut crate::closure::ClosureH
 pub extern "C" fn js_async_first_call(step_closure_nanbox: f64) -> f64 {
     let ptr = crate::value::js_nanbox_get_pointer(step_closure_nanbox)
         as *mut crate::closure::ClosureHeader;
+    // #5941 diagnostic (inert unless PERRY_STUCK_DUMP=1): detect a step
+    // closure re-entering first_call while a prior activation is live —
+    // the per-activation identity collision. Strip before PR.
+    let stuck_dump_on = super::stuck_dump::enabled();
+    if stuck_dump_on {
+        super::stuck_dump::note_first_call(ptr as usize);
+    }
     // CRITICAL: clear `trap_next` for the inner activation. The previous
     // implementation preserved `old.trap_next` so the inner step would
     // "compose correctly" — but that allowed the inner async fn's
@@ -520,6 +551,9 @@ pub extern "C" fn js_async_first_call(step_closure_nanbox: f64) -> f64 {
         )
     };
     INLINE_TRAP.with(|c| c.set(prev));
+    if stuck_dump_on {
+        super::stuck_dump::note_first_call_result(ptr as usize, result.to_bits());
+    }
     result
 }
 
@@ -592,6 +626,10 @@ extern "C" fn async_step_fulfill_thunk(
 ) -> f64 {
     let step = crate::closure::js_closure_get_capture_ptr(closure, 0)
         as *const crate::closure::ClosureHeader;
+    // #5941 diagnostic (inert unless PERRY_STUCK_DUMP=1). Strip before PR.
+    if super::stuck_dump::enabled() {
+        super::stuck_dump::note_thunk_fire(step as usize);
+    }
     // #5485: the activation's own trap_next, captured when this thunk was
     // built (at the `await`), not the ambient INLINE_TRAP.trap_next at
     // resume time — which may belong to an UNRELATED outer activation and,
@@ -627,6 +665,10 @@ extern "C" fn async_step_reject_thunk(
 ) -> f64 {
     let step = crate::closure::js_closure_get_capture_ptr(closure, 0)
         as *const crate::closure::ClosureHeader;
+    // #5941 diagnostic (inert unless PERRY_STUCK_DUMP=1). Strip before PR.
+    if super::stuck_dump::enabled() {
+        super::stuck_dump::note_thunk_fire(step as usize);
+    }
     // #5485: restore the captured per-activation trap_next (see
     // async_step_fulfill_thunk for the full rationale).
     let captured_trap_next = crate::closure::js_closure_get_capture_ptr(closure, 1) as *mut Promise;

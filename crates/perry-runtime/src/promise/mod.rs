@@ -26,6 +26,9 @@ pub mod microtasks;
 pub mod native_async;
 pub mod scanners;
 pub mod spec_combinators;
+/// #5941 diagnostic toolkit (env-gated, inert unless PERRY_STUCK_DUMP=1).
+/// Strip before PR.
+pub(crate) mod stuck_dump;
 pub mod then;
 
 // ─── Explicit named re-exports ────────────────────────────────────
