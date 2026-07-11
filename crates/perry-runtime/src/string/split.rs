@@ -129,15 +129,26 @@ pub extern "C" fn js_string_split_n(
     const STRING_TAG: u64 = 0x7FFF_0000_0000_0000;
     const POINTER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
     if delim.is_empty() {
-        // Empty delimiter: split into individual characters (single pass)
-        let mut parts: Vec<*mut StringHeader> = str_data
-            .chars()
-            .map(|c| {
-                let mut buf = [0u8; 4];
-                let char_str = c.encode_utf8(&mut buf);
-                js_string_from_bytes(char_str.as_ptr(), char_str.len() as u32)
-            })
-            .collect();
+        // Empty delimiter: split into individual characters (single pass).
+        //
+        // #6085: `str_data.chars()` decodes through std's UTF-8-validity
+        // assumption (`next_code_point` reads continuation bytes with
+        // `unwrap_unchecked`). Perry payloads are EXACT-SIZED and not
+        // guaranteed valid UTF-8 — a `Buffer`/FFI blob sliced at a byte
+        // delimiter can end in a truncated multi-byte lead — so that walk read
+        // up to 3 bytes past the end of the allocation. Step the raw bytes with
+        // the bounded WTF-8 decoder instead and emit each sequence verbatim;
+        // well-formed input yields byte-identical parts.
+        let src = unsafe { slice::from_raw_parts(string_data(s), (*s).byte_len as usize) };
+        let mut parts: Vec<*mut StringHeader> = Vec::new();
+        let mut i = 0usize;
+        while i < src.len() {
+            let (advance, _, _) = crate::string::wtf8_step(src, i);
+            let end = (i + advance).min(src.len());
+            let seq = &src[i..end];
+            parts.push(js_string_from_bytes(seq.as_ptr(), seq.len() as u32));
+            i = end;
+        }
         if limit > 0 && (parts.len() as i64) > (limit as i64) {
             parts.truncate(limit as usize);
         }
