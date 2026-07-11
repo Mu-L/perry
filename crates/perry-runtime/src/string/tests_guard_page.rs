@@ -196,6 +196,37 @@ fn split_by_empty_delimiter_does_not_read_past_payload() {
     let empty = js_string_from_bytes(b"".as_ptr(), 0);
     let arr = js_string_split_n(g.ptr(), empty, -1);
     assert!(!arr.is_null());
+    // "é", "A", dangling lead → 3 parts, each holding its raw bytes.
+    assert_eq!(unsafe { (*arr).length }, 3);
+}
+
+/// A truncated multi-byte tail must NOT be mistaken for whitespace.
+///
+/// `wtf8_step` zero-fills continuation bytes that don't exist, so a dangling
+/// `E2 80` decodes as U+2000 (EN QUAD) — which IS JS whitespace. Without an
+/// explicit "sequence is complete" gate, `trim`/`trimEnd` would silently DELETE
+/// those bytes. Trimming must only consume complete whitespace sequences.
+#[test]
+fn trim_preserves_truncated_multibyte_tail() {
+    // "A" + truncated E2 80 (would decode as U+2000 if zero-filled), length 4
+    // keeps the header 8-byte aligned.
+    let g = GuardedString::new(&[0x41, 0x41, 0xE2, 0x80]);
+    let s = g.ptr();
+    for out in [js_string_trim(s), js_string_trim_end(s)] {
+        let bytes =
+            unsafe { std::slice::from_raw_parts(string_data(out), (*out).byte_len as usize) };
+        assert_eq!(
+            bytes,
+            &[0x41, 0x41, 0xE2, 0x80],
+            "truncated tail must survive trimming byte-for-byte"
+        );
+    }
+    // A COMPLETE U+2000 really is whitespace and must still be trimmed.
+    let ws = GuardedString::new(&[0x41, 0xE2, 0x80, 0x80]); // "A" + U+2000
+    let trimmed = js_string_trim_end(ws.ptr());
+    let bytes =
+        unsafe { std::slice::from_raw_parts(string_data(trimmed), (*trimmed).byte_len as usize) };
+    assert_eq!(bytes, &[0x41], "complete U+2000 must still be trimmed");
 }
 
 #[test]

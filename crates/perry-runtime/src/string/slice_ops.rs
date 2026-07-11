@@ -212,20 +212,35 @@ pub(crate) fn is_js_whitespace(c: char) -> bool {
     )
 }
 
+/// Is the WTF-8 sequence starting at `i` a JS whitespace code point?
+/// Returns `(is_whitespace, advance)`.
+///
+/// The sequence must be COMPLETE — fully contained in `bytes` — to count as
+/// whitespace. `wtf8_step` zero-fills continuation bytes that don't exist, so a
+/// truncated tail like `E2 80` would otherwise decode as U+2000 (EN QUAD, which
+/// IS JS whitespace) and `trim`/`trimEnd` would silently eat those bytes. A
+/// truncated tail is therefore treated as non-whitespace and preserved verbatim
+/// — consistent with `case_convert`, which also only maps complete sequences.
+#[inline]
+fn js_whitespace_seq_at(bytes: &[u8], i: usize) -> (bool, usize) {
+    let (advance, units, cp) = crate::string::wtf8_step(bytes, i);
+    let complete = i + advance <= bytes.len();
+    let is_ws = complete && units > 0 && char::from_u32(cp).map(is_js_whitespace).unwrap_or(false);
+    (is_ws, advance)
+}
+
 /// Byte range `[start, end)` of `bytes` after trimming JS whitespace from the
 /// requested ends. Bounds-driven (#6085): decodes with `wtf8_step` instead of
 /// `str::trim_matches`, whose `chars()` walk reads continuation bytes past an
 /// exact-sized payload that ends in a truncated multi-byte lead.
 ///
-/// Every JS whitespace code point is well-formed (ASCII, U+00A0, U+2028, …), so
-/// a truncated/invalid tail sequence is never whitespace and simply terminates
-/// the scan — trimming behavior on valid input is unchanged.
+/// Trimming behavior on valid input is unchanged; a truncated/invalid tail is
+/// never treated as whitespace, so it survives the trim byte-for-byte.
 fn js_whitespace_trim_range(bytes: &[u8], trim_start: bool, trim_end: bool) -> (usize, usize) {
     let mut start = 0usize;
     if trim_start {
         while start < bytes.len() {
-            let (advance, units, cp) = crate::string::wtf8_step(bytes, start);
-            let is_ws = units > 0 && char::from_u32(cp).map(is_js_whitespace).unwrap_or(false);
+            let (is_ws, advance) = js_whitespace_seq_at(bytes, start);
             if !is_ws {
                 break;
             }
@@ -241,9 +256,8 @@ fn js_whitespace_trim_range(bytes: &[u8], trim_start: bool, trim_end: bool) -> (
         let mut i = start;
         let mut last_non_ws_end = start;
         while i < bytes.len() {
-            let (advance, units, cp) = crate::string::wtf8_step(bytes, i);
+            let (is_ws, advance) = js_whitespace_seq_at(bytes, i);
             let next = (i + advance).min(bytes.len());
-            let is_ws = units > 0 && char::from_u32(cp).map(is_js_whitespace).unwrap_or(false);
             if !is_ws {
                 last_non_ws_end = next;
             }
