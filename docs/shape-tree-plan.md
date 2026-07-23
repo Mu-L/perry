@@ -163,13 +163,25 @@ Each step lands independently behind green suites, per the #6759 method.
     (process-rooted, address-immortal) keys arrays, closing a latent ABA
     hazard where an owned array's recycled address could satisfy the
     unvalidated inline compare.
-  - **C3-codegen (remaining, own review gate)**: eager id stamping at
-    allocation (so typed_feedback observation tokens can canonicalize on
-    ids without the lazy-stamp two-token split) and the PIC comparing
-    the header id — needs a discriminated compare because the generic
-    PIC also serves class instances, whose `parent_class_id` is real
-    inheritance data. Folding the transition cache into shape-resident
-    edges rides the same rung.
+  - **C3-codegen (landed via #6807 + #6808, under its own review)**:
+    eager id stamping at allocation — shape-cached literals birth-stamp
+    (the id rides the `ShapeCacheEntry`, zero probes per allocation),
+    fresh dynamic shapes stamp at birth, PIC misses stamp at resolve,
+    and `object_shape()` self-heals unstamped receivers — so
+    typed_feedback tokens canonicalize on ids with no lazy-stamp
+    two-token split. The generic PIC compares a DISCRIMINATED token:
+    stamped plain objects by ShapeId lifted above the 48-bit pointer
+    space (`| 1<<62` — the token kinds cannot collide numerically, so
+    one compare suffices), class instances by keys pointer as before.
+    Id tokens survive grow-reallocs and GC moves and are immune to
+    address recycling, which also re-enables PIC caching for OWNED keys
+    arrays on plain objects. The hit path bounds the cached slot by the
+    receiver's inline capacity (same-shape siblings can differ in
+    physical allocation — a latent over-read closed in passing).
+    Transition-cache edges stay address-keyed (validated per hit by
+    `transition_edge_places_key` + `target_len`); folding them onto
+    shape-resident edges is deferred until profiling shows the
+    validation cost matters.
 - **C4 — dictionary mode: largely subsumed.**
   The concrete goals — per-shape hash lookup for wide objects, churn
   not corrupting acceleration, eager invalidation on delete/compaction,
