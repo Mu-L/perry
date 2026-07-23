@@ -649,17 +649,16 @@ fn install_temporal_getter(proto: *mut ObjectHeader, prop: &str, func_ptr: *cons
         super::super::object_ops::ensure_key_in_keys_array(proto, key);
         let getter_bits = crate::value::js_nanbox_pointer(closure as i64).to_bits();
         super::super::object_ops::install_builtin_getter(proto, prop, getter_bits);
-        super::super::set_accessor_descriptor(
+        // #6809: gate-neutral BUILTIN install — reads dispatch through
+        // `install_builtin_getter` above; the descriptor entry is
+        // reflection-only (see the regex/collection/byteLength siblings).
+        super::super::set_builtin_accessor_descriptor(
             proto as usize,
             prop.to_string(),
             super::super::AccessorDescriptor {
                 get: getter_bits,
                 set: 0,
             },
-        );
-        super::super::set_property_attrs(
-            proto as usize,
-            prop.to_string(),
             super::super::PropertyAttrs::new(true, false, true),
         );
         super::super::set_builtin_property_attrs(
