@@ -512,65 +512,13 @@ pub extern "C" fn js_object_set_field_by_name(
             }
         }
     }
-    // A Buffer is an ordinary object in Node (a Uint8Array), so `buf.foo = v`
-    // stores an own property — and an own key SHADOWS the same-named prototype
-    // method. Perry keeps buffers outside the object model (raw BufferHeader,
-    // no GcHeader), so this write used to be dropped entirely. mysql2's
-    // `MockBuffer` packet sizer depends on it: it replaces the write methods of
-    // a zero-length Buffer with a no-op, serializes once to measure, then
-    // allocates for real. Store into the GC-traced buffer own-prop table (the
-    // read side and the method-call dispatch both consult it).
-    if !key.is_null() && crate::buffer::is_registered_buffer(obj as usize) {
-        unsafe {
-            let key_ptr = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
-            let key_len = (*key).byte_len as usize;
-            if let Ok(name) = std::str::from_utf8(std::slice::from_raw_parts(key_ptr, key_len)) {
-                // Numeric keys are element writes (`buf[0] = 1`) — leave those
-                // to the index path; only NAMED props become expandos.
-                if name.parse::<u32>().is_err() {
-                    crate::buffer::buffer_set_own_prop(obj as usize, name, value);
-                    return;
-                }
-            }
-        }
-    }
-    // #5437: a live Web Stream handle arrives here as its raw id in the
-    // stream band (the `stream.prop = v` codegen path). React's
-    // `renderToReadableStream` attaches its shell-ready promise as an
-    // expando (`stream.allReady = ...`); without a store the write was
-    // dropped, which stalled the Next.js dynamic-SSR render. Route to the
-    // stdlib per-stream expando table (GC-traced there).
-    {
-        let addr = obj as usize;
-        if crate::value::addr_class::is_stream_id_band(addr) {
-            if !key.is_null() {
-                if let (Some(probe), Some(setter)) = (
-                    crate::object::stream_handle_probe(),
-                    crate::object::stream_expando_set(),
-                ) {
-                    if unsafe { probe(addr) } {
-                        if let Some(name) =
-                            unsafe { super::has_own_helpers::str_from_string_header(key) }
-                        {
-                            unsafe { setter(addr, name.as_ptr(), name.len(), value) };
-                        }
-                    }
-                }
-            }
-            // A stream-band address is a reserved handle id, never a real
-            // `ObjectHeader`. Stop unconditionally — even when the expando
-            // write was a no-op (dead/unregistered handle, hooks absent, or a
-            // non-UTF-8 key). Falling through would reach the ObjectHeader
-            // path below and deref `addr - GC_HEADER_SIZE` (unmapped) → crash.
-            // Mirrors the reserved small-handle early-return further down.
-            return;
-        }
-    }
     // `Object.prototype["2"] = v` (stringified-index write) makes the index
     // visible through array hole/OOB reads. Cheap gate: one relaxed flag
     // load, then an address compare against the cached canonical
     // Object.prototype; the digit scan only runs on a match (test262
-    // concat/S15.4.4.4_A3_T3).
+    // concat/S15.4.4.4_A3_T3). Hoisted above the exotic gauntlet (#6809):
+    // the canonical prototype IS a genuine ObjectHeader, so it must run
+    // even when the gauntlet below is skipped.
     {
         let raw = (obj as u64 & 0x0000_FFFF_FFFF_FFFF) as usize;
         if crate::array::object_prototype_addr_matches(raw) && !key.is_null() {
@@ -581,197 +529,284 @@ pub extern "C" fn js_object_set_field_by_name(
             }
         }
     }
-    // A `Temporal.*` value is an opaque, immutable NaN-boxed cell that is NOT
-    // an `ObjectHeader` — writing an arbitrary property (e.g. test262's
-    // `instance.constructor = …` subclassing probes) must NOT interpret the
-    // cell as an `ObjectHeader` and corrupt its boxed payload (which segfaults
-    // on the next deref). The cell's `temporal_rs` slots are immutable, but a
-    // user-defined *expando* property is legal and lives in the exotic side
-    // table (like Date/RegExp). `obj` still carries its NaN-box tag here
-    // (`0x7FFD…` for a real cell), so route through `exotic_expando_kind_of_value`,
-    // which checks the tag before masking to the cleaned heap address.
-    if let Some((addr, kind @ super::exotic_expando::ExoticKind::Temporal)) =
-        super::exotic_expando::exotic_expando_kind_of_value(f64::from_bits(obj as u64))
-    {
-        if !key.is_null() {
-            unsafe {
-                let name_ptr = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
-                let name_len = (*key).byte_len as usize;
-                let name = String::from_utf8_lossy(std::slice::from_raw_parts(name_ptr, name_len))
-                    .into_owned();
-                let receiver = f64::from_bits(obj as u64);
-                let _ =
-                    super::exotic_expando::exotic_set_property(addr, kind, &name, value, receiver);
-            }
-        }
-        return;
-    }
-    if let Some(addr) =
-        crate::typedarray_props::typed_array_addr_from_value(f64::from_bits(obj as u64))
-    {
-        unsafe {
-            crate::typedarray_props::typed_array_set_own_property(
-                addr as *mut crate::typedarray::TypedArrayHeader,
-                key,
-                value,
-            );
-        }
-        return;
-    }
-
-    // Issue #618-followup: detect INT32-tagged class ref (top16 == 0x7FFE).
-    // Drizzle's `((SQL2) => { SQL2.Aliased = Aliased; })(SQL)` pattern sets
-    // a static property on an imported class — Perry stores classes as
-    // INT32-tagged class ids, so the receiver here is e.g. 0x7FFE_0000_0000_002A
-    // not a real ObjectHeader. Route to the CLASS_DYNAMIC_PROPS side-table
-    // so a later `SQL.Aliased` read can find it.
-    {
+    // #6809: header-first receiver classification. A receiver whose GC
+    // header identifies a genuine `ObjectHeader` (GC_TYPE_OBJECT, not a
+    // RegExpHeader) can never be a Buffer, Web-Stream handle, Temporal
+    // cell, typed array, INT32 class ref, primitive, or Date/RegExp — those
+    // are different header types or non-heap encodings — so the whole
+    // exotic-receiver gauntlet below is skipped in one header read. The
+    // write profile (#6759 acceptance) showed the gauntlet's address-keyed
+    // registry probes (each with its own TLS fetch, several behind locks)
+    // dominating hot stores. Skipping by HEADER also closes the stale-
+    // registry misroute where a dead exotic's recycled address, re-tenanted
+    // by a plain object, could hijack the write. RegExp receivers fail
+    // `meta_capable_object` (header magic) and keep taking the gauntlet.
+    let receiver_is_object_header = {
         let bits = obj as u64;
-        if (bits >> 48) == 0x7FFE && !key.is_null() {
-            let class_id = (bits & 0xFFFF_FFFF) as u32;
-            unsafe {
-                let name_ptr = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
-                let name_len = (*key).byte_len as usize;
-                let name = std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len))
-                    .unwrap_or("")
-                    .to_string();
-                // Empty-string is a legal accessor key (`set ''(v)`); the
-                // `!name.is_empty()` guard below skips it, so dispatch a
-                // prototype-ref instance setter / constructor-ref static setter
-                // named "" here (Test262 accessor-name-* literal-string-empty).
-                if name.is_empty() {
-                    let recv = f64::from_bits(bits);
-                    if super::class_prototype_ref_id(recv).is_some()
-                        && super::class_registry::class_instance_setter_apply(
-                            class_id, &name, recv, value,
-                        )
-                    {
-                        return;
-                    }
-                    if super::class_registry::class_static_accessor_setter_apply(
-                        class_id, &name, recv, value,
-                    ) {
-                        return;
-                    }
-                }
-                if !name.is_empty() {
-                    if name == "name"
-                        && !super::class_registry::class_is_key_deleted(class_id, &name)
-                        && super::class_registry::lookup_static_method_in_chain(class_id, &name)
-                            .is_none()
-                    {
-                        return;
-                    }
-                    let has_own_data = CLASS_DYNAMIC_PROPS.with(|m| {
-                        m.borrow()
-                            .get(&class_id)
-                            .is_some_and(|props| props.contains_key(&name))
-                    });
-                    // `C.prototype[key] = v` where `key` is an instance
-                    // `set key(v)` accessor defined on the prototype: invoke the
-                    // setter with `this` = the prototype ref. The prototype ref
-                    // and the constructor ref are both INT32-tagged class refs;
-                    // distinguish via `class_prototype_ref_id`. Instance setters
-                    // live in the vtable; static accessors (below) live in the
-                    // constructor ref's table (Test262 accessor-name-inst).
-                    if !has_own_data
-                        && super::class_prototype_ref_id(f64::from_bits(bits)).is_some()
-                        && super::class_registry::class_instance_setter_apply(
-                            class_id,
-                            &name,
-                            f64::from_bits(bits),
-                            value,
-                        )
-                    {
-                        return;
-                    }
-                    if !has_own_data
-                        && super::class_registry::class_static_accessor_setter_apply(
-                            class_id,
-                            &name,
-                            f64::from_bits(bits),
-                            value,
-                        )
-                    {
-                        return;
-                    }
-                    // Writing `.caller` / `.arguments` on a class constructor
-                    // hits the poison-pill %ThrowTypeError% accessor (which has
-                    // no [[Set]]) on `Function.prototype`, so a strict-mode
-                    // assignment throws. Mirrors the read side in
-                    // get_field_by_name and the ordinary-closure setter path.
-                    // A `defineProperty`-installed own data prop was handled by
-                    // `has_own_data` above; prototype-refs (`C.prototype`) are
-                    // plain objects with no such restriction.
-                    if !has_own_data
-                        && matches!(name.as_str(), "caller" | "arguments")
-                        && super::class_prototype_ref_id(f64::from_bits(bits)).is_none()
-                    {
-                        crate::fs::validate::throw_type_error_with_code(
-                            "Restricted function property access",
-                            "ERR_INVALID_ARG_TYPE",
-                        );
-                    }
-                    class_dynamic_prop_root_store(class_id, name, value);
-                }
-            }
-            return;
-        }
-    }
-    // Property writes to primitive values operate on temporary wrapper objects
-    // and do not persist. More importantly for Perry's raw-f64 numbers, they
-    // must never fall through to the ObjectHeader dereference path below.
-    {
-        let bits = obj as u64;
-        let top16 = bits >> 48;
-        let jv = JSValue::from_bits(bits);
-        if (jv.is_number() && top16 != 0)
-            || jv.is_bool()
-            || jv.is_any_string()
-            || jv.is_undefined()
-            || jv.is_null()
-            || jv.is_bigint()
-        {
-            return;
-        }
-    }
-    // #2089: a `Date` is a NaN-boxed pointer to an 8-byte `DateCell`, and a
-    // RegExp is a `RegExpHeader` — neither is an `ObjectHeader`, so a write
-    // must NOT fall through to the object deref below (memory corruption).
-    // Expando properties on these exotic instances live in the side table
-    // (`object::exotic_expando`), honoring accessor descriptors and
-    // attribute writability installed by `Object.defineProperty`.
-    {
-        let bits = obj as u64;
-        let top16 = bits >> 48;
-        let addr = if top16 == 0x7FFD {
-            (bits & 0x0000_FFFF_FFFF_FFFF) as usize
-        } else if top16 == 0 {
+        let cleaned = if bits >> 48 == 0x7FFD {
+            (bits & crate::value::POINTER_MASK) as usize
+        } else if bits >> 48 == 0 {
             bits as usize
         } else {
             0
         };
-        if addr != 0 {
-            if let Some(kind) = super::exotic_expando::exotic_expando_kind(addr) {
+        cleaned != 0 && unsafe { super::prototype_chain::meta_capable_object(cleaned).is_some() }
+    };
+    'exotic_gauntlet: {
+        if receiver_is_object_header {
+            break 'exotic_gauntlet;
+        }
+        // A Buffer is an ordinary object in Node (a Uint8Array), so `buf.foo = v`
+        // stores an own property — and an own key SHADOWS the same-named prototype
+        // method. Perry keeps buffers outside the object model (raw BufferHeader,
+        // no GcHeader), so this write used to be dropped entirely. mysql2's
+        // `MockBuffer` packet sizer depends on it: it replaces the write methods of
+        // a zero-length Buffer with a no-op, serializes once to measure, then
+        // allocates for real. Store into the GC-traced buffer own-prop table (the
+        // read side and the method-call dispatch both consult it).
+        if !key.is_null() && crate::buffer::is_registered_buffer(obj as usize) {
+            unsafe {
+                let key_ptr = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
+                let key_len = (*key).byte_len as usize;
+                if let Ok(name) = std::str::from_utf8(std::slice::from_raw_parts(key_ptr, key_len))
+                {
+                    // Numeric keys are element writes (`buf[0] = 1`) — leave those
+                    // to the index path; only NAMED props become expandos.
+                    if name.parse::<u32>().is_err() {
+                        crate::buffer::buffer_set_own_prop(obj as usize, name, value);
+                        return;
+                    }
+                }
+            }
+        }
+        // #5437: a live Web Stream handle arrives here as its raw id in the
+        // stream band (the `stream.prop = v` codegen path). React's
+        // `renderToReadableStream` attaches its shell-ready promise as an
+        // expando (`stream.allReady = ...`); without a store the write was
+        // dropped, which stalled the Next.js dynamic-SSR render. Route to the
+        // stdlib per-stream expando table (GC-traced there).
+        {
+            let addr = obj as usize;
+            if crate::value::addr_class::is_stream_id_band(addr) {
                 if !key.is_null() {
-                    unsafe {
-                        let mut sso = [0u8; crate::value::SHORT_STRING_MAX_LEN];
-                        if let Some(name_bytes) = crate::string::js_string_key_bytes(
-                            crate::value::JSValue::string_ptr(key as *mut _),
-                            &mut sso,
-                        ) {
-                            if let Ok(name) = std::str::from_utf8(name_bytes) {
-                                let receiver = f64::from_bits(
-                                    crate::value::JSValue::pointer(addr as *const u8).bits(),
-                                );
-                                let _ = super::exotic_expando::exotic_set_property(
-                                    addr, kind, name, value, receiver,
-                                );
+                    if let (Some(probe), Some(setter)) = (
+                        crate::object::stream_handle_probe(),
+                        crate::object::stream_expando_set(),
+                    ) {
+                        if unsafe { probe(addr) } {
+                            if let Some(name) =
+                                unsafe { super::has_own_helpers::str_from_string_header(key) }
+                            {
+                                unsafe { setter(addr, name.as_ptr(), name.len(), value) };
                             }
                         }
                     }
                 }
+                // A stream-band address is a reserved handle id, never a real
+                // `ObjectHeader`. Stop unconditionally — even when the expando
+                // write was a no-op (dead/unregistered handle, hooks absent, or a
+                // non-UTF-8 key). Falling through would reach the ObjectHeader
+                // path below and deref `addr - GC_HEADER_SIZE` (unmapped) → crash.
+                // Mirrors the reserved small-handle early-return further down.
                 return;
+            }
+        }
+        // A `Temporal.*` value is an opaque, immutable NaN-boxed cell that is NOT
+        // an `ObjectHeader` — writing an arbitrary property (e.g. test262's
+        // `instance.constructor = …` subclassing probes) must NOT interpret the
+        // cell as an `ObjectHeader` and corrupt its boxed payload (which segfaults
+        // on the next deref). The cell's `temporal_rs` slots are immutable, but a
+        // user-defined *expando* property is legal and lives in the exotic side
+        // table (like Date/RegExp). `obj` still carries its NaN-box tag here
+        // (`0x7FFD…` for a real cell), so route through `exotic_expando_kind_of_value`,
+        // which checks the tag before masking to the cleaned heap address.
+        if let Some((addr, kind @ super::exotic_expando::ExoticKind::Temporal)) =
+            super::exotic_expando::exotic_expando_kind_of_value(f64::from_bits(obj as u64))
+        {
+            if !key.is_null() {
+                unsafe {
+                    let name_ptr =
+                        (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
+                    let name_len = (*key).byte_len as usize;
+                    let name =
+                        String::from_utf8_lossy(std::slice::from_raw_parts(name_ptr, name_len))
+                            .into_owned();
+                    let receiver = f64::from_bits(obj as u64);
+                    let _ = super::exotic_expando::exotic_set_property(
+                        addr, kind, &name, value, receiver,
+                    );
+                }
+            }
+            return;
+        }
+        if let Some(addr) =
+            crate::typedarray_props::typed_array_addr_from_value(f64::from_bits(obj as u64))
+        {
+            unsafe {
+                crate::typedarray_props::typed_array_set_own_property(
+                    addr as *mut crate::typedarray::TypedArrayHeader,
+                    key,
+                    value,
+                );
+            }
+            return;
+        }
+
+        // Issue #618-followup: detect INT32-tagged class ref (top16 == 0x7FFE).
+        // Drizzle's `((SQL2) => { SQL2.Aliased = Aliased; })(SQL)` pattern sets
+        // a static property on an imported class — Perry stores classes as
+        // INT32-tagged class ids, so the receiver here is e.g. 0x7FFE_0000_0000_002A
+        // not a real ObjectHeader. Route to the CLASS_DYNAMIC_PROPS side-table
+        // so a later `SQL.Aliased` read can find it.
+        {
+            let bits = obj as u64;
+            if (bits >> 48) == 0x7FFE && !key.is_null() {
+                let class_id = (bits & 0xFFFF_FFFF) as u32;
+                unsafe {
+                    let name_ptr =
+                        (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
+                    let name_len = (*key).byte_len as usize;
+                    let name = std::str::from_utf8(std::slice::from_raw_parts(name_ptr, name_len))
+                        .unwrap_or("")
+                        .to_string();
+                    // Empty-string is a legal accessor key (`set ''(v)`); the
+                    // `!name.is_empty()` guard below skips it, so dispatch a
+                    // prototype-ref instance setter / constructor-ref static setter
+                    // named "" here (Test262 accessor-name-* literal-string-empty).
+                    if name.is_empty() {
+                        let recv = f64::from_bits(bits);
+                        if super::class_prototype_ref_id(recv).is_some()
+                            && super::class_registry::class_instance_setter_apply(
+                                class_id, &name, recv, value,
+                            )
+                        {
+                            return;
+                        }
+                        if super::class_registry::class_static_accessor_setter_apply(
+                            class_id, &name, recv, value,
+                        ) {
+                            return;
+                        }
+                    }
+                    if !name.is_empty() {
+                        if name == "name"
+                            && !super::class_registry::class_is_key_deleted(class_id, &name)
+                            && super::class_registry::lookup_static_method_in_chain(class_id, &name)
+                                .is_none()
+                        {
+                            return;
+                        }
+                        let has_own_data = CLASS_DYNAMIC_PROPS.with(|m| {
+                            m.borrow()
+                                .get(&class_id)
+                                .is_some_and(|props| props.contains_key(&name))
+                        });
+                        // `C.prototype[key] = v` where `key` is an instance
+                        // `set key(v)` accessor defined on the prototype: invoke the
+                        // setter with `this` = the prototype ref. The prototype ref
+                        // and the constructor ref are both INT32-tagged class refs;
+                        // distinguish via `class_prototype_ref_id`. Instance setters
+                        // live in the vtable; static accessors (below) live in the
+                        // constructor ref's table (Test262 accessor-name-inst).
+                        if !has_own_data
+                            && super::class_prototype_ref_id(f64::from_bits(bits)).is_some()
+                            && super::class_registry::class_instance_setter_apply(
+                                class_id,
+                                &name,
+                                f64::from_bits(bits),
+                                value,
+                            )
+                        {
+                            return;
+                        }
+                        if !has_own_data
+                            && super::class_registry::class_static_accessor_setter_apply(
+                                class_id,
+                                &name,
+                                f64::from_bits(bits),
+                                value,
+                            )
+                        {
+                            return;
+                        }
+                        // Writing `.caller` / `.arguments` on a class constructor
+                        // hits the poison-pill %ThrowTypeError% accessor (which has
+                        // no [[Set]]) on `Function.prototype`, so a strict-mode
+                        // assignment throws. Mirrors the read side in
+                        // get_field_by_name and the ordinary-closure setter path.
+                        // A `defineProperty`-installed own data prop was handled by
+                        // `has_own_data` above; prototype-refs (`C.prototype`) are
+                        // plain objects with no such restriction.
+                        if !has_own_data
+                            && matches!(name.as_str(), "caller" | "arguments")
+                            && super::class_prototype_ref_id(f64::from_bits(bits)).is_none()
+                        {
+                            crate::fs::validate::throw_type_error_with_code(
+                                "Restricted function property access",
+                                "ERR_INVALID_ARG_TYPE",
+                            );
+                        }
+                        class_dynamic_prop_root_store(class_id, name, value);
+                    }
+                }
+                return;
+            }
+        }
+        // Property writes to primitive values operate on temporary wrapper objects
+        // and do not persist. More importantly for Perry's raw-f64 numbers, they
+        // must never fall through to the ObjectHeader dereference path below.
+        {
+            let bits = obj as u64;
+            let top16 = bits >> 48;
+            let jv = JSValue::from_bits(bits);
+            if (jv.is_number() && top16 != 0)
+                || jv.is_bool()
+                || jv.is_any_string()
+                || jv.is_undefined()
+                || jv.is_null()
+                || jv.is_bigint()
+            {
+                return;
+            }
+        }
+        // #2089: a `Date` is a NaN-boxed pointer to an 8-byte `DateCell`, and a
+        // RegExp is a `RegExpHeader` — neither is an `ObjectHeader`, so a write
+        // must NOT fall through to the object deref below (memory corruption).
+        // Expando properties on these exotic instances live in the side table
+        // (`object::exotic_expando`), honoring accessor descriptors and
+        // attribute writability installed by `Object.defineProperty`.
+        {
+            let bits = obj as u64;
+            let top16 = bits >> 48;
+            let addr = if top16 == 0x7FFD {
+                (bits & 0x0000_FFFF_FFFF_FFFF) as usize
+            } else if top16 == 0 {
+                bits as usize
+            } else {
+                0
+            };
+            if addr != 0 {
+                if let Some(kind) = super::exotic_expando::exotic_expando_kind(addr) {
+                    if !key.is_null() {
+                        unsafe {
+                            let mut sso = [0u8; crate::value::SHORT_STRING_MAX_LEN];
+                            if let Some(name_bytes) = crate::string::js_string_key_bytes(
+                                crate::value::JSValue::string_ptr(key as *mut _),
+                                &mut sso,
+                            ) {
+                                if let Ok(name) = std::str::from_utf8(name_bytes) {
+                                    let receiver = f64::from_bits(
+                                        crate::value::JSValue::pointer(addr as *const u8).bits(),
+                                    );
+                                    let _ = super::exotic_expando::exotic_set_property(
+                                        addr, kind, name, value, receiver,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
             }
         }
     }
