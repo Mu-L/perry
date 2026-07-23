@@ -424,6 +424,18 @@ pub extern "C" fn js_object_get_field_ic_miss(
             let keys_data = (keys as *const u8).add(8) as *const f64;
             let alloc_limit =
                 std::cmp::max((*obj).field_count, crate::object::INLINE_SLOT_FLOOR as u32) as usize;
+            // #6804: stamp the receiver's stable ShapeId at PIC-miss
+            // resolution, so the id-keyed FIELD_CACHE (and the future
+            // id-comparing PIC) see a stamped object from its first read.
+            if (*obj).class_id == 0
+                && !crate::object::shapes::is_shape_id((*obj).parent_class_id)
+                && !crate::regex::regex_header_has_magic(obj as *const crate::regex::RegExpHeader)
+            {
+                let id = crate::object::shapes::shape_id_for_keys_ensure(keys, key_count as u32);
+                if id != 0 {
+                    (*(obj as *mut ObjectHeader)).parent_class_id = id;
+                }
+            }
             for i in 0..key_count {
                 let k_bits = (*keys_data.add(i)).to_bits();
                 let k_ptr = (k_bits & 0x0000_FFFF_FFFF_FFFF) as *const crate::StringHeader;
