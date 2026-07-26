@@ -1857,6 +1857,38 @@ enum ObjectArrayWriteNumber {
 /// the measured #6812 gap while preserving a fixed-size, allocation-free
 /// preflight ABI.
 const MAX_OBJECT_ARRAY_WRITE_FIELDS: usize = 4;
+/// #6812 (w8): caps for the leading numeric-temp run. Substituting a temp
+/// duplicates its tree at every use (`let b = a + a;` doubles per level), so
+/// both the temp count and every parsed tree's node count are budgeted —
+/// the range/emit walkers recurse over these trees and must stay on a
+/// bounded stack for generated/inlined bodies of any size.
+const MAX_OBJECT_ARRAY_WRITE_TEMPS: usize = 8;
+const MAX_OBJECT_ARRAY_WRITE_NUMBER_NODES: usize = 64;
+
+/// Iterative (explicit-worklist) node count with early exit past the cap, so
+/// counting an oversized tree never recurses either.
+fn object_array_write_number_node_count(root: &ObjectArrayWriteNumber) -> usize {
+    let mut count = 0usize;
+    let mut work = vec![root];
+    while let Some(node) = work.pop() {
+        count += 1;
+        if count > MAX_OBJECT_ARRAY_WRITE_NUMBER_NODES {
+            return count;
+        }
+        match node {
+            ObjectArrayWriteNumber::Add(left, right)
+            | ObjectArrayWriteNumber::Sub(left, right)
+            | ObjectArrayWriteNumber::Mul(left, right) => {
+                work.push(left);
+                work.push(right);
+            }
+            ObjectArrayWriteNumber::OuterCounter
+            | ObjectArrayWriteNumber::InnerCounter
+            | ObjectArrayWriteNumber::Constant(_) => {}
+        }
+    }
+    count
+}
 
 struct ObjectArrayWriteLoop {
     outer_counter_id: u32,
@@ -1894,11 +1926,19 @@ fn match_object_array_write_number(
     expr: &perry_hir::Expr,
     outer_counter_id: u32,
     inner_counter_id: u32,
+    temps: &std::collections::HashMap<u32, ObjectArrayWriteNumber>,
 ) -> Option<ObjectArrayWriteNumber> {
     use perry_hir::{BinaryOp, Expr};
     match expr {
         Expr::LocalGet(id) if *id == outer_counter_id => Some(ObjectArrayWriteNumber::OuterCounter),
         Expr::LocalGet(id) if *id == inner_counter_id => Some(ObjectArrayWriteNumber::InnerCounter),
+        // #6812 (w8): a body-local immutable numeric temp (`let x = r + i;`)
+        // — the shape the call inliner leaves behind — substitutes its parsed
+        // expression tree. Recomputation at each use is safe: the grammar
+        // admits only pure numeric expressions over counters/constants/
+        // earlier temps, and the finite-range proof runs on the substituted
+        // tree exactly as if the user had written it inline.
+        Expr::LocalGet(id) => temps.get(id).cloned(),
         Expr::Integer(n) if (-i64::from(i32::MAX)..=i64::from(i32::MAX)).contains(n) => {
             Some(ObjectArrayWriteNumber::Constant(*n as f64))
         }
@@ -1906,8 +1946,10 @@ fn match_object_array_write_number(
         Expr::Binary { op, left, right }
             if matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul) =>
         {
-            let left = match_object_array_write_number(left, outer_counter_id, inner_counter_id)?;
-            let right = match_object_array_write_number(right, outer_counter_id, inner_counter_id)?;
+            let left =
+                match_object_array_write_number(left, outer_counter_id, inner_counter_id, temps)?;
+            let right =
+                match_object_array_write_number(right, outer_counter_id, inner_counter_id, temps)?;
             Some(if matches!(op, BinaryOp::Mul) {
                 ObjectArrayWriteNumber::Mul(Box::new(left), Box::new(right))
             } else if matches!(op, BinaryOp::Add) {
@@ -2200,7 +2242,10 @@ fn match_object_array_write_loop(
     else {
         return None;
     };
-    if stores.is_empty() || stores.len() > MAX_OBJECT_ARRAY_WRITE_FIELDS {
+    // Only emptiness here: `stores` may still carry leading numeric temps
+    // (#6812 w8), so the MAX_OBJECT_ARRAY_WRITE_FIELDS cap applies to the
+    // real writes after the temp run is split off below.
+    if stores.is_empty() {
         return None;
     }
     let (Expr::LocalGet(array_id), Expr::LocalGet(index_id)) = (object.as_ref(), index.as_ref())
@@ -2229,6 +2274,46 @@ fn match_object_array_write_loop(
         }
     }
 
+    // #6812 (w8): admit a leading run of body-local immutable numeric temps
+    // between the alias and the writes — the exact shape the call inliner
+    // produces (`setCD(o, r + i, r - i)` becomes `let x = r + i;
+    // let y = r - i; o.c = x; o.d = y`). Each temp's init must parse in the
+    // same pure-numeric grammar (over counters, constants, and earlier
+    // temps); write values then resolve `LocalGet(temp)` by substitution, so
+    // the emitter and the finite-range proof see the trees the user could
+    // have written inline (recomputation of a pure numeric expression is
+    // unobservable). A temp that is captured (boxed) or fails the grammar
+    // rejects the whole loop — statements are never skipped.
+    let mut temps = std::collections::HashMap::new();
+    let mut stores = stores;
+    while let Some((
+        Stmt::Let {
+            id: temp_id,
+            mutable: false,
+            init: Some(temp_init),
+            ..
+        },
+        rest,
+    )) = stores.split_first()
+    {
+        if ctx.boxed_vars.contains(temp_id) || temps.len() >= MAX_OBJECT_ARRAY_WRITE_TEMPS {
+            return None;
+        }
+        let parsed =
+            match_object_array_write_number(temp_init, outer_counter_id, inner_counter_id, &temps)?;
+        // Substitution can compound: `let b = a + a; let c = b + b;` doubles
+        // the tree per level, so a size budget — not a temp-count cap alone —
+        // keeps the recursive range/emit walkers on bounded stacks.
+        if object_array_write_number_node_count(&parsed) > MAX_OBJECT_ARRAY_WRITE_NUMBER_NODES {
+            return None;
+        }
+        temps.insert(*temp_id, parsed);
+        stores = rest;
+    }
+    if stores.is_empty() || stores.len() > MAX_OBJECT_ARRAY_WRITE_FIELDS {
+        return None;
+    }
+
     let match_store = |effect: &Expr| -> Option<(String, ObjectArrayWriteNumber)> {
         let Expr::PutValueSet {
             target,
@@ -2250,9 +2335,23 @@ fn match_object_array_write_loop(
         let property = match key.as_ref() {
             Expr::String(property) => property.clone(),
             Expr::LocalGet(id) => ctx.const_string_locals.get(id).cloned()?,
+            // #6812 (w13): `o[7] = v` — a constant integer key IS the
+            // canonical numeric-string property ("7") on a plain object.
+            // Receivers that are real arrays at runtime are safe: the
+            // preflight guard type-checks every element as GC_TYPE_OBJECT
+            // and rejects the nest, and the per-write fallback handles
+            // element writes generically.
+            Expr::Integer(n) => n.to_string(),
             _ => return None,
         };
-        let value = match_object_array_write_number(value, outer_counter_id, inner_counter_id)?;
+        let value =
+            match_object_array_write_number(value, outer_counter_id, inner_counter_id, &temps)?;
+        // Same size budget as the temps: a value combining several
+        // substituted temps must still hand the recursive range/emit
+        // walkers a bounded tree.
+        if object_array_write_number_node_count(&value) > MAX_OBJECT_ARRAY_WRITE_NUMBER_NODES {
+            return None;
+        }
         object_array_write_number_finite_range(&value, outer_start, outer_bound, inner_bound)?;
         Some((property, value))
     };
@@ -2322,9 +2421,61 @@ fn lower_object_array_write_versioned_for(
     update: Option<&perry_hir::Expr>,
     body: &[Stmt],
 ) -> Result<bool> {
-    let Some(matched) = match_object_array_write_loop(ctx, init, condition, update, body) else {
+    let Some(mut matched) = match_object_array_write_loop(ctx, init, condition, update, body)
+    else {
         return Ok(false);
     };
+
+    // #6812 (w13): peel outer iteration #1 through the ordinary lowering
+    // before versioning. A first-write loop (`o[7] = v` where "7" is a new
+    // key) appends the key to every receiver — a shape transition — so a
+    // preflight taken before any iteration rejects with "target key is
+    // absent from the shared shape" and the ENTIRE nest runs generically.
+    // The peeled round primes the shapes with exact source semantics; the
+    // guard then proves the remaining [start+1, bound) rounds, which run in
+    // the call-free clone. When the guard would have passed anyway the cost
+    // is one ordinary outer round of a multi-round nest. The peel calls
+    // `lower_for_after_init` directly, so it cannot re-enter this
+    // versioning path.
+    let mut peeled_init_stmt: Option<Stmt> = None;
+    if matched.outer_start < matched.outer_bound {
+        let Some(Stmt::Let {
+            id,
+            name,
+            ty,
+            mutable,
+            ..
+        }) = init
+        else {
+            // match_constant_counted_for only admits a Let-counted for;
+            // defensive rather than unreachable.
+            return Ok(false);
+        };
+        let peel_cond = perry_hir::Expr::Compare {
+            op: perry_hir::CompareOp::Lt,
+            left: Box::new(perry_hir::Expr::LocalGet(*id)),
+            right: Box::new(perry_hir::Expr::Integer(i64::from(matched.outer_start) + 1)),
+        };
+        lower_for_after_init(
+            ctx,
+            init,
+            Some(&peel_cond),
+            update,
+            body,
+            "for.object_array_write_peel",
+        )?;
+        matched.outer_start += 1;
+        peeled_init_stmt = Some(Stmt::Let {
+            id: *id,
+            name: name.clone(),
+            ty: ty.clone(),
+            mutable: *mutable,
+            init: Some(perry_hir::Expr::Integer(i64::from(matched.outer_start))),
+        });
+    }
+    // Both the guard-fail fallback and the fast nest must cover only the
+    // un-peeled rounds.
+    let init = peeled_init_stmt.as_ref().or(init);
 
     let slow_pre_idx = ctx.new_block("object_array_write.loop.slow.preheader");
     let merge_idx = ctx.new_block("object_array_write.loop.merge");
