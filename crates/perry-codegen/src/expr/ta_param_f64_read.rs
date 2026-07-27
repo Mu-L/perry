@@ -156,6 +156,27 @@ fn lower_checked_typed_array_f64_load(
     let obj_box = lower_expr(ctx, object)?;
     let idx_i32 = lower_expr_as_i32(ctx, index)?;
 
+    // VALIDATION TOGGLE (PERRY_TA_UNSAFE_NOGUARD=1): unguarded bare load — no
+    // pointer/kind guard, no bounds check, no slow branch — to measure the
+    // ceiling if the per-read guard were free vs the checked path. UNSOUND.
+    if std::env::var("PERRY_TA_UNSAFE_NOGUARD").as_deref() == Ok("1") {
+        let blk = ctx.block();
+        let obj_bits = blk.bitcast_double_to_i64(&obj_box);
+        let raw = blk.and(I64, &obj_bits, crate::nanbox::POINTER_MASK_I64);
+        let data_base = blk.add(I64, &raw, "16");
+        let idx_i64 = blk.zext(I32, &idx_i32, I64);
+        let off = blk.shl(I64, &idx_i64, &elem_size.trailing_zeros().to_string());
+        let addr = blk.add(I64, &data_base, &off);
+        let ptr = blk.inttoptr(I64, &addr);
+        let raw_elem = blk.load(elem_ty, &ptr);
+        return Ok(match conv {
+            F64Conv::F64 => raw_elem,
+            F64Conv::F32 => blk.fpext(F32, &raw_elem, DOUBLE),
+            F64Conv::SInt => blk.sitofp(elem_ty, &raw_elem, DOUBLE),
+            F64Conv::UInt => blk.uitofp(elem_ty, &raw_elem, DOUBLE),
+        });
+    }
+
     let chk_idx = ctx.new_block("ctaf.get.chk");
     let load_idx = ctx.new_block("ctaf.get.load");
     let oob_idx = ctx.new_block("ctaf.get.oob");
