@@ -970,6 +970,24 @@ fn compute_object_cache_key_with_env(
             .as_deref()
             .unwrap_or(""),
     );
+    // Representation-selection Phase 2 — specialized calling convention:
+    // `PERRY_SPECIALIZED_ABI=0/off/false` removes the specialized entries and
+    // their static/guarded dispatch sites; `PERRY_SPECIALIZED_ABI_MAX`
+    // changes which functions get an entry. Both change emitted IR / .o
+    // bytes — an unkeyed flag would make A/B arms silently share objects.
+    h.field(
+        "env_specialized_abi",
+        env_var("PERRY_SPECIALIZED_ABI").as_deref().unwrap_or(""),
+    );
+    h.field(
+        "env_specialized_abi_max",
+        env_var("PERRY_SPECIALIZED_ABI_MAX")
+            .as_deref()
+            .unwrap_or(""),
+    );
+    // FEAT_JSCVT ToInt32 (`fjcvtzs` on apple-arm64): flipping it changes
+    // every `toint32_wrap` emission site's IR, so it must key the cache.
+    h.field("env_jscvt", env_var("PERRY_JSCVT").as_deref().unwrap_or(""));
 
     h.finish()
 }

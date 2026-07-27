@@ -473,6 +473,9 @@ pub(super) fn compile_method(
         integer_locals: native_facts.integer_locals(),
         not_bigint_locals: native_facts.not_bigint_locals(),
         unsigned_i32_locals: native_facts.unsigned_i32_locals(),
+        // Conservative: treat every slot as possibly-bound (param binds are
+        // emitted before FnCtx exists here), so clears never get skipped.
+        shadow_slots_bound: shadow_slot_map.values().copied().collect(),
         shadow_slot_map,
         persistent_shadow_slots: std::collections::HashSet::new(),
         shadow_slot_clears_after_stmt,
@@ -489,6 +492,9 @@ pub(super) fn compile_method(
         local_slot_reps: HashMap::new(),
         repsel_context_allows_canonical_i32: repsel_allows,
         repsel_closure_ref_locals: repsel_closure_refs,
+        spec_abi_functions: &cross_module.spec_abi_functions,
+        spec_ta_bindings: &cross_module.spec_ta_bindings,
+        spec_ta_ready: std::collections::HashSet::new(),
         i1_local_slots: HashMap::new(),
         index_used_locals: native_facts.index_used_locals(),
         strictly_i32_bounded_locals: native_facts.strictly_i32_bounded_locals(),
@@ -1490,6 +1496,9 @@ pub(super) fn compile_static_method(
         integer_locals: native_facts.integer_locals(),
         not_bigint_locals: native_facts.not_bigint_locals(),
         unsigned_i32_locals: native_facts.unsigned_i32_locals(),
+        // Conservative: treat every slot as possibly-bound (param binds are
+        // emitted before FnCtx exists here), so clears never get skipped.
+        shadow_slots_bound: shadow_slot_map.values().copied().collect(),
         shadow_slot_map,
         persistent_shadow_slots: std::collections::HashSet::new(),
         shadow_slot_clears_after_stmt,
@@ -1506,6 +1515,9 @@ pub(super) fn compile_static_method(
         local_slot_reps: HashMap::new(),
         repsel_context_allows_canonical_i32: repsel_allows,
         repsel_closure_ref_locals: repsel_closure_refs,
+        spec_abi_functions: &cross_module.spec_abi_functions,
+        spec_ta_bindings: &cross_module.spec_ta_bindings,
+        spec_ta_ready: std::collections::HashSet::new(),
         i1_local_slots: HashMap::new(),
         index_used_locals: native_facts.index_used_locals(),
         strictly_i32_bounded_locals: native_facts.strictly_i32_bounded_locals(),

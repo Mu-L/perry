@@ -45,6 +45,7 @@ mod object_literal;
 mod pod_layout_constants;
 mod pod_record;
 mod property_get_names;
+mod proven_view_access;
 mod range_facts;
 mod strings;
 mod typed_feedback;
@@ -55,9 +56,9 @@ mod write_barrier;
 pub(crate) use crate::native_value::{materialize_js_value, materialize_js_value_without_record};
 pub(crate) use array_literal::lower_array_literal;
 pub(crate) use buffer_access::{
-    access_facts_for_spec, emit_buffer_access_pointer, lower_buffer_access_proof,
-    lower_buffer_load, lower_buffer_store, lower_typed_array_load, lower_typed_array_store,
-    BufferAccessSpec,
+    access_facts_for_spec, can_lower_integer_typed_array_store_value, emit_buffer_access_pointer,
+    lower_buffer_access_proof, lower_buffer_load, lower_buffer_store, lower_typed_array_load,
+    lower_typed_array_store, BufferAccessSpec,
 };
 pub(crate) use buffer_views::{
     alias_buffer_view_slot, attach_native_owned_view_fact, buffer_access_materialization_reason,
@@ -92,6 +93,10 @@ pub(crate) use object_literal::lower_object_literal;
 pub(crate) use pod_record::{
     lower_and_store_initial_pod_field, lower_pod_local_reassignment, materialize_pod_local,
     try_lower_pod_field_get, try_lower_pod_field_set,
+};
+pub(crate) use proven_view_access::{
+    index_is_exact_i32_shape, local_is_proven_int_store_view,
+    try_lower_proven_view_checked_f64_load, try_lower_proven_view_checked_store,
 };
 pub(crate) use range_facts::{
     bounds_for_buffer_access_width, effective_alias_state_for_access,
@@ -633,6 +638,13 @@ pub(crate) struct FnCtx<'a> {
     /// cleared after lowering that statement. Built once per user function
     /// from HIR local-reference last-use information.
     pub shadow_slot_clears_after_stmt: std::collections::HashMap<usize, Vec<u32>>,
+    /// Slot indices that have had at least one `js_shadow_slot_bind` (or
+    /// value-set) emitted so far. Slots start zeroed and are only ever
+    /// written through the bind/set helpers, so a scheduled CLEAR of a
+    /// never-bound slot is a provable no-op (`js_shadow_slot_set(idx, 0)` on
+    /// a slot that already holds 0) — `emit_shadow_slot_clear` skips it.
+    /// Seeded at construction with the entry-bound parameter slots.
+    pub shadow_slots_bound: std::collections::HashSet<u32>,
 
     /// Cached pointer to this function's `InlineArenaState` slot —
     /// allocated lazily on the first `new ClassName()` site that uses
@@ -761,6 +773,24 @@ pub(crate) struct FnCtx<'a> {
     /// capture machinery stays on the boxed protocol. Empty when
     /// `repsel_context_allows_canonical_i32` is false.
     pub repsel_closure_ref_locals: std::collections::HashSet<u32>,
+
+    /// Representation-selection Phase 2 (`codegen/spec_abi.rs`): FuncId →
+    /// specialization plan for functions that have an emitted specialized
+    /// entry in this module. Direct `FuncRef` call sites consult this to
+    /// dispatch statically-proven sites to the raw-ABI symbol.
+    pub spec_abi_functions: &'a std::collections::HashMap<u32, crate::codegen::SpecFnPlan>,
+
+    /// Phase 2 pre-pass output (`collectors/spec_abi_sites.rs`): LocalIds
+    /// proven to permanently hold one specific non-view typed array. A call
+    /// arg `LocalGet(id)` matches a `TaPtr` slot only when `id` is here AND in
+    /// `spec_ta_ready` (its binding statement already lowered at top level).
+    pub spec_ta_bindings: &'a std::collections::HashMap<u32, crate::collectors::SpecTaBinding>,
+
+    /// Dominance mirror for `spec_ta_bindings`: ids whose top-level binding
+    /// `Stmt::Let` has been lowered in THIS body (inserted by
+    /// `stmt::lower_top_level_stmts`). A proven binding is only usable at call
+    /// sites it dominates; closure bodies get their own (empty) set.
+    pub spec_ta_ready: std::collections::HashSet<u32>,
 
     /// Parallel `i1` slots for ordinary boolean locals that have stayed inside
     /// the representation-first subset. The generic `double` slot remains as a
