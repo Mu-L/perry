@@ -55,6 +55,27 @@ pub(crate) fn auto_optimized_archives_are_fresh(
     true
 }
 
+/// `PERRY_SIZE_OPT=z|s` — opt-in size-optimized rebuild of the
+/// auto-optimized runtime/stdlib archives (`-C opt-level=z`/`s` instead of
+/// the profile's `3`). Any other value (or unset) means "off". Read in the
+/// rustflags builder AND the cache key so the two can never disagree about
+/// which archive a `target/perry-auto-<hash>` dir contains.
+pub(crate) fn size_opt_level() -> Option<&'static str> {
+    match std::env::var("PERRY_SIZE_OPT").ok().as_deref() {
+        Some("z") => Some("z"),
+        Some("s") => Some("s"),
+        _ => None,
+    }
+}
+
+/// `PERRY_SIZE_LTO=fat` — additionally rebuild the archives with fat LTO +
+/// a single codegen unit. Slower build, smaller/faster archive; only
+/// meaningful together with `size_opt_level`. Keyed into the cache like the
+/// opt level.
+pub(crate) fn size_lto_fat() -> bool {
+    std::env::var("PERRY_SIZE_LTO").ok().as_deref() == Some("fat")
+}
+
 /// Cache key for the auto-optimize target dir + build stamp. Hashed into the
 /// `target/perry-auto-<hash>` dir name so each (features, panic-mode, target,
 /// runtime-gate, version) combination gets its own incremental cache. Kept in
@@ -67,7 +88,7 @@ pub(crate) fn auto_optimized_cache_key(
 ) -> String {
     let target_str = target.unwrap_or("host");
     format!(
-        "{}|{}|{}|wasm={}|regex={}|temporal={}|ee={}|url={}|norm={}|seg={}|loc={}|diag={}|dgram={}|http2={}|dyneval={}|v={}",
+        "{}|{}|{}|wasm={}|regex={}|temporal={}|ee={}|url={}|norm={}|seg={}|loc={}|diag={}|dgram={}|http2={}|dyneval={}|sizeopt={}|anchors={}|v={}",
         feature_arg,
         panic_abort_safe,
         target_str,
@@ -88,6 +109,12 @@ pub(crate) fn auto_optimized_cache_key(
         // #6559: dyn-eval presence changes the built archive, so it must
         // key the freshness stamp like every other runtime feature toggle.
         perry_hir::has_deferred_dynamic_code_sites(),
+        format!(
+            "{}{}",
+            size_opt_level().unwrap_or("off"),
+            if size_lto_fat() { "+fatlto" } else { "" }
+        ),
+        std::env::var("PERRY_LLVM_BITCODE_LINK").ok().as_deref() == Some("1"),
         env!("CARGO_PKG_VERSION"),
     )
 }
@@ -176,6 +203,25 @@ pub(crate) fn auto_optimized_cross_features(
         if !ctx.uses_regex {
             cross_features.push("perry-runtime/regex-engine".to_string());
         }
+    }
+    // mimalloc global allocator (#62): force-added on EVERY auto-optimize
+    // rebuild, including size-optimized ones. Dropping it for size (~140 KB)
+    // produces binaries whose console output silently vanishes / that throw
+    // spurious TypeErrors: runtime pointer-classification paths assume the
+    // allocator's address bands (the macOS mimalloc heap lands in a high
+    // window; system-malloc allocations land elsewhere and get misread as
+    // handles/non-pointers). Until value/addr_class.rs is audited for
+    // system-allocator ranges, the feature stays force-on; the cfg gate in
+    // perry-runtime remains for that future audit.
+    cross_features.push("perry-runtime/alloc-mimalloc".to_string());
+    // The `#[used]` keep-alive anchors exist for the whole-program bitcode
+    // LTO path only (see perry-runtime's `keepalive-anchors` feature docs).
+    // The classic link keeps every reachable symbol via real undefined
+    // references, so the anchors are omitted there — that is what lets
+    // `-dead_strip` drop the never-imported node-module surface from small
+    // programs. Re-enable them whenever the bitcode link was requested.
+    if std::env::var("PERRY_LLVM_BITCODE_LINK").ok().as_deref() == Some("1") {
+        cross_features.push("perry-runtime/keepalive-anchors".to_string());
     }
     // Compile OUT perry-runtime's no-op fetch stubs (`js_fetch_with_options` /
     // `js_headers_new` / `js_request_new`, gated `#[cfg(not(feature =
