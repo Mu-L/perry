@@ -223,7 +223,13 @@ fn native_or_plain_key(name: &str, overridden: bool) -> *mut crate::string::Stri
 /// "no fixed receiver — read IMPLICIT_THIS", which `Function.prototype.call`/
 /// `.apply` sets to the borrowed `this`.
 pub(crate) fn install_event_emitter_prototype_methods(proto: *mut ObjectHeader) {
-    register_stub_arities();
+    // Only the emitter stubs' arities: the full `register_stub_arities`
+    // address-takes the entire stream stub family (pipe/compose/transform/
+    // readwrite), pinning the whole tower into any binary that can install
+    // EventEmitter prototype methods (reachable through several always-on
+    // paths). Stream namespaces/instances still run the full registration
+    // via `build_object` / `install_methods_on_existing_object`.
+    register_emitter_stub_arities();
     let methods = super::emitter_methods();
     let mut on_method: Option<f64> = None;
     for (name, func) in methods {
@@ -241,6 +247,31 @@ pub(crate) fn install_event_emitter_prototype_methods(proto: *mut ObjectHeader) 
         }
         js_object_set_field_by_name(proto, hidden_key(name.as_bytes()), val);
     }
+}
+
+/// Arities for exactly the [`super::emitter_methods`] stub set (plus the
+/// capture-rejection helper `emit` can invoke). Kept separate from
+/// [`register_stub_arities`] so EventEmitter prototype installs don't
+/// address-take the stream tower.
+pub(super) fn register_emitter_stub_arities() {
+    let register = |func: *const u8, arity: u32| {
+        crate::closure::js_register_closure_arity(func, arity);
+    };
+    register(ns_on2 as *const u8, 2);
+    register(ns_once2 as *const u8, 2);
+    register(ns_prepend_listener2 as *const u8, 2);
+    register(ns_prepend_once_listener2 as *const u8, 2);
+    register(ns_off2 as *const u8, 2);
+    register(ns_remove_listener2 as *const u8, 2);
+    register(ns_remove_all_listeners1 as *const u8, 1);
+    crate::closure::js_register_closure_rest(ns_emit_rest as *const u8, 1);
+    register(ns_set_max_listeners as *const u8, 1);
+    register(ns_get_max_listeners as *const u8, 0);
+    register(ns_event_names as *const u8, 0);
+    register(ns_listener_count as *const u8, 1);
+    register(ns_listeners as *const u8, 1);
+    register(ns_raw_listeners as *const u8, 1);
+    register(ns_capture_rejection as *const u8, 1);
 }
 
 pub(super) fn register_stub_arities() {
