@@ -971,6 +971,9 @@ fn attach_sqlite_session_prototype(constructor_value: f64) {
 }
 
 pub(crate) fn buffer_constructor_value() -> f64 {
+    // Arm BEFORE the constructor value can exist anywhere (see
+    // `parent_static::arm_buffer_static_chain`).
+    super::super::class_registry::parent_static::arm_buffer_static_chain();
     BUFFER_CONSTRUCTOR_VALUE.with(|slot| {
         let cached = slot.get();
         if cached != 0 {

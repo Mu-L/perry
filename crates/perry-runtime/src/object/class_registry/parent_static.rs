@@ -1335,11 +1335,34 @@ unsafe fn try_native_static_method_in_proto_chain(
     args_ptr: *const f64,
     args_len: usize,
 ) -> Option<f64> {
-    // NOTE: deliberately NOT routed through `NmNamespaceOps` — a
-    // `class X extends Buffer` registers the parent value before the lazy
-    // callable-exports closure would arm the table (probe-verified: the
-    // hooked form broke `MyBuf.from`), so this probe must stay static.
-    nm_static_buffer_proto_chain(class_id, name, args_ptr, args_len)
+    // Routed through a DEDICATED armed hook (not `NmNamespaceOps`, whose
+    // arming happens too late for this path: `class X extends Buffer`
+    // registers the parent before the lazy callable-exports closure runs —
+    // probe-verified). `buffer_constructor_value()` arms this at ENTRY,
+    // before the first Buffer constructor value can exist anywhere, so
+    // unarmed ⇒ the probe below could never match. Cutting this static call
+    // is what lets the namespace/EE/stream tower dead-strip from binaries
+    // that never touch Buffer.
+    let f = BUF_STATIC_CHAIN_FN.load(std::sync::atomic::Ordering::Acquire);
+    if f.is_null() {
+        return None;
+    }
+    // SAFETY: only `nm_static_buffer_proto_chain` is ever stored.
+    let f: unsafe fn(u32, &str, *const f64, usize) -> Option<f64> = std::mem::transmute(f);
+    f(class_id, name, args_ptr, args_len)
+}
+
+static BUF_STATIC_CHAIN_FN: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// Armed by `callable_exports::buffer_constructor_value()` at entry.
+/// `black_box` for the usual speculative-devirtualization guard.
+pub(crate) fn arm_buffer_static_chain() {
+    let f: unsafe fn(u32, &str, *const f64, usize) -> Option<f64> = nm_static_buffer_proto_chain;
+    BUF_STATIC_CHAIN_FN.store(
+        std::hint::black_box(f as *mut ()),
+        std::sync::atomic::Ordering::Release,
+    );
 }
 
 /// Body of the Buffer-subclass static-dispatch probe (#1788 family).
