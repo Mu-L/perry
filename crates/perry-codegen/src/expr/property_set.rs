@@ -19,10 +19,11 @@ use crate::type_analysis::{
 use crate::types::{DOUBLE, I1, I32, I64, I8, PTR};
 
 use super::{
-    emit_jsvalue_slot_store_on_block, emit_typed_feedback_register_site,
-    expr_produces_non_pointer_bits_by_construction, lower_expr, lower_expr_native,
-    raw_f64_layout_fact, try_lower_pod_field_set, unbox_to_i64, FnCtx, TypedFeedbackContract,
-    TypedFeedbackKind,
+    class_field_store_needs_layout_note, class_field_store_needs_string_addref,
+    emit_jsvalue_slot_store_on_block, emit_jsvalue_slot_store_with_flags_on_block,
+    emit_typed_feedback_register_site, expr_produces_non_pointer_bits_by_construction, lower_expr,
+    lower_expr_native, raw_f64_layout_fact, try_lower_pod_field_set, unbox_to_i64, FnCtx,
+    TypedFeedbackContract, TypedFeedbackKind,
 };
 
 fn canonicalize_raw_f64_numeric_store_value(
@@ -596,15 +597,47 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                                 }
                                 ctx.current_block = merge_idx;
                             } else {
+                                // Repsel Phase 4b.1: retire the two bookkeeping
+                                // calls that are provably dead here.
+                                //
+                                // The receiver being `Ptr<Shape>`-proven is
+                                // what licenses the layout-note elision. Three
+                                // facts close it:
+                                //
+                                // Both are decided from the VALUE expression,
+                                // and gated independently because they are dead
+                                // under different conditions: the note needs
+                                // "not a pointer", the addref only "not a heap
+                                // string". Neither is keyed on the declared
+                                // field type — Perry does not enforce declared
+                                // types at runtime, so a `boolean` field can
+                                // legitimately receive a string through an
+                                // `any`, and a wrong addref elision there
+                                // silently corrupts it on the next in-place
+                                // append.
+                                //
+                                // `requires_raw_f64` is false on this arm, so
+                                // the raw-f64-mask arm of `layout_note_slot` —
+                                // the one that *must* downgrade — is
+                                // unreachable from here. The full per-layout-
+                                // state argument, including why a pointer store
+                                // into a pointer-masked slot is deliberately
+                                // NOT elided, is on
+                                // `class_field_store_needs_layout_note`.
+                                let layout_note_needed =
+                                    class_field_store_needs_layout_note(ctx, value);
+                                let string_addref_needed =
+                                    class_field_store_needs_string_addref(ctx, value);
                                 let blk = ctx.block();
                                 let field_addr = blk.ptrtoint(&field_ptr, I64);
-                                emit_jsvalue_slot_store_on_block(
+                                emit_jsvalue_slot_store_with_flags_on_block(
                                     blk,
                                     &field_ptr,
                                     &val_double,
                                     &obj_handle,
                                     &field_idx_str,
-                                    true,
+                                    string_addref_needed,
+                                    layout_note_needed,
                                     &obj_bits,
                                     &field_addr,
                                     field_set_barrier_needed,

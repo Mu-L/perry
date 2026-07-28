@@ -234,6 +234,51 @@ Unboxed storage extends to heap slots where the *container's* shape is proven an
   fact). Hole-vs-undefined observability (`in`, `Object.keys`, `JSON.stringify`) is
   preserved structurally: those surfaces reference the local as a bare value and
   therefore disqualify it, and bare (non-ToNumber) element reads never lower guard-free.
+- **Unboxed object fields: assessed and REJECTED (Phase 4b).** The "unboxed field layout"
+  bullets at the top of this section were scoped down after recon, and the eligibility
+  machinery they describe was deliberately *not* built. Three findings drove that:
+  1. **`number` fields are already bit-unboxed.** NaN-boxing reserves only `0x7FF9..=0x7FFF`,
+     so a number field slot already holds raw IEEE bits; `raw_f64_mask`
+     (`gc/layout.rs::layout_raw_f64_bits`) is a *proof bit*, not a storage change. Phase 3b
+     already deleted the read-side guard on proven receivers, so no unboxing win remains.
+  2. **Raw string handles at rest would break SSO** — short strings live inline in the NaN
+     box and would have to be heap-materialized just to be stored "unboxed" — and buy nothing.
+  3. **Raw `i1`/`i32` slots would need a third mask *plus* a layout probe at ~25 direct
+     slot-read sites** — `JSON.stringify`, `util.inspect`, `v8` IPC serde and descriptor reads
+     among them. Those are hot paths, not the "rare, already-slow" surfaces the
+     observation-equivalence bullet assumes, so the probe would cost more than the
+     representation saves.
+
+  What Phase 4b ships instead is the bookkeeping the existing boxed layout was paying
+  needlessly:
+  - **4b.1** — a class-field store on a `Ptr<Shape>`-proven receiver retires
+    `js_gc_note_slot_layout` when the value is a **non-pointer by construction**, and
+    `js_string_addref_if_heap_string` when the value provably **cannot be a heap string** (the
+    strictly weaker condition, which is why the two are gated independently — an object or
+    array literal retires the addref but keeps the note). The generational write barrier is
+    untouched. The note elision is sound in every layout state the receiver can be in:
+    `UNKNOWN` and `POINTER_FREE` short-circuit inside the note; an intact descriptor falls
+    through the `pointer_mask` arm untouched; and under `SIDE_MASK` the note would only ever
+    *clear* the slot's bit, so skipping it leaves a stale set bit over a non-pointer, which
+    costs one extra visit and nothing else — `mark_field_into_worklist` re-validates every slot
+    word, and the evacuation rewrite path routes through the same function.
+    The addref elision is keyed on the **value expression, never the declared field type**:
+    Perry does not validate declared types at runtime, so a `boolean`-declared field can
+    legitimately receive a string through an `any`, and a wrong elision there silently corrupts
+    an aliased string on the next in-place append.
+
+    Two scope notes. **A pointer-valued store into a pointer-masked slot is deliberately not
+    elided**, even though it is a no-op under an intact descriptor: `lower_new_impl` has an exit
+    (the standalone-ctor-symbol branch where `call_local_constructor_symbol` yields `None`) that
+    returns a freshly allocated instance *without* emitting `js_gc_init_typed_shape_layout`, and
+    such an object sits at `POINTER_FREE` where the note is the only thing that ever sets the
+    pointer-mask bit the collector reads. Closing that exit (#6921) is the prerequisite for the
+    stronger elision. Likewise the **guarded (non-`Ptr<Shape>`) class-field store keeps both calls** — its
+    receiver can be a runtime-constructed object that never had a descriptor installed.
+  - **4b.2** — `runtime_store_jsvalue_slot` canonicalizes an INT32-boxed numeric store into a
+    raw-f64-masked slot (the object twin of `canonicalize_array_numeric_store_bits`), instead
+    of letting one FFI/native-supplied integer evict that object's typed descriptor
+    permanently and one-way.
 
 ## 6. Phasing (one design; each phase sound on its own)
 
