@@ -1672,3 +1672,173 @@ fn test_int32_store_without_typed_descriptor_is_left_verbatim() {
         "with no intact descriptor there is no raw-f64 contract to uphold — bits stay verbatim"
     );
 }
+
+/// #6921 — the `lower_new_impl` standalone-constructor exit returns a freshly
+/// allocated class instance on which NO constructor has run, so the
+/// `js_gc_init_typed_shape_layout` that exit now emits sees an object whose
+/// every field is still `undefined`. That is the premise the fix rests on, so
+/// pin it here rather than reasoning about it.
+///
+/// Three properties, in the order they matter:
+///
+/// 1. A fresh instance really is left at `GC_LAYOUT_POINTER_FREE` with no
+///    descriptor — the one state in which the per-store `layout_note_slot`
+///    call is load-bearing for GC correctness rather than a precision hint.
+///    That is why an exit which skips the layout init blocks the note elision.
+/// 2. A raw-f64 mask CANNOT be honoured over `undefined` fields, and
+///    `init_typed_shape_layout` must downgrade to `GC_LAYOUT_UNKNOWN` — the
+///    conservative state — never install a mask that fails to describe the
+///    live words. This is what makes emitting the init on that exit SAFE.
+/// 3. A pointer-only mask IS installed over `undefined` fields, so a later
+///    pointer store into that slot is traced even though `layout_note_slot`
+///    never ran. This is what makes emitting it USEFUL.
+#[test]
+fn typed_shape_layout_init_on_unconstructed_instance_is_conservative() {
+    let _guard = GcTestIsolationGuard::new();
+    // `GcTestIsolationGuard` takes the thread's mutable-root scanner registry,
+    // which includes the runtime-handle scanner. Put it back BEFORE opening the
+    // scope below, or the handles are decorative and every object here is an
+    // unrooted raw pointer held across a GC-capable allocation — the same bug
+    // class (#6655) this test exists to be free of.
+    register_runtime_handle_root_scanner_for_tests();
+    let scope = RuntimeHandleScope::new();
+    clear_marks();
+    clear_mark_seeds();
+
+    // Every allocation below is a GC point, and evacuation MOVES arena objects,
+    // so nothing may be held as a raw pointer across one. Each instance is
+    // rooted in `scope` the moment it is created and re-read through
+    // `handle_user` after any later allocation.
+    fn handle_user(handle: &RuntimeHandle<'_>) -> usize {
+        (handle.get_nanbox_u64() & POINTER_MASK) as usize
+    }
+    let layout_state = |user: usize| unsafe {
+        (*header_from_user_ptr(user as *const u8))._reserved & GC_LAYOUT_STATE_MASK
+    };
+    let alloc_instance =
+        || crate::object::js_object_alloc_class_inline_keys(0, 0, 2, std::ptr::null_mut()) as usize;
+
+    // (1) The unconstructed instance, exactly as `js_object_alloc_class_*`
+    // hands it to the standalone-ctor exit.
+    let fresh = scope.root_nanbox_u64(ptr_bits(alloc_instance()));
+    let fresh_user = handle_user(&fresh);
+    assert_eq!(
+        layout_state(fresh_user),
+        GC_LAYOUT_POINTER_FREE,
+        "a fresh class instance is POINTER_FREE — the collector scans zero \
+         slots on it until something publishes a pointer bit"
+    );
+    assert!(
+        !layout_has_typed_descriptor(fresh_user),
+        "and carries no typed descriptor"
+    );
+
+    // (2) Raw-f64 mask over all-`undefined` fields must land in UNKNOWN.
+    let raw_only = scope.root_nanbox_u64(ptr_bits(alloc_instance()));
+    let raw_only_user = handle_user(&raw_only);
+    let raw_mask = [0b01u64];
+    js_gc_init_typed_shape_layout(
+        raw_only_user as u64,
+        2,
+        raw_mask.as_ptr(),
+        raw_mask.len() as u32,
+        std::ptr::null(),
+        0,
+    );
+    assert_eq!(
+        layout_state(raw_only_user),
+        GC_LAYOUT_UNKNOWN,
+        "`undefined` is not raw-f64 bits, so the descriptor must be refused \
+         and the object downgraded to the conservative state — never left \
+         POINTER_FREE, never given a mask that misdescribes it"
+    );
+    assert!(
+        !layout_has_typed_descriptor(raw_only_user),
+        "a refused descriptor must not be installed"
+    );
+
+    // (3) Pointer-only mask over all-`undefined` fields IS installed, and the
+    // slot is traced on a later store without any `layout_note_slot` call.
+    let ptr_only = scope.root_nanbox_u64(ptr_bits(alloc_instance()));
+    let ptr_only_user = handle_user(&ptr_only);
+    let ptr_mask = [0b01u64];
+    js_gc_init_typed_shape_layout(
+        ptr_only_user as u64,
+        2,
+        std::ptr::null(),
+        0,
+        ptr_mask.as_ptr(),
+        ptr_mask.len() as u32,
+    );
+    assert_eq!(
+        layout_state(ptr_only_user),
+        GC_LAYOUT_SIDE_MASK,
+        "a pointer mask is compatible with `undefined` fields and is installed"
+    );
+    assert_eq!(
+        test_layout_pointer_slot_count(ptr_only_user, 2),
+        Some(1),
+        "slot 0 is published as pointer-bearing"
+    );
+
+    // The child is reachable ONLY through that slot; write it with a raw store
+    // so no `layout_note_slot` runs, then prove tracing still finds it.
+    let child = scope
+        .root_nanbox_u64(string_bits(
+            crate::string::js_string_from_bytes(b"6921-child".as_ptr(), 10) as usize,
+        ));
+    // Allocating the child was a GC point: re-read the instance rather than
+    // reusing `ptr_only_user`, which may now name from-space.
+    let ptr_only_user = handle_user(&ptr_only);
+    let fields = unsafe {
+        (ptr_only_user as *mut u8).add(std::mem::size_of::<crate::object::ObjectHeader>())
+            as *mut u64
+    };
+    unsafe {
+        std::ptr::write(fields, child.get_nanbox_u64());
+    }
+
+    // Force a real collection here, with the conservative native-stack scan
+    // pinned OFF. That makes the `RuntimeHandleScope` above LOAD-BEARING rather
+    // than decorative: the raw Rust locals are no longer a safety net, so the
+    // scope is the only thing keeping these objects alive. Drop the scanner
+    // registration at the top of this test and this collection reclaims them.
+    {
+        let _scan = ConservativeScanDisabledGuard::new();
+        let _ = collect_minor_trace(GcTriggerKind::Direct);
+    }
+    // Re-read everything through the handles — a copied minor relocates
+    // nursery objects and rewrites the rooted slots.
+    let ptr_only_user = handle_user(&ptr_only);
+    assert_eq!(
+        test_layout_pointer_slot_count(ptr_only_user, 2),
+        Some(1),
+        "the typed descriptor must survive the collection (and any relocation) \
+         — the note-elision premise depends on it staying intact, not just on \
+         it being installed once"
+    );
+
+    // A collection may have left objects marked; start the hand-driven mark
+    // from a known-clean state so the assertions below mean what they say.
+    clear_marks();
+    clear_mark_seeds();
+    let valid_ptrs = build_valid_pointer_set();
+    assert!(
+        try_mark_value(ptr_bits(handle_user(&ptr_only)), &valid_ptrs),
+        "test setup: the instance marks as a root"
+    );
+    trace_marked_objects(&valid_ptrs);
+    unsafe {
+        let child_header = header_from_user_ptr(handle_user(&child) as *const u8);
+        assert_ne!(
+            (*child_header).gc_flags & GC_FLAG_MARKED,
+            0,
+            "the typed descriptor alone must make the pointer slot traceable — \
+             this is the liveness `layout_note_slot` would otherwise have had \
+             to establish store-by-store"
+        );
+    }
+
+    clear_marks();
+    clear_mark_seeds();
+}
