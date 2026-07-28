@@ -325,10 +325,50 @@ static NATIVE_MODULE_VTABLE_IMPL: NativeModuleVtable = NativeModuleVtable {
 static NATIVE_MODULE_VTABLE_PTR: AtomicPtr<NativeModuleVtable> =
     AtomicPtr::new(std::ptr::null_mut());
 
+/// Generic-object-path behaviors for namespace objects, referenced ONLY from
+/// here (see `nm_namespace_hooks`): descriptors / dynamic stores / reflect
+/// probes / key enumeration link into a binary exactly when a namespace
+/// object can exist.
+static NM_NAMESPACE_OPS_IMPL: super::NmNamespaceOps = super::NmNamespaceOps {
+    get_own_descriptor: super::descriptors::nm_get_own_descriptor,
+    field_set_override: super::field_set_by_name::nm_field_set_override,
+    reflect_has_enumerable: super::reflect_support::nm_reflect_has_enumerable,
+    own_keys_array: nm_own_keys_array_opt,
+    bind_method: nm_bind_method_ops,
+    ee_prototype_install: super::class_registry::prototype_objects::nm_ee_prototype_install,
+    ee_dynamic_super: nm_ee_dynamic_super,
+};
+
+/// Dynamic-`super()` EventEmitter-subclass init (extracted from
+/// `closure::dispatch::value_call`; see `NmNamespaceOps::ee_dynamic_super`).
+unsafe fn nm_ee_dynamic_super(func_value: f64) -> Option<f64> {
+    let (module, method) = bound_native_callable_module_and_method(func_value)?;
+    if module.trim_start_matches("node:") == "events"
+        && (method == "EventEmitter" || method == "EventEmitterAsyncResource")
+    {
+        let this_val = super::js_implicit_this_get();
+        if crate::value::JSValue::from_bits(this_val.to_bits()).is_pointer() {
+            return Some(crate::node_stream::js_event_emitter_subclass_init(this_val));
+        }
+    }
+    None
+}
+
+unsafe fn nm_bind_method_ops(obj_value: f64, name_ptr: *const u8, name_len: usize) -> f64 {
+    js_native_module_bind_method(obj_value, name_ptr, name_len)
+}
+
+unsafe fn nm_own_keys_array_opt(
+    obj: *const super::ObjectHeader,
+) -> Option<*mut crate::array::ArrayHeader> {
+    vt_own_keys_array(obj)
+}
+
 /// Make the native-module vtable reachable. Must be called by every code
 /// path that creates a NATIVE_MODULE_CLASS_ID object — this is the only
 /// static reference to the dispatch/table machinery in the crate.
 pub(crate) fn install_native_module_vtable() {
+    super::arm_nm_namespace_ops(&NM_NAMESPACE_OPS_IMPL);
     NATIVE_MODULE_VTABLE_PTR.store(
         &NATIVE_MODULE_VTABLE_IMPL as *const NativeModuleVtable as *mut NativeModuleVtable,
         Ordering::Relaxed,
