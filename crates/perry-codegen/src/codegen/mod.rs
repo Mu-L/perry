@@ -1340,6 +1340,13 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
     let mut typed_string_methods = std::collections::HashSet::new();
     let mut typed_i1_method_param_reps = std::collections::HashMap::new();
     let mut typed_f64_receiver_methods = std::collections::HashMap::new();
+    // Phase 3b typed-receiver widening: chain-global field indexes need the
+    // full class table — and it must be the SAME table dynamic dispatch's
+    // call-site gating consults (`class_table`, incl. class-expression
+    // aliases), or a chain resolvable only through an alias would gate a
+    // clone call the emission loop never produced (undefined symbol at
+    // link).
+    let receiver_class_table = &class_table;
     for class in &hir.classes {
         for method in &class.methods {
             let source_function = format!("{}::{}", class.name, method.name);
@@ -1364,15 +1371,17 @@ pub fn compile_module(hir: &HirModule, opts: CompileOptions) -> Result<Vec<u8>> 
                     ],
                 ),
             }
-            match typed_abi::typed_f64_receiver_method_info(class, method) {
+            match typed_abi::typed_f64_receiver_method_info(class, method, receiver_class_table) {
                 Some(info) => {
                     typed_f64_receiver_methods
                         .insert((class.name.clone(), method.name.clone()), info);
                 }
                 None => {
-                    if let Some(reason) =
-                        typed_abi::typed_f64_receiver_method_rejection_reason(class, method)
-                    {
+                    if let Some(reason) = typed_abi::typed_f64_receiver_method_rejection_reason(
+                        class,
+                        method,
+                        &receiver_class_table,
+                    ) {
                         record_typed_clone_rejection(
                             &mut typed_clone_rejection_records,
                             source_function.clone(),
