@@ -206,6 +206,70 @@ fn a_cycle_that_nothing_drives_is_finished_within_a_bounded_number_of_host_safep
     }
 }
 
+/// #6978 follow-up: the host-safepoint allowance is charged PER CYCLE.
+///
+/// A mutator assist can finish one cycle and arm the next entirely between two
+/// host safepoints. If the counter were only cleared when a safepoint happens
+/// to observe an idle collector, the second cycle would inherit its
+/// predecessor's spent allowance and be driven to completion on its very first
+/// safepoint — silently synchronous. The FFI stepper stands in here for the
+/// mutator assist: it drives cycles without going through
+/// `gc_runtime_safepoint`, which is exactly the off-safepoint path.
+#[test]
+fn the_host_safepoint_allowance_is_charged_per_cycle_not_carried_across_cycles() {
+    let _guard = CopyingNurseryTestGuard::new(1);
+    let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    reset_old_reclaim_pressure();
+
+    // Cycle A: spend the whole safepoint allowance without completing it.
+    make_arena_pressure(&trigger_guard, b"host_safepoint_cycle_a_live");
+    assert_eq!(gc_runtime_safepoint().status, JS_GC_STEP_STATUS_ACTIVE);
+    for _ in 0..GC_CYCLE_HOST_SAFEPOINT_LIMIT {
+        assert_eq!(gc_runtime_safepoint().status, JS_GC_STEP_STATUS_ACTIVE);
+    }
+
+    // ...then finish A OFF-safepoint, and arm + start B off-safepoint too, so
+    // no safepoint ever observes the collector idle in between.
+    let mut status = JsGcStepResult::default();
+    let mut finished_off_safepoint = false;
+    for _ in 0..64 {
+        if js_gc_step_work_units(u64::MAX, &mut status) != JS_GC_STEP_STATUS_ACTIVE {
+            finished_off_safepoint = true;
+            break;
+        }
+    }
+    assert!(
+        finished_off_safepoint,
+        "cycle A should complete through the host-driven stepper"
+    );
+    make_arena_pressure(&trigger_guard, b"host_safepoint_cycle_b_live");
+    assert_eq!(
+        js_gc_step_work_units(1, &mut status),
+        JS_GC_STEP_STATUS_ACTIVE,
+        "cycle B should start off-safepoint, the way a mutator assist starts one"
+    );
+
+    // Cycle B must get its OWN allowance, not A's leftovers.
+    for offered in 1..=GC_CYCLE_HOST_SAFEPOINT_LIMIT {
+        assert_eq!(
+            gc_runtime_safepoint().status,
+            JS_GC_STEP_STATUS_ACTIVE,
+            "safepoint {offered} of the SECOND cycle must still be an ordinary bounded \
+             step -- the allowance is per cycle, not per process"
+        );
+    }
+    assert_eq!(
+        gc_runtime_safepoint().status,
+        JS_GC_STEP_STATUS_COMPLETED,
+        "and the guarantee must still fire for the second cycle"
+    );
+
+    let live_after = (js_shadow_slot_get(0) & POINTER_MASK) as *const crate::StringHeader;
+    unsafe {
+        assert_string_bytes(live_after, b"host_safepoint_cycle_b_live");
+    }
+}
+
 #[test]
 fn microtask_runner_tail_pays_bounded_safepoint_under_pressure() {
     let _guard = CopyingNurseryTestGuard::new(1);

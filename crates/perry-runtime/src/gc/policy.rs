@@ -1757,6 +1757,12 @@ fn gc_finish_budgeted_cycle(mut cycle: BudgetedGcCycle) -> JsGcStepResult {
         }
     }
     GC_BUDGETED_CYCLE_ACTIVE.with(|active| active.set(false));
+    // #6978: the host-safepoint allowance is charged PER CYCLE. Reset it on
+    // every completion, whatever completed the cycle — a mutator assist can
+    // finish one cycle and arm the next entirely between two safepoints, and
+    // the next cycle must not inherit its predecessor's spent allowance and be
+    // finished on its very first safepoint.
+    gc_reset_host_safepoint_starvation();
     gc_step_result(
         JS_GC_STEP_STATUS_COMPLETED,
         GcCyclePhase::Complete.ffi_code(),
@@ -1925,7 +1931,12 @@ pub(crate) fn gc_runtime_safepoint() -> JsGcStepResult {
             GcProgressKind::NormalIncremental,
         );
     }
-    gc_reset_host_safepoint_starvation();
+    // A completion resets the allowance in `gc_finish_budgeted_cycle`. Do NOT
+    // reset it here on any other exit: if the stepper was blocked (suppression
+    // / unsafe zone / root lock) or the phase loop ran out, the cycle is still
+    // parked, and clearing the count would send it back through another
+    // `GC_CYCLE_HOST_SAFEPOINT_LIMIT` bounded slices before retrying — on a
+    // program with few safepoints, possibly never.
     result
 }
 
