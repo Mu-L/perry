@@ -20,7 +20,7 @@ use super::new_helpers::{
     ctor_body_has_value_return, ctor_body_uses_this, ctor_chain_uses_new_target,
     emit_promise_subclass_init, local_constructor_symbol_exists, node_stream_parent_kind,
 };
-use crate::expr::{lower_expr, lower_js_args_array, nanbox_pointer_inline, FnCtx};
+use crate::expr::{lower_expr, lower_js_args_array, nanbox_pointer_inline, temp_root, FnCtx};
 use crate::nanbox::{double_literal, POINTER_MASK_I64};
 use crate::types::{DOUBLE, I32, I64, I8, PTR};
 
@@ -131,7 +131,62 @@ pub(crate) fn lower_new_member_captured(
     lower_new_impl(ctx, class_name, args, true)
 }
 
+/// Refresh `lowered_args` after something that may have collected (#6969).
+///
+/// Two cases, and both are mandatory rather than defensive:
+///
+/// - a **rooted** argument is re-read from its slot, because the slot is a
+///   *mutable* root that an evacuating cycle rewrites in place, leaving the
+///   register pushed beforehand stale;
+/// - an argument that was NOT rooted because it reads a registered root (a
+///   shadow-slotted local, a module global, a string literal) is **re-loaded**.
+///   Those are never swept, but evacuation rewrote their storage too, so the
+///   cached register points at where the value used to be. Re-lowering emits
+///   the load again and costs no runtime call.
+///
+/// Called after the instance allocation and again before the late consumers
+/// that sit behind further arbitrary lowering (field initializers, an inlined
+/// constructor body) — each of those is another chance to relocate.
+fn refresh_rooted_args(
+    ctx: &mut FnCtx<'_>,
+    args: &[Expr],
+    lowered_args: &mut [String],
+    arg_roots: &[Option<String>],
+) -> Result<()> {
+    for (i, (value, slot)) in lowered_args.iter_mut().zip(arg_roots.iter()).enumerate() {
+        match slot {
+            Some(idx) => {
+                let idx = idx.clone();
+                *value = temp_root::temp_root_get_double(ctx, &idx);
+            }
+            None if temp_root::operand_is_reloadable(&args[i]) => {
+                *value = lower_constructor_arg(ctx, &args[i])?;
+            }
+            None => {}
+        }
+    }
+    Ok(())
+}
+
 fn lower_new_impl(
+    ctx: &mut FnCtx<'_>,
+    class_name: &str,
+    args: &[Expr],
+    caps_absent_from_args: bool,
+) -> Result<String> {
+    // #6969: expression-scope temp-root barrier. The body below roots its
+    // constructor arguments across the instance allocation, and it has ~20
+    // return paths with `lowered_args` consumed at a dozen of them — one cut
+    // here releases the group whichever path ran, instead of a
+    // `temp_root_release` at each that reviewers and future edits must keep
+    // balanced.
+    let scope = temp_root::temp_root_scope_begin(ctx, args);
+    let result = lower_new_impl_inner(ctx, class_name, args, caps_absent_from_args);
+    temp_root::temp_root_scope_end(ctx, scope);
+    result
+}
+
+fn lower_new_impl_inner(
     ctx: &mut FnCtx<'_>,
     class_name: &str,
     args: &[Expr],
@@ -324,9 +379,26 @@ fn lower_new_impl(
     // user args happened to equal its captured locals.
 
     // Lower the args first (constructor params).
+    //
+    // #6969: each argument is rooted as soon as it is lowered, NOT after the
+    // loop — `new Pair(fresh(0), churn(N))` collects inside `churn`, which is
+    // argument 1's lowering, and by then argument 0 exists only in an SSA
+    // register. (Rooting after the loop is worse than not rooting at all: it
+    // publishes an already-dangling pointer to the scanner.) The roots also
+    // carry the arguments across the instance allocation below, which always
+    // collects; the re-read is immediately after it (see `obj_box`), and the
+    // scope cut in `lower_new_impl` is the release.
     let mut lowered_args: Vec<String> = Vec::with_capacity(args.len());
+    let mut arg_roots: Vec<Option<String>> = Vec::with_capacity(args.len());
     for a in args {
-        lowered_args.push(lower_constructor_arg(ctx, a)?);
+        let value = lower_constructor_arg(ctx, a)?;
+        let slot = if temp_root::operand_needs_root(ctx, a) {
+            Some(temp_root::temp_root_push_double(ctx, &value))
+        } else {
+            None
+        };
+        lowered_args.push(value);
+        arg_roots.push(slot);
     }
 
     // Compute total field count including inherited parent fields.
@@ -768,6 +840,9 @@ fn lower_new_impl(
         )
     };
     let obj_box = nanbox_pointer_inline(ctx.block(), &obj_handle);
+    // #6969: the instance allocation has run, so refresh every argument before
+    // the constructor consumes them.
+    refresh_rooted_args(ctx, args, &mut lowered_args, &arg_roots)?;
 
     // Constructor bodies may contain terminating recursive construction
     // shapes such as `if (typeof opts === "function") return new C(...)`.
@@ -1485,6 +1560,9 @@ fn lower_new_impl(
                 // Walked to an ancestor — call its ctor with this and forwarded args.
                 // `...rest` ctors get the trailing args packed into one array
                 // for the final slot (mirrors method_has_rest, #672).
+                // Field initializers / an inlined constructor body were lowered
+                // between the instance allocation and here, so refresh again.
+                refresh_rooted_args(ctx, args, &mut lowered_args, &arg_roots)?;
                 let marshalled = marshal_imported_ctor_args(ctx, &ctor, &lowered_args);
                 let mut ctor_args: Vec<(crate::types::LlvmType, &str)> =
                     Vec::with_capacity(1 + marshalled.len());
@@ -1522,6 +1600,9 @@ fn lower_new_impl(
                 // Pad missing optional args with TAG_UNDEFINED so the constructor
                 // doesn't read garbage from stale registers, and pack the rest
                 // slot into an array when the ctor's last param is `...rest`.
+                // Field initializers / an inlined constructor body were lowered
+                // between the instance allocation and here, so refresh again.
+                refresh_rooted_args(ctx, args, &mut lowered_args, &arg_roots)?;
                 let marshalled = marshal_imported_ctor_args(ctx, &ctor, &lowered_args);
                 // Pass `this` as NaN-boxed double (same as compile_method's this_arg).
                 let mut ctor_args: Vec<(crate::types::LlvmType, &str)> =
@@ -1608,6 +1689,9 @@ fn lower_new_impl(
                     "js_get_dynamic_parent_value",
                     &[(I32, &cid.to_string())],
                 );
+                // Same here: the dynamic-parent `super(...)` buffer is filled long
+                // after the allocation, behind further lowering.
+                refresh_rooted_args(ctx, args, &mut lowered_args, &arg_roots)?;
                 let (args_ptr, args_len) = if lowered_args.is_empty() {
                     ("null".to_string(), "0".to_string())
                 } else {

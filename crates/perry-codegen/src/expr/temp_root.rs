@@ -52,6 +52,16 @@ pub(crate) fn temp_root_get_double(ctx: &mut FnCtx<'_>, idx: &str) -> String {
     ctx.block().bitcast_i64_to_double(&bits)
 }
 
+/// Overwrite slot `idx` with a new raw `i64`.
+///
+/// For producers that hand back a *different* address each round — the
+/// `concat` accumulator (#6971), where every `js_string_concat` yields a new
+/// string and the old one stops being the value that must stay alive.
+pub(crate) fn temp_root_set_i64(ctx: &mut FnCtx<'_>, idx: &str, value_i64: &str) {
+    ctx.block()
+        .call_void("js_gc_temp_root_set", &[(I32, idx), (I64, value_i64)]);
+}
+
 /// Drop slot `idx` and everything pushed above it.
 pub(crate) fn temp_root_truncate(ctx: &mut FnCtx<'_>, idx: &str) {
     ctx.block()
@@ -261,6 +271,175 @@ pub(crate) fn lower_operand_pair_rooted(
     Ok((left_value, right_value, guard))
 }
 
+/// Already-lowered operand values kept alive across work whose shape the
+/// caller controls — a later operand whose *representation* is chosen per
+/// branch (`Expr::MapSet`, #6970) or an allocation that happens after the whole
+/// list is lowered (`new C(a, b)`, #6969).
+///
+/// [`lower_exprs_rooted`] cannot serve those: it decides what to protect from
+/// the expressions it is handed and re-reads immediately, whereas these sites
+/// need the re-read to happen *after* a step the helper never sees. So the
+/// caller supplies the protection decision and picks the re-read point.
+///
+/// When `protect` is false this emits nothing at all and [`RootedOperands::reread`]
+/// hands the original registers straight back, so unprotected sites keep their
+/// pre-#6951 IR byte for byte.
+pub(crate) struct RootedOperands {
+    /// Slot index per operand, or `None` when the operand was not rooted.
+    slots: Vec<Option<String>>,
+    /// The registers as originally lowered — the answer when nothing is rooted
+    /// and the operand cannot be re-loaded.
+    values: Vec<String>,
+    /// Whether an unrooted operand must be re-loaded from its own storage
+    /// rather than reused from its register. See [`RootedOperands::reread`].
+    reloadable: Vec<bool>,
+    /// First slot pushed; truncating it drops the whole group.
+    guard: Option<String>,
+}
+
+/// Does this operand read a location the collector *rewrites in place*, so that
+/// re-lowering it after a collection yields the corrected address?
+///
+/// A local with a shadow slot, a module global and a string-literal handle are
+/// all registered roots — they are marked, and on an evacuating cycle they are
+/// **rewritten**. That keeps the object alive and the *storage* correct, but it
+/// says nothing about a register loaded from that storage beforehand: after
+/// relocation the register holds the pre-move address. Re-loading is the fix,
+/// and it is free — no temp-root traffic, just the load that would have been
+/// emitted anyway.
+///
+/// This is the same staleness #6981 reports one layer in (a raw typed-array
+/// pointer passed under the specialized ABI).
+pub(crate) fn operand_is_reloadable(expr: &Expr) -> bool {
+    // ONLY provably immutable sources. A string literal always re-lowers to a
+    // load of the same `__perry_init_strings_*` handle, so re-reading it can
+    // never observe a different value.
+    //
+    // A local or a module global must NOT be here, even though both are
+    // registered roots whose storage evacuation rewrites. Re-lowering one reads
+    // its value *now*, and "now" is after the later arguments, the field
+    // initializers and possibly an inlined constructor body have run — any of
+    // which may have reassigned it. `new C(g, bump())` where `bump()` sets
+    // `g` must capture `g`'s value at call time; re-lowering produced the
+    // post-`bump()` value, a miscompile rather than a rooting bug. Those
+    // operands get a real temp root instead: the slot preserves the call-time
+    // value AND the collector rewrites it on evacuation.
+    matches!(expr, Expr::String(_))
+}
+
+/// Build the protection **incrementally**, one operand at a time, so each is
+/// rooted before the next one is lowered.
+///
+/// That ordering is the whole point. Lowering every operand first and rooting
+/// the finished list afterwards is not merely late, it is *worse than doing
+/// nothing*: by then an earlier operand may already have been swept, and the
+/// push publishes a dangling pointer into a slot the collector scans. That is
+/// what turned #6969 from a silent wrong answer into a SIGSEGV, and it is why
+/// `m.set(k, v)` roots `map` before `key` is lowered rather than after.
+///
+/// See [`RootedOperands::push`] for the per-operand contract.
+pub(crate) fn root_operands_begin(capacity: usize) -> RootedOperands {
+    RootedOperands {
+        slots: Vec::with_capacity(capacity),
+        values: Vec::with_capacity(capacity),
+        reloadable: Vec::with_capacity(capacity),
+        guard: None,
+    }
+}
+
+impl RootedOperands {
+    /// Record one already-lowered operand.
+    ///
+    /// `collects` says "something between this operand and the consuming call
+    /// can reach a collection point" — the caller supplies it because the
+    /// hazard is not visible in an expression list: for `m.set(k, v)` the
+    /// receiver's window covers both `key`'s lowering and `value`'s, while the
+    /// key's covers only `value`'s.
+    ///
+    /// From that flag two decisions follow, and an operand needs exactly one:
+    ///
+    /// - [`operand_needs_root`] → push a temp-root slot, because nothing else
+    ///   keeps this value alive;
+    /// - otherwise [`operand_is_reloadable`] → emit no runtime call, but
+    ///   re-load the value at the re-read point, because its storage is a
+    ///   registered root that evacuation *rewrites* while the cached register
+    ///   keeps the old address.
+    ///
+    /// When `collects` is false neither applies: nothing can be swept and
+    /// nothing can move, so the register is reused and the IR is unchanged.
+    pub(crate) fn push(
+        &mut self,
+        ctx: &mut FnCtx<'_>,
+        operand: &Expr,
+        value: &str,
+        collects: bool,
+    ) {
+        let needs_root = collects && operand_needs_root(ctx, operand);
+        if needs_root {
+            let idx = temp_root_push_double(ctx, value);
+            // The FIRST slot pushed is the guard: truncating it drops every
+            // slot above it too, so one call releases the whole group.
+            if self.guard.is_none() {
+                self.guard = Some(idx.clone());
+            }
+            self.slots.push(Some(idx));
+        } else {
+            self.slots.push(None);
+        }
+        self.reloadable
+            .push(!needs_root && collects && operand_is_reloadable(operand));
+        self.values.push(value.to_string());
+    }
+
+    /// Re-read every operand after the collection point.
+    ///
+    /// Three cases, and the third is the subtle one:
+    ///
+    /// - **rooted** → read the slot. Mandatory, not defensive: the slot is a
+    ///   *mutable* root, so an evacuating cycle rewrites it and the register
+    ///   pushed beforehand is stale.
+    /// - **unrooted but re-loadable** → re-lower it. A local/global/literal is
+    ///   already a registered root, so it was never at risk of being *swept* —
+    ///   but an evacuating cycle rewrote its storage, so the register loaded
+    ///   before the collection points at where the object *used to be*. Emitting
+    ///   the load again is correct and costs no runtime call.
+    /// - **unrooted and not re-loadable** → keep the register. This is only
+    ///   reached for values `expr_is_known_non_pointer_shadow_value` proved are
+    ///   not heap references, which relocation cannot invalidate.
+    pub(crate) fn reread(
+        &self,
+        ctx: &mut FnCtx<'_>,
+        operands: &[&Expr],
+    ) -> anyhow::Result<Vec<String>> {
+        let mut out = Vec::with_capacity(self.values.len());
+        for (i, original) in self.values.iter().enumerate() {
+            let value = match &self.slots[i] {
+                Some(idx) => {
+                    let idx = idx.clone();
+                    temp_root_get_double(ctx, &idx)
+                }
+                None if self.reloadable[i] => super::lower_expr(ctx, operands[i])?,
+                None => original.clone(),
+            };
+            out.push(value);
+        }
+        Ok(out)
+    }
+
+    /// True when this group actually pushed slots — the signal a caller uses to
+    /// keep an eager unbox (and therefore its exact register numbering) on the
+    /// unprotected path.
+    pub(crate) fn is_rooted(&self) -> bool {
+        self.guard.is_some()
+    }
+
+    /// Drop the group. Call it *after* the consuming call: the consumer
+    /// allocates while reading these values.
+    pub(crate) fn release(self, ctx: &mut FnCtx<'_>) {
+        temp_root_release(ctx, self.guard);
+    }
+}
+
 /// Release a guard returned by [`lower_exprs_rooted`]. Call it *after* the
 /// consuming call, not before: the consumer allocates while reading these
 /// values.
@@ -319,4 +498,80 @@ pub(crate) fn any_may_trigger_gc<'a>(
     exprs: impl IntoIterator<Item = &'a Expr>,
 ) -> bool {
     exprs.into_iter().any(|e| expr_may_trigger_gc(ctx, e))
+}
+
+/// Would `expr`'s lowered value need a temp root, assuming everything after it
+/// reaches a collection point?
+///
+/// A temp root buys two distinct things, and the suppressions here only give
+/// up the first:
+///
+/// 1. **liveness** — the object is marked instead of swept;
+/// 2. **a re-readable location** — a slot the collector rewrites, so the value
+///    can be recovered after relocation.
+///
+/// Suppressed operands already have (1) from somewhere else, and get (2) from
+/// [`operand_is_reloadable`] instead, which re-emits the load rather than
+/// reusing the pre-collection register. Both halves are required: dropping the
+/// second is exactly the staleness #6981 reports one layer in.
+///
+/// - provably not a heap reference — a slot for it is pure TLS traffic, and
+///   relocation cannot invalidate it either;
+/// - a string literal — a load from a module global `__perry_init_strings_*`
+///   registered with `js_gc_register_global_root`;
+/// - a module-global read — `@perry_global_*` are registered GC roots
+///   (marked *and* rewritten on evacuation);
+/// - a local that **has a reserved shadow slot**, which binds the collector to
+///   the local's own alloca — so evacuation rewrites the alloca in place.
+///
+/// Together these are why `new C(a, b)` on ordinary locals emits no runtime
+/// rooting calls even though the instance allocation that follows always
+/// collects.
+///
+/// The shadow-slot check is load-bearing, not decoration. Suppressing every
+/// `LocalGet` looks equivalent and is not: a local can be pointer-valued and
+/// have *no* shadow slot, in which case it lives in a bare alloca that the root
+/// walk never visits (that is the #6968 defect) — so it has neither (1) nor
+/// (2). `m.set(fresh(), churn())` regressed straight back to an abort when this
+/// was written as a blanket `LocalGet` suppression; the Map receiver was
+/// exactly such a local.
+pub(crate) fn operand_needs_root(ctx: &FnCtx<'_>, expr: &Expr) -> bool {
+    if super::expr_is_known_non_pointer_shadow_value(ctx, expr) {
+        return false;
+    }
+    // Only a string literal is suppressed: it is a registered root AND
+    // immutable, so `operand_is_reloadable` can recover it with a plain load.
+    //
+    // Locals and module globals are deliberately NOT suppressed. Being a
+    // registered root buys liveness, but the value has to survive relocation
+    // *and* stay the value the call actually observed — and a re-load gives up
+    // the second. Rooting is the only thing that gives both, so they pay for a
+    // slot.
+    !matches!(expr, Expr::String(_))
+}
+
+/// Open an expression-scope temp-root barrier for a call/constructor whose
+/// operands are `args`.
+///
+/// Pushes a null marker slot and returns its index. Because
+/// [`temp_root_truncate`] is a stack *cut*, [`temp_root_scope_end`] drops the
+/// marker and every slot pushed above it — no matter which of the callee's
+/// return paths ran. That is what makes rooting tractable in
+/// `lower_call/new.rs`, where `lowered_args` is consumed at a dozen sites
+/// spread over ~20 return paths (#6969); the alternative is a `temp_root_release`
+/// at each, which is exactly the bookkeeping that gets missed.
+///
+/// A null word decodes to nothing, so the marker itself roots no object.
+/// Emits nothing when no operand could ever need rooting.
+pub(crate) fn temp_root_scope_begin(ctx: &mut FnCtx<'_>, args: &[Expr]) -> Option<String> {
+    args.iter()
+        .any(|a| operand_needs_root(ctx, a))
+        .then(|| temp_root_push_i64(ctx, "0"))
+}
+
+/// Close a barrier opened by [`temp_root_scope_begin`].
+pub(crate) fn temp_root_scope_end(ctx: &mut FnCtx<'_>, scope: Option<String>) {
+    if let Some(idx) = scope {
+        temp_root_truncate(ctx, &idx);
+    }
 }
