@@ -26,6 +26,95 @@ pub const GC_MUTATOR_ASSIST_SOFT_PAUSE_US: u64 = 500;
 /// workloads never see the scaled assists.
 pub const GC_ASSIST_DEBT_BYTES_PER_WORK_UNIT: u64 = 32;
 
+/// COMPLETION GUARANTEE (#6978): the most host safepoints one budgeted cycle
+/// may span on the ordinary bounded budget before the safepoint finishes it
+/// outright.
+///
+/// The budgeted stepper has a *budget* but no *completion guarantee*, and it
+/// is driven by exactly two things: allocation-point mutator assists
+/// (`gc_check_trigger`) and host safepoints (`gc_runtime_safepoint`, called
+/// from the microtask checkpoint and the stdlib pump). A program that stops
+/// allocating stops driving it. Measured on `test_gap_repsel_canonical_i32`
+/// under `PERRY_GC_HEAP_LIMIT=8` (release, macOS arm64): `gc_check_trigger`
+/// runs **twice in the whole process** — the second call arms an `ArenaBytes`
+/// cycle and pays one 256-unit assist, and no allocation-point opportunity
+/// ever comes again. The host safepoints that follow each paid the fixed
+/// `GC_NORMAL_INCREMENTAL_WORK_UNITS` slice, which got the cycle through
+/// `BuildValidPointerSet` and one step into `RootScan` before the process
+/// exited. Note a fatter per-step budget cannot rescue this on its own: a
+/// cycle has seven resumable phases and one `step()` advances at most one of
+/// them, so completion needs a bounded *number of calls*, not more units.
+///
+/// A PARKED CYCLE IS NOT INERT. Until it completes:
+///   * nothing is reclaimed and the arming trigger is never re-baselined;
+///   * every subsequent allocation is born BLACK (`gc_birth_extra_flags`), so
+///     the parked cycle can never collect it;
+///   * the incremental mark barrier stays armed on every store; and
+///   * `gc_safepoint_moving_minor` — the precise-root copying minor at the
+///     outermost microtask boundary — returns early on
+///     `gc_budgeted_cycle_active()`, so the parked cycle also disables the
+///     collector's own moving path for the rest of the process.
+/// Net effect on a compiled program in the shipped configuration: ZERO
+/// completed collections.
+///
+/// A host safepoint is where the mutator has yielded and the JS stack has
+/// unwound — the cheapest and safest point in the process to finish a
+/// collection. So: a cycle may span this many host safepoints on the ordinary
+/// bounded budget; at the next one the safepoint drives it to completion.
+/// Measured cost on the corpus member that actually collects
+/// (`test_gap_repsel_gc_stress`, `--pressure 8`): its cycles complete on
+/// mutator assists alone (20 / 25 / 35 assist steps, **zero** host
+/// safepoints), so a healthy allocating workload never reaches this limit and
+/// pays nothing. The bound binds only when the mutator has stopped driving
+/// the collector — precisely when parking forever is the alternative.
+///
+/// Kill switch: `PERRY_GC_SAFEPOINT_FINISH=0` (also `off` / `false`).
+pub const GC_CYCLE_HOST_SAFEPOINT_LIMIT: u32 = 2;
+
+std::thread_local! {
+    /// How many host safepoints the currently-active budgeted cycle has
+    /// already been offered. Reset whenever a safepoint finds no active cycle
+    /// — which covers completion through every path (mutator assist, host
+    /// safepoint, the drain before a synchronous collection).
+    static GC_CYCLE_HOST_SAFEPOINTS: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Kill switch for the #6978 completion guarantee. Default ON; `0` / `off` /
+/// `false` restores the pre-fix behaviour, where every host safepoint takes
+/// one bounded step and a cycle nobody drives parks for the life of the
+/// process.
+fn gc_safepoint_finish_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        !matches!(
+            std::env::var("PERRY_GC_SAFEPOINT_FINISH").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        )
+    })
+}
+
+/// Count this host safepoint against the active budgeted cycle and report
+/// whether the cycle has now outlived `GC_CYCLE_HOST_SAFEPOINT_LIMIT` of them
+/// — i.e. whether this safepoint must finish it instead of taking another
+/// bounded slice.
+pub(super) fn gc_host_safepoint_starvation_due() -> bool {
+    if !super::gc_budgeted_cycle_active() || !gc_safepoint_finish_enabled() {
+        gc_reset_host_safepoint_starvation();
+        return false;
+    }
+    let seen = GC_CYCLE_HOST_SAFEPOINTS.with(|seen| {
+        let next = seen.get().saturating_add(1);
+        seen.set(next);
+        next
+    });
+    seen > GC_CYCLE_HOST_SAFEPOINT_LIMIT
+}
+
+pub(super) fn gc_reset_host_safepoint_starvation() {
+    GC_CYCLE_HOST_SAFEPOINTS.with(|seen| seen.set(0));
+}
+
 /// Runtime-visible classification for GC progress.
 ///
 /// Only `NormalIncremental` and `MutatorAssist` satisfy the low-pause

@@ -141,6 +141,71 @@ fn repeated_runtime_safepoints_complete_cycle_rebaseline_debt_and_preserve_roots
     }
 }
 
+/// #6978: a budgeted cycle that nothing drives must still complete.
+///
+/// The stepper has a budget but no completion guarantee. Its only two drivers
+/// are allocation-point mutator assists and host safepoints, so a program
+/// that stops allocating parks its cycle — measured on a compiled program,
+/// `gc_check_trigger` ran twice in the whole process, and the seven host
+/// safepoints that followed each paid one fixed `NormalIncremental` slice and
+/// left the cycle in `RootScan`. Parked is not inert: nothing is reclaimed,
+/// the arming trigger is never re-baselined, every later allocation is born
+/// black, and `gc_safepoint_moving_minor` early-returns on
+/// `gc_budgeted_cycle_active()` for the rest of the process.
+///
+/// So the host safepoint carries the guarantee: a cycle may span
+/// `GC_CYCLE_HOST_SAFEPOINT_LIMIT` safepoints on the ordinary bounded budget,
+/// and the next one finishes it. Both halves are asserted — the early
+/// safepoints must NOT finish it (that would make incremental mode
+/// synchronous), and the one past the limit must, WITHOUT any further
+/// allocation to assist it.
+#[test]
+fn a_cycle_that_nothing_drives_is_finished_within_a_bounded_number_of_host_safepoints() {
+    let _guard = CopyingNurseryTestGuard::new(1);
+    let trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
+    reset_old_reclaim_pressure();
+    make_arena_pressure(&trigger_guard, b"host_safepoint_starved_live");
+
+    let before = gc_collection_count();
+    let started = gc_runtime_safepoint();
+    assert_eq!(started.status, JS_GC_STEP_STATUS_ACTIVE);
+    for offered in 1..=GC_CYCLE_HOST_SAFEPOINT_LIMIT {
+        let result = gc_runtime_safepoint();
+        assert_eq!(
+            result.status, JS_GC_STEP_STATUS_ACTIVE,
+            "host safepoint {offered} of {GC_CYCLE_HOST_SAFEPOINT_LIMIT} must stay an \
+             ordinary bounded step -- finishing early would make incremental mode synchronous"
+        );
+        assert_eq!(gc_collection_count(), before);
+    }
+
+    // No allocation has happened since the cycle armed, so no mutator assist
+    // can ever come. This safepoint is the completion guarantee.
+    let completed = gc_runtime_safepoint();
+    assert_eq!(
+        completed.status, JS_GC_STEP_STATUS_COMPLETED,
+        "a cycle offered more than {GC_CYCLE_HOST_SAFEPOINT_LIMIT} host safepoints without \
+         completing must be finished by the safepoint, not parked"
+    );
+    assert_eq!(completed.completed, 1);
+    assert_eq!(completed.active, 0);
+    assert!(gc_collection_count() > before);
+    assert_eq!(
+        js_gc_step_status(std::ptr::null_mut()),
+        JS_GC_STEP_STATUS_IDLE,
+        "no budgeted cycle may remain parked after the completion guarantee fires"
+    );
+    assert!(
+        GC_NEXT_TRIGGER_BYTES.with(|trigger| trigger.get()) > crate::arena::arena_total_bytes(),
+        "the finished cycle must re-baseline the arming trigger like any other completion"
+    );
+
+    let live_after = (js_shadow_slot_get(0) & POINTER_MASK) as *const crate::StringHeader;
+    unsafe {
+        assert_string_bytes(live_after, b"host_safepoint_starved_live");
+    }
+}
+
 #[test]
 fn microtask_runner_tail_pays_bounded_safepoint_under_pressure() {
     let _guard = CopyingNurseryTestGuard::new(1);

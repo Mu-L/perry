@@ -1884,12 +1884,49 @@ fn gc_mutator_assist_step_work_units_inner_with_progress(
     gc_budgeted_step_work_units_inner_with_progress(work_units, start_progress_kind)
 }
 
+/// Host safepoint: the mutator has yielded (microtask checkpoint / stdlib
+/// pump) and the JS stack has unwound.
+///
+/// Ordinarily this pays one `NormalIncremental`-budgeted slice. #6978: once a
+/// cycle has been offered `GC_CYCLE_HOST_SAFEPOINT_LIMIT` such slices without
+/// completing, nothing else in the process is obliged to finish it — the
+/// allocation-point assists that would have are only emitted by allocation
+/// the program may never do again — so finish it here. One `step()` advances
+/// at most one phase even with an unbounded budget, so completion is a loop,
+/// bounded exactly like `gc_drain_active_budgeted_cycle`: seven phases plus
+/// slack, and a blocked stepper (suppression / unsafe zone / root lock)
+/// reports SKIPPED without progress, so bail then rather than spin.
 pub(crate) fn gc_runtime_safepoint() -> JsGcStepResult {
     let budget = gc_progress_contract().budget_for(GcProgressKind::NormalIncremental);
     let Some(work_units) = budget.work_units else {
         return gc_budgeted_status_result();
     };
-    gc_budgeted_step_work_units_inner_with_progress(work_units, GcProgressKind::NormalIncremental)
+    if !gc_host_safepoint_starvation_due() {
+        return gc_budgeted_step_work_units_inner_with_progress(
+            work_units,
+            GcProgressKind::NormalIncremental,
+        );
+    }
+    if std::env::var_os("PERRY_GC_DIAG").is_some() {
+        eprintln!(
+            "[gc-safepoint] finishing a cycle parked across {GC_CYCLE_HOST_SAFEPOINT_LIMIT} host safepoints"
+        );
+    }
+    let mut result = gc_budgeted_step_work_units_inner_with_progress(
+        usize::MAX,
+        GcProgressKind::NormalIncremental,
+    );
+    for _ in 0..64 {
+        if result.status != JS_GC_STEP_STATUS_ACTIVE {
+            break;
+        }
+        result = gc_budgeted_step_work_units_inner_with_progress(
+            usize::MAX,
+            GcProgressKind::NormalIncremental,
+        );
+    }
+    gc_reset_host_safepoint_starvation();
+    result
 }
 
 fn write_gc_step_result(out: *mut JsGcStepResult, result: JsGcStepResult) -> u32 {

@@ -117,7 +117,8 @@ Idle nursery blocks observed empty for 2 GC cycles are `dealloc`'d back to the O
 | `PERRY_GC_FORCE_EVACUATE=1` | With generated write barriers active and policy evacuation allowed, stress-copy every marked non-pinned nursery object instead of only tenured survivors. |
 | `PERRY_GC_VERIFY_EVACUATION=1` | After an evacuation that actually forwards objects, panic if any mutable live slot still points at a forwarded nursery object after rewrite. |
 | `PERRY_WRITE_BARRIERS=0` / `off` / `false` | Disable codegen-emitted write barriers at compile time and runtime exact helper barriers at runtime for benchmark/debug bisection. Unset, `=1`, `=on`, and `=true` keep barriers enabled. |
-| `PERRY_GC_DIAG=1` | Print per-cycle diagnostics, including one evacuation-policy line for cycles where evacuation was considered and for `barriers_inactive` skips. |
+| `PERRY_GC_SAFEPOINT_FINISH=0` / `off` / `false` | Disable the host-safepoint completion guarantee (#6978). A budgeted incremental cycle is driven only by allocation-point mutator assists and host safepoints; a program that stops allocating stops driving it, and a parked cycle reclaims nothing, keeps the mark barrier armed, makes every later allocation born-black, and blocks the moving safepoint minor for the rest of the process. By default a cycle may span `GC_CYCLE_HOST_SAFEPOINT_LIMIT` host safepoints on the ordinary bounded budget and the next one finishes it. Bisection only. |
+| `PERRY_GC_DIAG=1` | Print per-cycle diagnostics, including one evacuation-policy line for cycles where evacuation was considered and for `barriers_inactive` skips, and a `[gc-safepoint] finishing a cycle parked across N host safepoints` line whenever the completion guarantee above fires. |
 
 ## Why this design
 
