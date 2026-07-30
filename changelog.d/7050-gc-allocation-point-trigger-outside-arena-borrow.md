@@ -57,6 +57,14 @@ PERRY_CONSERVATIVE_STACK_SCAN=off`.
 after. `cargo test --release -p perry-runtime --lib -- --test-threads=1`: 1521
 passed, 0 failed.
 
+**Matrix.** `scripts/gc_repsel_matrix.sh --arms all --pressure 8`, 440 cells:
+`PASS=324 UNVER=91 XFAIL=1 FAIL=24`, from the `PASS=302 UNVER=91 XFAIL=1 FAIL=46`
+baseline — **+22 PASS / -22 FAIL, no cell regressed**. `repsel_gc_stress` is PASS
+in all 20 arms (was FAIL in 12), and so is `repsel_scalar_replaced_locals`
+(#7023, was intermittently FAIL in 11) — the same defect. The residual 24 FAILs
+are the two #6981 `p4a3` numarray rows, unchanged. Liveness is intact:
+`evac_minor`/`force_evac`/`force_verify` still report `copy-minor 21/22`.
+
 **Regression coverage** (`cargo-test`-visible, per #5960):
 `arena::tests::allocation_point_gc_trigger_runs_with_no_live_arena_borrow` pins
 that the trigger reached from `arena_cell_alloc` sees an arena-borrow depth of 0
