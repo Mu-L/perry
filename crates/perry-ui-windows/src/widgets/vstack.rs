@@ -68,8 +68,8 @@ unsafe extern "system" fn container_wnd_proc(
                 }
             }
             // Fallback: find our own bg or ancestor bg and return that brush
-            if let Some(color) = super::get_hwnd_bg_color(hwnd)
-                .or_else(|| super::find_ancestor_hwnd_bg_color(hwnd))
+            if let Some(color) =
+                super::get_hwnd_bg_color(hwnd).or_else(|| super::find_ancestor_hwnd_bg_color(hwnd))
             {
                 let hdc = HDC(wparam.0 as *mut _);
                 unsafe {
@@ -77,6 +77,10 @@ unsafe extern "system" fn container_wnd_proc(
                 }
                 let brush = unsafe { CreateSolidBrush(COLORREF(color)) };
                 return LRESULT(brush.0 as isize);
+            }
+            let hdc = HDC(wparam.0 as *mut _);
+            if let Some(result) = crate::theme::handle_control_color(hdc, msg == WM_CTLCOLORBTN) {
+                return result;
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -86,9 +90,16 @@ unsafe extern "system" fn container_wnd_proc(
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
-        x if x == 0x0133 /* WM_CTLCOLOREDIT */ => {
+        x if x == 0x0133 /* WM_CTLCOLOREDIT */ || x == WM_CTLCOLORLISTBOX => {
             if let Ok(parent) = GetParent(hwnd) {
-                return SendMessageW(parent, msg, Some(wparam), Some(lparam));
+                let result = SendMessageW(parent, msg, Some(wparam), Some(lparam));
+                if result.0 != 0 {
+                    return result;
+                }
+            }
+            let hdc = HDC(wparam.0 as *mut _);
+            if let Some(result) = crate::theme::handle_control_color(hdc, true) {
+                return result;
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -105,7 +116,8 @@ unsafe extern "system" fn container_wnd_proc(
                 // WM_PAINT — check if gradient exists before BeginPaint
                 let mut rect = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rect);
-                let has_gradient = crate::widgets::GRADIENT_MAP.lock()
+                let has_gradient = crate::widgets::GRADIENT_MAP
+                    .lock()
                     .map(|map| map.iter().any(|(k, _)| *k == hwnd.0 as isize))
                     .unwrap_or(false);
                 if has_gradient {
@@ -117,8 +129,8 @@ unsafe extern "system" fn container_wnd_proc(
                 }
             }
             // Fall through to solid color fill
-            let color = super::get_hwnd_bg_color(hwnd)
-                .or_else(|| super::find_ancestor_hwnd_bg_color(hwnd));
+            let color =
+                super::get_hwnd_bg_color(hwnd).or_else(|| super::find_ancestor_hwnd_bg_color(hwnd));
             if let Some(color) = color {
                 let brush = windows::Win32::Graphics::Gdi::CreateSolidBrush(COLORREF(color));
                 if msg == WM_ERASEBKGND {
@@ -138,6 +150,12 @@ unsafe extern "system" fn container_wnd_proc(
                     windows::Win32::Graphics::Gdi::EndPaint(hwnd, &ps);
                     return LRESULT(0);
                 }
+            }
+            if msg == WM_ERASEBKGND {
+                return crate::theme::erase_background(
+                    hwnd,
+                    windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut _),
+                );
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
