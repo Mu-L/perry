@@ -160,8 +160,12 @@ fn cp_read_timing_and_buffer_options(opts_val: f64, options: &mut CpRunOptions) 
         }
     }
 
-    if let Some(max_buffer) = cp_read_option_number(opts_val, b"maxBuffer") {
-        if max_buffer >= 0.0 {
+    let max_buffer = JSValue::from_bits(cp_get_field(opts_val, b"maxBuffer").to_bits());
+    if !max_buffer.is_undefined() && !max_buffer.is_null() {
+        let max_buffer = max_buffer.to_number();
+        if max_buffer == f64::INFINITY {
+            options.max_buffer = usize::MAX;
+        } else if max_buffer.is_finite() && max_buffer >= 0.0 {
             options.max_buffer = max_buffer.min(usize::MAX as f64) as usize;
         }
     }
@@ -207,6 +211,12 @@ impl CpRun {
 /// Piped stdin without input is closed so children that read stdin see EOF
 /// instead of blocking. Used by synchronous + buffered-callback entry points.
 pub(super) fn cp_run_to_completion(mut command: Command, options: &CpRunOptions) -> CpRun {
+    // A shell that has already completed its short command reports its real
+    // exit status with ENOBUFS; a direct child is still terminable at the
+    // buffer threshold and reports the configured signal.
+    let shell_command = std::path::Path::new(command.get_program())
+        .file_name()
+        .is_some_and(|name| name == "sh");
     let stdin_piped = matches!(options.stdio[0], CpStdio::Pipe) && options.input.is_some();
     let stdout_piped = matches!(options.stdio[1], CpStdio::Pipe);
     let stderr_piped = matches!(options.stdio[2], CpStdio::Pipe);
@@ -242,6 +252,7 @@ pub(super) fn cp_run_to_completion(mut command: Command, options: &CpRunOptions)
                 Ok(o) => {
                     let CpExit { code, signal } = cp_decode_status(&o.status);
                     if run_error.is_none()
+                        && options.max_buffer > 0
                         && ((stdout_piped && o.stdout.len() > options.max_buffer)
                             || (stderr_piped && o.stderr.len() > options.max_buffer))
                     {
@@ -249,6 +260,9 @@ pub(super) fn cp_run_to_completion(mut command: Command, options: &CpRunOptions)
                     }
                     let (code, signal) = match run_error {
                         Some(CpRunError::Timeout) => (None, Some(options.kill_signal)),
+                        Some(CpRunError::MaxBuffer) if !shell_command => {
+                            (None, Some(options.kill_signal))
+                        }
                         _ => (code, signal),
                     };
                     CpRun {

@@ -20,22 +20,30 @@ use super::*;
 use std::process::Command;
 use std::time::Duration;
 
-/// `child_process.fork(modulePath[, args][, options])`. `module_ptr`/`args_ptr`
-/// are raw (unboxed) `StringHeader` / `ArrayHeader` pointers; `opts_ptr` is a
-/// raw heap pointer (or 0). Returns a NaN-boxed ChildProcess.
+/// `child_process.fork(modulePath[, args][, options])`. `module_val` stays
+/// raw string/array pointers; `opts_ptr` is a raw heap pointer (or 0). The
+/// codegen boundary string-coerces a URL module path before calling this.
 #[no_mangle]
 pub extern "C" fn js_child_process_fork(module_ptr: i64, args_ptr: i64, opts_ptr: i64) -> f64 {
     cp_register_arities();
 
     reactor::cp_register_reactor_arities();
 
-    let module = unsafe { cp_read_string_header(module_ptr) };
-    let arg_strs = unsafe { cp_read_arg_strings(args_ptr) };
-    let opts_val = if opts_ptr > 0x10000 {
-        cp_box_ptr(opts_ptr as *const u8)
+    let module_raw = unsafe { cp_read_string_header(module_ptr) };
+    if module_raw.contains('\0') {
+        crate::fs::validate::throw_type_error_with_code(
+            "The argument must not contain null bytes",
+            "ERR_INVALID_ARG_VALUE",
+        );
+    }
+    let module = if module_raw.starts_with("file:") {
+        crate::url::node_compat::module_base_to_path(cp_box_string(&module_raw))
+            .unwrap_or(module_raw)
     } else {
-        cp_undefined()
+        module_raw
     };
+    let arg_strs = unsafe { cp_read_arg_strings(args_ptr) };
+    let opts_val = cp_options_from_raw_args(args_ptr, opts_ptr);
     let abort_signal = cp_read_abort_signal(opts_val);
 
     // Launch interpreter: options.execPath → $PERRY_FORK_EXECPATH → "node".
@@ -141,7 +149,7 @@ pub extern "C" fn js_child_process_fork(module_ptr: i64, args_ptr: i64, opts_ptr
     cp_apply_argv0(&mut command, opts_val);
     cp_apply_options(&mut command, opts_val);
     cp_apply_detached(&mut command, opts_val);
-    cp_apply_live_stdio(&mut command, &stdio_kinds);
+    let _ = cp_apply_live_stdio(&mut command, &stdio_kinds);
 
     let launched = fork_launch(
         cp,
@@ -230,6 +238,7 @@ fn fork_launch(
                 stdout_obj,
                 stderr_obj,
                 stdin_obj,
+                Vec::new(),
                 child,
                 Some(parent_sock),
                 advanced,
@@ -264,6 +273,7 @@ fn fork_launch(
                 stdout_obj,
                 stderr_obj,
                 stdin_obj,
+                Vec::new(),
                 child,
                 None,
                 false,

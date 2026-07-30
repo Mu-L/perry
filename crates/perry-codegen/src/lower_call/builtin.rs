@@ -282,6 +282,15 @@ pub(super) fn lower_builtin_new(
             let handle = blk.call(I64, "js_event_emitter_new_with_options", &[(DOUBLE, &opts)]);
             Ok(Some(nanbox_pointer_inline(blk, &handle)))
         }
+        // The public Node constructor creates an inert ChildProcess whose
+        // low-level `.spawn(options)` validates its own option bag. Normal
+        // callers use the dedicated spawn/fork lowering paths instead.
+        "ChildProcess" => {
+            for a in args {
+                let _ = lower_expr(ctx, a)?;
+            }
+            Ok(Some(ctx.block().call(DOUBLE, "js_child_process_new", &[])))
+        }
         "EventEmitterAsyncResource" => {
             let opts = if let Some(a) = args.first() {
                 lower_expr(ctx, a)?

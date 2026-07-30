@@ -443,14 +443,14 @@ pub extern "C" fn js_cluster_fork(env: f64) -> f64 {
 
     let settings = settings_value();
     let module = get_field(settings, b"exec");
-    let module_ptr = crate::string::js_string_materialize_to_heap(module) as i64;
-    if module_ptr == 0 {
+    if crate::value::JSValue::from_bits(module.to_bits()).is_undefined() {
         return TAG_UNDEFINED_F64;
     }
 
     let args = get_field(settings, b"args");
     let args_ptr = array_ptr(args).map(|p| p as i64).unwrap_or(0);
     let opts = build_fork_options(settings, env);
+    let module_ptr = crate::string::js_string_materialize_to_heap(module) as i64;
     let worker =
         crate::child_process::fork::js_child_process_fork(module_ptr, args_ptr, opts as i64);
     if object_ptr(worker).is_none() {

@@ -1815,6 +1815,59 @@ pub(crate) unsafe fn nm_attach_stream(
     value
 }
 
+/// Ensure the public `ChildProcess` constructor has its prototype. The direct
+/// codegen path can create the bound constructor without installing the module
+/// attach hook first.
+pub(crate) unsafe fn ensure_child_process_prototype(value: f64) -> f64 {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let constructor = scope.root_nanbox_f64(value);
+    let closure_addr =
+        (constructor.get_nanbox_f64().to_bits() & crate::value::POINTER_MASK) as usize;
+    if closure_addr == 0 || !crate::closure::is_closure_ptr(closure_addr) {
+        return constructor.get_nanbox_f64();
+    }
+    if crate::value::JSValue::from_bits(
+        crate::closure::closure_get_dynamic_prop(closure_addr, "prototype").to_bits(),
+    )
+    .is_pointer()
+    {
+        return constructor.get_nanbox_f64();
+    }
+    let proto = js_object_alloc_with_shape(
+        0x7FFF_FDA0,
+        1,
+        b"constructor\0".as_ptr(),
+        b"constructor\0".len() as u32,
+    );
+    js_object_set_field(
+        proto,
+        0,
+        JSValue::from_bits(constructor.get_nanbox_f64().to_bits()),
+    );
+    let closure_addr =
+        (constructor.get_nanbox_f64().to_bits() & crate::value::POINTER_MASK) as usize;
+    crate::closure::closure_set_dynamic_prop(
+        closure_addr,
+        "prototype",
+        crate::value::js_nanbox_pointer(proto as i64),
+    );
+    constructor.get_nanbox_f64()
+}
+
+/// Attach the public `ChildProcess.prototype` so low-level constructed
+/// instances participate in ordinary `instanceof ChildProcess` checks.
+pub(crate) unsafe fn nm_attach_child_process(
+    property_name: &str,
+    value: f64,
+    _closure_addr: usize,
+) -> f64 {
+    if property_name == "ChildProcess" {
+        ensure_child_process_prototype(value)
+    } else {
+        value
+    }
+}
+
 #[allow(unused_mut)]
 pub(crate) unsafe fn nm_attach_sqlite(
     property_name: &str,

@@ -186,7 +186,7 @@ fn cp_stdio_number_fd(value: f64) -> Option<i32> {
     }
 }
 
-fn cp_stdio_stream_fd(value: f64, fd_index: usize) -> Option<i32> {
+pub(crate) fn cp_stdio_stream_fd(value: f64, fd_index: usize) -> Option<i32> {
     let expected_stream = match fd_index {
         0 => crate::fs::is_fs_stream_instance_value(value, "ReadStream"),
         1 | 2 => crate::fs::is_fs_stream_instance_value(value, "WriteStream"),
@@ -250,7 +250,11 @@ pub(crate) fn cp_stdio_js_value(kind: CpStdio, pipe_obj: f64) -> f64 {
     }
 }
 
-pub(crate) fn cp_apply_live_stdio(command: &mut Command, stdio: &[CpStdio]) {
+/// Apply stdio 0-2 and create parent-readable pipes for extra `"pipe"` fds.
+pub(crate) fn cp_apply_live_stdio(
+    command: &mut Command,
+    stdio: &[CpStdio],
+) -> Vec<(usize, std::fs::File)> {
     let to_stdio = |kind: CpStdio| match kind {
         CpStdio::Pipe => Stdio::piped(),
         CpStdio::Ignore => Stdio::null(),
@@ -260,6 +264,47 @@ pub(crate) fn cp_apply_live_stdio(command: &mut Command, stdio: &[CpStdio]) {
     command.stdin(to_stdio(stdio.first().copied().unwrap_or(CpStdio::Pipe)));
     command.stdout(to_stdio(stdio.get(1).copied().unwrap_or(CpStdio::Pipe)));
     command.stderr(to_stdio(stdio.get(2).copied().unwrap_or(CpStdio::Pipe)));
+
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::process::CommandExt;
+
+        let mut readers = Vec::new();
+        for (fd, kind) in stdio.iter().copied().enumerate().skip(3) {
+            if kind != CpStdio::Pipe {
+                continue;
+            }
+            let mut pipe = [0; 2];
+            if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+                continue;
+            }
+            let read = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+            let write = unsafe { std::fs::File::from_raw_fd(pipe[1]) };
+            let write_fd = write.as_raw_fd();
+            unsafe {
+                libc::fcntl(write_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            unsafe {
+                command.pre_exec(move || {
+                    // Keep the write end owned by Command until the fork; the
+                    // parent drops it after spawn while FD_CLOEXEC closes the
+                    // original child descriptor on exec.
+                    if libc::dup2(write.as_raw_fd(), fd as i32) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            readers.push((fd, read));
+        }
+        return readers;
+    }
+
+    #[cfg(not(unix))]
+    {
+        Vec::new()
+    }
 }
 
 #[cfg(unix)]

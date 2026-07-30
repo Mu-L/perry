@@ -60,6 +60,15 @@ const TAG_END_SPARSE_ARRAY: u8 = b'@';
 const TAG_BEGIN_DENSE_ARRAY: u8 = b'A';
 const TAG_END_DENSE_ARRAY: u8 = b'$';
 const TAG_DATE: u8 = b'D';
+const TAG_REGEXP: u8 = b'R';
+const TAG_BEGIN_JS_MAP: u8 = b';';
+const TAG_END_JS_MAP: u8 = b':';
+const TAG_BEGIN_JS_SET: u8 = b'\'';
+const TAG_END_JS_SET: u8 = b',';
+const TAG_ERROR: u8 = b'r';
+const TAG_ERROR_MESSAGE: u8 = b'm';
+const TAG_ERROR_STACK: u8 = b's';
+const TAG_ERROR_END: u8 = b'.';
 const TAG_ARRAY_BUFFER: u8 = b'B';
 const TAG_HOST_OBJECT: u8 = b'\\';
 
@@ -219,6 +228,22 @@ impl Serializer {
                     self.write_host_typed_array(value, kind);
                     return;
                 }
+                if crate::map::is_registered_map(raw) {
+                    self.write_map(raw as *const crate::map::MapHeader);
+                    return;
+                }
+                if crate::set::is_registered_set(raw) {
+                    self.write_set(raw as *const crate::set::SetHeader);
+                    return;
+                }
+                if crate::regex::regex_header_has_magic(raw as *const crate::regex::RegExpHeader) {
+                    self.write_regexp(raw as *const crate::regex::RegExpHeader);
+                    return;
+                }
+                if crate::error::js_error_is_error(value).to_bits() == TAG_TRUE_F64.to_bits() {
+                    self.write_error(raw as *mut crate::error::ErrorHeader);
+                    return;
+                }
                 if crate::date::is_date_value(value) {
                     self.out.push(TAG_DATE);
                     self.write_double(crate::date::js_date_get_time(value));
@@ -358,6 +383,76 @@ impl Serializer {
         self.write_varint(0); // no extra named properties
         self.write_varint(len as u64);
         self.depth -= 1;
+    }
+
+    fn write_map(&mut self, map: *const crate::map::MapHeader) {
+        self.out.push(TAG_BEGIN_JS_MAP);
+        let size = unsafe { (*map).size };
+        for i in 0..size {
+            self.write_value(crate::map::js_map_entry_key_at(map, i));
+            self.write_value(crate::map::js_map_entry_value_at(map, i));
+        }
+        self.out.push(TAG_END_JS_MAP);
+        self.write_varint((size as u64) * 2);
+    }
+
+    fn write_set(&mut self, set: *const crate::set::SetHeader) {
+        self.out.push(TAG_BEGIN_JS_SET);
+        let size = unsafe { (*set).size };
+        for i in 0..size {
+            self.write_value(crate::set::js_set_value_at(set, i));
+        }
+        self.out.push(TAG_END_JS_SET);
+        self.write_varint(size as u64);
+    }
+
+    fn write_regexp(&mut self, re: *const crate::regex::RegExpHeader) {
+        self.out.push(TAG_REGEXP);
+        let source = crate::regex::js_regexp_get_source(re);
+        self.write_string(crate::value::js_nanbox_string(source as i64));
+        let flags = crate::regex::js_regexp_get_flags(re);
+        let flags = string_bytes(crate::value::js_nanbox_string(flags as i64));
+        let mut bits = 0u64;
+        for flag in flags {
+            bits |= match flag {
+                b'g' => 1,
+                b'i' => 2,
+                b'm' => 4,
+                b'y' => 8,
+                b'u' => 16,
+                b's' => 32,
+                b'd' => 64,
+                b'v' => 128,
+                _ => 0,
+            };
+        }
+        self.write_varint(bits);
+    }
+
+    fn write_error(&mut self, error: *mut crate::error::ErrorHeader) {
+        self.out.push(TAG_ERROR);
+        let kind = unsafe { (*error).error_kind };
+        let type_tag = match kind {
+            crate::error::ERROR_KIND_TYPE_ERROR => Some(b'T'),
+            crate::error::ERROR_KIND_RANGE_ERROR => Some(b'R'),
+            crate::error::ERROR_KIND_REFERENCE_ERROR => Some(b'F'),
+            crate::error::ERROR_KIND_SYNTAX_ERROR => Some(b'S'),
+            crate::error::ERROR_KIND_EVAL_ERROR => Some(b'E'),
+            crate::error::ERROR_KIND_URI_ERROR => Some(b'U'),
+            _ => None,
+        };
+        if let Some(tag) = type_tag {
+            self.out.push(tag);
+        }
+        if unsafe { (*error).flags & 1 != 0 } {
+            self.out.push(TAG_ERROR_MESSAGE);
+            let message = crate::error::js_error_get_message(error);
+            self.write_string(crate::value::js_nanbox_string(message as i64));
+        }
+        self.out.push(TAG_ERROR_STACK);
+        let stack = crate::error::js_error_get_stack(error);
+        self.write_string(crate::value::js_nanbox_string(stack as i64));
+        self.out.push(TAG_ERROR_END);
     }
 
     fn write_object(&mut self, obj: *const ObjectHeader) {
@@ -510,6 +605,10 @@ impl<'a> Deserializer<'a> {
                 TAG_BEGIN_JS_OBJECT => self.read_object()?,
                 TAG_BEGIN_DENSE_ARRAY => self.read_dense_array()?,
                 TAG_BEGIN_SPARSE_ARRAY => self.read_sparse_array()?,
+                TAG_BEGIN_JS_MAP => self.read_map()?,
+                TAG_BEGIN_JS_SET => self.read_set()?,
+                TAG_REGEXP => self.read_regexp()?,
+                TAG_ERROR => self.read_error()?,
                 TAG_ARRAY_BUFFER => self.read_array_buffer()?,
                 TAG_HOST_OBJECT => self.read_host_object()?,
                 TAG_OBJECT_REFERENCE => {
@@ -623,6 +722,112 @@ impl<'a> Deserializer<'a> {
                 crate::array::js_array_set_f64_extend(arr, key as u32, val);
             }
         }
+        Some(boxed)
+    }
+
+    fn read_map(&mut self) -> Option<f64> {
+        let map = crate::map::js_map_alloc(4);
+        let boxed = cp_box_ptr(map as *const u8);
+        self.id_table.push(boxed);
+        while self.peek_byte() != Some(TAG_END_JS_MAP) {
+            let key = self.read_value()?;
+            let value = self.read_value()?;
+            crate::map::js_map_set(map, key, value);
+        }
+        self.pos += 1;
+        self.read_varint()?;
+        Some(boxed)
+    }
+
+    fn read_set(&mut self) -> Option<f64> {
+        let set = crate::set::js_set_alloc(4);
+        let boxed = cp_box_ptr(set as *const u8);
+        self.id_table.push(boxed);
+        while self.peek_byte() != Some(TAG_END_JS_SET) {
+            crate::set::js_set_add(set, self.read_value()?);
+        }
+        self.pos += 1;
+        self.read_varint()?;
+        Some(boxed)
+    }
+
+    fn read_regexp(&mut self) -> Option<f64> {
+        let source = self.read_value()?;
+        let flags = self.read_varint()?;
+        let mut flag_bytes = Vec::with_capacity(8);
+        for (flag, bit) in [
+            (b'g', 1),
+            (b'i', 2),
+            (b'm', 4),
+            (b'y', 8),
+            (b'u', 16),
+            (b's', 32),
+            (b'd', 64),
+            (b'v', 128),
+        ] {
+            if flags & bit != 0 {
+                flag_bytes.push(flag);
+            }
+        }
+        let source = crate::value::js_get_string_pointer_unified(source) as *const StringHeader;
+        let flags =
+            crate::string::js_string_from_bytes(flag_bytes.as_ptr(), flag_bytes.len() as u32);
+        #[cfg(feature = "regex-engine")]
+        {
+            let re = crate::regex::js_regexp_new(source, flags);
+            let boxed = cp_box_ptr(re as *const u8);
+            self.id_table.push(boxed);
+            Some(boxed)
+        }
+        #[cfg(not(feature = "regex-engine"))]
+        {
+            let _ = (source, flags);
+            Some(cp_undefined())
+        }
+    }
+
+    fn read_error(&mut self) -> Option<f64> {
+        let kind = match self.peek_byte() {
+            Some(b'T') => {
+                self.pos += 1;
+                crate::error::ERROR_KIND_TYPE_ERROR
+            }
+            Some(b'R') => {
+                self.pos += 1;
+                crate::error::ERROR_KIND_RANGE_ERROR
+            }
+            Some(b'F') => {
+                self.pos += 1;
+                crate::error::ERROR_KIND_REFERENCE_ERROR
+            }
+            Some(b'S') => {
+                self.pos += 1;
+                crate::error::ERROR_KIND_SYNTAX_ERROR
+            }
+            Some(b'E') => {
+                self.pos += 1;
+                crate::error::ERROR_KIND_EVAL_ERROR
+            }
+            Some(b'U') => {
+                self.pos += 1;
+                crate::error::ERROR_KIND_URI_ERROR
+            }
+            _ => crate::error::ERROR_KIND_ERROR,
+        };
+        let mut message = cp_undefined();
+        while self.peek_byte() != Some(TAG_ERROR_END) {
+            match self.read_byte()? {
+                TAG_ERROR_MESSAGE => message = self.read_value()?,
+                TAG_ERROR_STACK => {
+                    let _ = self.read_value()?;
+                }
+                _ => return None,
+            }
+        }
+        self.pos += 1;
+        let error = crate::error::js_error_new_kind_from_value(kind, message);
+        let boxed = cp_box_ptr(error as *const u8);
+        self.id_table.push(boxed);
         Some(boxed)
     }
 

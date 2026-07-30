@@ -60,6 +60,15 @@ pub(crate) unsafe fn nm_ctor_tty(
     None
 }
 
+pub(crate) unsafe fn nm_ctor_child_process(
+    _module: &str,
+    method: &str,
+    _args_ptr: *const f64,
+    _args_len: usize,
+) -> Option<f64> {
+    (method == "ChildProcess").then(crate::child_process::cp_build_unstarted_child_process)
+}
+
 pub(crate) unsafe fn nm_ctor_fs(
     _module: &str,
     method: &str,

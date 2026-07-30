@@ -89,11 +89,7 @@ pub extern "C" fn js_child_process_spawn_sync(
         String::from_utf8_lossy(std::slice::from_raw_parts(cmd_data, cmd_len)).into_owned()
     };
 
-    let opts_val = if options_ptr.is_null() {
-        cp_undefined()
-    } else {
-        cp_box_ptr(options_ptr as *const u8)
-    };
+    let opts_val = cp_options_from_raw_args(args_ptr as i64, options_ptr as i64);
     let mode = cp_read_output_mode(opts_val, false);
 
     // Build command (run the file directly — spawnSync does not use a shell
@@ -468,7 +464,13 @@ fn cp_promisified_run(command: Command, cmd_str: String, opts: f64) -> f64 {
     let cb = js_closure_alloc(cp_promise_settle_cb as *const u8, 1);
     js_closure_set_capture_ptr(cb, 0, cp_box_ptr(promise as *const u8).to_bits() as i64);
     let cb_val = crate::value::js_nanbox_pointer(cb as i64);
-    reactor::cp_exec_async(command, cmd_str, cb_val, run_options, mode);
+    let child = reactor::cp_exec_async(command, cmd_str, cb_val, run_options, mode);
+    crate::object::exotic_expando::value_store(
+        crate::object::exotic_expando::ExoticKind::Promise,
+        promise as usize,
+        "child",
+        child.to_bits(),
+    );
     crate::value::js_nanbox_pointer(promise as i64)
 }
 

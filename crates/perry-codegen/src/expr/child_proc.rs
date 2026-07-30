@@ -48,6 +48,34 @@ fn emit_cp_validate_args(ctx: &mut FnCtx<'_>, args_box: &str) {
     );
 }
 
+/// Validate a spawn/fork option bag while it is still NaN-boxed. `sync`
+/// selects spawnSync's stdio rules and `allow_null` models fork's overload.
+fn emit_cp_validate_options(ctx: &mut FnCtx<'_>, opts_box: &str, sync: bool, allow_null: bool) {
+    let blk = ctx.block();
+    let _ = blk.call(
+        DOUBLE,
+        "js_child_process_validate_options",
+        &[
+            (DOUBLE, opts_box),
+            (I32, if sync { "1" } else { "0" }),
+            (I32, if allow_null { "1" } else { "0" }),
+        ],
+    );
+}
+
+fn emit_cp_validate_spawn_args(ctx: &mut FnCtx<'_>, args_box: &str, sync: bool, allow_null: bool) {
+    let blk = ctx.block();
+    let _ = blk.call(
+        DOUBLE,
+        "js_child_process_validate_spawn_args",
+        &[
+            (DOUBLE, args_box),
+            (I32, if sync { "1" } else { "0" }),
+            (I32, if allow_null { "1" } else { "0" }),
+        ],
+    );
+}
+
 pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
     match expr {
         Expr::ChildProcessExecSync { command, options } => {
@@ -86,13 +114,14 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let cmd_str = unbox_to_i64(blk, &cmd_box);
             let args_str = if let Some(a) = args {
                 let v = lower_expr(ctx, a)?;
-                emit_cp_validate_args(ctx, &v);
+                emit_cp_validate_spawn_args(ctx, &v, true, false);
                 unbox_to_i64(ctx.block(), &v)
             } else {
                 "0".to_string()
             };
             let opts_str = if let Some(o) = options {
                 let v = lower_expr(ctx, o)?;
+                emit_cp_validate_options(ctx, &v, true, false);
                 unbox_to_i64(ctx.block(), &v)
             } else {
                 "0".to_string()
@@ -155,13 +184,14 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let cmd_str = unbox_to_i64(blk, &cmd_box);
             let args_str = if let Some(a) = args {
                 let v = lower_expr(ctx, a)?;
-                emit_cp_validate_args(ctx, &v);
+                emit_cp_validate_spawn_args(ctx, &v, false, false);
                 unbox_to_i64(ctx.block(), &v)
             } else {
                 "0".to_string()
             };
             let opts_str = if let Some(o) = options {
                 let v = lower_expr(ctx, o)?;
+                emit_cp_validate_options(ctx, &v, false, false);
                 unbox_to_i64(ctx.block(), &v)
             } else {
                 "0".to_string()
@@ -186,16 +216,19 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // runtime wires up an IPC channel + send/disconnect/'message'. The
             // runtime returns an already-NaN-boxed ChildProcess pointer. #1933.
             let mod_box = lower_expr(ctx, module)?;
-            let blk = ctx.block();
-            let mod_str = unbox_to_i64(blk, &mod_box);
+            let mod_str =
+                ctx.block()
+                    .call(I64, "js_jsvalue_to_string_coerce", &[(DOUBLE, &mod_box)]);
             let args_str = if let Some(a) = args {
                 let v = lower_expr(ctx, a)?;
+                emit_cp_validate_spawn_args(ctx, &v, false, true);
                 unbox_to_i64(ctx.block(), &v)
             } else {
                 "0".to_string()
             };
             let opts_str = if let Some(o) = options {
                 let v = lower_expr(ctx, o)?;
+                emit_cp_validate_options(ctx, &v, false, true);
                 unbox_to_i64(ctx.block(), &v)
             } else {
                 "0".to_string()
