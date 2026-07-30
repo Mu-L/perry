@@ -105,8 +105,10 @@ export function checkPins(tools: Record<string, ToolPin>): string[] {
       ...(pin.integrity ? [pin.integrity] : []),
       ...Object.values(pin.platforms ?? {}).map(p => p.integrity),
     ]
-    if (pin.release === 'asset' && integrities.length === 0) {
-      out.push(`${name}: release asset without any integrity pin`)
+    const downloadable =
+      pin.release === 'asset' || Boolean(pin.purl) || pin.repository?.startsWith('npm:')
+    if (downloadable && integrities.length === 0) {
+      out.push(`${name}: downloadable pin without any integrity pin`)
     }
     for (const sri of integrities) {
       if (!/^sha512-[A-Za-z0-9+/]+={0,2}$/.test(sri)) {
@@ -293,6 +295,17 @@ export function extractArchive(name: string, destDir: string, asset: string, buf
 export function linkHandle(target: string, name: string): void {
   mkdirSync(BIN_DIR, { recursive: true })
   const handle = path.join(BIN_DIR, name)
+  if (process.platform !== 'win32' && isManagedSfwShim(handle)) {
+    const body = readFileSync(handle, 'utf8')
+    const updated = body.replace(/^REAL='[^']*'$/m, `REAL='${target}'`)
+    if (updated !== body) {
+      writeFileSync(handle, updated)
+    }
+    console.warn(
+      `[external-tools] preserving managed sfw shim ${handle} while updating its rack target`,
+    )
+    return
+  }
   // force also removes a DANGLING handle (existsSync would report false
   // for one and a bare symlink would then throw EEXIST).
   rmSync(handle, { force: true })
@@ -324,6 +337,14 @@ export function linkHandle(target: string, name: string): void {
     return
   }
   symlinkSync(target, handle)
+}
+
+export function isManagedSfwShim(handle: string): boolean {
+  try {
+    return readFileSync(handle, 'utf8').includes('# sfw shim for ')
+  } catch {
+    return false
+  }
 }
 
 async function installAssetTool(name: string, pin: ToolPin): Promise<void> {
@@ -551,10 +572,11 @@ if [ -n "\${${sentinel}:-}" ] || [ -z "$REAL" ] || ! command -v sfw >/dev/null 2
   echo "${cmd}: not found" >&2; exit 127
 fi
 export ${sentinel}=1
-# Enterprise sfw defaults to BLOCK for non-registry hosts, which breaks
-# ordinary dev flows the day a Socket key lands; free tier hardcodes
-# ignore and disregards the var, so setting it is always safe.
-export SFW_UNKNOWN_HOST_ACTION=ignore
+# Keep enterprise sfw's block-by-default posture. Operators can explicitly
+# allow unknown hosts for a single invocation when the command needs them.
+if [ "\${SFW_ALLOW_UNKNOWN_HOSTS:-}" = "1" ]; then
+  export SFW_UNKNOWN_HOST_ACTION=ignore
+fi
 exec sfw '${cmd}' "$@"
 `
     // Remove the handle before writing: writeFileSync FOLLOWS a symlink, so

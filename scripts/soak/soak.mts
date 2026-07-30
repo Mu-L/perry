@@ -47,7 +47,8 @@ export interface Finding {
 
 export function checkCargoConfig(body: string, file: string): Finding[] {
   const out: Finding[] = []
-  const age = /^global-min-publish-age\s*=\s*"([^"]*)"/m.exec(body)?.[1]
+  const registry = /^\[registry\][^[]*/ms.exec(body)?.[0] ?? ''
+  const age = /^global-min-publish-age\s*=\s*"([^"]*)"/m.exec(registry)?.[1]
   const wanted = `${SOAK_DAYS} days`
   if (age !== wanted) {
     out.push({
@@ -71,7 +72,7 @@ export function checkCargoConfig(body: string, file: string): Finding[] {
 }
 
 export function checkNpmrc(body: string, file: string): Finding[] {
-  const days = /^min-release-age=(\d+)\s*$/m.exec(body)?.[1]
+  const days = /^min-release-age[ \t]*=[ \t]*(\d+)[ \t]*$/m.exec(body)?.[1]
   if (Number(days) === SOAK_DAYS) {
     return []
   }
@@ -428,24 +429,35 @@ export function fixDependabotCooldown(body: string): string {
 }
 
 export function fixCargoConfig(body: string): string {
-  return body.replace(
-    /^(global-min-publish-age\s*=\s*)"[^"]*"/m,
-    `$1"${SOAK_DAYS} days"`,
-  )
+  const registrySection = /^\[registry\][^[]*/ms
+  const key = /^(global-min-publish-age\s*=\s*)"[^"]*"/m
+  if (registrySection.test(body)) {
+    return body.replace(registrySection, section => {
+      if (key.test(section)) {
+        return section.replace(key, `$1"${SOAK_DAYS} days"`)
+      }
+      return section.replace(
+        /^\[registry\][ \t]*$/m,
+        `[registry]\nglobal-min-publish-age = "${SOAK_DAYS} days"`,
+      )
+    })
+  }
+  return `${body.trimEnd()}\n\n[registry]\nglobal-min-publish-age = "${SOAK_DAYS} days"\n`
 }
 
 export function fixNpmrc(body: string): string {
-  if (/^min-release-age=\d+\s*$/m.test(body)) {
-    return body.replace(/^min-release-age=\d+\s*$/m, `min-release-age=${SOAK_DAYS}`)
+  const key = /^min-release-age[ \t]*=[ \t]*\d+[ \t]*$/m
+  if (key.test(body)) {
+    return body.replace(key, `min-release-age=${SOAK_DAYS}`)
   }
   return `${body.trimEnd()}\nmin-release-age=${SOAK_DAYS}\n`
 }
 
 export function fixWorkspaceYaml(body: string): string {
-  let out = body.replace(
-    /^(minimumReleaseAge:\s*)\d+\s*$/m,
-    `$1${SOAK_MINUTES}`,
-  )
+  const key = /^(minimumReleaseAge:\s*)\d+[ \t]*$/m
+  let out = key.test(body)
+    ? body.replace(key, `$1${SOAK_MINUTES}`)
+    : `minimumReleaseAge: ${SOAK_MINUTES}\n${body}`
   // Prune expired pins together with their annotation line.
   const today = todayIso()
   const lines = out.split('\n')

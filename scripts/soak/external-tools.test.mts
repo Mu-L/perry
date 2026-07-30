@@ -13,6 +13,7 @@ import {
   checkPins,
   download,
   extractArchive,
+  isManagedSfwShim,
   installTool,
   main,
   pruneExpiredSoakBypasses,
@@ -28,10 +29,26 @@ test('the repo external-tools.json passes checkPins', () => {
   assert.deepEqual(checkPins(tools), [])
 })
 
-test('checkPins flags missing pins, bad SRIs, and asset entries with no integrity', () => {
+test('checkPins flags missing pins, bad SRIs, and downloadable entries with no integrity', () => {
   assert.equal(checkPins({ a: {} }).length, 1)
   assert.equal(checkPins({ a: { version: '1.0.0', integrity: 'sha256-abc' } }).length, 1)
   assert.equal(checkPins({ a: { version: '1.0.0', release: 'asset' } }).length, 1)
+  assert.equal(checkPins({ a: { purl: 'pkg:npm/a@1.0.0' } }).length, 1)
+  assert.equal(checkPins({ a: { version: '1.0.0', repository: 'npm:a' } }).length, 1)
+})
+
+test('managed sfw shim detection distinguishes wrappers from ordinary handles', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'perry-sfw-shim-'))
+  try {
+    const handle = path.join(dir, 'npm')
+    writeFileSync(handle, '#!/bin/sh\n# sfw shim for npm — managed\n')
+    assert.equal(isManagedSfwShim(handle), true)
+    writeFileSync(handle, '#!/bin/sh\nexec npm \"$@\"\n')
+    assert.equal(isManagedSfwShim(handle), false)
+    assert.equal(isManagedSfwShim(path.join(dir, 'missing')), false)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('checkPins validates soakBypass dates and arithmetic; expiry is a warning, not a failure', () => {
