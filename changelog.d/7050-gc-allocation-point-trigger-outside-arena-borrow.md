@@ -30,21 +30,45 @@ anywhere near this often. That is why this is a PASS → FAIL correctly attribut
 to #7019 without #7019 containing the defect, and it explains the discriminator —
 the copying minor is only eligible when the conservative stack scan is off.
 
-**Fix.** `arena_cell_alloc(*mut Arena, size, align)` is the new collecting entry
-point: try the current block under a borrow that ends with the statement, run
+**Fix.** There are **two** sites from which a collection can be entered during an
+arena allocation, and both held the borrow across it.
+
+`arena_cell_alloc(*mut Arena, size, align)` is the new collecting entry point:
+try the current block under a borrow that ends with the statement, run
 `gc_check_trigger()` with **no arena borrow live**, then re-derive a fresh borrow
-for the slow path. `Arena::alloc(&mut self, ..)` is now collection-free, and the
+to retry the current block and scan the others.
+
+The second site is the out-of-memory path: `alloc_block` called
+`gc_try_emergency_reclaim()` on a null `alloc(layout)`, reached via
+`alloc_after_gc` → `alloc_fresh_block` → `install_fresh_block` → `alloc_block`,
+all under `&mut self`. Block reservation is now split — `try_alloc_block` (one
+raw malloc, never collects), `reserve_arena_block` (try → one emergency reclaim →
+retry, called **only** from `arena_cell_alloc` with no borrow live, which then
+re-acquires purely to `install_reserved_block` and bump), and `alloc_block_no_gc`
+for the remaining `&mut self` paths (`Arena::alloc`, the C4b evacuation path's
+`alloc_excluding_pages`, `arena_start_fresh_general_block`, `ArenaBlock::new`),
+which deliberately do not reclaim: two of them already run *inside* a collection.
+
+`Arena::alloc(&mut self, ..)` is therefore collection-free on every path, and the
 five thread-local entry points (`arena_alloc`, `arena_alloc_longlived`,
 `arena_alloc_old`, `arena_alloc_gc_survivor`, `js_inline_arena_slow_alloc`) route
-through it. The two that also touch `INLINE_STATE` keep those borrows short for
-the same reason — `Arena::resync_inline_to_current` mutates `INLINE_STATE` from
-inside the collection. When the GC runs is unchanged.
+through `arena_cell_alloc`. The two that also touch `INLINE_STATE` keep those
+borrows short for the same reason — `Arena::resync_inline_to_current` mutates
+`INLINE_STATE` from inside the collection. When the GC runs is unchanged; the one
+deliberate behaviour change is that `reserve_arena_block` retries the allocation
+even when `gc_try_emergency_reclaim()` returns `false` (it self-suppresses when
+already collecting), where the old code panicked without retrying.
 
 **Measured.** Same commit, same compiler, only the four arena files differing;
-release build, auto-optimized binaries (with `PERRY_NO_AUTO_OPTIMIZE=1` the crash
-does not reproduce at all, which is why the harness deliberately does not set
-it); macOS arm64, node 26.5.0; `PERRY_GC_HEAP_LIMIT=8 PERRY_GC_INCREMENTAL=0
-PERRY_CONSERVATIVE_STACK_SCAN=off`.
+release build, macOS arm64, node 26.5.0; `PERRY_GC_HEAP_LIMIT=8
+PERRY_GC_INCREMENTAL=0 PERRY_CONSERVATIVE_STACK_SCAN=off`.
+
+**The binaries must be auto-optimized.** Compiled with
+`PERRY_NO_AUTO_OPTIMIZE=1` the crash does not reproduce at any nursery cap on any
+arm — the test exits 0 with all 7 output lines and looks healthy.
+`scripts/gc_repsel_matrix.sh` deliberately does not set that flag, and a control
+arm that does set it is not a control for a run that did not: it is a different
+link, and here it silences the defect entirely.
 
 | `PERRY_GC_SCAVENGE_NURSERY_MB` | before | after |
 |---|---|---|
@@ -65,15 +89,20 @@ in all 20 arms (was FAIL in 12), and so is `repsel_scalar_replaced_locals`
 are the two #6981 `p4a3` numarray rows, unchanged. Liveness is intact:
 `evac_minor`/`force_evac`/`force_verify` still report `copy-minor 21/22`.
 
-**Regression coverage** (`cargo-test`-visible, per #5960):
-`arena::tests::allocation_point_gc_trigger_runs_with_no_live_arena_borrow` pins
-that the trigger reached from `arena_cell_alloc` sees an arena-borrow depth of 0
-(and that it was reached at all, so the test cannot pass vacuously);
-`arena::tests::raw_arena_alloc_method_never_reaches_the_gc_trigger` pins that
-`Arena::alloc` stays collection-free, so a refactor cannot move the trigger back
-under the borrow. The borrow-depth probe is `cfg(test)`-only — production
-allocation pays nothing. Teeth verified by sabotage: reinstating either half of
-the old shape turns the matching test red.
+**Regression coverage** (`cargo-test`-visible, per #5960), three tests that
+between them assert the invariant at **every** site a collection can be entered
+from an arena allocation:
+`allocation_point_gc_trigger_runs_with_no_live_arena_borrow` (the trigger sees
+borrow depth 0, and was reached at all so the test cannot pass vacuously);
+`raw_arena_alloc_method_never_reaches_the_gc_trigger` (`Arena::alloc` stays
+collection-free); and `emergency_block_reclaim_runs_with_no_live_arena_borrow`,
+which reaches the out-of-memory path via a `cfg(test)` one-shot injected block
+allocation failure — consumed only by `reserve_arena_block`'s first attempt, so
+the collection that reclaim then runs cannot eat it. The borrow-depth probe and
+the injection are `cfg(test)`-only; production allocation pays nothing. Teeth
+verified by sabotage in both directions: reinstating either half of the old
+trigger shape, or moving the reservation back under the borrow, turns the
+matching test red with the intended signature.
 
 **Investigation note.** #7022's dossier classified this as a missing rewrite of
 an old→young remembered-set edge, from `PERRY_GC_FROMSPACE_SCAN`'s
