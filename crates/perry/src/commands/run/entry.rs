@@ -24,6 +24,10 @@ pub fn can_compile_locally(target: Option<&str>) -> bool {
 
 /// Map perry target names to Rust target triples
 pub fn rust_target_triple(target: Option<&str>) -> Option<&'static str> {
+    if let Some(android) = crate::commands::compile::android_target::android_target(target) {
+        return Some(android.rust_triple);
+    }
+
     match target {
         Some("ios-simulator") => Some("aarch64-apple-ios-sim"),
         Some("ios") => Some("aarch64-apple-ios"),
@@ -31,9 +35,6 @@ pub fn rust_target_triple(target: Option<&str>) -> Option<&'static str> {
         Some("visionos") => Some("aarch64-apple-visionos"),
         Some("tvos-simulator") => Some("aarch64-apple-tvos-sim"),
         Some("tvos") => Some("aarch64-apple-tvos"),
-        Some("android") => Some("aarch64-linux-android"),
-        // Wear OS is Android-on-a-watch: same arm64 Android toolchain/.so.
-        Some("wearos") => Some("aarch64-linux-android"),
         _ => None,
     }
 }
@@ -266,5 +267,18 @@ pub fn resolve_target(
         }
         Some(Platform::Macos) | Some(Platform::Linux) | Some(Platform::Windows) => Ok((None, None)),
         None => Ok((None, None)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rust_target_triple;
+
+    #[test]
+    fn android_x86_64_uses_its_cross_runtime() {
+        assert_eq!(
+            rust_target_triple(Some("android-x86_64")),
+            Some("x86_64-linux-android")
+        );
     }
 }
