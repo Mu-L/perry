@@ -1018,3 +1018,55 @@ fn lazy_regions_defer_initial_block_allocation() {
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// #7022: the allocation-point GC trigger must not run under a live `&mut Arena`
+// borrow.
+//
+// `gc_check_trigger()` collects, and a collection ALLOCATES INTO THE ARENAS:
+// promotion and C4b evacuation call `arena_alloc_gc_old`, an evacuating minor
+// (#7019, default-on) fills a survivor semispace, and either can reach
+// `Arena::install_fresh_block` → `self.blocks.push(..)` on the *same* arena the
+// allocating frame is holding. A `Vec` growth there frees the buffer the outer
+// frame then indexes, and `&mut` carries `noalias`, so the outer frame is also
+// entitled to have cached `blocks.ptr`/`len` across the call.
+//
+// The two tests below pin the split that removes the hazard: the trigger lives
+// in `arena_cell_alloc` (raw pointer, borrows re-derived per statement) and NOT
+// in `Arena::alloc` (`&mut self`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn allocation_point_gc_trigger_runs_with_no_live_arena_borrow() {
+    reset_gc_trigger_arena_probe();
+    // Larger than any existing block, so the current-block fast path must miss
+    // and the slow path (the one that collects) is guaranteed to run.
+    let ptr = OLD_ARENA.with(|a| unsafe { arena_cell_alloc(a.get(), BLOCK_SIZE + 1, 8) });
+    assert!(!ptr.is_null(), "forced slow-path old-gen allocation failed");
+    assert!(
+        gc_trigger_arena_calls() > 0,
+        "the forced slow path must reach the allocation-point GC trigger; \
+         without it this test asserts nothing"
+    );
+    assert_eq!(
+        gc_trigger_arena_borrow_depth(),
+        0,
+        "gc_check_trigger() ran while an `&mut Arena` borrow was live — the \
+         collector allocates into this same arena and may reallocate its \
+         `blocks` Vec underneath the borrow (#7022)"
+    );
+}
+
+#[test]
+fn raw_arena_alloc_method_never_reaches_the_gc_trigger() {
+    reset_gc_trigger_arena_probe();
+    let ptr = OLD_ARENA.with(|a| unsafe { (*a.get()).alloc(BLOCK_SIZE + 1, 8) });
+    assert!(!ptr.is_null(), "forced slow-path old-gen allocation failed");
+    assert_eq!(
+        gc_trigger_arena_calls(),
+        0,
+        "`Arena::alloc(&mut self, ..)` must stay collection-free: it is called \
+         with a live borrow, so a GC trigger inside it re-enters the arena \
+         (#7022). The trigger belongs in `arena_cell_alloc`."
+    );
+}

@@ -27,9 +27,13 @@ pub(crate) use allocators::{
     inactive_survivor_index, with_survivor_arena, with_survivor_arena_mut,
 };
 pub(crate) use block::{
-    old_gen_in_use_bytes_sub, Arena, ArenaBlock, ACTIVE_SURVIVOR, ARENA, ARENA_TOTAL_BYTES,
-    BLOCK_SIZE, FRESH_GENERAL_BLOCK_MIN_USED_BYTES, INLINE_STATE, LONGLIVED_ARENA, OLD_ARENA,
-    OLD_GEN_IN_USE_BYTES, SURVIVOR_ARENA_0, SURVIVOR_ARENA_1,
+    arena_cell_alloc, old_gen_in_use_bytes_sub, Arena, ArenaBlock, ACTIVE_SURVIVOR, ARENA,
+    ARENA_TOTAL_BYTES, BLOCK_SIZE, FRESH_GENERAL_BLOCK_MIN_USED_BYTES, INLINE_STATE,
+    LONGLIVED_ARENA, OLD_ARENA, OLD_GEN_IN_USE_BYTES, SURVIVOR_ARENA_0, SURVIVOR_ARENA_1,
+};
+#[cfg(test)]
+pub(crate) use block::{
+    gc_trigger_arena_borrow_depth, gc_trigger_arena_calls, reset_gc_trigger_arena_probe,
 };
 pub(crate) use page_meta::{
     address_span_overlaps_pages, register_block_space, register_old_object_pages,

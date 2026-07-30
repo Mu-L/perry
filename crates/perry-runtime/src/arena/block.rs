@@ -341,24 +341,18 @@ impl Arena {
         }
     }
 
+    /// Fast path only: bump within the current block. Never collects, never
+    /// pushes a block — so it is safe to call under a short `&mut` borrow.
     #[inline]
-    pub(crate) fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
-        // Try current block first
-        if let Some(ptr) = self.try_block_alloc(self.current, size, align) {
-            return ptr;
-        }
+    pub(crate) fn try_alloc_current(&mut self, size: usize, align: usize) -> Option<*mut u8> {
+        self.try_block_alloc(self.current, size, align)
+    }
 
-        // Current block is full. Check GC trigger first — if it fires
-        // and reclaims at least one fully-empty block (via
-        // `arena_reset_empty_blocks`), we may be able to reuse that
-        // block instead of pushing a new one.
-        //
-        // Threshold pressure is paid through bounded mutator-assist work.
-        // A completed assist cycle may reset blocks before we retry; an
-        // incomplete cycle leaves the debt active for later host or allocator
-        // steps.
-        crate::gc::gc_check_trigger();
-
+    /// Everything `alloc` does *after* the GC trigger: retry the (possibly
+    /// newly reset) current block, scan the other blocks, then install a fresh
+    /// one. Split out of `alloc` for #7022 — see [`arena_cell_alloc`].
+    #[inline]
+    pub(crate) fn alloc_after_gc(&mut self, size: usize, align: usize) -> *mut u8 {
         // Retry the (possibly newly-reset) current block. arena.current
         // may have been changed by arena_reset_empty_blocks to point
         // at the lowest reset block.
@@ -391,6 +385,17 @@ impl Arena {
         self.alloc_fresh_block(size, align)
     }
 
+    /// GC-free allocation. Used by paths that already run inside a collection
+    /// (`alloc_excluding_pages`) and by the tests; the collecting entry point
+    /// is [`arena_cell_alloc`].
+    #[inline]
+    pub(crate) fn alloc(&mut self, size: usize, align: usize) -> *mut u8 {
+        if let Some(ptr) = self.try_alloc_current(size, align) {
+            return ptr;
+        }
+        self.alloc_after_gc(size, align)
+    }
+
     pub(crate) fn alloc_excluding_pages(
         &mut self,
         size: usize,
@@ -420,7 +425,133 @@ impl Arena {
     }
 }
 
+/// Allocate from an arena that lives behind a thread-local `UnsafeCell`,
+/// running the allocation-point GC trigger **between** two disjoint borrows.
+///
+/// # Why the borrow has to be split (#7022)
+///
+/// `gc_check_trigger()` can run a full mark-sweep or an evacuating minor, and
+/// both of those *allocate into the arenas*: promotion and C4b evacuation call
+/// `arena_alloc_gc_old`, the copying minor fills a survivor semispace, and
+/// either may reach `install_fresh_block` → `self.blocks.push(..)`. When the
+/// trigger was called from inside `Arena::alloc(&mut self, ..)`, that push ran
+/// against the **same** `Arena` the caller was holding a live `&mut` to: a
+/// `Vec` growth then frees the buffer the outer frame goes on to index
+/// (`self.blocks[idx]`), and `&mut` carries `noalias`, so the outer frame is
+/// also entitled to have cached `blocks.ptr`/`len` across the call. Measured on
+/// the #7022 reproducer: `install_fresh_block gen=Old space=Old` fires while
+/// `Arena::alloc` on the old arena holds the borrow, and `self.blocks`'s length
+/// changes underneath it.
+///
+/// #7019 (default-on evacuating young-gen scavenge) is what made this latent
+/// hazard live: before it, a collection triggered from an allocation point did
+/// not itself allocate arena blocks anywhere near this often.
+///
+/// Taking a `*mut Arena` and re-deriving a short-lived `&mut` per statement
+/// keeps the two borrows disjoint, so the collector may freely mutate the arena
+/// while it runs.
+///
+/// # Safety
+/// `arena` must be the `UnsafeCell` payload of a live thread-local `Arena` for
+/// the current thread.
+#[inline]
+pub(crate) unsafe fn arena_cell_alloc(arena: *mut Arena, size: usize, align: usize) -> *mut u8 {
+    // Try current block first, under a borrow that ends with this statement.
+    {
+        let _borrow = ArenaBorrowGuard::new();
+        if let Some(ptr) = (*arena).try_alloc_current(size, align) {
+            return ptr;
+        }
+    }
+
+    // Current block is full. Check the GC trigger first — if it fires and
+    // reclaims at least one fully-empty block (via `arena_reset_empty_blocks`),
+    // we may be able to reuse that block instead of pushing a new one.
+    //
+    // Threshold pressure is paid through bounded mutator-assist work. A
+    // completed assist cycle may reset blocks before we retry; an incomplete
+    // cycle leaves the debt active for later host or allocator steps.
+    //
+    // NO ARENA BORROW IS LIVE HERE. See the function docs.
+    note_gc_trigger_arena_borrow_depth();
+    crate::gc::gc_check_trigger();
+
+    let _borrow = ArenaBorrowGuard::new();
+    (*arena).alloc_after_gc(size, align)
+}
+
+// ---------------------------------------------------------------------------
+// #7022 invariant instrumentation: "no `&mut Arena` borrow is live while the
+// allocation-point GC trigger runs".
+//
+// Compiled ONLY under `cfg(test)`, so production allocation pays nothing. The
+// unit tests in `arena::tests` read `gc_trigger_arena_borrow_depth()` after
+// forcing an arena allocation past its current block; a refactor that puts the
+// trigger back inside the borrow makes them red.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
 thread_local! {
+    /// Number of `&mut Arena` borrows currently live inside `arena_cell_alloc`.
+    static ARENA_BORROW_DEPTH: Cell<u32> = const { Cell::new(0) };
+    /// `ARENA_BORROW_DEPTH` sampled immediately before the most recent
+    /// `gc_check_trigger()` call made from `arena_cell_alloc`, and how many
+    /// such calls have been made.
+    static GC_TRIGGER_BORROW_DEPTH: Cell<u32> = const { Cell::new(u32::MAX) };
+    static GC_TRIGGER_CALLS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// RAII marker for a live `&mut Arena` borrow (test builds only).
+pub(crate) struct ArenaBorrowGuard;
+
+impl ArenaBorrowGuard {
+    #[inline(always)]
+    fn new() -> Self {
+        #[cfg(test)]
+        ARENA_BORROW_DEPTH.with(|d| d.set(d.get() + 1));
+        ArenaBorrowGuard
+    }
+}
+
+impl Drop for ArenaBorrowGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        #[cfg(test)]
+        ARENA_BORROW_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+#[inline(always)]
+fn note_gc_trigger_arena_borrow_depth() {
+    #[cfg(test)]
+    {
+        let depth = ARENA_BORROW_DEPTH.with(Cell::get);
+        GC_TRIGGER_BORROW_DEPTH.with(|d| d.set(depth));
+        GC_TRIGGER_CALLS.with(|c| c.set(c.get() + 1));
+    }
+}
+
+/// Arena-borrow depth observed at the most recent allocation-point GC trigger,
+/// or `u32::MAX` if no trigger has been reached yet on this thread.
+#[cfg(test)]
+pub(crate) fn gc_trigger_arena_borrow_depth() -> u32 {
+    GC_TRIGGER_BORROW_DEPTH.with(Cell::get)
+}
+
+/// How many allocation-point GC triggers `arena_cell_alloc` has reached.
+#[cfg(test)]
+pub(crate) fn gc_trigger_arena_calls() -> u32 {
+    GC_TRIGGER_CALLS.with(Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_gc_trigger_arena_probe() {
+    GC_TRIGGER_BORROW_DEPTH.with(|d| d.set(u32::MAX));
+    GC_TRIGGER_CALLS.with(|c| c.set(0));
+}
+
+thread_local! {
+
     /// Cached running sum of `block.size` across every arena (general,
     /// longlived, old-gen). `arena_total_bytes()` previously walked
     /// every block of every arena summing this on every call — and
