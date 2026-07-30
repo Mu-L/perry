@@ -14,21 +14,32 @@ use super::*;
 #[inline]
 pub fn arena_alloc(size: usize, align: usize) -> *mut u8 {
     INLINE_STATE.with(|inline_s| unsafe {
-        let inline = &mut *inline_s.get();
+        let inline_ptr = inline_s.get();
         ARENA.with(|a| {
-            let arena = &mut *(*a).get();
+            let arena_ptr = (*a).get();
             // Sync inline → block before allocating, if the inline
-            // state has been initialized.
-            if !inline.data.is_null() {
-                arena.blocks[arena.current].offset = inline.offset;
+            // state has been initialized. Borrows are deliberately
+            // short-lived: `arena_cell_alloc` runs the GC between two
+            // disjoint borrows, and the collector mutates BOTH the arena
+            // and `INLINE_STATE` (`Arena::resync_inline_to_current`). #7022.
+            if !(*inline_ptr).data.is_null() {
+                let offset = (*inline_ptr).offset;
+                let arena = &mut *arena_ptr;
+                let current = arena.current;
+                arena.blocks[current].offset = offset;
             }
-            let ptr = arena.alloc(size, align);
+            let ptr = crate::arena::arena_cell_alloc(arena_ptr, size, align);
             // Resync block → inline (may have advanced to a new block).
-            if !inline.data.is_null() {
-                let block = &arena.blocks[arena.current];
-                inline.data = block.data;
-                inline.offset = block.offset;
-                inline.size = block.size;
+            if !(*inline_ptr).data.is_null() {
+                let (data, offset, block_size) = {
+                    let arena = &*arena_ptr;
+                    let block = &arena.blocks[arena.current];
+                    (block.data, block.offset, block.size)
+                };
+                let inline = &mut *inline_ptr;
+                inline.data = data;
+                inline.offset = offset;
+                inline.size = block_size;
             }
             ptr
         })
@@ -41,10 +52,7 @@ pub fn arena_alloc(size: usize, align: usize) -> *mut u8 {
 /// (`js_string_from_bytes_longlived`, `js_array_alloc_with_length_longlived`),
 /// not hot-path `new ClassName()` bump allocations.
 pub fn arena_alloc_longlived(size: usize, align: usize) -> *mut u8 {
-    LONGLIVED_ARENA.with(|a| unsafe {
-        let arena = &mut *a.get();
-        arena.alloc(size, align)
-    })
+    LONGLIVED_ARENA.with(|a| unsafe { crate::arena::arena_cell_alloc(a.get(), size, align) })
 }
 
 /// Allocate a GcHeader-prefixed object from the longlived arena (issue #179).
@@ -90,10 +98,7 @@ pub fn arena_alloc_gc_longlived(size: usize, align: usize, obj_type: u8) -> *mut
 /// touch) so codegen's hot bump-pointer loop on `new ClassName()`
 /// stays exclusively pinned to the nursery.
 pub fn arena_alloc_old(size: usize, align: usize) -> *mut u8 {
-    OLD_ARENA.with(|a| unsafe {
-        let arena = &mut *a.get();
-        arena.alloc(size, align)
-    })
+    OLD_ARENA.with(|a| unsafe { crate::arena::arena_cell_alloc(a.get(), size, align) })
 }
 
 pub(crate) fn arena_alloc_old_excluding_pages(
@@ -174,6 +179,16 @@ pub(crate) fn with_survivor_arena_mut<R>(idx: usize, f: impl FnOnce(&mut Arena) 
     }
 }
 
+/// Raw-pointer counterpart of [`with_survivor_arena_mut`] for callers that must
+/// not hold an `&mut Arena` across a GC trigger (#7022).
+pub(crate) fn with_survivor_arena_cell<R>(idx: usize, f: impl FnOnce(*mut Arena) -> R) -> R {
+    match idx {
+        0 => SURVIVOR_ARENA_0.with(|a| f(a.get())),
+        1 => SURVIVOR_ARENA_1.with(|a| f(a.get())),
+        _ => unreachable!("invalid survivor arena index"),
+    }
+}
+
 pub(crate) fn with_survivor_arena<R>(idx: usize, f: impl FnOnce(&Arena) -> R) -> R {
     match idx {
         0 => SURVIVOR_ARENA_0.with(|a| unsafe { f(&*a.get()) }),
@@ -189,7 +204,9 @@ pub(crate) fn arena_alloc_gc_survivor(size: usize, align: usize, obj_type: u8) -
 
     let total = gc_padded_total_size(size, align);
     let idx = inactive_survivor_index();
-    let raw = with_survivor_arena_mut(idx, |arena| arena.alloc(total, align));
+    let raw = with_survivor_arena_cell(idx, |cell| unsafe {
+        crate::arena::arena_cell_alloc(cell, total, align)
+    });
 
     unsafe {
         let header = raw as *mut GcHeader;

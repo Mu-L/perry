@@ -62,20 +62,30 @@ pub extern "C" fn js_inline_arena_slow_alloc(
     size: usize,
     align: usize,
 ) -> *mut u8 {
-    let state_ref = unsafe { &mut *state };
     ARENA.with(|a| unsafe {
-        let arena = &mut *a.get();
+        let arena_ptr = a.get();
         // Sync inline-state offset back to underlying block (so
         // arena_walk_objects and the slow-path GC trigger see the
-        // post-burst offset).
-        arena.blocks[arena.current].offset = state_ref.offset;
+        // post-burst offset). Borrows stay short-lived: the GC inside
+        // `arena_cell_alloc` mutates this same arena (#7022).
+        let offset = (*state).offset;
+        {
+            let arena = &mut *arena_ptr;
+            let current = arena.current;
+            arena.blocks[current].offset = offset;
+        }
         // Allocate via existing path (may push a new block + run GC).
-        let ptr = arena.alloc(size, align);
+        let ptr = crate::arena::arena_cell_alloc(arena_ptr, size, align);
         // Resync inline state to the (possibly new) current block.
-        let block = &arena.blocks[arena.current];
-        state_ref.data = block.data;
-        state_ref.offset = block.offset;
-        state_ref.size = block.size;
+        let (data, block_offset, block_size) = {
+            let arena = &*arena_ptr;
+            let block = &arena.blocks[arena.current];
+            (block.data, block.offset, block.size)
+        };
+        let state_ref = &mut *state;
+        state_ref.data = data;
+        state_ref.offset = block_offset;
+        state_ref.size = block_size;
         ptr
     })
 }
