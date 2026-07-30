@@ -551,6 +551,27 @@ crate = "perry-ext-ads"
 lib = "perry_ext_ads"
 tracking = "#867"
 
+# `node-forge` — the PKI subset (RSA keygen, X.509 build/sign, PEM
+# round-trips) that Socket Firewall's TLS-MITM CA uses. Ports the pure-JS
+# bignum/crypto/ASN.1 stack to native RustCrypto (`rsa` + `x509-cert`) so
+# apps stop AOT-compiling forge's enormous JS. Hyphenated package name →
+# `js_node_forge_*` symbol prefix + `perry_ext_node_forge` lib (same
+# convention as `date-fns`/`lru-cache`). CPU-only: not in
+# `binding_needs_shared_tokio`.
+[bindings.node-forge]
+crate = "perry-ext-node-forge"
+lib = "perry_ext_node_forge"
+tracking = "#466"
+
+# Upstream provenance pin (see PR #7031 / docs upstream-pins.md).
+[bindings.node-forge.upstream]
+version = "1.4.0"
+sha256 = "bf9d7ca0d774235354697bd4b5e642af6505e7ce2066762c3b855138cf870820"
+repo = "https://github.com/digitalbazaar/forge"
+ref = "fa385f92440879601240020f158bed68e444e83a"
+ported-at = "1.4.0"
+date = "2026-07-30"
+
 # `undici` — Node's HTTP client library, served by perry's NATIVE
 # fetch/http stack instead of AOT-compiling undici's ~50k lines of JS.
 # Subset binding: ProxyAgent / Agent / setGlobalDispatcher /
