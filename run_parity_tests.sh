@@ -772,8 +772,46 @@ for test_file in "${TEST_FILES[@]}"; do
     # up on the 2>&1-captured stream for any test that exercises a flagged
     # API (dns/dgram loopback, v8 heap snapshot, …) and diff against Node.
     perry_tmp=$(mktemp)
-    run_with_timeout 10 env PERRY_STUB_DIAG=off "${parity_env[@]}" "$perry_binary" "${test_argv[@]}" > "$perry_tmp" 2>&1
+    # Cap the test binary's fork budget at current-user-tasks + 50: legit
+    # multi-process tests (cluster/child_process) fit easily, while a
+    # fork-bombing test (cluster re-exec loop, 2026-07-22) stalls at ~50
+    # orphans instead of saturating the user process limit — which would
+    # starve the harness itself out of fork() and kill the whole run.
+    # If the proc count can't be measured or the cap can't be applied, abort
+    # this test before exec: an uncapped run could recreate the fork bomb this
+    # containment layer exists to prevent. The budget is per-UID, not per-tree,
+    # so a concurrent heavy job can transiently eat the +50 headroom; recomputing
+    # per test keeps that window small, and the worst case is one test
+    # classified as crash rather than a wedged machine.
+    run_with_timeout 10 "$BASH" -c '
+        if [ "$(uname -s)" = "Linux" ]; then
+            proc_list=$(ps -u "$(id -u)" -L -o lwp= 2>/dev/null)
+        else
+            proc_list=$(ps -u "$(id -u)" -o pid= 2>/dev/null)
+        fi || {
+            echo "failed to measure the current user process count" >&2
+            exit 125
+        }
+        nproc_now=$(printf "%s\n" "$proc_list" | awk "NF { count++ } END { print count + 0 }") || {
+            echo "failed to count the current user processes" >&2
+            exit 125
+        }
+        if ! [ "$nproc_now" -gt 0 ] 2>/dev/null; then
+            echo "invalid current user process count: $nproc_now" >&2
+            exit 125
+        fi
+        if ! ulimit -u $(( nproc_now + 50 )) 2>/dev/null; then
+            echo "failed to apply the per-test process limit" >&2
+            exit 125
+        fi
+        exec "$@"' _ env PERRY_STUB_DIAG=off "${parity_env[@]}" "$perry_binary" "${test_argv[@]}" > "$perry_tmp" 2>&1
     perry_exit=$?
+    # Reap orphaned children of the test binary (cluster tests fork workers
+    # that survive the timeout kill of the direct child and can fork-bomb the
+    # machine — 2026-07-22). Scoped to this run's tmp dir, so concurrent
+    # suite runs are unaffected. pkill -f treats the pattern as a regex, so
+    # escape the path's metacharacters (the mktemp dir contains a dot).
+    pkill -9 -f "$(printf '%s/' "$PARITY_TMP" | sed 's/[][\.*^$()+?{|]/\\&/g')" 2>/dev/null
     perry_output=$(cap_output < "$perry_tmp")
     rm -f "$perry_tmp"
 
