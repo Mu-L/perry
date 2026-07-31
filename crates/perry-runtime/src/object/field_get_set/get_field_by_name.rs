@@ -513,10 +513,12 @@ pub extern "C" fn js_object_get_field_by_name(
                                 super::super::prototype_chain::object_static_prototype(addr)
                             {
                                 if proto_bits != crate::value::TAG_NULL {
-                                    let proto = JSValue::from_bits(proto_bits);
-                                    if proto.is_pointer() {
-                                        let p = proto.as_pointer::<ObjectHeader>();
-                                        return super::super::js_object_get_field_by_name(p, key);
+                                    if let Some(inherited) =
+                                        super::super::prototype_chain::resolve_inherited_field(
+                                            addr, key,
+                                        )
+                                    {
+                                        return inherited;
                                     }
                                 }
                             }
@@ -540,6 +542,39 @@ pub extern "C" fn js_object_get_field_by_name(
                             return JSValue::from_bits(ctor.to_bits());
                         }
                         _ => {}
+                    }
+
+                    // A typed array reached through an `any`-typed value uses
+                    // this generic property getter instead of codegen's typed
+                    // method path. Resolve inherited methods/accessors through
+                    // the instance's actual prototype, preserving custom
+                    // `Reflect.construct` prototypes before the intrinsic
+                    // per-kind prototype fallback. Without this,
+                    // structured-cloned views had the right brand and bytes
+                    // but reads such as `cloned.join` returned `undefined`.
+                    match super::super::prototype_chain::object_static_prototype(addr) {
+                        Some(crate::value::TAG_NULL) => {}
+                        Some(_) => {
+                            if let Some(inherited) =
+                                super::super::prototype_chain::resolve_inherited_field(addr, key)
+                            {
+                                return inherited;
+                            }
+                        }
+                        None => {
+                            let proto = crate::object::builtin_prototype_value(
+                                crate::typedarray::name_for_kind(kind),
+                            );
+                            if let Some(inherited) = super::super::prototype_chain::
+                                resolve_inherited_field_from_prototype(
+                                    addr,
+                                    proto.to_bits(),
+                                    key,
+                                )
+                            {
+                                return inherited;
+                            }
+                        }
                     }
                 } else {
                     let buf = addr as *const crate::buffer::BufferHeader;
@@ -579,6 +614,33 @@ pub extern "C" fn js_object_get_field_by_name(
                             return JSValue::from_bits(ctor.to_bits());
                         }
                         _ => {}
+                    }
+
+                    // Buffer-backed Uint8Arrays share the intrinsic
+                    // Uint8Array prototype. Like the TypedArrayHeader branch
+                    // above, this is required when the receiver's static type
+                    // has been erased (for example by structured clone).
+                    match super::super::prototype_chain::object_static_prototype(addr) {
+                        Some(crate::value::TAG_NULL) => {}
+                        Some(_) => {
+                            if let Some(inherited) =
+                                super::super::prototype_chain::resolve_inherited_field(addr, key)
+                            {
+                                return inherited;
+                            }
+                        }
+                        None => {
+                            let proto = crate::object::builtin_prototype_value("Uint8Array");
+                            if let Some(inherited) = super::super::prototype_chain::
+                                resolve_inherited_field_from_prototype(
+                                    addr,
+                                    proto.to_bits(),
+                                    key,
+                                )
+                            {
+                                return inherited;
+                            }
+                        }
                     }
                 }
             }

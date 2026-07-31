@@ -25,6 +25,7 @@
 //! `TAG_NULL`, so a recorded-null entry is distinguishable from "no entry
 //! recorded" (default prototype); in the meta record, 0 means unset.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -43,6 +44,74 @@ pub(crate) fn array_static_proto_recorded() -> bool {
 const TAG_NULL: u64 = 0x7FFC_0000_0000_0002;
 
 static OBJECT_PROTOTYPES: OnceLock<Mutex<HashMap<usize, u64>>> = OnceLock::new();
+thread_local! {
+    /// Owners currently walking a recorded prototype chain. Although
+    /// `Object.setPrototypeOf` normally rejects cycles, residual/native owners
+    /// and custom-construction links can still expose a malformed chain. Keep
+    /// recursive property lookup bounded and stop on a repeated owner. These
+    /// are NaN-boxed root slots, not raw addresses: an accessor or Proxy trap
+    /// can collect and move an owner before re-entering property resolution.
+    static PROTOTYPE_RESOLUTION_STACK: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+const MAX_PROTOTYPE_RESOLUTION_DEPTH: usize = 64;
+
+struct PrototypeResolutionGuard;
+
+impl PrototypeResolutionGuard {
+    fn enter(owner: usize) -> Option<Self> {
+        let owner_bits = crate::value::js_nanbox_pointer(owner as i64).to_bits();
+        PROTOTYPE_RESOLUTION_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if stack.len() >= MAX_PROTOTYPE_RESOLUTION_DEPTH || stack.contains(&owner_bits) {
+                return None;
+            }
+            crate::gc::runtime_write_barrier_root_nanbox(owner_bits);
+            stack.push(owner_bits);
+            Some(Self)
+        })
+    }
+}
+
+impl Drop for PrototypeResolutionGuard {
+    fn drop(&mut self) {
+        PROTOTYPE_RESOLUTION_STACK.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
+}
+
+pub(crate) fn resolution_stack_savepoint() -> usize {
+    PROTOTYPE_RESOLUTION_STACK.with(|stack| stack.borrow().len())
+}
+
+pub(crate) fn resolution_stack_restore(depth: usize) {
+    PROTOTYPE_RESOLUTION_STACK.with(|stack| stack.borrow_mut().truncate(depth));
+}
+
+/// GC scanner for owners held across recursive inherited-property resolution.
+///
+/// Getters and Proxy traps may collect before re-entering this resolver. The
+/// scanner both keeps each active owner alive and rewrites its stack slot after
+/// evacuation so the repeated-owner check remains an identity check.
+pub(crate) fn scan_prototype_resolution_stack_roots_mut(
+    visitor: &mut crate::gc::RuntimeRootVisitor<'_>,
+) {
+    PROTOTYPE_RESOLUTION_STACK.with(|stack| {
+        for owner_bits in stack.borrow_mut().iter_mut() {
+            visitor.visit_nanbox_u64_slot(owner_bits);
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn test_resolution_stack_enter_and_forget(owner: usize) -> bool {
+    let Some(guard) = PrototypeResolutionGuard::enter(owner) else {
+        return false;
+    };
+    std::mem::forget(guard);
+    true
+}
+
 /// Latched true by the first recorded `Object.setPrototypeOf`. Lets hot
 /// per-object probes (e.g. JSON.stringify's `toJSON` fast-negative check,
 /// #6009) skip the map mutex entirely in processes that never re-prototype
@@ -324,6 +393,19 @@ pub(crate) fn resolve_inherited_field(
     key: *const crate::StringHeader,
 ) -> Option<crate::value::JSValue> {
     let proto_bits = object_static_prototype(obj_ptr)?;
+    resolve_inherited_field_from_prototype(obj_ptr, proto_bits, key)
+}
+
+/// Resolve an inherited property through a known prototype while retaining
+/// `obj_ptr` as the receiver for accessors and Proxy traps. Intrinsic
+/// TypedArray prototypes are not recorded in `object_static_prototype`, so
+/// their erased-type fallback passes the builtin prototype here directly.
+pub(crate) fn resolve_inherited_field_from_prototype(
+    obj_ptr: usize,
+    proto_bits: u64,
+    key: *const crate::StringHeader,
+) -> Option<crate::value::JSValue> {
+    let _guard = PrototypeResolutionGuard::enter(obj_ptr)?;
     if proto_bits == TAG_NULL {
         return None;
     }
@@ -355,9 +437,11 @@ pub(crate) fn resolve_inherited_field(
             let key_val = f64::from_bits(crate::value::js_nanbox_string(key as i64).to_bits());
             let receiver =
                 f64::from_bits(crate::value::js_nanbox_pointer(obj_ptr as i64).to_bits());
+            let scope = crate::gc::RuntimeHandleScope::new();
             let previous_this = super::js_implicit_this_set(receiver);
+            let previous_this_handle = scope.root_nanbox_f64(previous_this);
             let v = crate::proxy::js_proxy_get(proto_val, key_val);
-            super::js_implicit_this_set(previous_this);
+            super::js_implicit_this_set(previous_this_handle.get_nanbox_f64());
             if v.to_bits() == crate::value::TAG_UNDEFINED {
                 return None;
             }
@@ -374,18 +458,63 @@ pub(crate) fn resolve_inherited_field(
     // properties; otherwise prototype accessors would observe the prototype
     // object instead of the instance.
     let receiver = f64::from_bits(crate::value::js_nanbox_pointer(obj_ptr as i64).to_bits());
+    let scope = crate::gc::RuntimeHandleScope::new();
     let previous_this = super::js_implicit_this_set(receiver);
+    let previous_this_handle = scope.root_nanbox_f64(previous_this);
     // The recursive `get_field(proto, key)` re-derives the accessor receiver
     // from `proto`; stash the real instance so an inherited getter binds `this`
     // to it, not to the prototype.
     let prev_override = super::field_get_set::accessor_receiver_override_begin(receiver);
+    let prev_override_handle = prev_override.map(|value| scope.root_nanbox_f64(value));
     let v = super::js_object_get_field_by_name(proto, key);
-    super::field_get_set::accessor_receiver_override_end(prev_override);
-    super::js_implicit_this_set(previous_this);
+    super::field_get_set::accessor_receiver_override_end(
+        prev_override_handle.map(|handle| handle.get_nanbox_f64()),
+    );
+    super::js_implicit_this_set(previous_this_handle.get_nanbox_f64());
     if v.bits() == 0x7FFC_0000_0000_0001 {
         // undefined — treat as "not present" so callers fall back cleanly.
         None
     } else {
         Some(v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inherited_lookup_stops_on_recorded_prototype_cycle() {
+        let first = crate::object::js_object_alloc(0, 0);
+        let second = crate::object::js_object_alloc(0, 0);
+        object_set_static_prototype(
+            first as usize,
+            crate::value::js_nanbox_pointer(second as i64).to_bits(),
+        );
+        object_set_static_prototype(
+            second as usize,
+            crate::value::js_nanbox_pointer(first as i64).to_bits(),
+        );
+        let missing = crate::string::js_string_from_bytes(b"missing".as_ptr(), 7);
+        assert!(resolve_inherited_field(first as usize, missing).is_none());
+        assert!(PROTOTYPE_RESOLUTION_STACK.with(|stack| stack.borrow().is_empty()));
+    }
+
+    #[test]
+    fn exception_unwind_restores_resolution_stack_savepoint() {
+        let base_depth = resolution_stack_savepoint();
+        let _jump_buffer = crate::exception::js_try_push();
+        let first = PrototypeResolutionGuard::enter(usize::MAX - 1).unwrap();
+        let second = PrototypeResolutionGuard::enter(usize::MAX).unwrap();
+        assert_eq!(resolution_stack_savepoint(), base_depth + 2);
+
+        // A real longjmp skips these drops. Forget the guards to model that
+        // behavior, then replay js_throw's savepoint restoration.
+        std::mem::forget(first);
+        std::mem::forget(second);
+        crate::exception::test_unwind_innermost_shadow_restore();
+        crate::exception::js_try_end();
+
+        assert_eq!(resolution_stack_savepoint(), base_depth);
     }
 }
