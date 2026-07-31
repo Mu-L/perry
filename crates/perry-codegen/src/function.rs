@@ -635,6 +635,15 @@ impl LlFunction {
         } else {
             ""
         };
+        // The native-stack walker recovers frames through the x29 chain, so
+        // every generated function must link one; without the attribute,
+        // textual-IR input gets no frame-pointer default from the clang
+        // driver and LLVM may omit the chain even while saving x29.
+        let frame_pointer = if crate::codegen::helpers::native_stack_roots_enabled() {
+            " \"frame-pointer\"=\"non-leaf\""
+        } else {
+            ""
+        };
         let gc_strategy = if self.stack_map_requested
             && crate::codegen::helpers::statepoints_enabled()
             && !self.has_try
@@ -644,8 +653,8 @@ impl LlFunction {
             ""
         };
         let mut ir = format!(
-            "define {}{} @{}({}){}{} {{\n",
-            linkage, self.return_type, self.name, param_str, attrs, gc_strategy
+            "define {}{} @{}({}){}{}{} {{\n",
+            linkage, self.return_type, self.name, param_str, attrs, frame_pointer, gc_strategy
         );
 
         for (i, blk) in self.blocks.iter().enumerate() {

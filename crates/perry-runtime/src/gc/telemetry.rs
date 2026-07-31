@@ -306,6 +306,8 @@ pub(super) struct NativeStackMapTraceStats {
     pub(super) frames_visited: usize,
     pub(super) records_matched: usize,
     pub(super) locations_visited: usize,
+    pub(super) fp_walks: usize,
+    pub(super) fallback_walks: usize,
 }
 
 impl NativeStackMapTraceStats {
@@ -316,11 +318,15 @@ impl NativeStackMapTraceStats {
         frames_visited: usize,
         records_matched: usize,
         locations_visited: usize,
+        fp_walks: usize,
+        fallback_walks: usize,
     ) {
         self.walks = self.walks.saturating_add(walks);
         self.frames_visited = self.frames_visited.saturating_add(frames_visited);
         self.records_matched = self.records_matched.saturating_add(records_matched);
         self.locations_visited = self.locations_visited.saturating_add(locations_visited);
+        self.fp_walks = self.fp_walks.saturating_add(fp_walks);
+        self.fallback_walks = self.fallback_walks.saturating_add(fallback_walks);
     }
 }
 
@@ -1325,6 +1331,8 @@ pub(super) fn root_sources_json(stats: RootSourcesTraceStats) -> serde_json::Val
             "frames_visited": stats.native_stack_maps.frames_visited,
             "records_matched": stats.native_stack_maps.records_matched,
             "locations_visited": stats.native_stack_maps.locations_visited,
+            "fp_walks": stats.native_stack_maps.fp_walks,
+            "fallback_walks": stats.native_stack_maps.fallback_walks,
         },
         "native_stack_fallback": {
             "decision": stats.native_stack_fallback.decision.as_str(),

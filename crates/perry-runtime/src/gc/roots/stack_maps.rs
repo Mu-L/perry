@@ -31,10 +31,55 @@ struct StackMapLocation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StackMapRecord {
     pc: usize,
+    /// The containing function's total frame size from the stack-map header.
+    /// LLVM's AArch64 frame places the `[x29, x30]` pair at the top of the
+    /// frame, so a chain walker can reconstruct the body SP as
+    /// `fp + 16 - stack_size` for SP-relative locations.
+    stack_size: u64,
     locations: Vec<StackMapLocation>,
 }
 
-static STACK_MAPS: OnceLock<Vec<StackMapRecord>> = OnceLock::new();
+/// Parsed section plus the facts the fast walker's preconditions need.
+///
+/// `chain_walkable` is decided once at parse time: the raw x29-chain walk can
+/// recover only the frame pointer (register 29) directly, plus the body SP
+/// (register 31) derived from the header's per-function stack size. Any other
+/// register anywhere in the maps disables the fast path for the whole image
+/// rather than risking a wrong base mid-walk.
+#[derive(Debug, Default)]
+struct StackMapIndex {
+    records: Vec<StackMapRecord>,
+    chain_walkable: bool,
+    min_pc: usize,
+    max_pc: usize,
+}
+
+static STACK_MAPS: OnceLock<StackMapIndex> = OnceLock::new();
+
+const DWARF_REG_FP_AARCH64: u16 = 29;
+const DWARF_REG_SP_AARCH64: u16 = 31;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WalkerMode {
+    /// x29-chain walk when `chain_walkable`, transparent unwinder fallback otherwise.
+    Fast,
+    /// Force the platform unwinder (bisection control).
+    Unwind,
+    /// Run both walks and panic unless they visit the identical slot set.
+    /// This is the only check that can catch a fast walk that silently skips
+    /// frames: forced-evacuation verification enumerates roots through the
+    /// same walker, so it cannot see a slot the walker never reached.
+    Verify,
+}
+
+fn walker_mode() -> WalkerMode {
+    static MODE: OnceLock<WalkerMode> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("PERRY_STACKMAP_WALKER").as_deref() {
+        Ok("unwind") => WalkerMode::Unwind,
+        Ok("verify") => WalkerMode::Verify,
+        _ => WalkerMode::Fast,
+    })
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(in crate::gc) struct NativeStackWalkStats {
@@ -42,6 +87,8 @@ pub(in crate::gc) struct NativeStackWalkStats {
     pub(in crate::gc) frames_visited: usize,
     pub(in crate::gc) records_matched: usize,
     pub(in crate::gc) locations_visited: usize,
+    pub(in crate::gc) fp_walks: usize,
+    pub(in crate::gc) fallback_walks: usize,
 }
 
 #[inline]
@@ -55,6 +102,8 @@ pub(in crate::gc) fn record_native_stack_walk_source(
             stats.frames_visited,
             stats.records_matched,
             stats.locations_visited,
+            stats.fp_walks,
+            stats.fallback_walks,
         );
     }
 }
@@ -63,17 +112,32 @@ pub(in crate::gc) fn initialize() {
     let _ = stack_maps();
 }
 
-fn stack_maps() -> &'static [StackMapRecord] {
-    STACK_MAPS
-        .get_or_init(|| {
-            let Some(section) = loaded_stack_map_section() else {
-                return Vec::new();
-            };
-            let mut records = parse_concatenated_stack_maps(section).unwrap_or_default();
-            records.sort_unstable_by_key(|record| record.pc);
-            records
+fn stack_maps() -> &'static StackMapIndex {
+    STACK_MAPS.get_or_init(|| {
+        let Some(section) = loaded_stack_map_section() else {
+            return StackMapIndex::default();
+        };
+        let mut records = parse_concatenated_stack_maps(section).unwrap_or_default();
+        records.sort_unstable_by_key(|record| record.pc);
+        index_records(records)
+    })
+}
+
+fn index_records(records: Vec<StackMapRecord>) -> StackMapIndex {
+    let chain_walkable = records.iter().all(|record| {
+        record.locations.iter().all(|location| {
+            location.dwarf_reg == DWARF_REG_FP_AARCH64
+                || (location.dwarf_reg == DWARF_REG_SP_AARCH64 && record.stack_size >= 16)
         })
-        .as_slice()
+    });
+    let min_pc = records.first().map_or(usize::MAX, |record| record.pc);
+    let max_pc = records.last().map_or(0, |record| record.pc);
+    StackMapIndex {
+        records,
+        chain_walkable,
+        min_pc,
+        max_pc,
+    }
 }
 
 fn closest_record_pc(maps: &[StackMapRecord], ip: usize) -> Option<usize> {
@@ -98,11 +162,63 @@ fn closest_record_pc(maps: &[StackMapRecord], ip: usize) -> Option<usize> {
 pub(super) fn visit_stack_map_root_slots(
     visit: &mut impl FnMut(MutableRootSlot),
 ) -> NativeStackWalkStats {
-    let maps = stack_maps();
-    if maps.is_empty() {
+    let index = stack_maps();
+    if index.records.is_empty() {
         return NativeStackWalkStats::default();
     }
-    unwind::visit(maps, visit)
+    match walker_mode() {
+        WalkerMode::Unwind => unwind::visit(&index.records, visit),
+        WalkerMode::Fast => {
+            if index.chain_walkable {
+                if let Some(stats) = fp_chain::visit(index, visit) {
+                    return stats;
+                }
+            }
+            let mut stats = unwind::visit(&index.records, visit);
+            stats.fallback_walks = 1;
+            stats
+        }
+        WalkerMode::Verify => verify_visit(index, visit),
+    }
+}
+
+/// Debug-only cross-check: the fast walk reads slot addresses without
+/// mutating, then the unwinder performs the real visitation while recording
+/// what it reached. Any set difference is a missed or invented frame and
+/// panics immediately — this is the liveness gate for the fast walker itself.
+fn verify_visit(
+    index: &StackMapIndex,
+    visit: &mut impl FnMut(MutableRootSlot),
+) -> NativeStackWalkStats {
+    let mut fast_addresses: Vec<usize> = Vec::new();
+    let fast_stats = fp_chain::visit(index, &mut |slot: MutableRootSlot| {
+        fast_addresses.push(slot.ptr as usize);
+    });
+    let Some(fast_stats) = fast_stats else {
+        panic!(
+            "PERRY_STACKMAP_WALKER=verify: fast walk unavailable \
+             (chain_walkable={}, anomaly or unsupported target)",
+            index.chain_walkable
+        );
+    };
+    let mut unwind_addresses: Vec<usize> = Vec::new();
+    let mut stats = unwind::visit(&index.records, &mut |slot: MutableRootSlot| {
+        unwind_addresses.push(slot.ptr as usize);
+        visit(slot);
+    });
+    fast_addresses.sort_unstable();
+    fast_addresses.dedup();
+    unwind_addresses.sort_unstable();
+    unwind_addresses.dedup();
+    assert_eq!(
+        fast_addresses, unwind_addresses,
+        "PERRY_STACKMAP_WALKER=verify: fast walk visited {} unique slots, \
+         unwinder visited {}",
+        fast_addresses.len(),
+        unwind_addresses.len()
+    );
+    stats.fp_walks = fast_stats.fp_walks;
+    stats
 }
 
 fn parse_concatenated_stack_maps(bytes: &[u8]) -> Option<Vec<StackMapRecord>> {
@@ -137,8 +253,9 @@ fn parse_one_stack_map(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, usize)> {
     let mut expected_records = 0usize;
     for _ in 0..function_count {
         let address = read_u64(bytes, offset)? as usize;
+        let stack_size = read_u64(bytes, offset + 8)?;
         let records = read_u64(bytes, offset + 16)? as usize;
-        functions.push((address, records));
+        functions.push((address, stack_size, records));
         expected_records = expected_records.checked_add(records)?;
         offset = offset.checked_add(24)?;
     }
@@ -151,7 +268,7 @@ fn parse_one_stack_map(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, usize)> {
     }
 
     let mut out = Vec::with_capacity(record_count);
-    for (function_address, function_record_count) in functions {
+    for (function_address, function_stack_size, function_record_count) in functions {
         for _ in 0..function_record_count {
             let instruction_offset = read_u32(bytes, offset + 8)? as usize;
             let location_count = read_u16(bytes, offset + 14)? as usize;
@@ -195,6 +312,7 @@ fn parse_one_stack_map(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, usize)> {
 
             out.push(StackMapRecord {
                 pc: function_address.checked_add(instruction_offset)?,
+                stack_size: function_stack_size,
                 locations,
             });
         }
@@ -451,6 +569,149 @@ mod unwind {
     }
 }
 
+/// Raw x29-chain walker.
+///
+/// AArch64 prologues under `"frame-pointer"="non-leaf"` are
+/// `stp x29, x30, [sp, #-16]!; mov x29, sp`, so every frame's x29 points at
+/// a `[caller x29, return address]` pair. One hop is therefore two loads,
+/// against a full unwind step (compact-unwind lookup plus register
+/// recovery) — this is what turns the measured 350:1 frames-to-roots ratio
+/// from a tax into noise.
+///
+/// Fail-closed everywhere: a misaligned, non-increasing, or out-of-bounds
+/// frame pointer abandons the walk with `None` and the caller re-runs the
+/// whole scan through the platform unwinder. Slot visitation is idempotent
+/// (a rewritten slot no longer points at a forwarded object), so a partial
+/// fast walk followed by a full unwinder walk is safe.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod fp_chain {
+    use super::*;
+
+    fn current_frame_pointer() -> usize {
+        let fp: usize;
+        unsafe {
+            core::arch::asm!("mov {fp}, x29", fp = out(reg) fp, options(nomem, nostack));
+        }
+        fp
+    }
+
+    fn stack_top() -> usize {
+        unsafe extern "C" {
+            fn pthread_self() -> usize;
+            fn pthread_get_stackaddr_np(thread: usize) -> *mut c_void;
+        }
+        unsafe { pthread_get_stackaddr_np(pthread_self()) as usize }
+    }
+
+    pub(super) fn visit<F: FnMut(MutableRootSlot)>(
+        index: &StackMapIndex,
+        visit: &mut F,
+    ) -> Option<NativeStackWalkStats> {
+        if !index.chain_walkable {
+            return None;
+        }
+        let top = stack_top();
+        if top == 0 {
+            return None;
+        }
+        let mut stats = NativeStackWalkStats {
+            walks: 1,
+            fp_walks: 1,
+            ..NativeStackWalkStats::default()
+        };
+        let low_pc = index.min_pc.saturating_sub(MAX_SAFEPOINT_RETURN_DELTA);
+        let high_pc = index.max_pc.saturating_add(MAX_SAFEPOINT_RETURN_DELTA);
+        let mut fp = current_frame_pointer();
+        while fp != 0 {
+            if fp & 0xF != 0 || fp.checked_add(16)? > top {
+                return None;
+            }
+            let return_address = unsafe { *((fp + 8) as *const usize) };
+            let caller_fp = unsafe { *(fp as *const usize) };
+            stats.frames_visited = stats.frames_visited.saturating_add(1);
+            if return_address == 0 {
+                break;
+            }
+            if return_address >= low_pc && return_address <= high_pc {
+                if let Some(candidate_pc) = closest_record_pc(&index.records, return_address) {
+                    if return_address.abs_diff(candidate_pc) <= MAX_SAFEPOINT_RETURN_DELTA {
+                        // The record describes the caller's frame; its
+                        // locations are relative to the caller's own x29,
+                        // which is exactly the saved word we just read.
+                        if caller_fp == 0 {
+                            return None;
+                        }
+                        let first = index
+                            .records
+                            .partition_point(|record| record.pc < candidate_pc);
+                        let last = index
+                            .records
+                            .partition_point(|record| record.pc <= candidate_pc);
+                        stats.records_matched = stats
+                            .records_matched
+                            .saturating_add(last.saturating_sub(first));
+                        for record in &index.records[first..last] {
+                            // LLVM's AArch64 frame keeps the [x29, x30] pair
+                            // at the top of the frame, so the caller's body
+                            // SP is its fp + 16 - stack_size. `chain_walkable`
+                            // guaranteed stack_size >= 16 for SP records.
+                            let sp = caller_fp
+                                .checked_add(16)
+                                .and_then(|top| top.checked_sub(record.stack_size as usize));
+                            for location in &record.locations {
+                                stats.locations_visited =
+                                    stats.locations_visited.saturating_add(1);
+                                let base = if location.dwarf_reg == DWARF_REG_FP_AARCH64 {
+                                    Some(caller_fp)
+                                } else {
+                                    sp
+                                };
+                                let Some(base) = base else {
+                                    return None;
+                                };
+                                let address = if location.offset < 0 {
+                                    base.checked_sub(location.offset.unsigned_abs() as usize)
+                                } else {
+                                    base.checked_add(location.offset as usize)
+                                };
+                                let Some(address) = address else {
+                                    continue;
+                                };
+                                if address == 0
+                                    || address & (std::mem::align_of::<u64>() - 1) != 0
+                                {
+                                    continue;
+                                }
+                                visit(MutableRootSlot {
+                                    kind: MutableRootSlotKind::NativeStack,
+                                    ptr: address as *mut u64,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            if caller_fp != 0 && caller_fp <= fp {
+                return None;
+            }
+            fp = caller_fp;
+        }
+        Some(stats)
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+mod fp_chain {
+    use super::*;
+
+    pub(super) fn visit(
+        _index: &StackMapIndex,
+        _visit: &mut impl FnMut(MutableRootSlot),
+    ) -> Option<NativeStackWalkStats> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,6 +766,7 @@ mod tests {
             records,
             vec![StackMapRecord {
                 pc: 0x1010,
+                stack_size: 32,
                 locations: vec![StackMapLocation {
                     dwarf_reg: 29,
                     offset: -8,
@@ -537,6 +799,7 @@ mod tests {
             records,
             vec![StackMapRecord {
                 pc: 0x1020,
+                stack_size: 32,
                 locations: vec![StackMapLocation {
                     dwarf_reg: 29,
                     offset: -16,
@@ -557,14 +820,66 @@ mod tests {
     }
 
     #[test]
+    fn chain_walkable_index_accepts_fp_and_sized_sp_locations_only() {
+        let fp_record = StackMapRecord {
+            pc: 0x1000,
+            stack_size: 0,
+            locations: vec![StackMapLocation {
+                dwarf_reg: DWARF_REG_FP_AARCH64,
+                offset: -8,
+            }],
+        };
+        let sp_record = StackMapRecord {
+            pc: 0x2000,
+            stack_size: 160,
+            locations: vec![StackMapLocation {
+                dwarf_reg: DWARF_REG_SP_AARCH64,
+                offset: 16,
+            }],
+        };
+        let frameless_sp_record = StackMapRecord {
+            pc: 0x3000,
+            stack_size: 0,
+            locations: vec![StackMapLocation {
+                dwarf_reg: DWARF_REG_SP_AARCH64,
+                offset: 8,
+            }],
+        };
+        let other_reg_record = StackMapRecord {
+            pc: 0x4000,
+            stack_size: 160,
+            locations: vec![StackMapLocation {
+                dwarf_reg: 1,
+                offset: 0,
+            }],
+        };
+
+        let walkable = index_records(vec![fp_record.clone(), sp_record.clone()]);
+        assert!(walkable.chain_walkable);
+        assert_eq!(walkable.min_pc, 0x1000);
+        assert_eq!(walkable.max_pc, 0x2000);
+
+        assert!(
+            !index_records(vec![fp_record.clone(), frameless_sp_record]).chain_walkable,
+            "an SP location without a usable frame size must disable the fast walk"
+        );
+        assert!(
+            !index_records(vec![fp_record, other_reg_record]).chain_walkable,
+            "any non-FP/SP register must disable the fast walk"
+        );
+    }
+
+    #[test]
     fn matches_plain_maps_before_and_statepoints_after_unwinder_ips() {
         let maps = vec![
             StackMapRecord {
                 pc: 0x1000,
+                stack_size: 32,
                 locations: Vec::new(),
             },
             StackMapRecord {
                 pc: 0x1020,
+                stack_size: 32,
                 locations: Vec::new(),
             },
         ];
