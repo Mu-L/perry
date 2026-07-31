@@ -254,7 +254,7 @@ pub(crate) fn cp_stdio_js_value(kind: CpStdio, pipe_obj: f64) -> f64 {
 pub(crate) fn cp_apply_live_stdio(
     command: &mut Command,
     stdio: &[CpStdio],
-) -> Vec<(usize, std::fs::File)> {
+) -> std::io::Result<Vec<(usize, std::fs::File)>> {
     let to_stdio = |kind: CpStdio| match kind {
         CpStdio::Pipe => Stdio::piped(),
         CpStdio::Ignore => Stdio::null(),
@@ -276,13 +276,19 @@ pub(crate) fn cp_apply_live_stdio(
                 CpStdio::Pipe => {
                     let mut pipe = [0; 2];
                     if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
-                        continue;
+                        return Err(std::io::Error::last_os_error());
                     }
                     let read = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
                     let write = unsafe { std::fs::File::from_raw_fd(pipe[1]) };
+                    if unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
                     let write_fd = write.as_raw_fd();
+                    if unsafe { libc::fcntl(write_fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                     unsafe {
-                        libc::fcntl(write_fd, libc::F_SETFD, libc::FD_CLOEXEC);
                         command.pre_exec(move || {
                             if libc::dup2(write.as_raw_fd(), fd as i32) < 0
                                 || libc::fcntl(fd as i32, libc::F_SETFD, 0) < 0
@@ -326,12 +332,12 @@ pub(crate) fn cp_apply_live_stdio(
                 CpStdio::Inherit => {}
             }
         }
-        return readers;
+        return Ok(readers);
     }
 
     #[cfg(not(unix))]
     {
-        Vec::new()
+        Ok(Vec::new())
     }
 }
 

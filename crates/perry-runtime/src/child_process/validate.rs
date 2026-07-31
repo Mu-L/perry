@@ -109,7 +109,7 @@ fn cp_validate_stdio_entry(
     fd_index: usize,
     ipc_count: &mut u32,
 ) {
-    if JSValue::from_bits(value.to_bits()).is_null() {
+    if JSValue::from_bits(value.to_bits()).is_null() || cp_is_undefined(value) {
         return;
     }
     if JSValue::from_bits(value.to_bits()).is_any_string() {

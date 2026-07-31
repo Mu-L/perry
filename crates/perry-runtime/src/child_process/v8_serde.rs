@@ -67,6 +67,7 @@ const TAG_BEGIN_JS_SET: u8 = b'\'';
 const TAG_END_JS_SET: u8 = b',';
 const TAG_ERROR: u8 = b'r';
 const TAG_ERROR_MESSAGE: u8 = b'm';
+const TAG_ERROR_CAUSE: u8 = b'c';
 const TAG_ERROR_STACK: u8 = b's';
 const TAG_ERROR_END: u8 = b'.';
 const TAG_ARRAY_BUFFER: u8 = b'B';
@@ -482,8 +483,8 @@ impl Serializer {
                 b'y' => 8,
                 b'u' => 16,
                 b's' => 32,
-                b'd' => 64,
-                b'v' => 128,
+                b'd' => 128,
+                b'v' => 256,
                 _ => 0,
             };
         }
@@ -509,6 +510,10 @@ impl Serializer {
             self.out.push(TAG_ERROR_MESSAGE);
             let message = crate::error::js_error_get_message(error);
             self.write_string(crate::value::js_nanbox_string(message as i64));
+        }
+        if unsafe { crate::error::js_error_has_own_property(error, "cause") } {
+            self.out.push(TAG_ERROR_CAUSE);
+            self.write_value(crate::error::js_error_get_cause(error));
         }
         self.out.push(TAG_ERROR_STACK);
         let stack = crate::error::js_error_get_stack(error);
@@ -823,8 +828,8 @@ impl<'a> Deserializer<'a> {
             (b'y', 8),
             (b'u', 16),
             (b's', 32),
-            (b'd', 64),
-            (b'v', 128),
+            (b'd', 128),
+            (b'v', 256),
         ] {
             if flags & bit != 0 {
                 flag_bytes.push(flag);
@@ -880,15 +885,20 @@ impl<'a> Deserializer<'a> {
         };
         let mut message = cp_undefined();
         let mut stack = cp_undefined();
+        let mut cause = None;
         while self.peek_byte() != Some(TAG_ERROR_END) {
             match self.read_byte()? {
                 TAG_ERROR_MESSAGE => message = self.read_value()?,
                 TAG_ERROR_STACK => stack = self.read_value()?,
+                TAG_ERROR_CAUSE => cause = Some(self.read_value()?),
                 _ => return None,
             }
         }
         self.pos += 1;
         let error = crate::error::js_error_new_kind_from_value(kind, message);
+        if let Some(cause) = cause {
+            unsafe { crate::error::error_set_cause(error, cause) };
+        }
         let stack =
             crate::value::js_get_string_pointer_unified(stack) as *mut crate::string::StringHeader;
         if !stack.is_null() {

@@ -765,10 +765,11 @@ pub extern "C" fn js_child_process_spawn_streams(
 
     // Build + launch the child (honoring `shell`/`cwd`/`env`), non-blocking.
     let mut command = cp_build_command(&cmd_str, &arg_strs, opts_val);
-    let extra_readers = cp_apply_live_stdio(&mut command, &stdio_kinds);
+    let launch = cp_apply_live_stdio(&mut command, &stdio_kinds)
+        .and_then(|extra_readers| command.spawn().map(|child| (child, extra_readers)));
 
-    match command.spawn() {
-        Ok(child) => {
+    match launch {
+        Ok((child, extra_readers)) => {
             let handle = cp_register_live_child(
                 cp,
                 stdout_obj,

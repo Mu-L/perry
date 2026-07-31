@@ -149,20 +149,19 @@ pub extern "C" fn js_child_process_fork(module_ptr: i64, args_ptr: i64, opts_ptr
     cp_apply_argv0(&mut command, opts_val);
     cp_apply_options(&mut command, opts_val);
     cp_apply_detached(&mut command, opts_val);
-    let _ = cp_apply_live_stdio(&mut command, &stdio_kinds);
-
-    let launched = fork_launch(
-        cp,
-        stdout_obj,
-        stderr_obj,
-        stdin_obj,
-        command,
-        advanced,
-        timeout,
-        kill_signal,
-        abort_signal,
-        opts_val,
-    );
+    let launched = cp_apply_live_stdio(&mut command, &stdio_kinds).is_ok()
+        && fork_launch(
+            cp,
+            stdout_obj,
+            stderr_obj,
+            stdin_obj,
+            command,
+            advanced,
+            timeout,
+            kill_signal,
+            abort_signal,
+            opts_val,
+        );
     if !launched {
         // Spawn failure: emit a deferred `error`, leave `connected` false.
         let msg = format!("fork failed: {exec_path}");
