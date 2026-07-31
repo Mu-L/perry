@@ -498,6 +498,90 @@ fn accessor_function_value(bits: u64) -> f64 {
     }
 }
 
+#[derive(Clone, Copy)]
+struct MockMethodOptions {
+    getter: bool,
+    setter: bool,
+}
+
+fn is_non_null_object(value: f64) -> bool {
+    let js = JSValue::from_bits(value.to_bits());
+    js.is_pointer() && !is_callable_value(value)
+}
+
+fn mock_option_bool(options: f64, name: &str, default: bool) -> bool {
+    let Some(value) = object_property(options, name.as_bytes()) else {
+        return default;
+    };
+    match value.to_bits() {
+        crate::value::TAG_TRUE => true,
+        crate::value::TAG_FALSE => false,
+        crate::value::TAG_UNDEFINED => default,
+        _ => throw_invalid_arg_type(&format!("options.{name}"), "boolean", value),
+    }
+}
+
+fn parse_mock_method_options(
+    options: f64,
+    default_getter: bool,
+    default_setter: bool,
+) -> MockMethodOptions {
+    if is_undefined_value(options) {
+        return MockMethodOptions {
+            getter: default_getter,
+            setter: default_setter,
+        };
+    }
+    if !is_non_null_object(options) {
+        throw_invalid_arg_type("options", "object", options);
+    }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let options = scope.root_nanbox_f64(options);
+    let getter = mock_option_bool(options.get_nanbox_f64(), "getter", default_getter);
+    let setter = mock_option_bool(options.get_nanbox_f64(), "setter", default_setter);
+    MockMethodOptions { getter, setter }
+}
+
+fn normalize_mock_method_args(implementation: f64, options: f64) -> (f64, f64) {
+    if is_non_null_object(implementation) {
+        (undefined_value(), implementation)
+    } else {
+        (implementation, options)
+    }
+}
+
+fn throw_invalid_mock_option_value(arg: &str, value: f64, reason: &str) -> ! {
+    crate::validators::throw_invalid_arg_value(
+        arg,
+        reason,
+        &crate::fs::validate::describe_received(value),
+    );
+}
+
+fn validate_mock_accessor_options(options: MockMethodOptions, kind: &str) {
+    if kind == "getter" && !options.getter {
+        throw_invalid_mock_option_value(
+            "options.getter",
+            f64::from_bits(crate::value::TAG_FALSE),
+            "cannot be false",
+        );
+    }
+    if kind == "setter" && !options.setter {
+        throw_invalid_mock_option_value(
+            "options.setter",
+            f64::from_bits(crate::value::TAG_FALSE),
+            "cannot be false",
+        );
+    }
+    if options.getter && options.setter {
+        throw_invalid_mock_option_value(
+            "options.setter",
+            f64::from_bits(crate::value::TAG_TRUE),
+            "cannot be used with 'options.getter'",
+        );
+    }
+}
+
 fn install_accessor_mock(target: f64, property: &str, accessor: crate::object::AccessorDescriptor) {
     let raw = object_target_addr(target);
     let key = js_string_from_bytes(property.as_ptr(), property.len() as u32);
@@ -852,34 +936,54 @@ extern "C" fn mock_method_thunk(
     target: f64,
     property: f64,
     implementation: f64,
+    options: f64,
 ) -> f64 {
-    let property = property_name(property);
-    let original = get_property_value(target, &property);
-    let implementation = if is_undefined_value(implementation) {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let target = scope.root_nanbox_f64(target);
+    let property = scope.root_nanbox_f64(property);
+    let implementation = scope.root_nanbox_f64(implementation);
+    let options = scope.root_nanbox_f64(options);
+    let (implementation, options) =
+        normalize_mock_method_args(implementation.get_nanbox_f64(), options.get_nanbox_f64());
+    let implementation = scope.root_nanbox_f64(implementation);
+    let options = parse_mock_method_options(options, false, false);
+    validate_mock_accessor_options(options, "method");
+    if options.getter {
+        return create_getter_mock(
+            target.get_nanbox_f64(),
+            property.get_nanbox_f64(),
+            implementation.get_nanbox_f64(),
+        );
+    }
+    if options.setter {
+        return create_setter_mock(
+            target.get_nanbox_f64(),
+            property.get_nanbox_f64(),
+            implementation.get_nanbox_f64(),
+        );
+    }
+    let property_name = property_name(property.get_nanbox_f64());
+    let original = get_property_value(target.get_nanbox_f64(), &property_name);
+    let implementation = if is_undefined_value(implementation.get_nanbox_f64()) {
         original
     } else {
-        implementation
+        implementation.get_nanbox_f64()
     };
     assert_callable_arg("implementation", implementation);
     let function = create_mock_function(
         original,
         implementation,
         MockRestoreTarget::ObjectProperty {
-            target,
-            property: property.clone(),
+            target: target.get_nanbox_f64(),
+            property: property_name.clone(),
             original,
         },
     );
-    set_property_value(target, &property, function);
+    set_property_value(target.get_nanbox_f64(), &property_name, function);
     function
 }
 
-extern "C" fn mock_getter_thunk(
-    _closure: *const ClosureHeader,
-    target: f64,
-    property: f64,
-    implementation: f64,
-) -> f64 {
+fn create_getter_mock(target: f64, property: f64, implementation: f64) -> f64 {
     let property = property_name(property);
     let raw = object_target_addr(target);
     let original_accessor = crate::object::get_accessor_descriptor(raw, &property);
@@ -919,12 +1023,31 @@ extern "C" fn mock_getter_thunk(
     function
 }
 
-extern "C" fn mock_setter_thunk(
+extern "C" fn mock_getter_thunk(
     _closure: *const ClosureHeader,
     target: f64,
     property: f64,
     implementation: f64,
+    options: f64,
 ) -> f64 {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let target = scope.root_nanbox_f64(target);
+    let property = scope.root_nanbox_f64(property);
+    let implementation = scope.root_nanbox_f64(implementation);
+    let options = scope.root_nanbox_f64(options);
+    let (implementation, options) =
+        normalize_mock_method_args(implementation.get_nanbox_f64(), options.get_nanbox_f64());
+    let implementation = scope.root_nanbox_f64(implementation);
+    let options = parse_mock_method_options(options, true, false);
+    validate_mock_accessor_options(options, "getter");
+    create_getter_mock(
+        target.get_nanbox_f64(),
+        property.get_nanbox_f64(),
+        implementation.get_nanbox_f64(),
+    )
+}
+
+fn create_setter_mock(target: f64, property: f64, implementation: f64) -> f64 {
     let property = property_name(property);
     let raw = object_target_addr(target);
     let original_accessor = crate::object::get_accessor_descriptor(raw, &property);
@@ -962,6 +1085,30 @@ extern "C" fn mock_setter_thunk(
         },
     );
     function
+}
+
+extern "C" fn mock_setter_thunk(
+    _closure: *const ClosureHeader,
+    target: f64,
+    property: f64,
+    implementation: f64,
+    options: f64,
+) -> f64 {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let target = scope.root_nanbox_f64(target);
+    let property = scope.root_nanbox_f64(property);
+    let implementation = scope.root_nanbox_f64(implementation);
+    let options = scope.root_nanbox_f64(options);
+    let (implementation, options) =
+        normalize_mock_method_args(implementation.get_nanbox_f64(), options.get_nanbox_f64());
+    let implementation = scope.root_nanbox_f64(implementation);
+    let options = parse_mock_method_options(options, false, true);
+    validate_mock_accessor_options(options, "setter");
+    create_setter_mock(
+        target.get_nanbox_f64(),
+        property.get_nanbox_f64(),
+        implementation.get_nanbox_f64(),
+    )
 }
 
 extern "C" fn mock_property_thunk(
@@ -1042,17 +1189,17 @@ fn mock_object_value() -> f64 {
         set_field(
             mock,
             "method",
-            closure_value(mock_method_thunk as *const u8, 3),
+            closure_value(mock_method_thunk as *const u8, 4),
         );
         set_field(
             mock,
             "getter",
-            closure_value(mock_getter_thunk as *const u8, 3),
+            closure_value(mock_getter_thunk as *const u8, 4),
         );
         set_field(
             mock,
             "setter",
-            closure_value(mock_setter_thunk as *const u8, 3),
+            closure_value(mock_setter_thunk as *const u8, 4),
         );
         set_field(
             mock,
@@ -1480,18 +1627,33 @@ pub extern "C" fn js_node_test_mock_fn(
 }
 
 #[no_mangle]
-pub extern "C" fn js_node_test_mock_method(target: f64, property: f64, implementation: f64) -> f64 {
-    mock_method_thunk(std::ptr::null(), target, property, implementation)
+pub extern "C" fn js_node_test_mock_method(
+    target: f64,
+    property: f64,
+    implementation: f64,
+    options: f64,
+) -> f64 {
+    mock_method_thunk(std::ptr::null(), target, property, implementation, options)
 }
 
 #[no_mangle]
-pub extern "C" fn js_node_test_mock_getter(target: f64, property: f64, implementation: f64) -> f64 {
-    mock_getter_thunk(std::ptr::null(), target, property, implementation)
+pub extern "C" fn js_node_test_mock_getter(
+    target: f64,
+    property: f64,
+    implementation: f64,
+    options: f64,
+) -> f64 {
+    mock_getter_thunk(std::ptr::null(), target, property, implementation, options)
 }
 
 #[no_mangle]
-pub extern "C" fn js_node_test_mock_setter(target: f64, property: f64, implementation: f64) -> f64 {
-    mock_setter_thunk(std::ptr::null(), target, property, implementation)
+pub extern "C" fn js_node_test_mock_setter(
+    target: f64,
+    property: f64,
+    implementation: f64,
+    options: f64,
+) -> f64 {
+    mock_setter_thunk(std::ptr::null(), target, property, implementation, options)
 }
 
 #[no_mangle]
@@ -1616,6 +1778,10 @@ pub(crate) fn scan_test_module_roots_mut(visitor: &mut crate::gc::RuntimeRootVis
         }
     });
 }
+
+#[cfg(test)]
+#[path = "test_unit_tests.rs"]
+mod tests;
 
 fn reporter_with_kind(kind: i32, source: f64) -> f64 {
     if JSValue::from_bits(source.to_bits()).is_undefined() {
