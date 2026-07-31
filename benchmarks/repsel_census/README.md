@@ -65,9 +65,18 @@ of them is recorded at the site where the proof is dropped:
 reproducible without the report at all: compile the workload twice, once with
 `PERRY_PTR_SHAPE_LOCALS=0`, and compare the objects.
 
+`--no-link` does **not** honour `-o`: the object goes to a per-run temp
+directory and the path is printed. So capture the printed path in each arm and
+compare those — comparing the `-o` arguments compares two files that were never
+created.
+
 ```bash
-perry compile <src> -o /tmp/x --no-link --no-cache          # prints the .o path
-PERRY_PTR_SHAPE_LOCALS=0 perry compile <src> -o /tmp/x --no-link --no-cache
+obj() {  # echo the object path this compile actually wrote
+  "$@" --no-link --no-cache 2>&1 | sed -n 's/^Wrote object file: //p'
+}
+a=$(obj perry compile <src> -o /tmp/ignored)
+b=$(PERRY_PTR_SHAPE_LOCALS=0 obj perry compile <src> -o /tmp/ignored)
+cmp "$a" "$b" && echo "IDENTICAL — the promotion emitted nothing"
 ```
 
 Byte-identical objects mean the promotions the report counted as wins changed
@@ -75,6 +84,18 @@ nothing. `07_object_create` and `12_binary_trees` are byte-identical today.
 `09_method_calls` differs, but only by two `__pshape` clones with **zero call
 sites** — which is why the census reports its consumption as 0 and the object
 A/B alone would have been misleading.
+
+### Per-site coverage
+
+The consumed count is per **value**, so one working recorder is enough to mark a
+value consumed and the other five could rot unnoticed. `CONSUMPTION_SITES` (in
+the script) registers all six, and a site that records nothing corpus-wide fails
+the run.
+
+This is not hypothetical. When coverage was first measured, four fired and two
+had **never fired on any workload here** —
+`class_field_get_number.shape_proven_load` and `ptr_shape_update`. Both were
+reachable; nothing reached them. `fixture_ptr_shape_sites.ts` exists to.
 
 Only `ptr-shape` has consumption instrumentation. The other seven census keys
 report *no consumption data* rather than a zero

@@ -109,7 +109,13 @@ pub fn render_text(entries: &[Entry]) -> String {
             t.denied,
             t.candidates(),
         );
-        if t.consumed > 0 || t.unconsumed > 0 {
+        // Printed whenever the analysis is INSTRUMENTED, not whenever the
+        // numbers happen to be nonzero. An analysis whose promotions were all
+        // wasted has `consumed == 0` and possibly no mechanism record either;
+        // staying silent there would render the worst case identically to an
+        // uninstrumented analysis, which is the confusion this column exists to
+        // remove.
+        if analysis.records_consumption() {
             let _ = writeln!(
                 out,
                 "  {:<16} {:>4} of those selections were CONSUMED by codegen{}",
@@ -309,6 +315,9 @@ struct JsonAnalysis<'a> {
     denied: usize,
     consumed: usize,
     unconsumed: usize,
+    /// Whether `consumed` means "nothing applied" or "nobody measured". The
+    /// census cross-checks its own table against this, so the two cannot drift.
+    records_consumption: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -356,6 +365,7 @@ pub fn render_json(entries: &[Entry]) -> String {
                         denied: t.denied,
                         consumed: t.consumed,
                         unconsumed: t.unconsumed,
+                        records_consumption: a.records_consumption(),
                     }
                 })
                 .collect(),
@@ -389,6 +399,7 @@ mod tests {
             invoked_per_element: None,
             detail: None,
             byte_offset: None,
+            site: None,
         }
     }
 
@@ -411,6 +422,7 @@ mod tests {
             invoked_per_element: None,
             detail: None,
             byte_offset: None,
+            site: None,
         }
     }
 
@@ -531,6 +543,9 @@ mod tests {
     fn with_outcome(analysis: Analysis, name: &str, outcome: Outcome, rule: Option<&str>) -> Entry {
         let mut e = selected(analysis, name, "Ptr<Shape>");
         e.outcome = outcome;
+        if outcome == Outcome::Consumed {
+            e.site = Some("ptr_shape_set".to_string());
+        }
         e.rule = rule.map(str::to_string);
         e.reason = rule.map(|_| "the context gate dropped it".to_string());
         e.issue = rule.map(|_| "#7109".to_string());
@@ -566,6 +581,56 @@ mod tests {
             text.contains("1 of those selections were CONSUMED by codegen"),
             "the summary must separate selection from consumption; got:\n{text}"
         );
+    }
+
+    /// The worst case: every promotion of an instrumented analysis was wasted,
+    /// and no mechanism was recorded either (the state a
+    /// `PERRY_CANONICAL_I32_LOCALS=0` build produces, where the context gate is
+    /// closed but the env-knob arm deliberately records no denial). The summary
+    /// must still say `0 consumed`; staying silent renders it identically to an
+    /// analysis nobody instrumented.
+    #[test]
+    fn a_fully_wasted_analysis_still_reports_zero_consumed() {
+        let entries = vec![
+            selected(Analysis::PtrShape, "acc", "Ptr<Shape>"),
+            selected(Analysis::PtrShape, "totals", "Ptr<Shape>"),
+        ];
+        let text = render_text(&entries);
+        assert!(
+            text.contains("0 of those selections were CONSUMED by codegen"),
+            "a fully wasted instrumented analysis must still print its zero; got:\n{text}"
+        );
+    }
+
+    /// ...and an UNinstrumented analysis must stay silent, because a printed
+    /// zero there would be a false claim that codegen applied nothing.
+    #[test]
+    fn an_uninstrumented_analysis_prints_no_consumption_line() {
+        let entries = vec![selected(Analysis::CanonicalSlot, "i", "I32")];
+        let text = render_text(&entries);
+        assert!(
+            !text.contains("CONSUMED by codegen"),
+            "canonical-slot records no consumption; a zero there would be a lie; got:\n{text}"
+        );
+    }
+
+    /// The compiler-side flag and the census's `CONSUMPTION_INSTRUMENTED` table
+    /// are two spellings of one fact. Serializing the flag is what lets the
+    /// census detect drift instead of silently trusting its own copy.
+    #[test]
+    fn json_exposes_which_analyses_record_consumption() {
+        let json: serde_json::Value = serde_json::from_str(&render_json(&[selected(
+            Analysis::PtrShape,
+            "a",
+            "Ptr<Shape>",
+        )]))
+        .unwrap();
+        for row in json["summary"]["by_analysis"].as_array().unwrap() {
+            let flag = row["records_consumption"]
+                .as_bool()
+                .unwrap_or_else(|| panic!("missing records_consumption on {row:?}"));
+            assert_eq!(flag, row["analysis"] == "ptr-shape");
+        }
     }
 
     /// A build where every promotion is applied must NOT grow the section —

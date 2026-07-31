@@ -73,7 +73,13 @@ def win(analysis: str, rep: str) -> dict:
     return {"analysis": analysis, "outcome": "selected", "rep": rep}
 
 
-def consumed_entry(analysis: str, local_id, function: str = "f", position: str = "local") -> dict:
+def consumed_entry(
+    analysis: str,
+    local_id,
+    function: str = "f",
+    position: str = "local",
+    site: str = "ptr_shape_set",
+) -> dict:
     return {
         "analysis": analysis,
         "outcome": "consumed",
@@ -81,6 +87,7 @@ def consumed_entry(analysis: str, local_id, function: str = "f", position: str =
         "position": position,
         "local_id": local_id,
         "function": function,
+        "site": site,
     }
 
 
@@ -421,10 +428,53 @@ class Consumption(unittest.TestCase):
                     "w": {
                         "counts": {"ptr-shape": 2, "ptr-shape-consumed": 1},
                         "unconsumed_mechanisms": {"scalar_replaced": 1},
+                        "unconsumed_by_analysis": {"ptr-shape": 1},
                     }
                 }
             )
         )
+
+    def test_a_mechanism_from_another_analysis_does_not_excuse_the_gap(self):
+        """The explanation must belong to the analysis that has the gap.
+
+        `unconsumed_mechanisms` is keyed by rule name only. Summing it across
+        analyses would let a mechanism recorded for `ptr-numarray` excuse a
+        silent `ptr-shape` gap the moment a second analysis is instrumented.
+        """
+        self.assertTrue(
+            CENSUS.check_unconsumed_is_explained(
+                {
+                    "w": {
+                        "counts": {"ptr-shape": 2, "ptr-shape-consumed": 1},
+                        "unconsumed_mechanisms": {"some_other_rule": 3},
+                        "unconsumed_by_analysis": {"ptr-numarray": 3},
+                    }
+                }
+            )
+        )
+
+    def test_the_instrumentation_tables_must_not_drift(self):
+        """`CONSUMPTION_INSTRUMENTED` here vs `records_consumption()` in Rust.
+
+        Two spellings of one fact. A duplicated predicate is tolerable only if
+        something checks it -- the census refuses a report whose compiler-side
+        flag disagrees with its own table.
+        """
+        payload = report(selected={"ptr-shape": 1}, entries=[win("ptr-shape", "Ptr<Shape>")])
+        for row in payload["summary"]["by_analysis"]:
+            row["records_consumption"] = row["analysis"] in CENSUS.CONSUMPTION_INSTRUMENTED
+        CENSUS.census_from_report(payload)  # agrees: fine
+
+        for row in payload["summary"]["by_analysis"]:
+            if row["analysis"] == "ptr-shape":
+                row["records_consumption"] = False
+        with self.assertRaises(HarnessError):
+            CENSUS.census_from_report(payload)
+
+        for row in payload["summary"]["by_analysis"]:
+            row["records_consumption"] = True
+        with self.assertRaises(HarnessError):
+            CENSUS.census_from_report(payload)
 
     def test_the_instrumentation_table_lives_in_code_not_the_baseline(self):
         """Same rule as LIVENESS_FLOORS and ZERO_CANDIDATE_ALLOWLIST.
@@ -468,6 +518,93 @@ class Consumption(unittest.TestCase):
                 f"{analysis} records consumption but no liveness fixture asserts a "
                 f"nonzero {consumed_key}. Without one the consumed column is a "
                 "counter nobody has watched go red.",
+            )
+
+    def test_every_consumption_site_must_fire_somewhere_in_the_corpus(self):
+        """The per-site liveness gate.
+
+        The consumed count is per VALUE, so one working recorder is enough to
+        mark a value consumed and the other five can rot silently. This is what
+        makes that visible -- and it is not hypothetical: when coverage was
+        first measured, `class_field_get_number.shape_proven_load` and
+        `ptr_shape_update` had never fired on any workload in the corpus.
+        """
+        every = {
+            "w": {
+                "consumption_sites": {s: 1 for s in CENSUS.CONSUMPTION_SITES},
+            }
+        }
+        self.assertFalse(CENSUS.check_consumption_site_coverage(every))
+        for missing in CENSUS.CONSUMPTION_SITES:
+            partial = {
+                "w": {
+                    "consumption_sites": {
+                        s: 1 for s in CENSUS.CONSUMPTION_SITES if s != missing
+                    }
+                }
+            }
+            failures = CENSUS.check_consumption_site_coverage(partial)
+            self.assertTrue(
+                any(missing in f for f in failures),
+                f"a dead {missing!r} recorder must be visible",
+            )
+
+    def test_an_unregistered_consumption_site_is_loud(self):
+        """A new consumption lowering must be registered, not absorbed.
+
+        Folding an unknown site into an existing count is how a recorder stops
+        firing without anyone noticing.
+        """
+        payload = report(
+            selected={"ptr-shape": 1},
+            consumed={"ptr-shape": 1},
+            entries=[
+                win("ptr-shape", "Ptr<Shape>"),
+                consumed_entry("ptr-shape", 1, site="brand_new_lowering"),
+            ],
+        )
+        with self.assertRaises(HarnessError):
+            CENSUS.census_from_report(payload)
+
+    def test_a_consumption_entry_with_no_site_is_loud(self):
+        payload = report(
+            selected={"ptr-shape": 1},
+            consumed={"ptr-shape": 1},
+            entries=[win("ptr-shape", "Ptr<Shape>")]
+            + [{k: v for k, v in consumed_entry("ptr-shape", 1).items() if k != "site"}],
+        )
+        with self.assertRaises(HarnessError):
+            CENSUS.census_from_report(payload)
+
+    def test_the_site_registry_lives_in_code_not_the_baseline(self):
+        source = (
+            CENSUS.REPO_ROOT / "scripts/compiler_output_harness/repsel_census.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("CONSUMPTION_SITES: dict[str, str] = {", source)
+        baseline = json.loads(
+            (CENSUS.REPO_ROOT / "benchmarks/repsel_census/baseline.json").read_text()
+        )
+        self.assertNotIn("consumption_sites_registry", baseline)
+
+    def test_the_shipped_baseline_exercises_every_consumption_site(self):
+        """Pins the coverage the site fixture was added to provide.
+
+        `--update` records per-workload site counts as context. If a site drops
+        out of the shipped baseline, the corpus stopped reaching it and the
+        gate above would have gone red on a real run -- this catches it without
+        needing a compiler.
+        """
+        baseline = json.loads(
+            (CENSUS.REPO_ROOT / "benchmarks/repsel_census/baseline.json").read_text()
+        )
+        seen: set[str] = set()
+        for w in baseline["workloads"]:
+            seen.update(w.get("consumption_sites", {}))
+        for site in CENSUS.CONSUMPTION_SITES:
+            self.assertIn(
+                site,
+                seen,
+                f"no workload in the shipped baseline exercises {site!r}",
             )
 
     def test_the_shipped_baseline_shows_a_consumed_gap(self):
