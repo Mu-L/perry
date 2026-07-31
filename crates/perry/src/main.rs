@@ -4,6 +4,8 @@
 
 mod commands;
 mod compat_reports;
+#[cfg(test)]
+mod shadow_layout_contract;
 mod telemetry;
 #[cfg(test)]
 mod test_env_lock;

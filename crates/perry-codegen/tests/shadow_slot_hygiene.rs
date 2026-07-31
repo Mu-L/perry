@@ -1,3 +1,15 @@
+//! NOTE (#7088): the hot shadow-slot stores are now emitted **inline** against
+//! the `ShadowStackState` pointer `js_shadow_frame_enter` returns, not as
+//! `js_shadow_slot_bind` / `js_shadow_slot_set` calls. Each inline site still
+//! emits one of those calls on its null-state fallback arm, at exactly the
+//! position the old unconditional call occupied — LLVM folds the arm away
+//! because the push's return is `nonnull`. The searches below therefore still
+//! locate the right program point, and the *ordering* properties they assert
+//! (bind before clear, clear before the next allocation, slot indices not
+//! shifted by a numeric local) are unchanged. What they no longer prove is
+//! that a call is what executes; `expr::shadow_inline`'s unit tests cover the
+//! emitted shape.
+
 use perry_codegen::{compile_module, AppMetadata, CompileOptions};
 use perry_hir::types::Type;
 use perry_hir::{Expr, Function, Module, ModuleInitKind, Stmt};
@@ -572,7 +584,7 @@ fn function_shadow_slots_clear_dead_values_and_skip_numeric_roots() {
         .expect("LLVM IR should be UTF-8");
 
     assert!(
-        ir.contains("call i64 @js_shadow_frame_push(i32 2)"),
+        ir.contains("call ptr @js_shadow_frame_enter(i32 2)"),
         "known numeric Any local must not reserve a shadow slot"
     );
 
@@ -611,7 +623,7 @@ fn entry_module_top_level_shadow_frame_starts_after_init_prelude() {
         .find("__perry_init_strings_")
         .expect("entry main should initialize module strings before user code");
     let frame_push = main_ir
-        .find("call i64 @js_shadow_frame_push(i32 2)")
+        .find("call ptr @js_shadow_frame_enter(i32 2)")
         .expect("entry main should push a top-level shadow frame");
     let user_alloc = main_ir
         .find("call i64 @js_map_alloc")
@@ -639,7 +651,7 @@ fn entry_module_top_level_shadow_slots_update_and_clear() {
     let main_ir = function_slice(&ir, "main");
 
     assert!(
-        main_ir.contains("call i64 @js_shadow_frame_push(i32 2)"),
+        main_ir.contains("call ptr @js_shadow_frame_enter(i32 2)"),
         "known numeric top-level Any local must not reserve a shadow slot"
     );
 
@@ -680,7 +692,7 @@ fn non_entry_module_init_body_gets_post_init_shadow_frame() {
         .find("__perry_init_strings_")
         .expect("non-entry init body should initialize strings before user code");
     let frame_push = init_ir
-        .find("call i64 @js_shadow_frame_push(i32 2)")
+        .find("call ptr @js_shadow_frame_enter(i32 2)")
         .expect("non-entry init body should push a top-level shadow frame");
     let user_alloc = init_ir
         .find("call i64 @js_map_alloc")
@@ -764,8 +776,14 @@ fn flat_const_row_aliases_do_not_reserve_shadow_slots() {
     .expect("LLVM IR should be UTF-8");
     let main_ir = function_slice(&ir, "main");
 
+    // PRE-EXISTING RED, not caused by #7088: verified by running this suite
+    // against pristine `origin/main` sources, where the same assertion fails
+    // with three reserved slots instead of one. Two row aliases now take a
+    // persistent shadow slot each. This suite runs nightly/at-tag rather than
+    // per-PR, which is how it went red unnoticed. Kept asserting the intended
+    // property, with the string updated for `js_shadow_frame_enter`.
     assert!(
-        main_ir.contains("call i64 @js_shadow_frame_push(i32 1)"),
+        main_ir.contains("call ptr @js_shadow_frame_enter(i32 1)"),
         "only the flat-const table root should reserve a shadow slot"
     );
     assert!(
@@ -782,7 +800,7 @@ fn reassigned_any_from_number_to_pointer_reserves_and_updates_shadow_slot() {
     let fn_ir = function_slice(&ir, "perry_fn_reassigned_any_shadow_ts__probe_reassign");
 
     assert!(
-        fn_ir.contains("call i64 @js_shadow_frame_push(i32 1)"),
+        fn_ir.contains("call ptr @js_shadow_frame_enter(i32 1)"),
         "Any local with a later pointer write must reserve a shadow slot"
     );
     let array_alloc = fn_ir
@@ -806,7 +824,7 @@ fn mixed_any_writes_keep_alias_shadow_slots_precise() {
     );
 
     assert!(
-        fn_ir.contains("call i64 @js_shadow_frame_push(i32 3)"),
+        fn_ir.contains("call ptr @js_shadow_frame_enter(i32 3)"),
         "mixed Any writes must keep source, alias, and later reserved as shadow slots"
     );
     for slot_idx in 0..3 {
@@ -831,7 +849,7 @@ fn closure_body_write_to_captured_outer_local_is_visible_to_shadow_analysis() {
     );
 
     assert!(
-        fn_ir.contains("call i64 @js_shadow_frame_push(i32 2)"),
+        fn_ir.contains("call ptr @js_shadow_frame_enter(i32 2)"),
         "captured Any local written to a pointer inside a closure must keep its outer slot"
     );
     assert!(

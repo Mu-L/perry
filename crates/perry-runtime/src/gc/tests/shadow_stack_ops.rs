@@ -274,8 +274,8 @@ fn bind_roots_the_value_present_at_the_call_not_a_later_store() {
     SHADOW.with(|cell| unsafe {
         let s = &*cell.get();
         let top = s.frame_top;
-        assert_eq!(s.slots[top].value, ptr_bits(0xAAAA_0000));
-        assert_eq!(s.slots[top + 1].value, ptr_bits(0xBBBB_0000));
+        assert_eq!(s.slots()[top].value, ptr_bits(0xAAAA_0000));
+        assert_eq!(s.slots()[top + 1].value, ptr_bits(0xBBBB_0000));
     });
 
     // A bound slot deliberately tracks later mutator stores through the
@@ -468,4 +468,311 @@ fn out_of_range_frame_pop_is_ignored() {
     assert_eq!(js_shadow_slot_get(0), 0x7FFD_0000_0000_0001);
     js_shadow_frame_pop(h);
     assert_eq!(shadow_stack_depth(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// #7088: the inline slot-store addressing contract.
+//
+// Generated code no longer calls `js_shadow_slot_bind` / `js_shadow_slot_set`
+// for the hot per-store root write. It computes the entry address itself from
+// the `ShadowStackState` pointer `js_shadow_frame_enter` returned, using the
+// published `SHADOW_*` offsets, and stores the two words directly.
+//
+// The helpers below are a *faithful Rust transcription of the emitted LLVM IR*
+// -- same offsets, same guards, same order -- so these tests exercise the
+// contract codegen depends on: if an offset, the entry size or the liveness
+// bit moves, or if the state pointer stops naming the same memory the runtime
+// functions write, they fail. What they cannot check is that codegen emits
+// this exact sequence; `shadow_inline`'s IR-shape test covers that half.
+// ---------------------------------------------------------------------------
+
+/// Byte-offset load helper matching the emitted `getelementptr inbounds i8`.
+unsafe fn state_word(state: *mut ShadowStackState, byte_off: usize) -> usize {
+    *(state.cast::<u8>().add(byte_off).cast::<usize>())
+}
+
+/// The emitted inline bind, transcribed. Returns `false` when a guard fired,
+/// i.e. when the emitted code would have skipped the write.
+unsafe fn inline_bind_as_codegen_emits(
+    state: *mut ShadowStackState,
+    idx: u32,
+    local_slot: *mut u64,
+) -> bool {
+    let frame_top = state_word(state, SHADOW_STATE_FRAME_TOP_OFFSET);
+    if frame_top == usize::MAX {
+        return false;
+    }
+    let slot = frame_top + idx as usize;
+    if slot >= state_word(state, SHADOW_STATE_LEN_OFFSET) {
+        return false;
+    }
+    let buf = state_word(state, SHADOW_STATE_PTR_OFFSET) as *mut u8;
+    let entry = buf.add(slot * SHADOW_ENTRY_SIZE);
+    let raw = local_slot as usize;
+    let bound = if raw & SHADOW_SLOT_ACTIVE_BIT == 0 {
+        raw
+    } else {
+        0
+    };
+    *entry.cast::<u64>() = *local_slot;
+    *entry.add(SHADOW_ENTRY_META_OFFSET).cast::<usize>() = bound | SHADOW_SLOT_ACTIVE_BIT;
+    true
+}
+
+/// The emitted inline clear, transcribed.
+unsafe fn inline_clear_as_codegen_emits(state: *mut ShadowStackState, idx: u32) -> bool {
+    let frame_top = state_word(state, SHADOW_STATE_FRAME_TOP_OFFSET);
+    if frame_top == usize::MAX {
+        return false;
+    }
+    let slot = frame_top + idx as usize;
+    if slot >= state_word(state, SHADOW_STATE_LEN_OFFSET) {
+        return false;
+    }
+    let buf = state_word(state, SHADOW_STATE_PTR_OFFSET) as *mut u8;
+    let entry = buf.add(slot * SHADOW_ENTRY_SIZE);
+    let meta_ptr = entry.add(SHADOW_ENTRY_META_OFFSET).cast::<usize>();
+    *entry.cast::<u64>() = 0;
+    *meta_ptr &= !SHADOW_SLOT_ACTIVE_BIT;
+    true
+}
+
+/// `js_shadow_frame_enter` must push exactly the frame `js_shadow_frame_push`
+/// pushes, and hand back a state whose `frame_top` yields the same handle.
+///
+/// Sabotage check: drop the `- SHADOW_STACK_HEADER_SLOTS` from codegen's
+/// handle recovery and the recovered handle stops matching, so every emitted
+/// `js_shadow_frame_pop` would unbalance the stack.
+#[test]
+fn frame_enter_pushes_the_same_frame_and_yields_the_same_handle() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_shadow_stack();
+
+    let before = shadow_stack_depth();
+    let state = js_shadow_frame_enter(3);
+    assert!(
+        !state.is_null(),
+        "frame_enter must return the state address"
+    );
+    assert_eq!(shadow_stack_depth(), before + 1);
+    assert_eq!(
+        state as usize,
+        js_shadow_state_addr() as usize,
+        "frame_enter and state_addr must name the same thread-local"
+    );
+
+    let frame_top = unsafe { state_word(state, SHADOW_STATE_FRAME_TOP_OFFSET) };
+    let recovered_handle = (frame_top - SHADOW_STACK_HEADER_SLOTS) as u64;
+
+    js_shadow_frame_pop(recovered_handle);
+    assert_eq!(
+        shadow_stack_depth(),
+        before,
+        "handle recovered from frame_top must pop the frame frame_enter pushed"
+    );
+}
+
+/// The inline write and the runtime accessor must address the same memory, in
+/// both directions.
+///
+/// Sabotage check: change any `SHADOW_STATE_*` offset, `SHADOW_ENTRY_SIZE` or
+/// `SHADOW_ENTRY_META_OFFSET` and this fails.
+#[test]
+fn inline_write_and_runtime_accessor_address_the_same_entry() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_shadow_stack();
+    let state = js_shadow_frame_enter(2);
+    let handle =
+        unsafe { state_word(state, SHADOW_STATE_FRAME_TOP_OFFSET) } - SHADOW_STACK_HEADER_SLOTS;
+
+    // inline write -> runtime read
+    let mut storage: u64 = 0x7FFD_0000_DEAD_BEEF;
+    assert!(unsafe { inline_bind_as_codegen_emits(state, 1, &mut storage as *mut u64) });
+    assert_eq!(
+        js_shadow_slot_get(1),
+        0x7FFD_0000_DEAD_BEEF,
+        "runtime accessor must observe the inline write"
+    );
+
+    // runtime write -> inline read
+    let mut other: u64 = 0x7FFF_0000_0000_00AA;
+    js_shadow_slot_bind(0, &mut other as *mut u64);
+    let buf = unsafe { state_word(state, SHADOW_STATE_PTR_OFFSET) } as *const u8;
+    let frame_top = unsafe { state_word(state, SHADOW_STATE_FRAME_TOP_OFFSET) };
+    let entry = unsafe { buf.add(frame_top * SHADOW_ENTRY_SIZE) };
+    assert_eq!(
+        unsafe { *entry.cast::<u64>() },
+        0x7FFF_0000_0000_00AA,
+        "inline addressing must observe the runtime write"
+    );
+    assert_eq!(
+        unsafe { *entry.add(SHADOW_ENTRY_META_OFFSET).cast::<usize>() },
+        (&mut other as *mut u64 as usize) | SHADOW_SLOT_ACTIVE_BIT,
+        "inline addressing must see the binding the runtime recorded"
+    );
+
+    js_shadow_frame_pop(handle as u64);
+}
+
+/// The inline clear must leave the binding in place with the liveness bit
+/// dropped -- the same state `js_shadow_slot_set(idx, 0)` leaves, so a later
+/// re-activation still writes through to the same compiled local.
+///
+/// Sabotage check: make the inline clear zero `meta` outright and the
+/// re-activated slot stops writing through to `storage`.
+#[test]
+fn inline_clear_matches_the_runtime_clear_and_keeps_the_binding() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_shadow_stack();
+    let state = js_shadow_frame_enter(1);
+    let handle =
+        unsafe { state_word(state, SHADOW_STATE_FRAME_TOP_OFFSET) } - SHADOW_STACK_HEADER_SLOTS;
+
+    let mut storage: u64 = 0x7FFD_0000_0000_1111;
+    js_shadow_slot_bind(0, &mut storage as *mut u64);
+    assert_eq!(scanner_slot_values().len(), 1, "slot starts live");
+
+    assert!(unsafe { inline_clear_as_codegen_emits(state, 0) });
+    assert!(
+        scanner_slot_values().is_empty(),
+        "cleared slot must not be reported as a root"
+    );
+    assert_eq!(js_shadow_slot_get(0), 0, "cleared slot reads as dead");
+
+    // Re-activation still writes through the retained binding.
+    js_shadow_slot_set(0, 0x7FFD_0000_0000_2222);
+    assert_eq!(
+        storage, 0x7FFD_0000_0000_2222,
+        "inline clear must keep the binding so re-activation writes through"
+    );
+
+    js_shadow_frame_pop(handle as u64);
+}
+
+/// A value written by the inline sequence must be marked and rewritten by an
+/// evacuating collection exactly as one written through `js_shadow_slot_bind`.
+///
+/// This is the liveness + rewritability property for the inline path. Sabotage
+/// check: drop the `| SHADOW_SLOT_ACTIVE_BIT` from the inline meta write and
+/// the scanner skips the entry, so the object is collected and `storage` no
+/// longer points into the heap.
+#[test]
+fn inline_bound_slot_survives_and_is_rewritten_by_a_copying_minor() {
+    let _guard = CopyingNurseryTestGuard::new(1);
+    reset_shadow_stack();
+    let state = js_shadow_frame_enter(1);
+
+    let child = young_leaf();
+    let mut storage: u64 = ptr_bits(child);
+    assert!(unsafe { inline_bind_as_codegen_emits(state, 0, &mut storage as *mut u64) });
+
+    let _ = gc_collect_minor();
+
+    let moved = (storage & POINTER_MASK) as usize;
+    assert_ne!(moved, 0, "inline-bound local was cleared by the collection");
+    assert_ne!(moved, child, "test did not actually evacuate the object");
+    assert!(
+        crate::arena::pointer_in_nursery(moved) || crate::arena::pointer_in_old_gen(moved),
+        "inline-bound local must hold a live heap address after collection"
+    );
+    assert_eq!(
+        js_shadow_slot_get(0),
+        storage,
+        "slot read must observe the rewritten compiled local"
+    );
+}
+
+/// The `frame_top == usize::MAX` sentinel guard, mirroring the one in
+/// `js_shadow_slot_set` / `js_shadow_slot_bind`.
+///
+/// Honest scope: in a *balanced* program the guard is unreachable, because
+/// `frame_top == usize::MAX` implies `len == 0` (the outermost pop restores
+/// both), so the bounds check alone would already skip the write. It is kept
+/// because the emitted sequence must be observably identical to the runtime
+/// function it replaces, and because if the two ever *can* diverge the failure
+/// mode is silent corruption rather than a skip: `usize::MAX + idx` wraps to
+/// `idx - 1`, which for `idx >= 1` is an in-bounds index into the frame
+/// *header* — overwriting `prev_frame_top` and `slot_count` and unlinking every
+/// outer frame from the root scan.
+///
+/// So the test forces exactly that state rather than pretending a balanced
+/// program reaches it. Sabotage check: drop the sentinel test from
+/// `inline_bind_as_codegen_emits` (and from the emitter it transcribes) and the
+/// header is overwritten instead of the write being skipped.
+#[test]
+fn inline_write_with_no_frame_installed_is_skipped_not_wrapped() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_shadow_stack();
+    let state = js_shadow_frame_enter(2);
+    let handle =
+        unsafe { state_word(state, SHADOW_STATE_FRAME_TOP_OFFSET) } - SHADOW_STACK_HEADER_SLOTS;
+
+    // Snapshot the frame header, then force the no-frame sentinel while the
+    // buffer still holds this frame's entries.
+    let buf = unsafe { state_word(state, SHADOW_STATE_PTR_OFFSET) } as *mut u8;
+    let header_before = unsafe { *buf.cast::<u64>() };
+    let header_meta_before = unsafe { *buf.add(SHADOW_ENTRY_META_OFFSET).cast::<usize>() };
+    unsafe {
+        *(state
+            .cast::<u8>()
+            .add(SHADOW_STATE_FRAME_TOP_OFFSET)
+            .cast::<usize>()) = usize::MAX;
+    }
+
+    let mut storage: u64 = 0x7FFD_0000_0000_9999;
+    assert!(
+        !unsafe { inline_bind_as_codegen_emits(state, 1, &mut storage as *mut u64) },
+        "inline write must be skipped when no frame is installed"
+    );
+    assert!(
+        !unsafe { inline_clear_as_codegen_emits(state, 1) },
+        "inline clear must be skipped when no frame is installed"
+    );
+    assert_eq!(
+        unsafe { *buf.cast::<u64>() },
+        header_before,
+        "a skipped write must not have wrapped into the frame header's \
+         prev_frame_top word"
+    );
+    assert_eq!(
+        unsafe { *buf.add(SHADOW_ENTRY_META_OFFSET).cast::<usize>() },
+        header_meta_before,
+        "a skipped write must not have wrapped into the frame header's \
+         slot_count word"
+    );
+
+    // Restore a coherent state so the frame can be popped.
+    unsafe {
+        *(state
+            .cast::<u8>()
+            .add(SHADOW_STATE_FRAME_TOP_OFFSET)
+            .cast::<usize>()) = handle + SHADOW_STACK_HEADER_SLOTS;
+    }
+    js_shadow_frame_pop(handle as u64);
+}
+
+/// An out-of-range slot index must be skipped, matching the runtime
+/// functions' `slot >= len` guard, rather than writing past the frame.
+#[test]
+fn inline_write_past_the_frame_is_skipped() {
+    let _guard = GcTestIsolationGuard::new();
+    reset_shadow_stack();
+    let state = js_shadow_frame_enter(1);
+    let handle =
+        unsafe { state_word(state, SHADOW_STATE_FRAME_TOP_OFFSET) } - SHADOW_STACK_HEADER_SLOTS;
+
+    let len_before = unsafe { state_word(state, SHADOW_STATE_LEN_OFFSET) };
+    let mut storage: u64 = 0x7FFD_0000_0000_7777;
+    // Slot 5 in a 1-slot frame is past the end of the buffer.
+    assert!(
+        !unsafe { inline_bind_as_codegen_emits(state, 5, &mut storage as *mut u64) },
+        "out-of-range inline write must be skipped"
+    );
+    assert_eq!(
+        unsafe { state_word(state, SHADOW_STATE_LEN_OFFSET) },
+        len_before,
+        "a skipped write must not disturb the buffer"
+    );
+
+    js_shadow_frame_pop(handle as u64);
 }
