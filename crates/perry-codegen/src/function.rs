@@ -1314,8 +1314,19 @@ fn lower_precise_roots_to_native_stack(
         let is_compiler_only = direct_callee.is_some_and(|callee| callee.starts_with("llvm."))
             || trimmed.contains("call void asm ");
         let cannot_collect = direct_callee.is_some_and(|callee| {
-            crate::gc_call_effects::classify_direct_callee(callee)
-                == crate::gc_call_effects::GcCallEffect::CannotCollect
+            match crate::gc_call_effects::classify_direct_callee(callee) {
+                crate::gc_call_effects::GcCallEffect::CannotCollect => true,
+                // Under the explicit-safepoint contract the runtime
+                // guarantees these helpers' triggers never consume this
+                // frame's precise roots (they defer to a declared safepoint
+                // or collect behind a forced conservative scan), so the
+                // call site needs no metadata. Without the contract they
+                // stay safepoints.
+                crate::gc_call_effects::GcCallEffect::AllocNoReentry => {
+                    crate::codegen::helpers::gc_safepoint_only_contract_enabled()
+                }
+                crate::gc_call_effects::GcCallEffect::Unknown => false,
+            }
         });
         if is_compiler_only || cannot_collect {
             // LLVM intrinsics, zero-instruction compiler barriers, and

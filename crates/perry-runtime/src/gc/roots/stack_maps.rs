@@ -112,6 +112,13 @@ pub(in crate::gc) fn initialize() {
     let _ = stack_maps();
 }
 
+/// Whether this image carries any native stack-map records — i.e. whether
+/// precise frame roots depend on mapped PCs at all. Consumed by the
+/// `PERRY_GC_SAFEPOINT_ONLY` contract assert.
+pub(in crate::gc) fn native_maps_active() -> bool {
+    !stack_maps().records.is_empty()
+}
+
 fn stack_maps() -> &'static StackMapIndex {
     STACK_MAPS.get_or_init(|| {
         let Some(section) = loaded_stack_map_section() else {

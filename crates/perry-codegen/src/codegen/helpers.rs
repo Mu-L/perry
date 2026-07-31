@@ -115,6 +115,23 @@ pub(crate) fn native_stack_roots_enabled() -> bool {
     stack_maps_enabled() || statepoints_enabled()
 }
 
+/// `PERRY_GC_SAFEPOINT_ONLY=1` — the explicit-safepoint collection contract
+/// (research, `exp/stackmap-viability`). The runtime enforces that a
+/// precise-root collection only begins at a declared safepoint; under that
+/// guarantee, audited allocate-but-never-reenter helpers
+/// (`GcCallEffect::AllocNoReentry`) need no statepoint. Participates in both
+/// build and object cache keys.
+pub(crate) fn gc_safepoint_only_contract_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        matches!(
+            std::env::var("PERRY_GC_SAFEPOINT_ONLY").as_deref(),
+            Ok("1") | Ok("on") | Ok("true") | Ok("strict")
+        )
+    })
+}
+
 /// Inline shadow-slot store gate (#7088). Default ON.
 ///
 /// When enabled, a store to a GC-rooted local is emitted as an address

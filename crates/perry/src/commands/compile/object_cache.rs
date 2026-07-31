@@ -807,6 +807,13 @@ fn compute_object_cache_key_with_env(
         "env_statepoints",
         env_var("PERRY_STATEPOINTS").as_deref().unwrap_or(""),
     );
+    // Explicit-safepoint contract: flips audited AllocNoReentry helpers
+    // between statepoint and plain call. Two arms sharing a cached object
+    // would make the contract's metadata reduction unmeasurable.
+    h.field(
+        "env_gc_safepoint_only",
+        env_var("PERRY_GC_SAFEPOINT_ONLY").as_deref().unwrap_or(""),
+    );
     // #7088: flips the shadow-slot store between an inline sequence and the
     // `js_shadow_slot_*` calls. Two arms that shared a cached object would
     // silently measure the same code.

@@ -12,6 +12,17 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GcCallEffect {
     CannotCollect,
+    /// May allocate — and therefore arm a GC trigger — but never runs a
+    /// collection synchronously inside the call and never re-enters generated
+    /// JS (no getters, setters, valueOf/toString coercion, or callbacks).
+    ///
+    /// Only meaningful under `PERRY_GC_SAFEPOINT_ONLY`: the runtime contract
+    /// guarantees any trigger these helpers arm either defers to a declared
+    /// safepoint (moving) or collects behind a forced conservative scan (the
+    /// alloc-point valve), so the caller's precise frame roots are never
+    /// consumed at this call site and it needs no statepoint. Without the
+    /// contract these remain safepoints.
+    AllocNoReentry,
     Unknown,
 }
 
@@ -70,6 +81,17 @@ pub(crate) fn classify_direct_callee(name: &str) -> GcCallEffect {
         | "js_implicit_this_set"
         | "js_new_target_get"
         | "js_new_target_set" => GcCallEffect::CannotCollect,
+        // Audited allocate-but-never-reenter helpers (2026-07-31): each body
+        // was checked for closure invocation, coercion (valueOf/toString),
+        // and accessor dispatch — none present, and none takes a receiver
+        // that could route through user code (`js_array_length` takes a
+        // typed `*const ArrayHeader`, not a JSValue). The forced-evacuation
+        // probe gates backstop the audit.
+        "js_closure_alloc_singleton"
+        | "js_object_alloc_class_inline_keys"
+        | "js_array_push_f64"
+        | "js_array_length"
+        | "js_array_slice_values" => GcCallEffect::AllocNoReentry,
         _ => GcCallEffect::Unknown,
     }
 }
@@ -102,6 +124,33 @@ mod tests {
             "js_gc_loop_safepoint",
             "js_alloc_object",
             "user_function",
+        ] {
+            assert_eq!(
+                classify_direct_callee(name),
+                GcCallEffect::Unknown,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn audited_alloc_helpers_are_contract_only_non_safepoints() {
+        for name in ["js_closure_alloc_singleton", "js_array_push_f64"] {
+            assert_eq!(
+                classify_direct_callee(name),
+                GcCallEffect::AllocNoReentry,
+                "{name}"
+            );
+        }
+        // Re-entering helpers must never be in the AllocNoReentry class:
+        // a poll can fire inside the callback/getter with this frame
+        // mid-stack, and the caller's roots must be findable.
+        for name in [
+            "js_array_map",
+            "js_array_sort_with_comparator",
+            "js_number_coerce",
+            "js_dynamic_string_or_number_add",
+            "js_object_get_field_by_name_f64",
         ] {
             assert_eq!(
                 classify_direct_callee(name),
