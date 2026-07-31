@@ -663,6 +663,10 @@ pub fn gc_init() {
 
 #[no_mangle]
 pub extern "C" fn js_gc_init() {
+    // Parse LLVM stack-map metadata before the first collection. The parser
+    // allocates its immutable index once; root scans themselves must remain
+    // allocation-free while the collector owns the heap.
+    initialize_stack_maps();
     // Windows: opt console stdout/stderr into VT/ANSI escape processing
     // once at program start so runtime-emitted escapes (console.clear, tty
     // cursor ops, color output keyed off isTTY) render instead of printing

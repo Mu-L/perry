@@ -74,6 +74,47 @@ pub(super) fn shadow_stack_enabled() -> bool {
     })
 }
 
+/// Research-only precise-root backend using LLVM's
+/// `llvm.experimental.stackmap` intrinsic.
+///
+/// `PERRY_STACK_MAPS=1` keeps the existing pointer-local/liveness analysis but
+/// changes the storage and discovery mechanism: roots remain in their native
+/// frame allocas and LLVM records those writable locations at call sites. The
+/// runtime can then unwind the native stack and visit the exact slots without
+/// a parallel heap-backed shadow stack.
+///
+/// This is intentionally opt-in while the experiment establishes correctness,
+/// target coverage, and performance. It is independent of
+/// `PERRY_SHADOW_STACK=0`: the latter still disables precise-root analysis
+/// entirely, while this selects the backend used when that analysis is on.
+pub(crate) fn stack_maps_enabled() -> bool {
+    matches!(
+        std::env::var("PERRY_STACK_MAPS").as_deref(),
+        Ok("1") | Ok("on") | Ok("true")
+    )
+}
+
+/// Research-only moving-GC backend using LLVM's explicit statepoint
+/// relocation sequence.
+///
+/// This is separate from `PERRY_STACK_MAPS` so the two native-stack
+/// prototypes can be measured independently. Statepoint mode still consumes
+/// LLVM's stack-map section at runtime, but supported calls are represented
+/// by `gc.statepoint` / `gc.result` / `gc.relocate` instead of a standalone
+/// metadata marker plus compiler memory barriers.
+pub(crate) fn statepoints_enabled() -> bool {
+    matches!(
+        std::env::var("PERRY_STATEPOINTS").as_deref(),
+        Ok("1") | Ok("on") | Ok("true")
+    )
+}
+
+/// Whether precise roots should use a native-stack metadata backend rather
+/// than Perry's heap-backed shadow frame.
+pub(crate) fn native_stack_roots_enabled() -> bool {
+    stack_maps_enabled() || statepoints_enabled()
+}
+
 /// Inline shadow-slot store gate (#7088). Default ON.
 ///
 /// When enabled, a store to a GC-rooted local is emitted as an address

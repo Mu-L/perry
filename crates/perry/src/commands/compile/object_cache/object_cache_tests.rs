@@ -583,6 +583,8 @@ fn key_changes_with_codegen_env_vars() {
         "PERRY_LLVM_CLANG",
         "PERRY_WRITE_BARRIERS",
         "PERRY_SHADOW_STACK",
+        "PERRY_STACK_MAPS",
+        "PERRY_STATEPOINTS",
         "PERRY_DISABLE_BUFFER_FAST_PATH",
         "PERRY_VERIFY_NATIVE_REGIONS",
         "PERRY_UNBOXED_OBJECT_FIELDS",

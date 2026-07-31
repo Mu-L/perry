@@ -5,7 +5,9 @@ mod runtime_handles;
 mod scan_mode;
 mod scanner_shims;
 mod shadow_stack;
+mod stack_maps;
 mod temp_roots;
+pub(super) use stack_maps::initialize as initialize_stack_maps;
 
 pub(super) use runtime_handles::{
     new_runtime_handle_root_scan_state, scan_runtime_handle_roots_mut,
@@ -1371,6 +1373,7 @@ impl MutableRootSlot {
 /// mutable slot addresses so the same walk can support mark-only
 /// scanning and post-forwarding rewrites.
 pub(super) fn visit_shadow_stack_root_slots(mut visit: impl FnMut(MutableRootSlot)) {
+    stack_maps::visit_stack_map_root_slots(&mut visit);
     SHADOW.with(|cell| unsafe {
         let s = &mut *cell.get();
         if s.len == 0 || s.ptr.is_null() {

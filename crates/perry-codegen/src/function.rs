@@ -127,6 +127,14 @@ pub struct LlFunction {
     shadow_frame_push: Option<ShadowFramePush>,
     /// Slot count currently baked into that push line.
     shadow_frame_slot_count: u32,
+    /// Research backend: preserve the existing precise-root slot numbering,
+    /// but encode the slots in LLVM stack maps instead of allocating a
+    /// parallel runtime shadow frame.
+    stack_map_requested: bool,
+    /// Logical root slots reserved by the existing liveness analysis. The
+    /// final IR pass resolves these indices to the native allocas named by
+    /// `js_shadow_slot_bind` calls, removes the calls, and emits stack maps.
+    stack_map_slot_count: u32,
     /// Runtime hooks emitted immediately before each non-pointer `ret`.
     /// Entry/module-init functions use this for process-level diagnostics
     /// that must run regardless of which block reaches the normal epilogue.
@@ -227,6 +235,8 @@ impl LlFunction {
             shadow_frame_post_init_region: false,
             shadow_frame_push: None,
             shadow_frame_slot_count: 0,
+            stack_map_requested: false,
+            stack_map_slot_count: 0,
             pre_return_void_calls: Vec::new(),
         }
     }
@@ -267,6 +277,13 @@ impl LlFunction {
     }
 
     fn enable_shadow_frame_inner(&mut self, slot_count: u32, post_init: bool) {
+        if crate::codegen::helpers::native_stack_roots_enabled() {
+            self.shadow_frame_requested = true;
+            self.shadow_frame_post_init_region = post_init;
+            self.stack_map_requested = slot_count != 0;
+            self.stack_map_slot_count = slot_count;
+            return;
+        }
         if self.shadow_frame_slot.is_some() {
             return;
         }
@@ -353,6 +370,12 @@ impl LlFunction {
     pub fn reserve_shadow_slot(&mut self) -> Option<u32> {
         if !self.shadow_frame_requested {
             return None;
+        }
+        if crate::codegen::helpers::native_stack_roots_enabled() {
+            let idx = self.stack_map_slot_count;
+            self.stack_map_slot_count += 1;
+            self.stack_map_requested = true;
+            return Some(idx);
         }
         if self.shadow_frame_push.is_none() {
             let post_init = self.shadow_frame_post_init_region;
@@ -612,9 +635,17 @@ impl LlFunction {
         } else {
             ""
         };
+        let gc_strategy = if self.stack_map_requested
+            && crate::codegen::helpers::statepoints_enabled()
+            && !self.has_try
+        {
+            " gc \"statepoint-example\""
+        } else {
+            ""
+        };
         let mut ir = format!(
-            "define {}{} @{}({}){} {{\n",
-            linkage, self.return_type, self.name, param_str, attrs
+            "define {}{} @{}({}){}{} {{\n",
+            linkage, self.return_type, self.name, param_str, attrs, gc_strategy
         );
 
         for (i, blk) in self.blocks.iter().enumerate() {
@@ -714,6 +745,20 @@ impl LlFunction {
             ir
         };
 
+        // Research backend: turn the existing shadow-slot binding IR into
+        // native-frame stack maps only after lowering is complete, when every
+        // lazily-reserved scalar root and every call site is visible.
+        let ir = if self.stack_map_requested {
+            let backend = if crate::codegen::helpers::statepoints_enabled() && !self.has_try {
+                PreciseRootBackend::Statepoint
+            } else {
+                PreciseRootBackend::StackMap
+            };
+            lower_precise_roots_to_native_stack(&ir, self.stack_map_slot_count, backend)
+        } else {
+            ir
+        };
+
         // setjmp volatile promotion (#6385).
         //
         // Runs LAST so it sees every instruction, including the ones the
@@ -731,5 +776,688 @@ impl LlFunction {
         }
 
         ir
+    }
+}
+
+fn parse_shadow_bind(line: &str) -> Option<(usize, String)> {
+    let rest = line
+        .trim()
+        .strip_prefix("call void @js_shadow_slot_bind(i32 ")?;
+    let (idx, ptr) = rest.split_once(", ptr ")?;
+    let ptr = ptr.strip_suffix(')')?.trim();
+    Some((idx.parse().ok()?, ptr.to_string()))
+}
+
+fn parse_shadow_set(line: &str) -> Option<(usize, String)> {
+    let rest = line
+        .trim()
+        .strip_prefix("call void @js_shadow_slot_set(i32 ")?;
+    let (idx, value) = rest.split_once(", i64 ")?;
+    let value = value.strip_suffix(')')?.trim();
+    Some((idx.parse().ok()?, value.to_string()))
+}
+
+/// Compute a conservative set of active logical shadow slots before each IR
+/// line. Joins use union ("active on any incoming path"), so a stale local can
+/// be retained but a live root cannot be omitted.
+fn stack_map_active_slots(
+    lines: &[&str],
+    slot_count: u32,
+) -> Vec<Option<std::collections::HashSet<usize>>> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    #[derive(Debug)]
+    struct Block {
+        first_line: usize,
+        end_line: usize,
+        successors: Vec<usize>,
+    }
+
+    fn label_name(line: &str) -> Option<&str> {
+        if line.starts_with(char::is_whitespace) {
+            return None;
+        }
+        line.strip_suffix(':')
+            .filter(|name| !name.is_empty() && !name.starts_with(';'))
+    }
+
+    fn referenced_labels(line: &str) -> Vec<&str> {
+        let mut labels = Vec::new();
+        let mut rest = line;
+        while let Some(pos) = rest.find("label %") {
+            let after = &rest[pos + "label %".len()..];
+            let len = after
+                .bytes()
+                .take_while(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'$')
+                })
+                .count();
+            if len == 0 {
+                break;
+            }
+            labels.push(&after[..len]);
+            rest = &after[len..];
+        }
+        labels
+    }
+
+    let labels: Vec<(usize, &str)> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| label_name(line).map(|name| (idx, name)))
+        .collect();
+    let mut states = vec![None; lines.len()];
+    if labels.is_empty() {
+        return states;
+    }
+
+    let label_to_block: HashMap<&str, usize> = labels
+        .iter()
+        .enumerate()
+        .map(|(block, (_, name))| (*name, block))
+        .collect();
+    let mut blocks: Vec<Block> = labels
+        .iter()
+        .enumerate()
+        .map(|(block, (label_line, _))| Block {
+            first_line: label_line + 1,
+            end_line: labels
+                .get(block + 1)
+                .map_or(lines.len(), |(next_line, _)| *next_line),
+            successors: Vec::new(),
+        })
+        .collect();
+    for block in &mut blocks {
+        let mut seen = HashSet::new();
+        for line in &lines[block.first_line..block.end_line] {
+            for label in referenced_labels(line) {
+                if let Some(&successor) = label_to_block.get(label) {
+                    if seen.insert(successor) {
+                        block.successors.push(successor);
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_root_op(state: &mut HashSet<usize>, line: &str, slot_count: u32) {
+        if let Some((idx, _)) = parse_shadow_bind(line) {
+            if idx < slot_count as usize {
+                state.insert(idx);
+            }
+        } else if let Some((idx, value)) = parse_shadow_set(line) {
+            if idx < slot_count as usize {
+                if value == "0" {
+                    state.remove(&idx);
+                } else {
+                    state.insert(idx);
+                }
+            }
+        }
+    }
+
+    let mut entries: Vec<Option<HashSet<usize>>> = vec![None; blocks.len()];
+    entries[0] = Some(HashSet::new());
+    let mut work = VecDeque::from([0usize]);
+    while let Some(block_idx) = work.pop_front() {
+        let Some(mut state) = entries[block_idx].clone() else {
+            continue;
+        };
+        let block = &blocks[block_idx];
+        for line in &lines[block.first_line..block.end_line] {
+            apply_root_op(&mut state, line, slot_count);
+        }
+        for &successor in &block.successors {
+            let changed = match &mut entries[successor] {
+                Some(existing) => {
+                    let old_len = existing.len();
+                    existing.extend(state.iter().copied());
+                    existing.len() != old_len
+                }
+                entry @ None => {
+                    *entry = Some(state.clone());
+                    true
+                }
+            };
+            if changed {
+                work.push_back(successor);
+            }
+        }
+    }
+
+    for (block_idx, block) in blocks.iter().enumerate() {
+        let Some(mut state) = entries[block_idx].clone() else {
+            continue;
+        };
+        for (line_idx, line) in lines
+            .iter()
+            .enumerate()
+            .take(block.end_line)
+            .skip(block.first_line)
+        {
+            states[line_idx] = Some(state.clone());
+            apply_root_op(&mut state, line, slot_count);
+        }
+    }
+    states
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreciseRootBackend {
+    StackMap,
+    Statepoint,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DirectCall<'a> {
+    result: Option<&'a str>,
+    return_type: &'a str,
+    callee: &'a str,
+    args: Vec<&'a str>,
+    arg_types: Vec<&'a str>,
+}
+
+fn split_call_args(args: &str) -> Option<Vec<&str>> {
+    if args.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (idx, ch) in args.char_indices() {
+        match ch {
+            '(' | '[' | '{' | '<' => depth += 1,
+            ')' | ']' | '}' | '>' => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            ',' if depth == 0 => {
+                out.push(args[start..idx].trim());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    out.push(args[start..].trim());
+    Some(out)
+}
+
+fn statepoint_scalar_type(arg: &str) -> Option<&str> {
+    let ty = arg.split_ascii_whitespace().next()?;
+    matches!(
+        ty,
+        "i1" | "i8" | "i16" | "i32" | "i64" | "i128" | "float" | "double" | "ptr"
+    )
+    .then_some(ty)
+}
+
+/// Parse the deliberately small direct-call subset emitted by `LlBlock`.
+///
+/// Calls with tail markers, operand attributes, aggregate types, inline asm,
+/// indirect targets, or call-site suffixes stay on the plain stack-map
+/// fallback. That keeps the research mode correct while making its explicit
+/// statepoint coverage measurable and easy to expand.
+fn parse_direct_statepoint_call(line: &str) -> Option<DirectCall<'_>> {
+    let trimmed = line.trim();
+    let (result, call) = if let Some(call) = trimmed.strip_prefix("call ") {
+        (None, call)
+    } else {
+        let (result, call) = trimmed.split_once(" = call ")?;
+        (Some(result.trim()), call)
+    };
+    let (return_type, target_and_args) = call.split_once(' ')?;
+    if !matches!(
+        return_type,
+        "void" | "i1" | "i8" | "i16" | "i32" | "i64" | "i128" | "float" | "double" | "ptr"
+    ) {
+        return None;
+    }
+    if return_type != "void" && result.is_none() {
+        return None;
+    }
+    let open = target_and_args.find('(')?;
+    let close = target_and_args.rfind(')')?;
+    if close + 1 != target_and_args.len() {
+        return None;
+    }
+    let callee = target_and_args[..open].trim();
+    if !callee.starts_with('@')
+        || callee.starts_with("@llvm.")
+        || matches!(callee, "@setjmp" | "@_setjmp" | "@longjmp" | "@_longjmp")
+    {
+        return None;
+    }
+    let args = split_call_args(&target_and_args[open + 1..close])?;
+    let arg_types = args
+        .iter()
+        .map(|arg| statepoint_scalar_type(arg))
+        .collect::<Option<Vec<_>>>()?;
+    Some(DirectCall {
+        result,
+        return_type,
+        callee,
+        args,
+        arg_types,
+    })
+}
+
+fn gc_result_suffix(ty: &str) -> Option<&'static str> {
+    match ty {
+        "i1" => Some("i1"),
+        "i8" => Some("i8"),
+        "i16" => Some("i16"),
+        "i32" => Some("i32"),
+        "i64" => Some("i64"),
+        "i128" => Some("i128"),
+        "float" => Some("f32"),
+        "double" => Some("f64"),
+        "ptr" => Some("p0"),
+        _ => None,
+    }
+}
+
+fn emit_plain_stack_map(out: &mut String, line: &str, live: &[&String], map_id: u64) {
+    let operands = live
+        .iter()
+        .map(|ptr| format!(", ptr {ptr}"))
+        .collect::<String>();
+    out.push_str("  call void asm sideeffect \"\", \"~{memory}\"()\n");
+    out.push_str(&format!(
+        "  call void (i64, i32, ...) @llvm.experimental.stackmap(i64 {map_id}, i32 0{operands})\n"
+    ));
+    out.push_str(line);
+    out.push('\n');
+    out.push_str("  call void asm sideeffect \"\", \"~{memory}\"()\n");
+}
+
+/// Emit one explicit statepoint relocation sequence.
+///
+/// Perry roots remain ordinary NaN-boxed `i64` values everywhere else. At
+/// this boundary we load each live word, carry its exact bits through a
+/// temporary addrspace(1) pointer, and convert the `gc.relocate` result back
+/// into the existing slot. LLVM therefore owns the spill/reload and the
+/// post-safepoint SSA transition without requiring a whole-program
+/// representation change for this prototype.
+fn emit_statepoint(out: &mut String, call: &DirectCall<'_>, live: &[&String], statepoint_id: u64) {
+    for (root_idx, ptr) in live.iter().enumerate() {
+        out.push_str(&format!(
+            "  %perry_sp_bits_{statepoint_id}_{root_idx} = load i64, ptr {ptr}\n"
+        ));
+        out.push_str(&format!(
+            "  %perry_sp_root_{statepoint_id}_{root_idx} = inttoptr i64 \
+             %perry_sp_bits_{statepoint_id}_{root_idx} to ptr addrspace(1)\n"
+        ));
+    }
+
+    let function_type = format!("{} ({})", call.return_type, call.arg_types.join(", "));
+    let call_args = call
+        .args
+        .iter()
+        .map(|arg| format!(", {arg}"))
+        .collect::<String>();
+    let gc_live = live
+        .iter()
+        .enumerate()
+        .map(|(root_idx, _)| format!("ptr addrspace(1) %perry_sp_root_{statepoint_id}_{root_idx}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push_str(&format!(
+        "  %perry_sp_token_{statepoint_id} = call token (i64, i32, ptr, i32, i32, ...) \
+         @llvm.experimental.gc.statepoint.p0(i64 {statepoint_id}, i32 0, \
+         ptr elementtype({function_type}) {}, i32 {}, i32 0{call_args}, i32 0, i32 0) \
+         [\"gc-live\"({gc_live})]\n",
+        call.callee,
+        call.args.len()
+    ));
+
+    if let Some(result) = call.result {
+        let suffix = gc_result_suffix(call.return_type)
+            .expect("non-void statepoint return type was validated by the parser");
+        out.push_str(&format!(
+            "  {result} = call {} @llvm.experimental.gc.result.{suffix}(token \
+             %perry_sp_token_{statepoint_id})\n",
+            call.return_type
+        ));
+    }
+
+    for (root_idx, ptr) in live.iter().enumerate() {
+        out.push_str(&format!(
+            "  %perry_sp_relocated_{statepoint_id}_{root_idx} = call ptr addrspace(1) \
+             @llvm.experimental.gc.relocate.p1(token %perry_sp_token_{statepoint_id}, \
+             i32 {root_idx}, i32 {root_idx})\n"
+        ));
+        out.push_str(&format!(
+            "  %perry_sp_relocated_bits_{statepoint_id}_{root_idx} = ptrtoint \
+             ptr addrspace(1) %perry_sp_relocated_{statepoint_id}_{root_idx} to i64\n"
+        ));
+        out.push_str(&format!(
+            "  store i64 %perry_sp_relocated_bits_{statepoint_id}_{root_idx}, ptr {ptr}\n"
+        ));
+    }
+}
+
+/// Lower Perry's existing precise-root operations to native-stack metadata.
+///
+/// The old binding calls already name exactly the mutable native alloca that a
+/// moving collection must rewrite. We use them as compile-time markers:
+///
+/// * collect `logical slot -> native alloca`;
+/// * remove the runtime bind calls and shadow-frame traffic;
+/// * compute conservative per-call liveness from bind/clear markers without
+///   mutating the native slot;
+/// * either place a plain stack map before a call, or replace a supported call
+///   with a statepoint/result/relocate sequence.
+///
+/// Statepoint mode deliberately retains a plain-stack-map fallback for call
+/// forms outside the narrow parser above. The fallback preserves correctness
+/// while the report records how much of real Perry code reaches the explicit
+/// relocation path.
+fn lower_precise_roots_to_native_stack(
+    ir: &str,
+    slot_count: u32,
+    backend: PreciseRootBackend,
+) -> String {
+    let lines: Vec<&str> = ir.lines().collect();
+    let active_slots = stack_map_active_slots(&lines, slot_count);
+    let mut roots: Vec<Option<String>> = vec![None; slot_count as usize];
+    for line in &lines {
+        if let Some((idx, ptr)) = parse_shadow_bind(line) {
+            if let Some(root) = roots.get_mut(idx) {
+                match root {
+                    Some(existing) => {
+                        debug_assert_eq!(
+                            existing, &ptr,
+                            "one precise-root slot must not bind two native allocas"
+                        );
+                    }
+                    None => *root = Some(ptr),
+                }
+            }
+        }
+    }
+
+    let slot_roots = roots;
+    let root_ptrs: Vec<String> = slot_roots.iter().flatten().cloned().collect();
+    if root_ptrs.is_empty() {
+        return ir
+            .lines()
+            .filter(|line| parse_shadow_bind(line).is_none() && parse_shadow_set(line).is_none())
+            .map(|line| format!("{line}\n"))
+            .collect();
+    }
+
+    let mut out = String::with_capacity(ir.len() + root_ptrs.len() * 128);
+    let mut available = std::collections::HashSet::<String>::new();
+    let mut initialized = std::collections::HashSet::<String>::new();
+    let mut map_id = 0u64;
+
+    for (line_idx, line) in lines.iter().enumerate() {
+        if parse_shadow_bind(line).is_some() {
+            // Compile-time marker only. The real slot is already populated by
+            // the local store immediately preceding this old bind.
+            continue;
+        }
+        if parse_shadow_set(line).is_some() {
+            // This marker changes stack-map liveness, not the program local.
+            // Shadow-stack clears only flipped SLOT_ACTIVE for the same
+            // reason: a value can be semantically read after its final
+            // GC-capable call.
+            continue;
+        }
+
+        // A stack-map operand must dominate the intrinsic. Root allocas are
+        // normally entry-hoisted, but tracking definitions here also handles
+        // the few block-local scalar-replacement slots without emitting
+        // invalid SSA.
+        for ptr in &root_ptrs {
+            if line.trim_start().starts_with(&format!("{ptr} = ")) {
+                available.insert(ptr.clone());
+            }
+        }
+
+        out.push_str(line);
+        out.push('\n');
+
+        // Slots can be named by a stack map before their source-level `let`
+        // executes. Zero them directly after the alloca so an earlier
+        // safepoint never exposes uninitialized stack bytes as roots.
+        for ptr in &root_ptrs {
+            if available.contains(ptr)
+                && !initialized.contains(ptr)
+                && line.trim_start().starts_with(&format!("{ptr} = alloca "))
+            {
+                out.push_str(&format!("  store i64 0, ptr {ptr}\n"));
+                initialized.insert(ptr.clone());
+            }
+        }
+
+        // Insert before calls, not after. Rebuild the tail when the line just
+        // appended is a call so the intrinsic's instruction offset is the
+        // actual call-site offset in the final machine function.
+        let trimmed = line.trim_start();
+        let is_call = trimmed.starts_with("call ")
+            || trimmed.contains(" = call ")
+            || trimmed.starts_with("tail call ")
+            || trimmed.contains(" = tail call ");
+        if !is_call || trimmed.contains("@llvm.experimental.stackmap") {
+            continue;
+        }
+        let active = active_slots.get(line_idx).and_then(Option::as_ref);
+        let live: Vec<&String> = slot_roots
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| active.is_some_and(|slots| slots.contains(idx)))
+            .filter_map(|(_, ptr)| ptr.as_ref())
+            .filter(|ptr| available.contains(*ptr) && initialized.contains(*ptr))
+            .collect();
+        if live.is_empty() {
+            continue;
+        }
+        if backend == PreciseRootBackend::Statepoint
+            && (trimmed.contains("@llvm.") || trimmed.contains("call void asm "))
+        {
+            // LLVM intrinsics and zero-instruction compiler barriers cannot
+            // enter Perry's allocator, so they are not safepoints. The plain
+            // stack-map prototype instrumented every textual `call`; the
+            // statepoint path can make this distinction without losing roots.
+            continue;
+        }
+
+        // Move the call line behind the intrinsic.
+        let call_len = line.len() + 1;
+        out.truncate(out.len() - call_len);
+        if backend == PreciseRootBackend::Statepoint {
+            if let Some(call) = parse_direct_statepoint_call(line) {
+                emit_statepoint(&mut out, &call, &live, map_id);
+                map_id += 1;
+                continue;
+            }
+        }
+        emit_plain_stack_map(&mut out, line, &live, map_id);
+        map_id += 1;
+    }
+    out
+}
+
+#[cfg(test)]
+mod stack_map_tests {
+    use super::{
+        lower_precise_roots_to_native_stack, parse_direct_statepoint_call, PreciseRootBackend,
+    };
+
+    fn lower_stack_maps(input: &str, slots: u32) -> String {
+        lower_precise_roots_to_native_stack(input, slots, PreciseRootBackend::StackMap)
+    }
+
+    fn lower_statepoints(input: &str, slots: u32) -> String {
+        lower_precise_roots_to_native_stack(input, slots, PreciseRootBackend::Statepoint)
+    }
+
+    #[test]
+    fn lowers_bind_and_liveness_clear_to_native_frame_maps() {
+        let input = r#"define i64 @probe(i64 %arg) {
+entry.0:
+  %r0 = alloca i64
+  store i64 %arg, ptr %r0
+  call void @js_shadow_slot_bind(i32 0, ptr %r0)
+  %r1 = call i64 @may_collect()
+  call void @js_shadow_slot_set(i32 0, i64 0)
+  call void @may_collect_again()
+  ret i64 %r1
+}
+"#;
+        let output = lower_stack_maps(input, 1);
+        assert!(!output.contains("@js_shadow_slot_bind"));
+        assert!(!output.contains("@js_shadow_slot_set"));
+        assert!(output.contains("%r0 = alloca i64\n  store i64 0, ptr %r0"));
+        assert!(output.contains(
+            "@llvm.experimental.stackmap(i64 0, i32 0, ptr %r0)\n  %r1 = call i64 \
+             @may_collect()\n  call void asm sideeffect \"\", \"~{memory}\"()"
+        ));
+        assert_eq!(output.matches("store i64 0, ptr %r0").count(), 1);
+        assert_eq!(output.matches("@llvm.experimental.stackmap").count(), 1);
+        assert!(output.contains("call void @may_collect_again()"));
+    }
+
+    #[test]
+    fn does_not_reference_a_root_before_its_alloca_dominates() {
+        let input = r#"define void @probe() {
+entry.0:
+  call void @early_call()
+  %r0 = alloca i64
+  call void @js_shadow_slot_bind(i32 0, ptr %r0)
+  call void @late_call()
+  ret void
+}
+"#;
+        let output = lower_stack_maps(input, 1);
+        let early = output.find("call void @early_call()").unwrap();
+        let first_map = output.find("@llvm.experimental.stackmap").unwrap();
+        assert!(early < first_map);
+        assert!(output.contains(
+            "@llvm.experimental.stackmap(i64 0, i32 0, ptr %r0)\n  call void @late_call()"
+        ));
+    }
+
+    #[test]
+    fn unions_root_liveness_at_control_flow_joins() {
+        let input = r#"define void @probe(i1 %cond) {
+entry.0:
+  %r0 = alloca i64
+  call void @js_shadow_slot_bind(i32 0, ptr %r0)
+  br i1 %cond, label %live.1, label %dead.2
+live.1:
+  call void @live_call()
+  br label %merge.3
+dead.2:
+  call void @js_shadow_slot_set(i32 0, i64 0)
+  call void @dead_call()
+  br label %merge.3
+merge.3:
+  call void @merge_call()
+  ret void
+}
+"#;
+        let output = lower_stack_maps(input, 1);
+        assert!(output.contains(
+            "@llvm.experimental.stackmap(i64 0, i32 0, ptr %r0)\n  call void @live_call()"
+        ));
+        assert!(!output.contains(
+            "@llvm.experimental.stackmap(i64 1, i32 0, ptr %r0)\n  call void @dead_call()"
+        ));
+        assert!(output.contains(
+            "@llvm.experimental.stackmap(i64 1, i32 0, ptr %r0)\n  call void @merge_call()"
+        ));
+    }
+
+    #[test]
+    fn parses_the_scalar_direct_call_subset() {
+        assert_eq!(
+            parse_direct_statepoint_call("  %r7 = call double @foo(i64 %r1, ptr %r2)"),
+            Some(super::DirectCall {
+                result: Some("%r7"),
+                return_type: "double",
+                callee: "@foo",
+                args: vec!["i64 %r1", "ptr %r2"],
+                arg_types: vec!["i64", "ptr"],
+            })
+        );
+        assert!(parse_direct_statepoint_call(
+            "  %r7 = call double (i64, ptr)* %fn(i64 %r1, ptr %r2)"
+        )
+        .is_none());
+        assert!(parse_direct_statepoint_call("  call void @llvm.assume(i1 %ok)").is_none());
+        assert!(parse_direct_statepoint_call("  %r7 = tail call i64 @foo()").is_none());
+    }
+
+    #[test]
+    fn lowers_direct_calls_to_explicit_statepoint_relocations() {
+        let input = r#"define i64 @probe(i64 %arg) {
+entry.0:
+  %r0 = alloca i64
+  store i64 %arg, ptr %r0
+  call void @js_shadow_slot_bind(i32 0, ptr %r0)
+  %r1 = call i64 @may_collect(i64 %arg)
+  ret i64 %r1
+}
+"#;
+        let output = lower_statepoints(input, 1);
+        assert!(!output.contains("call i64 @may_collect"));
+        assert!(!output.contains("asm sideeffect"));
+        assert!(output
+            .contains("%perry_sp_root_0_0 = inttoptr i64 %perry_sp_bits_0_0 to ptr addrspace(1)"));
+        assert!(output.contains(
+            "ptr elementtype(i64 (i64)) @may_collect, i32 1, i32 0, i64 %arg, i32 0, i32 0"
+        ));
+        assert!(output
+            .contains("%r1 = call i64 @llvm.experimental.gc.result.i64(token %perry_sp_token_0)"));
+        assert!(output
+            .contains("@llvm.experimental.gc.relocate.p1(token %perry_sp_token_0, i32 0, i32 0)"));
+        assert!(output.contains("store i64 %perry_sp_relocated_bits_0_0, ptr %r0"));
+    }
+
+    #[test]
+    fn statepoint_mode_falls_back_for_indirect_calls() {
+        let input = r#"define i64 @probe(i64 %arg, ptr %fn) {
+entry.0:
+  %r0 = alloca i64
+  store i64 %arg, ptr %r0
+  call void @js_shadow_slot_bind(i32 0, ptr %r0)
+  %r1 = call i64 ()* %fn()
+  ret i64 %r1
+}
+"#;
+        let output = lower_statepoints(input, 1);
+        assert!(output.contains("@llvm.experimental.stackmap(i64 0, i32 0, ptr %r0)"));
+        assert!(output.contains("%r1 = call i64 ()* %fn()"));
+        assert!(!output.contains("@llvm.experimental.gc.statepoint"));
+    }
+
+    #[test]
+    fn statepoint_mode_does_not_map_non_allocating_llvm_intrinsics() {
+        let input = r#"define void @probe(i64 %arg, i1 %condition) {
+entry.0:
+  %r0 = alloca i64
+  store i64 %arg, ptr %r0
+  call void @js_shadow_slot_bind(i32 0, ptr %r0)
+  call void @llvm.assume(i1 %condition)
+  call void @may_collect()
+  ret void
+}
+"#;
+        let output = lower_statepoints(input, 1);
+        assert!(output.contains("call void @llvm.assume(i1 %condition)"));
+        assert_eq!(
+            output
+                .matches("@llvm.experimental.gc.statepoint.p0")
+                .count(),
+            1
+        );
+        assert!(!output.contains("@llvm.experimental.stackmap"));
     }
 }
