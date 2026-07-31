@@ -754,7 +754,7 @@ impl LlFunction {
             } else {
                 PreciseRootBackend::StackMap
             };
-            lower_precise_roots_to_native_stack(&ir, self.stack_map_slot_count, backend)
+            lower_precise_roots_to_native_stack(&ir, &self.name, self.stack_map_slot_count, backend)
         } else {
             ir
         };
@@ -948,6 +948,15 @@ enum PreciseRootBackend {
     Statepoint,
 }
 
+impl PreciseRootBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::StackMap => "stack-map",
+            Self::Statepoint => "statepoint",
+        }
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct DirectCall<'a> {
     result: Option<&'a str>,
@@ -1044,6 +1053,23 @@ fn parse_direct_statepoint_call(line: &str) -> Option<DirectCall<'_>> {
         args,
         arg_types,
     })
+}
+
+/// Return a direct callee name without the leading `@`.
+///
+/// This accepts more call syntax than the statepoint parser because the
+/// GC-effect audit only needs to recognize a direct target. Unsupported and
+/// indirect forms return `None` and therefore stay conservative.
+fn direct_callee_name(line: &str) -> Option<&str> {
+    let call = line.trim().split_once("call ")?.1;
+    let args_open = call.find('(')?;
+    let target = call[..args_open].trim();
+    let name = target.split_ascii_whitespace().last()?.strip_prefix('@')?;
+    (!name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '$')))
+    .then_some(name)
 }
 
 fn gc_result_suffix(ty: &str) -> Option<&'static str> {
@@ -1159,6 +1185,7 @@ fn emit_statepoint(out: &mut String, call: &DirectCall<'_>, live: &[&String], st
 /// relocation path.
 fn lower_precise_roots_to_native_stack(
     ir: &str,
+    function_name: &str,
     slot_count: u32,
     backend: PreciseRootBackend,
 ) -> String {
@@ -1183,12 +1210,24 @@ fn lower_precise_roots_to_native_stack(
 
     let slot_roots = roots;
     let root_ptrs: Vec<String> = slot_roots.iter().flatten().cloned().collect();
+    let mut report = crate::statepoint_report::enabled().then(|| {
+        crate::statepoint_report::FunctionRecord::new(
+            function_name,
+            backend.as_str(),
+            slot_count,
+            root_ptrs.len(),
+        )
+    });
     if root_ptrs.is_empty() {
-        return ir
+        let out = ir
             .lines()
             .filter(|line| parse_shadow_bind(line).is_none() && parse_shadow_set(line).is_none())
             .map(|line| format!("{line}\n"))
             .collect();
+        if let Some(report) = report {
+            crate::statepoint_report::record(report);
+        }
+        return out;
     }
 
     let mut out = String::with_capacity(ir.len() + root_ptrs.len() * 128);
@@ -1255,16 +1294,28 @@ fn lower_precise_roots_to_native_stack(
             .filter_map(|(_, ptr)| ptr.as_ref())
             .filter(|ptr| available.contains(*ptr) && initialized.contains(*ptr))
             .collect();
+        if let Some(report) = report.as_mut() {
+            report.note_call(live.len());
+        }
         if live.is_empty() {
             continue;
         }
-        if backend == PreciseRootBackend::Statepoint
-            && (trimmed.contains("@llvm.") || trimmed.contains("call void asm "))
-        {
-            // LLVM intrinsics and zero-instruction compiler barriers cannot
-            // enter Perry's allocator, so they are not safepoints. The plain
-            // stack-map prototype instrumented every textual `call`; the
-            // statepoint path can make this distinction without losing roots.
+
+        let direct_callee = direct_callee_name(line);
+        let is_compiler_only = direct_callee.is_some_and(|callee| callee.starts_with("llvm."))
+            || trimmed.contains("call void asm ");
+        let cannot_collect = direct_callee.is_some_and(|callee| {
+            crate::gc_call_effects::classify_direct_callee(callee)
+                == crate::gc_call_effects::GcCallEffect::CannotCollect
+        });
+        if is_compiler_only || cannot_collect {
+            // LLVM intrinsics, zero-instruction compiler barriers, and
+            // runtime helpers in the audited GC-effect table cannot enter
+            // Perry's allocator. Neither native-stack backend needs metadata
+            // around them.
+            if let Some(report) = report.as_mut() {
+                report.note_skipped(direct_callee.unwrap_or("<inline-asm>"));
+            }
             continue;
         }
 
@@ -1274,12 +1325,25 @@ fn lower_precise_roots_to_native_stack(
         if backend == PreciseRootBackend::Statepoint {
             if let Some(call) = parse_direct_statepoint_call(line) {
                 emit_statepoint(&mut out, &call, &live, map_id);
+                if let Some(report) = report.as_mut() {
+                    report.note_statepoint(call.callee.trim_start_matches('@'), live.len());
+                }
                 map_id += 1;
                 continue;
             }
         }
         emit_plain_stack_map(&mut out, line, &live, map_id);
+        if let Some(report) = report.as_mut() {
+            report.note_plain_stack_map(
+                direct_callee.unwrap_or("<indirect-or-unsupported>"),
+                live.len(),
+                backend == PreciseRootBackend::Statepoint,
+            );
+        }
         map_id += 1;
+    }
+    if let Some(report) = report {
+        crate::statepoint_report::record(report);
     }
     out
 }
@@ -1287,15 +1351,16 @@ fn lower_precise_roots_to_native_stack(
 #[cfg(test)]
 mod stack_map_tests {
     use super::{
-        lower_precise_roots_to_native_stack, parse_direct_statepoint_call, PreciseRootBackend,
+        direct_callee_name, lower_precise_roots_to_native_stack, parse_direct_statepoint_call,
+        PreciseRootBackend,
     };
 
     fn lower_stack_maps(input: &str, slots: u32) -> String {
-        lower_precise_roots_to_native_stack(input, slots, PreciseRootBackend::StackMap)
+        lower_precise_roots_to_native_stack(input, "probe", slots, PreciseRootBackend::StackMap)
     }
 
     fn lower_statepoints(input: &str, slots: u32) -> String {
-        lower_precise_roots_to_native_stack(input, slots, PreciseRootBackend::Statepoint)
+        lower_precise_roots_to_native_stack(input, "probe", slots, PreciseRootBackend::Statepoint)
     }
 
     #[test]
@@ -1378,6 +1443,15 @@ merge.3:
     #[test]
     fn parses_the_scalar_direct_call_subset() {
         assert_eq!(
+            direct_callee_name("  %r7 = call double @foo(i64 %r1, ptr %r2)"),
+            Some("foo")
+        );
+        assert_eq!(
+            direct_callee_name("  %r7 = call i64 ()* %fn()"),
+            None,
+            "an indirect target must not be inferred from its arguments"
+        );
+        assert_eq!(
             parse_direct_statepoint_call("  %r7 = call double @foo(i64 %r1, ptr %r2)"),
             Some(super::DirectCall {
                 result: Some("%r7"),
@@ -1459,5 +1533,32 @@ entry.0:
             1
         );
         assert!(!output.contains("@llvm.experimental.stackmap"));
+    }
+
+    #[test]
+    fn audited_non_collecting_helpers_are_not_safepoints_in_either_backend() {
+        let input = r#"define void @probe(i64 %arg) {
+entry.0:
+  %r0 = alloca i64
+  store i64 %arg, ptr %r0
+  call void @js_shadow_slot_bind(i32 0, ptr %r0)
+  call void @js_gc_temp_root_push(i64 %arg)
+  call void @js_write_barrier_root_nanbox(i64 %arg)
+  call void @js_gc_loop_safepoint()
+  ret void
+}
+"#;
+        for output in [lower_stack_maps(input, 1), lower_statepoints(input, 1)] {
+            assert!(output.contains("call void @js_gc_temp_root_push(i64 %arg)"));
+            assert!(output.contains("call void @js_write_barrier_root_nanbox(i64 %arg)"));
+            assert_eq!(
+                output.matches("@llvm.experimental.stackmap").count()
+                    + output
+                        .matches("@llvm.experimental.gc.statepoint.p0")
+                        .count(),
+                1,
+                "only the explicit collection boundary should be a safepoint:\n{output}"
+            );
+        }
     }
 }

@@ -301,12 +301,38 @@ pub(super) struct NativeStackFallbackTraceStats {
 }
 
 #[derive(Clone, Copy, Default)]
+pub(super) struct NativeStackMapTraceStats {
+    pub(super) walks: usize,
+    pub(super) frames_visited: usize,
+    pub(super) records_matched: usize,
+    pub(super) locations_visited: usize,
+}
+
+impl NativeStackMapTraceStats {
+    #[inline]
+    pub(super) fn record_walk(
+        &mut self,
+        walks: usize,
+        frames_visited: usize,
+        records_matched: usize,
+        locations_visited: usize,
+    ) {
+        self.walks = self.walks.saturating_add(walks);
+        self.frames_visited = self.frames_visited.saturating_add(frames_visited);
+        self.records_matched = self.records_matched.saturating_add(records_matched);
+        self.locations_visited = self.locations_visited.saturating_add(locations_visited);
+    }
+}
+
+#[derive(Clone, Copy, Default)]
 pub(super) struct RootSourcesTraceStats {
     pub(super) compiled_shadow: RootSourceSlotTraceStats,
+    pub(super) compiled_native: RootSourceSlotTraceStats,
     pub(super) module_globals: RootSourceSlotTraceStats,
     pub(super) runtime_handles: RootSourceSlotTraceStats,
     pub(super) runtime_mutable_scanners: RootSourceSlotTraceStats,
     pub(super) ffi_mutable_scanners: RootSourceSlotTraceStats,
+    pub(super) native_stack_maps: NativeStackMapTraceStats,
     pub(super) native_stack_fallback: NativeStackFallbackTraceStats,
 }
 
@@ -1289,10 +1315,17 @@ pub(super) fn root_source_slot_json(stats: RootSourceSlotTraceStats) -> serde_js
 pub(super) fn root_sources_json(stats: RootSourcesTraceStats) -> serde_json::Value {
     serde_json::json!({
         "compiled_shadow": root_source_slot_json(stats.compiled_shadow),
+        "compiled_native": root_source_slot_json(stats.compiled_native),
         "module_globals": root_source_slot_json(stats.module_globals),
         "runtime_handles": root_source_slot_json(stats.runtime_handles),
         "runtime_mutable_scanners": root_source_slot_json(stats.runtime_mutable_scanners),
         "ffi_mutable_scanners": root_source_slot_json(stats.ffi_mutable_scanners),
+        "native_stack_maps": {
+            "walks": stats.native_stack_maps.walks,
+            "frames_visited": stats.native_stack_maps.frames_visited,
+            "records_matched": stats.native_stack_maps.records_matched,
+            "locations_visited": stats.native_stack_maps.locations_visited,
+        },
         "native_stack_fallback": {
             "decision": stats.native_stack_fallback.decision.as_str(),
             "scanned": stats.native_stack_fallback.scanned,

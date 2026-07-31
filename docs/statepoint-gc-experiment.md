@@ -30,6 +30,119 @@ Perry's GC simpler. Keep the shadow stack as the default.
 The prototype remains opt-in with `PERRY_STATEPOINTS=1`. The default
 shadow-stack path is unchanged.
 
+## Follow-up: root pressure and audited safepoints
+
+The first prototype treated almost every textual call with live roots as a
+safepoint. That was correct but needlessly pessimistic. The follow-up adds an
+audited GC-call-effect table whose only claim is whether a helper can enter
+Perry's collector. Unknown calls remain safepoints.
+
+This is intentionally separate from LLVM memory effects. Temporary-root
+bookkeeping, write barriers, layout notes, feedback counters, and refcount
+writes mutate memory, but they do not run a Perry collection and therefore do
+not need stack-map metadata.
+
+`--statepoint-report[=json]` makes the resulting root pressure visible. It
+reports per-function logical/bound root slots, calls with live roots, audited
+non-collecting calls, statepoints, relocations, plain-map fallbacks, live-root
+widths, and callee frequencies. It is observational and disables cache reuse
+for the reporting run:
+
+```sh
+PERRY_STATEPOINTS=1 perry compile app.ts --statepoint-report
+```
+
+On `benchmarks/app-patterns/kernels/batch.ts`, the audit changed:
+
+| Metric | Before | After | Change |
+|---|---:|---:|---:|
+| Statepoints | 442 | 219 | -50.5% |
+| Relocations | 867 | 403 | -53.5% |
+| `__llvm_stackmaps` | 54,968 B | 26,432 B | -51.9% |
+| Plain-map fallbacks | 0 | 0 | unchanged |
+
+The report found 223 calls with live roots that cannot collect. The largest
+groups were typed-feedback bookkeeping, class-field guards, temporary-root
+push/get/truncate, layout notes, write barriers, and property-observation
+records.
+
+Across the eight GC probes:
+
+| Probe | Statepoints before | Statepoints after | Relocations after | Calls skipped |
+|---|---:|---:|---:|---:|
+| Nursery churn | 152 | 65 | 91 | 88 |
+| Survivor promotion | 165 | 79 | 132 | 88 |
+| Cross-generation writes | 168 | 74 | 95 | 96 |
+| Dead after deep stack | 119 | 55 | 59 | 65 |
+| Closure capture | 146 | 69 | 81 | 78 |
+| String retention | 92 | 45 | 46 | 50 |
+| Array grow/evacuate | 100 | 49 | 49 | 52 |
+| Map/set side tables | 138 | 66 | 124 | 74 |
+| **Total** | **1,080** | **502** | **677** | **591** |
+
+The same audit applies to the plain-map backend. Its eight-probe metadata
+payload is now 26,816 bytes; explicit statepoints use 53,952 bytes. Statepoint
+metadata therefore remains 2.01x plain maps even after both shrink by roughly
+half. Reducing the number of maybe-pointer roots through representation
+promotion remains the larger shared lever.
+
+All eight probes pass in shadow, plain-map, and statepoint modes with forced
+evacuation and relocation verification: 24/24 mode/probe comparisons match
+Node's probe/checksum output.
+
+### Follow-up runtime and compile measurements
+
+Each runtime cell below is the median of seven executions on the same host and
+full-feature runtime artifact. Host variance was high, so the numbers are
+directional:
+
+| Probe | Shadow | Plain stack map | Statepoint | Statepoint vs plain |
+|---|---:|---:|---:|---:|
+| Nursery churn | 196.698 ms | 194.860 ms | 195.178 ms | +0.16% |
+| Survivor promotion | 234.184 ms | 235.600 ms | 233.294 ms | -0.98% |
+| Cross-generation writes | 383.002 ms | 330.386 ms | 341.206 ms | +3.27% |
+| Dead after deep stack | 1,029.803 ms | 996.121 ms | 1,196.806 ms | +20.15% |
+| Closure capture | 230.904 ms | 212.415 ms | 188.984 ms | -11.03% |
+| String retention | 151.553 ms | 173.651 ms | 162.272 ms | -6.55% |
+| Array grow/evacuate | 251.063 ms | 267.094 ms | 237.260 ms | -11.17% |
+| Map/set side tables | 577.092 ms | 563.401 ms | 601.368 ms | +6.74% |
+
+Geometric means put plain maps at -1.17% versus shadow, statepoints at -1.54%
+versus shadow, and statepoints at -0.38% versus plain maps. That small aggregate
+statepoint lead is below the noise floor; the deep-stack regression remains a
+clear negative signal.
+
+For uncached `batch.ts` compilation, seven-run medians were 910.3 ms shadow,
+946.0 ms plain maps (+3.92%), and 958.3 ms statepoints (+5.28%).
+
+### Native-root and unwinder telemetry
+
+Native stack-map roots now have their own `root_sources.compiled_native`
+telemetry bucket instead of being incorrectly charged to
+`compiled_shadow`. `root_sources.native_stack_maps` also records walks, frames
+visited, records matched, and locations visited.
+
+The forced-evacuation deep-stack probe reported 105 walks, 36,458 frames
+visited, 36,139 records matched, and only 104 root locations visited, with a
+maximum of 694 frames in one cycle. The walker is therefore a justified
+optimization target, but a direct frame-pointer walker is not yet a safe
+substitution: current generated AArch64 code saves `x29` without consistently
+establishing an `x29` frame chain, and Rust/runtime frames have no matching
+contract. A fast path first needs an explicit frame-pointer/unwind ABI for
+generated and intervening runtime frames, plus fallback and cross-architecture
+tests.
+
+### Work deliberately left gated
+
+This follow-up does not alter temporary-root semantics, collection scheduling,
+or the conservative native-stack fallback. The representation plan makes the
+temp-root correctness work a prerequisite for an explicit-only collection
+contract and conservative-scanner removal. Doing that here would overlap the
+other agent's work and make failures impossible to attribute. Once that
+prerequisite lands, the next experiment is to assert that moving collections
+occur only at declared safepoints and then measure whether the conservative
+scanner can be deleted.
+
 ## Which statepoint design this tests
 
 This is the explicit bridge, not LLVM's `RewriteStatepointsForGC` pipeline.

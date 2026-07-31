@@ -14,6 +14,7 @@
 //! there.
 
 use super::{MutableRootSlot, MutableRootSlotKind};
+use crate::gc::telemetry::RootSourcesTraceStats;
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
@@ -34,6 +35,29 @@ struct StackMapRecord {
 }
 
 static STACK_MAPS: OnceLock<Vec<StackMapRecord>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::gc) struct NativeStackWalkStats {
+    pub(in crate::gc) walks: usize,
+    pub(in crate::gc) frames_visited: usize,
+    pub(in crate::gc) records_matched: usize,
+    pub(in crate::gc) locations_visited: usize,
+}
+
+#[inline]
+pub(in crate::gc) fn record_native_stack_walk_source(
+    stats: NativeStackWalkStats,
+    root_sources: &mut Option<&mut RootSourcesTraceStats>,
+) {
+    if let Some(sources) = root_sources {
+        sources.native_stack_maps.record_walk(
+            stats.walks,
+            stats.frames_visited,
+            stats.records_matched,
+            stats.locations_visited,
+        );
+    }
+}
 
 pub(in crate::gc) fn initialize() {
     let _ = stack_maps();
@@ -71,12 +95,14 @@ fn closest_record_pc(maps: &[StackMapRecord], ip: usize) -> Option<usize> {
     }
 }
 
-pub(super) fn visit_stack_map_root_slots(visit: &mut impl FnMut(MutableRootSlot)) {
+pub(super) fn visit_stack_map_root_slots(
+    visit: &mut impl FnMut(MutableRootSlot),
+) -> NativeStackWalkStats {
     let maps = stack_maps();
     if maps.is_empty() {
-        return;
+        return NativeStackWalkStats::default();
     }
-    unwind::visit(maps, visit);
+    unwind::visit(maps, visit)
 }
 
 fn parse_concatenated_stack_maps(bytes: &[u8]) -> Option<Vec<StackMapRecord>> {
@@ -339,16 +365,28 @@ mod unwind {
     struct WalkState<'a, F> {
         maps: &'a [StackMapRecord],
         visit: &'a mut F,
+        stats: NativeStackWalkStats,
     }
 
-    pub(super) fn visit<F: FnMut(MutableRootSlot)>(maps: &[StackMapRecord], visit: &mut F) {
-        let mut state = WalkState { maps, visit };
+    pub(super) fn visit<F: FnMut(MutableRootSlot)>(
+        maps: &[StackMapRecord],
+        visit: &mut F,
+    ) -> NativeStackWalkStats {
+        let mut state = WalkState {
+            maps,
+            visit,
+            stats: NativeStackWalkStats {
+                walks: 1,
+                ..NativeStackWalkStats::default()
+            },
+        };
         unsafe {
             _Unwind_Backtrace(
                 walk_frame::<F>,
                 (&mut state as *mut WalkState<'_, _>).cast::<c_void>(),
             );
         }
+        state.stats
     }
 
     unsafe extern "C" fn walk_frame<F: FnMut(MutableRootSlot)>(
@@ -356,6 +394,7 @@ mod unwind {
         argument: *mut c_void,
     ) -> i32 {
         let state = &mut *argument.cast::<WalkState<'_, F>>();
+        state.stats.frames_visited = state.stats.frames_visited.saturating_add(1);
         let ip = _Unwind_GetIP(context);
         let Some(candidate_pc) = closest_record_pc(state.maps, ip) else {
             return 0;
@@ -371,8 +410,13 @@ mod unwind {
         let last = state
             .maps
             .partition_point(|record| record.pc <= candidate_pc);
+        state.stats.records_matched = state
+            .stats
+            .records_matched
+            .saturating_add(last.saturating_sub(first));
         for record in &state.maps[first..last] {
             for location in &record.locations {
+                state.stats.locations_visited = state.stats.locations_visited.saturating_add(1);
                 let base = _Unwind_GetGR(context, i32::from(location.dwarf_reg));
                 let address = if location.offset < 0 {
                     base.checked_sub(location.offset.unsigned_abs() as usize)
@@ -386,9 +430,7 @@ mod unwind {
                     continue;
                 }
                 (state.visit)(MutableRootSlot {
-                    // Reuse the compiled-frame telemetry bucket so the
-                    // experiment compares root source counts directly.
-                    kind: MutableRootSlotKind::ShadowStack,
+                    kind: MutableRootSlotKind::NativeStack,
                     ptr: address as *mut u64,
                 });
             }
@@ -401,7 +443,12 @@ mod unwind {
 mod unwind {
     use super::*;
 
-    pub(super) fn visit(_maps: &[StackMapRecord], _visit: &mut impl FnMut(MutableRootSlot)) {}
+    pub(super) fn visit(
+        _maps: &[StackMapRecord],
+        _visit: &mut impl FnMut(MutableRootSlot),
+    ) -> NativeStackWalkStats {
+        NativeStackWalkStats::default()
+    }
 }
 
 #[cfg(test)]

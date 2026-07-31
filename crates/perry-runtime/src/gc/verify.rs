@@ -892,7 +892,7 @@ pub(super) fn rewrite_mutable_root_slots_with_sources(
     mut shadow_stats: Option<&mut ShadowRootTraceStats>,
     mut root_sources: Option<&mut RootSourcesTraceStats>,
 ) {
-    visit_mutable_root_slots(|slot| unsafe {
+    let native_stack_walk = visit_mutable_root_slots(|slot| unsafe {
         let bits = slot.read();
         record_mutable_slot_scan_source(slot, bits, valid_ptrs, &mut root_sources);
         if bits == 0 {
@@ -908,6 +908,7 @@ pub(super) fn rewrite_mutable_root_slots_with_sources(
             }
         }
     });
+    record_native_stack_walk_source(native_stack_walk, &mut root_sources);
 }
 
 pub(super) fn rewrite_mutable_registered_roots(valid_ptrs: &ValidPointerSet) {
@@ -948,6 +949,7 @@ pub(super) fn verify_mutable_root_slots(valid_ptrs: &ValidPointerSet) {
         if let Some(new_bits) = try_rewrite_value(bits, valid_ptrs) {
             let surface = match slot.kind {
                 MutableRootSlotKind::ShadowStack => "shadow stack roots",
+                MutableRootSlotKind::NativeStack => "native stack-map roots",
                 MutableRootSlotKind::GlobalRoot => "global roots",
             };
             panic_stale_forwarded_reference(surface, slot.ptr as usize, bits, new_bits);

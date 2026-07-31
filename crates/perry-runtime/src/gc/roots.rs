@@ -8,6 +8,7 @@ mod shadow_stack;
 mod stack_maps;
 mod temp_roots;
 pub(super) use stack_maps::initialize as initialize_stack_maps;
+pub(super) use stack_maps::record_native_stack_walk_source;
 
 pub(super) use runtime_handles::{
     new_runtime_handle_root_scan_state, scan_runtime_handle_roots_mut,
@@ -1341,13 +1342,14 @@ pub(super) fn atomic_store_ordering(
 /// Which registry a mutable root slot came from.
 ///
 /// The kind selects a *telemetry bucket* only — it must never select a
-/// different pointer decoding. Both kinds are marked by
-/// `mark_mutable_root_bits` and rewritten by `try_rewrite_value`, and both
+/// different pointer decoding. All kinds are marked by
+/// `mark_mutable_root_bits` and rewritten by `try_rewrite_value`, and all
 /// therefore accept a heap reference either NaN-boxed or bare. That symmetry
 /// is the #6910 invariant; see `gc::root_words`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MutableRootSlotKind {
     ShadowStack,
+    NativeStack,
     GlobalRoot,
 }
 
@@ -1372,8 +1374,10 @@ impl MutableRootSlot {
 /// Visit every live shadow-stack slot. The visitor receives real
 /// mutable slot addresses so the same walk can support mark-only
 /// scanning and post-forwarding rewrites.
-pub(super) fn visit_shadow_stack_root_slots(mut visit: impl FnMut(MutableRootSlot)) {
-    stack_maps::visit_stack_map_root_slots(&mut visit);
+pub(super) fn visit_shadow_stack_root_slots(
+    mut visit: impl FnMut(MutableRootSlot),
+) -> stack_maps::NativeStackWalkStats {
+    let native_stack_walk = stack_maps::visit_stack_map_root_slots(&mut visit);
     SHADOW.with(|cell| unsafe {
         let s = &mut *cell.get();
         if s.len == 0 || s.ptr.is_null() {
@@ -1415,6 +1419,7 @@ pub(super) fn visit_shadow_stack_root_slots(mut visit: impl FnMut(MutableRootSlo
             top = header.value as usize;
         }
     });
+    native_stack_walk
 }
 
 /// Visit every registered module-global root slot.
@@ -1435,9 +1440,12 @@ pub(super) fn visit_global_root_slots(mut visit: impl FnMut(MutableRootSlot)) {
 
 /// Visit the root slots whose storage is owned by this runtime and can
 /// therefore be rewritten after evacuation.
-pub(super) fn visit_mutable_root_slots(mut visit: impl FnMut(MutableRootSlot)) {
-    visit_shadow_stack_root_slots(&mut visit);
+pub(super) fn visit_mutable_root_slots(
+    mut visit: impl FnMut(MutableRootSlot),
+) -> stack_maps::NativeStackWalkStats {
+    let native_stack_walk = visit_shadow_stack_root_slots(&mut visit);
     visit_global_root_slots(&mut visit);
+    native_stack_walk
 }
 
 #[derive(Default)]
@@ -1462,7 +1470,7 @@ pub(super) fn mark_mutable_root_slots_step(
         }
         let mut seen = 0usize;
         let mut exhausted = true;
-        visit_shadow_stack_root_slots(|slot| unsafe {
+        let native_stack_walk = visit_shadow_stack_root_slots(|slot| unsafe {
             if seen < cursor.shadow_seen {
                 seen += 1;
                 return;
@@ -1474,8 +1482,10 @@ pub(super) fn mark_mutable_root_slots_step(
 
             let bits = slot.read();
             record_mutable_slot_scan_source(slot, bits, valid_ptrs, &mut root_sources);
-            if let Some(stats) = shadow_stats.as_mut() {
-                stats.record_scan(bits);
+            if matches!(slot.kind, MutableRootSlotKind::ShadowStack) {
+                if let Some(stats) = shadow_stats.as_mut() {
+                    stats.record_scan(bits);
+                }
             }
             if bits != 0 {
                 mark_mutable_root_bits(bits, valid_ptrs);
@@ -1484,6 +1494,7 @@ pub(super) fn mark_mutable_root_slots_step(
             cursor.shadow_seen = seen;
             remaining -= 1;
         });
+        record_native_stack_walk_source(native_stack_walk, &mut root_sources);
         if !exhausted {
             return false;
         }
@@ -1557,6 +1568,7 @@ pub(super) fn root_source_for_mutable_slot(
 ) -> &mut RootSourceSlotTraceStats {
     match kind {
         MutableRootSlotKind::ShadowStack => &mut sources.compiled_shadow,
+        MutableRootSlotKind::NativeStack => &mut sources.compiled_native,
         MutableRootSlotKind::GlobalRoot => &mut sources.module_globals,
     }
 }
@@ -1596,7 +1608,7 @@ pub(super) fn mark_mutable_root_slots(
     mut shadow_stats: Option<&mut ShadowRootTraceStats>,
     mut root_sources: Option<&mut RootSourcesTraceStats>,
 ) {
-    visit_mutable_root_slots(|slot| unsafe {
+    let native_stack_walk = visit_mutable_root_slots(|slot| unsafe {
         let bits = slot.read();
         record_mutable_slot_scan_source(slot, bits, valid_ptrs, &mut root_sources);
         if matches!(slot.kind, MutableRootSlotKind::ShadowStack) {
@@ -1609,6 +1621,7 @@ pub(super) fn mark_mutable_root_slots(
         }
         mark_mutable_root_bits(bits, valid_ptrs);
     });
+    record_native_stack_walk_source(native_stack_walk, &mut root_sources);
 }
 
 #[inline]

@@ -771,6 +771,19 @@ fn root_source_active_shadow_frame_reports_precise_shadow_roots_only() {
 }
 
 #[test]
+fn root_source_native_stack_slot_has_a_distinct_telemetry_bucket() {
+    let mut sources = RootSourcesTraceStats::default();
+    root_source_for_mutable_slot(&mut sources, MutableRootSlotKind::NativeStack)
+        .record_scan(true, true);
+    root_source_for_mutable_slot(&mut sources, MutableRootSlotKind::NativeStack).record_rewrite();
+
+    assert_eq!(sources.compiled_native.slots_scanned, 1);
+    assert_eq!(sources.compiled_native.pointer_roots, 1);
+    assert_eq!(sources.compiled_native.rewritten_slots, 1);
+    assert_eq!(sources.compiled_shadow.slots_scanned, 0);
+}
+
+#[test]
 fn test_copied_minor_eligibility_empty_rust_copy_only_scanner_falls_back() {
     let _guard = CopyingNurseryTestGuard::new(0);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();

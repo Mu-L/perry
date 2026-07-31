@@ -203,7 +203,8 @@ Potentially:
 The current prototype is not yet a platform:
 
 - scanning is implemented only for Mach-O/macOS;
-- every call is conservatively instrumented instead of only GC-capable calls;
+- unknown calls remain conservatively instrumented; an audited call-effect
+  table now omits runtime helpers proven unable to enter Perry's collector;
 - the runtime assumes the matching stack-map PC is within 16 bytes of the
   unwound return PC;
 - active roots must remain in addressable allocas;

@@ -494,12 +494,33 @@ pub struct CompileArgs {
     /// that codegen actually executes and has something to report.
     #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "text")]
     pub opt_report: Option<OptReportFormat>,
+
+    /// Report native-stack GC root pressure for the stack-map/statepoint
+    /// research backends. Shows calls with live roots, audited calls that
+    /// cannot collect, statepoint relocation counts, plain stack-map
+    /// fallbacks, and the live-root-width distribution.
+    ///
+    /// Useful with `PERRY_STACK_MAPS=1` or `PERRY_STATEPOINTS=1`.
+    /// `--statepoint-report=json` emits a stable machine-readable schema.
+    /// Observational only; cache reuse is disabled for the reporting run so
+    /// codegen executes and produces records.
+    #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "text")]
+    pub statepoint_report: Option<StatepointReportFormat>,
 }
 
 /// Output format for `--opt-report`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum OptReportFormat {
     /// Human-readable, ranked, grouped by actionability tier.
+    Text,
+    /// Stable JSON schema for tooling.
+    Json,
+}
+
+/// Output format for `--statepoint-report`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum StatepointReportFormat {
+    /// Human-readable root-pressure summary and ranked callees.
     Text,
     /// Stable JSON schema for tooling.
     Json,
