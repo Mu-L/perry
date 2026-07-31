@@ -115,6 +115,51 @@ clear negative signal.
 For uncached `batch.ts` compilation, seven-run medians were 910.3 ms shadow,
 946.0 ms plain maps (+3.92%), and 958.3 ms statepoints (+5.28%).
 
+### Follow-up: x29-chain fast walker (2026-07-31, after rebase onto #7114)
+
+The deep-stack telemetry below (36,458 frames unwound for 104 root
+locations) identified `_Unwind_Backtrace` as the walker bottleneck: full
+compact-unwind register recovery on every native frame. The branch now walks
+the raw x29 chain instead — two loads per frame — enabled by two facts:
+
+1. Generated functions now carry `"frame-pointer"="non-leaf"`. Textual-IR
+   input gets no frame-pointer default from the clang driver, which is why
+   generated code previously saved x29 without establishing a chain.
+2. Statepoint spills are SP-relative (`Indirect [R#31 + N]`) on AArch64
+   regardless of frame-pointer attributes, but the stack-map header records
+   each function's frame size, and LLVM's AArch64 frame keeps the
+   `[x29, x30]` pair at the top of the frame — so the body SP is always
+   `fp + 16 - stack_size` from the same chain loads.
+
+The fast path is fail-closed twice over. At parse time, any location that is
+not FP-relative or sized-SP-relative marks the whole image not chain-walkable.
+At walk time, a misaligned, non-increasing, or out-of-bounds frame pointer
+abandons the walk and re-runs the platform unwinder (slot visits are
+idempotent, so a partial fast walk followed by a full unwinder walk is safe).
+`PERRY_STACKMAP_WALKER=unwind` forces the old walker as a bisection control;
+`PERRY_STACKMAP_WALKER=verify` runs both and panics unless they visit the
+identical slot set. Verify exists because forced-evacuation verification
+enumerates roots through the same walker and therefore cannot catch a walker
+that silently skips frames — this is CLAUDE.md gate-failure mode 4 applied to
+the walker itself. Telemetry gains `fp_walks`/`fallback_walks` so any run can
+prove which walker executed.
+
+Results (loaded host, directional): 24/24 correctness matrix, 16/16
+verify-mode probe runs (fast walk engaged and byte-identical to the unwinder
+everywhere), and the deep-stack statepoint probe improves 4.8% end-to-end
+against the unwinder walker on the same binary with interleaved reps.
+
+A finding for the mode decision fell out of the register census: plain-map
+mode emits `Register R#1` locations — the root slot's address materialized in
+a caller-saved register at the map point. No parser can soundly use that
+location (the register is clobbered by the callee and unrecoverable at GC
+time), so those roots are structurally invisible to the collector. LLVM's
+stackmap intrinsic offers no way to force the address into memory; statepoint
+spill slots cannot exhibit the problem. Plain maps are therefore unsound by
+construction at a small but nonzero rate (3 of 60 locations on the deep-stack
+probe), which strengthens the case for deleting the plain-map arm once
+statepoints match it on the walker-sensitive workloads.
+
 ### Native-root and unwinder telemetry
 
 Native stack-map roots now have their own `root_sources.compiled_native`
