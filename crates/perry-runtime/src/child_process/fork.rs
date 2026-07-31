@@ -75,12 +75,26 @@ pub extern "C" fn js_child_process_fork(module_ptr: i64, args_ptr: i64, opts_ptr
     let stdout_obj = cp_build_readable();
     let stderr_obj = cp_build_readable();
     let stdin_obj = cp_build_writable();
-    let mut stdio_kinds = cp_read_stdio(opts_val, 3);
+    let stdio_field = cp_get_field(opts_val, b"stdio");
+    let ipc_fd = cp_array_ptr(stdio_field)
+        .and_then(|stdio| {
+            (0..crate::array::js_array_length(stdio)).find(|&fd| {
+                cp_value_to_string(crate::array::js_array_get_f64(stdio, fd)).as_deref()
+                    == Some("ipc")
+            })
+        })
+        .unwrap_or(3) as usize;
+    let stdio_count = cp_array_ptr(stdio_field)
+        .map(|stdio| crate::array::js_array_length(stdio) as usize)
+        .unwrap_or(4)
+        .max(4);
+    let mut stdio_kinds = cp_read_stdio(opts_val, stdio_count);
+    // The IPC socket is installed by fork_launch after live stdio setup.
+    stdio_kinds[ipc_fd] = CpStdio::Ignore;
     // Node fork semantics: `silent: false` (cluster.fork's default) inherits
     // stdin/stdout/stderr from the parent; `silent: true` pipes them. Only an
     // explicit `silent: false` overrides — an absent `silent` keeps Perry's
     // historical pipe default, and an explicit `stdio` option wins (#4914).
-    let stdio_field = cp_get_field(opts_val, b"stdio");
     if crate::value::JSValue::from_bits(stdio_field.to_bits()).is_undefined()
         && cp_get_field(opts_val, b"silent").to_bits() == crate::value::TAG_FALSE
     {
@@ -127,11 +141,29 @@ pub extern "C" fn js_child_process_fork(module_ptr: i64, args_ptr: i64, opts_ptr
     cp_set_field(cp, b"stdout", cp_stdio_js_value(stdio_kinds[1], stdout_obj));
     cp_set_field(cp, b"stderr", cp_stdio_js_value(stdio_kinds[2], stderr_obj));
     cp_set_field(cp, b"stdin", cp_stdio_js_value(stdio_kinds[0], stdin_obj));
-    let mut stdio = crate::array::js_array_alloc(4);
+    let mut stdio = crate::array::js_array_alloc(stdio_count as u32);
     stdio = crate::array::js_array_push_f64(stdio, cp_stdio_js_value(stdio_kinds[0], stdin_obj));
     stdio = crate::array::js_array_push_f64(stdio, cp_stdio_js_value(stdio_kinds[1], stdout_obj));
     stdio = crate::array::js_array_push_f64(stdio, cp_stdio_js_value(stdio_kinds[2], stderr_obj));
-    stdio = crate::array::js_array_push_f64(stdio, TAG_NULL_F64); // fd 3 = ipc
+    let mut extra_streams = Vec::new();
+    for (fd, kind) in stdio_kinds.iter().copied().enumerate().skip(3) {
+        let stream = if fd != ipc_fd && kind == CpStdio::Pipe {
+            cp_build_readable()
+        } else {
+            TAG_NULL_F64
+        };
+        if fd != ipc_fd && kind == CpStdio::Pipe {
+            extra_streams.push((fd, stream));
+        }
+        stdio = crate::array::js_array_push_f64(
+            stdio,
+            if fd == ipc_fd {
+                TAG_NULL_F64
+            } else {
+                cp_stdio_js_value(kind, stream)
+            },
+        );
+    }
     cp_set_field(cp, b"stdio", cp_box_ptr(stdio as *const u8));
     cp_set_field(cp, b"exitCode", TAG_NULL_F64);
     cp_set_field(cp, b"signalCode", TAG_NULL_F64);
@@ -149,19 +181,31 @@ pub extern "C" fn js_child_process_fork(module_ptr: i64, args_ptr: i64, opts_ptr
     cp_apply_argv0(&mut command, opts_val);
     cp_apply_options(&mut command, opts_val);
     cp_apply_detached(&mut command, opts_val);
-    let launched = cp_apply_live_stdio(&mut command, &stdio_kinds).is_ok()
-        && fork_launch(
+    let launched = match cp_apply_live_stdio(&mut command, &stdio_kinds) {
+        Ok(extra_readers) => fork_launch(
             cp,
             stdout_obj,
             stderr_obj,
             stdin_obj,
+            extra_readers
+                .into_iter()
+                .filter_map(|(fd, pipe)| {
+                    extra_streams
+                        .iter()
+                        .find(|(stream_fd, _)| *stream_fd == fd)
+                        .map(|(_, stream)| (fd, *stream, pipe))
+                })
+                .collect(),
             command,
             advanced,
             timeout,
             kill_signal,
             abort_signal,
             opts_val,
-        );
+            ipc_fd,
+        ),
+        Err(_) => false,
+    };
     if !launched {
         // Spawn failure: emit a deferred `error`, leave `connected` false.
         let msg = format!("fork failed: {exec_path}");
@@ -189,12 +233,14 @@ fn fork_launch(
     stdout_obj: f64,
     stderr_obj: f64,
     stdin_obj: f64,
+    extra_pipes: Vec<(usize, f64, std::fs::File)>,
     mut command: Command,
     advanced: bool,
     timeout: Option<Duration>,
     kill_signal: i32,
     abort_signal: Option<f64>,
     opts_val: f64,
+    ipc_fd: usize,
 ) -> bool {
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::UnixStream;
@@ -205,12 +251,12 @@ fn fork_launch(
         Err(_) => return false,
     };
 
-    // The child inherits `child_sock` across fork; dup it onto fd 3 (which
+    // The child inherits `child_sock` across fork; dup it onto the IPC fd (which
     // `dup2` leaves without CLOEXEC, so it survives exec) and advertise it via
     // NODE_CHANNEL_FD — the convention a Node child reads to enable
     // `process.send` / `process.on('message')`.
     let child_fd = child_sock.as_raw_fd();
-    command.env("NODE_CHANNEL_FD", "3");
+    command.env("NODE_CHANNEL_FD", ipc_fd.to_string());
     // #2130: tell a node child to use V8 structured-clone framing on the channel.
     command.env(
         "NODE_CHANNEL_SERIALIZATION_MODE",
@@ -218,7 +264,7 @@ fn fork_launch(
     );
     unsafe {
         command.pre_exec(move || {
-            if libc::dup2(child_fd, 3) < 0 {
+            if libc::dup2(child_fd, ipc_fd as i32) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -237,7 +283,7 @@ fn fork_launch(
                 stdout_obj,
                 stderr_obj,
                 stdin_obj,
-                Vec::new(),
+                extra_pipes,
                 child,
                 Some(parent_sock),
                 advanced,
@@ -257,12 +303,14 @@ fn fork_launch(
     stdout_obj: f64,
     stderr_obj: f64,
     stdin_obj: f64,
+    extra_pipes: Vec<(usize, f64, std::fs::File)>,
     mut command: Command,
     advanced: bool,
     timeout: Option<Duration>,
     kill_signal: i32,
     abort_signal: Option<f64>,
     opts_val: f64,
+    _ipc_fd: usize,
 ) -> bool {
     let _ = advanced;
     match command.spawn() {
@@ -272,7 +320,7 @@ fn fork_launch(
                 stdout_obj,
                 stderr_obj,
                 stdin_obj,
-                Vec::new(),
+                extra_pipes,
                 child,
                 None,
                 false,

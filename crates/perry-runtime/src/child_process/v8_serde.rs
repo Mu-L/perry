@@ -279,6 +279,10 @@ impl Serializer {
                     return;
                 }
                 if crate::error::js_error_is_error(value).to_bits() == TAG_TRUE_F64.to_bits() {
+                    if self.depth >= MAX_DEPTH {
+                        self.out.push(TAG_UNDEFINED);
+                        return;
+                    }
                     if self.write_reference_or_register(raw) {
                         return;
                     }
@@ -492,6 +496,7 @@ impl Serializer {
     }
 
     fn write_error(&mut self, error: *mut crate::error::ErrorHeader) {
+        self.depth += 1;
         self.out.push(TAG_ERROR);
         let kind = unsafe { (*error).error_kind };
         let type_tag = match kind {
@@ -519,6 +524,7 @@ impl Serializer {
         let stack = crate::error::js_error_get_stack(error);
         self.write_string(crate::value::js_nanbox_string(stack as i64));
         self.out.push(TAG_ERROR_END);
+        self.depth -= 1;
     }
 
     fn write_object(&mut self, obj: *const ObjectHeader) {
@@ -883,21 +889,44 @@ impl<'a> Deserializer<'a> {
             }
             _ => crate::error::ERROR_KIND_ERROR,
         };
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let error = scope.root_raw_mut_ptr(crate::error::js_error_new_kind_from_value(
+            kind,
+            cp_undefined(),
+        ));
+        let id = self.id_table.len();
+        self.id_table.push(cp_box_ptr(
+            error.get_raw_mut_ptr::<crate::error::ErrorHeader>() as *const u8,
+        ));
         let mut message = cp_undefined();
         let mut stack = cp_undefined();
-        let mut cause = None;
         while self.peek_byte() != Some(TAG_ERROR_END) {
             match self.read_byte()? {
                 TAG_ERROR_MESSAGE => message = self.read_value()?,
                 TAG_ERROR_STACK => stack = self.read_value()?,
-                TAG_ERROR_CAUSE => cause = Some(self.read_value()?),
+                TAG_ERROR_CAUSE => {
+                    let cause = self.read_value()?;
+                    unsafe {
+                        crate::error::error_set_cause(
+                            error.get_raw_mut_ptr::<crate::error::ErrorHeader>(),
+                            cause,
+                        )
+                    };
+                }
                 _ => return None,
             }
         }
         self.pos += 1;
-        let error = crate::error::js_error_new_kind_from_value(kind, message);
-        if let Some(cause) = cause {
-            unsafe { crate::error::error_set_cause(error, cause) };
+        let error = error.get_raw_mut_ptr::<crate::error::ErrorHeader>();
+        if !JSValue::from_bits(message.to_bits()).is_undefined() {
+            let message = crate::value::js_get_string_pointer_unified(message)
+                as *mut crate::string::StringHeader;
+            if !message.is_null() {
+                unsafe {
+                    (*error).message = message;
+                    (*error).flags |= 1;
+                }
+            }
         }
         let stack =
             crate::value::js_get_string_pointer_unified(stack) as *mut crate::string::StringHeader;
@@ -905,7 +934,7 @@ impl<'a> Deserializer<'a> {
             unsafe { (*error).stack = stack };
         }
         let boxed = cp_box_ptr(error as *const u8);
-        self.id_table.push(boxed);
+        self.id_table[id] = boxed;
         Some(boxed)
     }
 
