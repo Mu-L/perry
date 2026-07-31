@@ -112,11 +112,16 @@ pub(crate) fn cp_signal_from_value(signal: f64) -> i32 {
 pub(crate) fn cp_signal_is_valid(signal: f64) -> bool {
     let js = JSValue::from_bits(signal.to_bits());
     if js.is_int32() {
-        return js.as_int32() >= 0;
+        let n = js.as_int32();
+        return n == 0 || cp_signal_number(cp_signal_name(n)) == Some(n);
     }
     if js.is_number() {
-        let n = js.as_number();
-        return n.is_finite() && n >= 0.0 && n.fract() == 0.0;
+        let number = js.as_number();
+        let n = number as i32;
+        return number.is_finite()
+            && number >= 0.0
+            && number.fract() == 0.0
+            && (n == 0 || cp_signal_number(cp_signal_name(n)) == Some(n));
     }
     js.is_any_string()
         && cp_value_to_string(signal).is_some_and(|name| cp_signal_number(&name).is_some())

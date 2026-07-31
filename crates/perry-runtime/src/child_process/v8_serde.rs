@@ -143,6 +143,7 @@ fn kind_for_v8_index(idx: u64) -> Option<u8> {
 struct Serializer {
     out: Vec<u8>,
     depth: u32,
+    refs: std::collections::HashMap<usize, u64>,
 }
 
 const MAX_DEPTH: u32 = 512;
@@ -152,6 +153,7 @@ impl Serializer {
         Serializer {
             out: Vec::with_capacity(64),
             depth: 0,
+            refs: std::collections::HashMap::new(),
         }
     }
 
@@ -181,6 +183,18 @@ impl Serializer {
 
     fn write_double(&mut self, value: f64) {
         self.out.extend_from_slice(&value.to_bits().to_le_bytes());
+    }
+
+    fn write_reference_or_register(&mut self, raw: usize) -> bool {
+        if let Some(&id) = self.refs.get(&raw) {
+            self.out.push(TAG_OBJECT_REFERENCE);
+            self.write_varint(id);
+            true
+        } else {
+            let id = self.refs.len() as u64;
+            self.refs.insert(raw, id);
+            false
+        }
     }
 
     fn write_value(&mut self, value: f64) {
@@ -221,39 +235,82 @@ impl Serializer {
             let raw = (bits & crate::value::POINTER_MASK) as usize;
             if raw >= 0x10000 {
                 if crate::buffer::is_registered_buffer(raw) {
+                    if self.write_reference_or_register(raw) {
+                        return;
+                    }
                     self.write_host_buffer(value);
                     return;
                 }
                 if let Some(kind) = crate::typedarray::lookup_typed_array_kind(raw) {
+                    if self.write_reference_or_register(raw) {
+                        return;
+                    }
                     self.write_host_typed_array(value, kind);
                     return;
                 }
                 if crate::map::is_registered_map(raw) {
+                    if self.depth >= MAX_DEPTH {
+                        self.out.push(TAG_UNDEFINED);
+                        return;
+                    }
+                    if self.write_reference_or_register(raw) {
+                        return;
+                    }
                     self.write_map(raw as *const crate::map::MapHeader);
                     return;
                 }
                 if crate::set::is_registered_set(raw) {
+                    if self.depth >= MAX_DEPTH {
+                        self.out.push(TAG_UNDEFINED);
+                        return;
+                    }
+                    if self.write_reference_or_register(raw) {
+                        return;
+                    }
                     self.write_set(raw as *const crate::set::SetHeader);
                     return;
                 }
                 if crate::regex::regex_header_has_magic(raw as *const crate::regex::RegExpHeader) {
+                    if self.write_reference_or_register(raw) {
+                        return;
+                    }
                     self.write_regexp(raw as *const crate::regex::RegExpHeader);
                     return;
                 }
                 if crate::error::js_error_is_error(value).to_bits() == TAG_TRUE_F64.to_bits() {
+                    if self.write_reference_or_register(raw) {
+                        return;
+                    }
                     self.write_error(raw as *mut crate::error::ErrorHeader);
                     return;
                 }
                 if crate::date::is_date_value(value) {
+                    if self.write_reference_or_register(raw) {
+                        return;
+                    }
                     self.out.push(TAG_DATE);
                     self.write_double(crate::date::js_date_get_time(value));
                     return;
                 }
                 if let Some(arr) = cp_array_ptr(value) {
+                    if self.depth >= MAX_DEPTH {
+                        self.out.push(TAG_UNDEFINED);
+                        return;
+                    }
+                    if self.write_reference_or_register(raw) {
+                        return;
+                    }
                     self.write_dense_array(arr);
                     return;
                 }
                 if let Some(obj) = cp_object_ptr(value) {
+                    if self.depth >= MAX_DEPTH {
+                        self.out.push(TAG_UNDEFINED);
+                        return;
+                    }
+                    if self.write_reference_or_register(raw) {
+                        return;
+                    }
                     self.write_object(obj);
                     return;
                 }
@@ -386,6 +443,7 @@ impl Serializer {
     }
 
     fn write_map(&mut self, map: *const crate::map::MapHeader) {
+        self.depth += 1;
         self.out.push(TAG_BEGIN_JS_MAP);
         let size = unsafe { (*map).size };
         for i in 0..size {
@@ -394,9 +452,11 @@ impl Serializer {
         }
         self.out.push(TAG_END_JS_MAP);
         self.write_varint((size as u64) * 2);
+        self.depth -= 1;
     }
 
     fn write_set(&mut self, set: *const crate::set::SetHeader) {
+        self.depth += 1;
         self.out.push(TAG_BEGIN_JS_SET);
         let size = unsafe { (*set).size };
         for i in 0..size {
@@ -404,6 +464,7 @@ impl Serializer {
         }
         self.out.push(TAG_END_JS_SET);
         self.write_varint(size as u64);
+        self.depth -= 1;
     }
 
     fn write_regexp(&mut self, re: *const crate::regex::RegExpHeader) {
@@ -782,7 +843,10 @@ impl<'a> Deserializer<'a> {
         #[cfg(not(feature = "regex-engine"))]
         {
             let _ = (source, flags);
-            Some(cp_undefined())
+            crate::fs::validate::throw_type_error_with_code(
+                "RegExp values are not supported by this build's advanced IPC serializer",
+                "ERR_INVALID_ARG_VALUE",
+            );
         }
     }
 
@@ -815,17 +879,21 @@ impl<'a> Deserializer<'a> {
             _ => crate::error::ERROR_KIND_ERROR,
         };
         let mut message = cp_undefined();
+        let mut stack = cp_undefined();
         while self.peek_byte() != Some(TAG_ERROR_END) {
             match self.read_byte()? {
                 TAG_ERROR_MESSAGE => message = self.read_value()?,
-                TAG_ERROR_STACK => {
-                    let _ = self.read_value()?;
-                }
+                TAG_ERROR_STACK => stack = self.read_value()?,
                 _ => return None,
             }
         }
         self.pos += 1;
         let error = crate::error::js_error_new_kind_from_value(kind, message);
+        let stack =
+            crate::value::js_get_string_pointer_unified(stack) as *mut crate::string::StringHeader;
+        if !stack.is_null() {
+            unsafe { (*error).stack = stack };
+        }
         let boxed = cp_box_ptr(error as *const u8);
         self.id_table.push(boxed);
         Some(boxed)

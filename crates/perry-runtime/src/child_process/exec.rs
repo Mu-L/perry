@@ -58,7 +58,8 @@ pub extern "C" fn js_child_process_exec_sync(
     };
     cp_apply_options(&mut command, opts_val);
 
-    let run_options = cp_read_sync_stdio_run_options(opts_val);
+    let mut run_options = cp_read_sync_stdio_run_options(opts_val);
+    run_options.mark_shell_command();
     let run = cp_run_to_completion(command, &run_options);
     let stdout_box = cp_box_run_output(&run.stdout, run.stdout_piped, &mode);
     if run.success() {
@@ -287,7 +288,8 @@ pub extern "C" fn js_child_process_exec(cmd_ptr: *const StringHeader, arg1: f64,
         c
     };
     cp_apply_options(&mut command, arg1);
-    let run_options = cp_read_async_run_options(arg1);
+    let mut run_options = cp_read_async_run_options(arg1);
+    run_options.mark_shell_command();
 
     if cb.is_null() {
         // Legacy no-callback shape — run synchronously and return stdout

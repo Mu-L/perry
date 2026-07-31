@@ -193,11 +193,12 @@ pub(crate) fn cp_build_unstarted_child_process() -> f64 {
         ("spawn", cp_cast1(cp_method_child_spawn)),
     ];
     let obj = cp_build_object(&methods, CP_SHAPE_ID + 0x60 + methods.len() as u32);
-    let child = cp_box_ptr(obj as *const u8);
-    cp_set_field(child, b"connected", TAG_FALSE_F64);
-    cp_set_field(child, b"killed", TAG_FALSE_F64);
-    cp_set_field(child, b"exitCode", TAG_NULL_F64);
-    cp_set_field(child, b"signalCode", TAG_NULL_F64);
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let child = scope.root_nanbox_f64(cp_box_ptr(obj as *const u8));
+    cp_set_field(child.get_nanbox_f64(), b"connected", TAG_FALSE_F64);
+    cp_set_field(child.get_nanbox_f64(), b"killed", TAG_FALSE_F64);
+    cp_set_field(child.get_nanbox_f64(), b"exitCode", TAG_NULL_F64);
+    cp_set_field(child.get_nanbox_f64(), b"signalCode", TAG_NULL_F64);
 
     let constructor =
         crate::object::bound_native_callable_export_value("child_process", "ChildProcess");
@@ -205,13 +206,13 @@ pub(crate) fn cp_build_unstarted_child_process() -> f64 {
         unsafe { crate::object::callable_exports::ensure_child_process_prototype(constructor) };
     let raw = (constructor.to_bits() & crate::value::POINTER_MASK) as usize;
     let prototype = crate::closure::closure_get_dynamic_prop(raw, "prototype");
-    if cp_object_ptr(prototype).is_some() {
+    if let Some(obj) = cp_object_ptr(child.get_nanbox_f64()) {
         crate::object::prototype_chain::object_set_static_prototype(
             obj as usize,
             prototype.to_bits(),
         );
     }
-    child
+    child.get_nanbox_f64()
 }
 
 /// Public constructor hook for the codegen `new ChildProcess()` fast path.

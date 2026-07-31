@@ -16,6 +16,7 @@ pub(crate) struct CpRunOptions {
     input: Option<Vec<u8>>,
     timeout: Option<Duration>,
     kill_signal: i32,
+    shell_command: bool,
     pub(super) max_buffer: usize,
     stdio: [CpStdio; 3],
 }
@@ -32,6 +33,10 @@ impl CpRunOptions {
     pub(super) fn timeout(&self) -> Option<Duration> {
         self.timeout
     }
+
+    pub(super) fn mark_shell_command(&mut self) {
+        self.shell_command = true;
+    }
 }
 
 impl Default for CpRunOptions {
@@ -40,6 +45,7 @@ impl Default for CpRunOptions {
             input: None,
             timeout: None,
             kill_signal: CP_SIGTERM,
+            shell_command: false,
             max_buffer: CP_DEFAULT_MAX_BUFFER,
             stdio: [CpStdio::Pipe; 3],
         }
@@ -123,6 +129,7 @@ pub(super) fn cp_read_spawn_sync_run_options(opts_val: f64) -> CpRunOptions {
         stdio.get(1).copied().unwrap_or(CpStdio::Pipe),
         stdio.get(2).copied().unwrap_or(CpStdio::Pipe),
     ];
+    options.shell_command = crate::value::js_is_truthy(cp_get_field(opts_val, b"shell")) != 0;
     options
 }
 
@@ -214,9 +221,7 @@ pub(super) fn cp_run_to_completion(mut command: Command, options: &CpRunOptions)
     // A shell that has already completed its short command reports its real
     // exit status with ENOBUFS; a direct child is still terminable at the
     // buffer threshold and reports the configured signal.
-    let shell_command = std::path::Path::new(command.get_program())
-        .file_name()
-        .is_some_and(|name| name == "sh");
+    let shell_command = options.shell_command;
     let stdin_piped = matches!(options.stdio[0], CpStdio::Pipe) && options.input.is_some();
     let stdout_piped = matches!(options.stdio[1], CpStdio::Pipe);
     let stderr_piped = matches!(options.stdio[2], CpStdio::Pipe);

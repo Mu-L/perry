@@ -250,7 +250,7 @@ pub(crate) fn cp_stdio_js_value(kind: CpStdio, pipe_obj: f64) -> f64 {
     }
 }
 
-/// Apply stdio 0-2 and create parent-readable pipes for extra `"pipe"` fds.
+/// Apply stdio 0-2 and honor explicit descriptors beyond fd 2.
 pub(crate) fn cp_apply_live_stdio(
     command: &mut Command,
     stdio: &[CpStdio],
@@ -272,31 +272,59 @@ pub(crate) fn cp_apply_live_stdio(
 
         let mut readers = Vec::new();
         for (fd, kind) in stdio.iter().copied().enumerate().skip(3) {
-            if kind != CpStdio::Pipe {
-                continue;
-            }
-            let mut pipe = [0; 2];
-            if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
-                continue;
-            }
-            let read = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
-            let write = unsafe { std::fs::File::from_raw_fd(pipe[1]) };
-            let write_fd = write.as_raw_fd();
-            unsafe {
-                libc::fcntl(write_fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            }
-            unsafe {
-                command.pre_exec(move || {
-                    // Keep the write end owned by Command until the fork; the
-                    // parent drops it after spawn while FD_CLOEXEC closes the
-                    // original child descriptor on exec.
-                    if libc::dup2(write.as_raw_fd(), fd as i32) < 0 {
-                        return Err(std::io::Error::last_os_error());
+            match kind {
+                CpStdio::Pipe => {
+                    let mut pipe = [0; 2];
+                    if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+                        continue;
                     }
-                    Ok(())
-                });
+                    let read = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+                    let write = unsafe { std::fs::File::from_raw_fd(pipe[1]) };
+                    let write_fd = write.as_raw_fd();
+                    unsafe {
+                        libc::fcntl(write_fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                        command.pre_exec(move || {
+                            if libc::dup2(write.as_raw_fd(), fd as i32) < 0
+                                || libc::fcntl(fd as i32, libc::F_SETFD, 0) < 0
+                            {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            Ok(())
+                        });
+                    }
+                    readers.push((fd, read));
+                }
+                CpStdio::Ignore => {
+                    let Ok(null) = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open("/dev/null")
+                    else {
+                        continue;
+                    };
+                    unsafe {
+                        command.pre_exec(move || {
+                            if libc::dup2(null.as_raw_fd(), fd as i32) < 0
+                                || libc::fcntl(fd as i32, libc::F_SETFD, 0) < 0
+                            {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            Ok(())
+                        });
+                    }
+                }
+                CpStdio::Fd(source) => unsafe {
+                    command.pre_exec(move || {
+                        if libc::dup2(source, fd as i32) < 0
+                            || libc::fcntl(fd as i32, libc::F_SETFD, 0) < 0
+                        {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                },
+                CpStdio::Inherit => {}
             }
-            readers.push((fd, read));
         }
         return readers;
     }

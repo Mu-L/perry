@@ -14,7 +14,8 @@ mod sync_run;
 mod validate;
 pub use validate::{
     js_child_process_validate_args, js_child_process_validate_command,
-    js_child_process_validate_options, js_child_process_validate_spawn_args,
+    js_child_process_validate_fork_module, js_child_process_validate_options,
+    js_child_process_validate_spawn_args,
 };
 
 // #3137: reuse the codec for the public `node:v8` serialize/deserialize API.

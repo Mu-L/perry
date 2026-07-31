@@ -306,6 +306,29 @@ pub unsafe extern "C" fn js_child_process_validate_command(
     value
 }
 
+/// `fork()` accepts strings, Buffers, and WHATWG URL objects. This runs before
+/// codegen converts the value to a raw string pointer so primitives cannot be
+/// silently string-coerced into module paths.
+#[no_mangle]
+pub extern "C" fn js_child_process_validate_fork_module(value: f64) -> f64 {
+    let js = JSValue::from_bits(value.to_bits());
+    let raw = (value.to_bits() & crate::value::POINTER_MASK) as usize;
+    let is_url = cp_object_ptr(value).is_some_and(crate::url::is_url_object_shape);
+    if js.is_any_string()
+        || (raw >= 0x10000
+            && crate::buffer::is_registered_buffer(raw)
+            && !crate::buffer::is_any_array_buffer(raw))
+        || is_url
+    {
+        return value;
+    }
+    let message = format!(
+        "The \"modulePath\" argument must be of type string or an instance of Buffer or URL. Received {}",
+        crate::fs::validate::describe_received(value)
+    );
+    crate::fs::validate::throw_type_error_with_code(&message, "ERR_INVALID_ARG_TYPE");
+}
+
 /// Codegen-invoked `args` validator (#3079). `value` is the original NaN-boxed
 /// JS value passed in the args slot. Diverges via `js_throw` on a primitive.
 #[no_mangle]
@@ -350,6 +373,10 @@ static KEEP_JS_CP_VALIDATE_COMMAND: unsafe extern "C" fn(f64, *const u8, u32) ->
 #[cfg(feature = "keepalive-anchors")]
 #[used]
 static KEEP_JS_CP_VALIDATE_ARGS: extern "C" fn(f64) -> f64 = js_child_process_validate_args;
+#[cfg(feature = "keepalive-anchors")]
+#[used]
+static KEEP_JS_CP_VALIDATE_FORK_MODULE: extern "C" fn(f64) -> f64 =
+    js_child_process_validate_fork_module;
 #[cfg(feature = "keepalive-anchors")]
 #[used]
 static KEEP_JS_CP_VALIDATE_OPTIONS: extern "C" fn(f64, i32, i32) -> f64 =

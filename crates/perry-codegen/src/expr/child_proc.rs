@@ -35,6 +35,17 @@ fn emit_cp_validate_command(ctx: &mut FnCtx<'_>, cmd_box: &str, name: &str) {
     );
 }
 
+/// `fork()` accepts a module path string, Buffer, or WHATWG URL. Validate the
+/// original tagged value before coercing it to the raw string pointer.
+fn emit_cp_validate_fork_module(ctx: &mut FnCtx<'_>, module_box: &str) {
+    let blk = ctx.block();
+    let _ = blk.call(
+        DOUBLE,
+        "js_child_process_validate_fork_module",
+        &[(DOUBLE, module_box)],
+    );
+}
+
 /// #3079: emit a setup-time `args` validation call. `args_box` is the original
 /// NaN-boxed value passed in the args slot. The runtime throws `TypeError
 /// [ERR_INVALID_ARG_TYPE]` for a primitive (string/number/boolean/…), accepting
@@ -216,6 +227,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // runtime wires up an IPC channel + send/disconnect/'message'. The
             // runtime returns an already-NaN-boxed ChildProcess pointer. #1933.
             let mod_box = lower_expr(ctx, module)?;
+            emit_cp_validate_fork_module(ctx, &mod_box);
             let mod_str =
                 ctx.block()
                     .call(I64, "js_jsvalue_to_string_coerce", &[(DOUBLE, &mod_box)]);
