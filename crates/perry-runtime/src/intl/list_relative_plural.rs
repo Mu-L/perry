@@ -291,12 +291,81 @@ pub(crate) fn rtf_singular_unit(unit: &str) -> Option<&'static str> {
     RTF_SINGULAR_UNITS.iter().copied().find(|u| *u == candidate)
 }
 
-/// Build the long-form, `numeric: "always"` en-US relative-time parts for
-/// `value` in `unit`. (`short`/`narrow` abbreviations and the `numeric: "auto"`
-/// special words — "tomorrow"/"yesterday" — need CLDR data and fall back to the
-/// long numeric form here.) Returns `(leading, number, trailing)` literal/number
-/// fragments so `format` and `formatToParts` stay consistent.
-pub(crate) fn rtf_parts(value: f64, unit: &str) -> Vec<(&'static str, String)> {
+/// en-US CLDR relative word form for `numeric: "auto"` when one exists for
+/// `(value, unit, style)`. Returns a single full phrase (e.g. `"yesterday"`,
+/// `"last week"`); `None` means fall through to the numeric form. Only the
+/// discrete integer values that CLDR actually names for en are covered —
+/// everything else (including non-integers and |value| > 1) stays numeric.
+///
+/// `style` is `"long"` / `"short"` / `"narrow"`; short and narrow differ from
+/// long for `week`/`month`/`quarter`/`year` abbreviations (`wk.` / `mo.` /
+/// `qtr.` / `yr.`), matching ICU en.
+fn rtf_auto_word(value: f64, unit: &str, style: &str) -> Option<&'static str> {
+    // Auto forms apply only to exact integers. `0.0` is fine; `0.5` is not.
+    if value.fract() != 0.0 {
+        return None;
+    }
+    let n = value as i64;
+    let shortish = style == "short" || style == "narrow";
+    match (unit, n) {
+        ("second", 0) => Some("now"),
+        ("minute", 0) => Some("this minute"),
+        ("hour", 0) => Some("this hour"),
+        ("day", -1) => Some("yesterday"),
+        ("day", 0) => Some("today"),
+        ("day", 1) => Some("tomorrow"),
+        ("week", -1) => Some(if shortish { "last wk." } else { "last week" }),
+        ("week", 0) => Some(if shortish { "this wk." } else { "this week" }),
+        ("week", 1) => Some(if shortish { "next wk." } else { "next week" }),
+        ("month", -1) => Some(if shortish { "last mo." } else { "last month" }),
+        ("month", 0) => Some(if shortish { "this mo." } else { "this month" }),
+        ("month", 1) => Some(if shortish { "next mo." } else { "next month" }),
+        ("quarter", -1) => Some(if shortish {
+            "last qtr."
+        } else {
+            "last quarter"
+        }),
+        ("quarter", 0) => Some(if shortish {
+            "this qtr."
+        } else {
+            "this quarter"
+        }),
+        ("quarter", 1) => Some(if shortish {
+            "next qtr."
+        } else {
+            "next quarter"
+        }),
+        ("year", -1) => Some(if shortish { "last yr." } else { "last year" }),
+        ("year", 0) => Some(if shortish { "this yr." } else { "this year" }),
+        ("year", 1) => Some(if shortish { "next yr." } else { "next year" }),
+        _ => None,
+    }
+}
+
+/// Build en-US relative-time parts for `value` in `unit`.
+///
+/// When `numeric == "auto"`, substitutes the CLDR relative word form
+/// (`"yesterday"` / `"today"` / `"tomorrow"`, `"last/this/next <unit>"`,
+/// `"now"`, …) for the discrete integer values CLDR names; otherwise (and for
+/// every other value) renders the long numeric form (`"in 2 days"` /
+/// `"1 day ago"`). `format` and `formatToParts` share this path so they stay
+/// consistent. A word-form result is a single `"literal"` part (no unit field),
+/// matching Node / ECMA-402 FormatRelativeTimeToParts.
+///
+/// `style` is consulted only for the auto word forms (`week`/`month`/
+/// `quarter`/`year` short abbreviations); the numeric path still uses the long
+/// unit names (a pre-existing limitation of the en-US fallback formatter).
+pub(crate) fn rtf_parts(
+    value: f64,
+    unit: &str,
+    numeric: &str,
+    style: &str,
+) -> Vec<(&'static str, String)> {
+    if numeric == "auto" {
+        if let Some(word) = rtf_auto_word(value, unit, style) {
+            return vec![("literal", word.to_string())];
+        }
+    }
     let abs = value.abs();
     let num_str = format_number_parts(abs, "en-US", None, None);
     let unit_display = if abs == 1.0 {
@@ -332,12 +401,22 @@ pub(crate) fn to_number_reject_bigint(value: f64) -> f64 {
 /// Shared steps of `format`/`formatToParts`: `value = ? ToNumber(value)` (a
 /// Symbol or BigInt throws TypeError; an object's `valueOf` is honoured), then
 /// `unit = ? ToString(unit)`, then the RangeError guards for a non-finite value
-/// or an unsanctioned unit. Returns the rendered parts together with the
-/// resolved singular `unit` (the `[[Unit]]` field formatToParts attaches).
+/// or an unsanctioned unit. Reads the instance's `[[Numeric]]` / `[[Style]]`
+/// slots so `numeric: "auto"` can select CLDR word forms (#6960). Returns the
+/// rendered parts together with the resolved singular `unit` (the `[[Unit]]`
+/// field formatToParts attaches — omitted for pure-literal auto words).
 pub(crate) fn rtf_instance_parts_and_unit(
+    obj: *const ObjectHeader,
     value: f64,
     unit_arg: f64,
 ) -> (Vec<(&'static str, String)>, &'static str) {
+    // Read `[[Numeric]]` / `[[Style]]` before ToNumber/ToString: those ops can
+    // invoke user `valueOf`/`toString`/`Symbol.toPrimitive`, which may allocate
+    // and evacuate `obj`. The slots are immutable after construction, so
+    // reading them first is observationally identical and keeps `obj` from
+    // being held as a raw pointer across a GC-capable call (#6960 / CodeRabbit).
+    let numeric = get_string_field(obj, KEY_NUMERIC).unwrap_or_else(|| "always".to_string());
+    let style = get_string_field(obj, KEY_RTF_STYLE).unwrap_or_else(|| "long".to_string());
     // ToNumber: a Symbol/BigInt value throws TypeError *before* the finite-ness
     // RangeError (format/value-symbol.js); an object's valueOf is invoked.
     let number = to_number_reject_bigint(value);
@@ -355,11 +434,15 @@ pub(crate) fn rtf_instance_parts_and_unit(
             "Value {unit_str} out of range for Intl.RelativeTimeFormat.format() unit"
         ));
     };
-    (rtf_parts(number, unit), unit)
+    (rtf_parts(number, unit, &numeric, &style), unit)
 }
 
-pub(crate) fn rtf_instance_parts(value: f64, unit_arg: f64) -> Vec<(&'static str, String)> {
-    rtf_instance_parts_and_unit(value, unit_arg).0
+pub(crate) fn rtf_instance_parts(
+    obj: *const ObjectHeader,
+    value: f64,
+    unit_arg: f64,
+) -> Vec<(&'static str, String)> {
+    rtf_instance_parts_and_unit(obj, value, unit_arg).0
 }
 
 /// Build the `formatToParts` array, attaching the `[[Unit]]` field to every part
@@ -384,9 +467,9 @@ pub(crate) extern "C" fn rtf_format_thunk(
     value: f64,
     unit: f64,
 ) -> f64 {
-    let _obj = this_intl_object("format", KIND_RELATIVE_TIME);
+    let obj = this_intl_object("format", KIND_RELATIVE_TIME);
     string_value(
-        &rtf_instance_parts(value, unit)
+        &rtf_instance_parts(obj, value, unit)
             .iter()
             .map(|(_, v)| v.as_str())
             .collect::<String>(),
@@ -398,9 +481,9 @@ pub(crate) extern "C" fn rtf_bound_format_thunk(
     value: f64,
     unit: f64,
 ) -> f64 {
-    let _obj = captured_intl_object(closure, "format", KIND_RELATIVE_TIME);
+    let obj = captured_intl_object(closure, "format", KIND_RELATIVE_TIME);
     string_value(
-        &rtf_instance_parts(value, unit)
+        &rtf_instance_parts(obj, value, unit)
             .iter()
             .map(|(_, v)| v.as_str())
             .collect::<String>(),
@@ -412,8 +495,8 @@ pub(crate) extern "C" fn rtf_to_parts_thunk(
     value: f64,
     unit: f64,
 ) -> f64 {
-    let _obj = this_intl_object("formatToParts", KIND_RELATIVE_TIME);
-    let (parts, unit) = rtf_instance_parts_and_unit(value, unit);
+    let obj = this_intl_object("formatToParts", KIND_RELATIVE_TIME);
+    let (parts, unit) = rtf_instance_parts_and_unit(obj, value, unit);
     rtf_parts_to_js_array(&parts, unit)
 }
 
@@ -422,8 +505,8 @@ pub(crate) extern "C" fn rtf_bound_to_parts_thunk(
     value: f64,
     unit: f64,
 ) -> f64 {
-    let _obj = captured_intl_object(closure, "formatToParts", KIND_RELATIVE_TIME);
-    let (parts, unit) = rtf_instance_parts_and_unit(value, unit);
+    let obj = captured_intl_object(closure, "formatToParts", KIND_RELATIVE_TIME);
+    let (parts, unit) = rtf_instance_parts_and_unit(obj, value, unit);
     rtf_parts_to_js_array(&parts, unit)
 }
 
