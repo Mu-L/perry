@@ -432,6 +432,7 @@ enum MockRestoreTarget {
 
 struct MockState {
     id: i64,
+    tracked: bool,
     original: f64,
     implementation: f64,
     once: Vec<f64>,
@@ -701,6 +702,7 @@ fn create_mock_function(original: f64, implementation: f64, restore: MockRestore
     MOCK_STATES.with(|states| {
         states.borrow_mut().push(MockState {
             id,
+            tracked: true,
             original: original.get_nanbox_f64(),
             implementation: implementation.get_nanbox_f64(),
             once: Vec::new(),
@@ -720,6 +722,7 @@ fn create_restore_context(restore: MockRestoreTarget) -> f64 {
     MOCK_STATES.with(|states| {
         states.borrow_mut().push(MockState {
             id,
+            tracked: true,
             original: undefined_value(),
             implementation: undefined_value(),
             once: Vec::new(),
@@ -743,9 +746,9 @@ fn restore_mock_state(id: i64) {
         let Some(state) = states.iter_mut().find(|state| state.id == id) else {
             return None;
         };
-        state.implementation = state.original;
-        state.once.clear();
-        reset_mock_state_calls(state);
+        if matches!(state.restore, MockRestoreTarget::None) {
+            state.implementation = state.original;
+        }
         Some(state.restore.clone())
     });
     match restore {
@@ -1161,27 +1164,32 @@ extern "C" fn mock_property_thunk(
 }
 
 extern "C" fn mock_reset_thunk(_closure: *const ClosureHeader) -> f64 {
+    restore_tracked_mocks();
     MOCK_STATES.with(|states| {
         for state in states.borrow_mut().iter_mut() {
-            state.implementation = state.original;
-            state.once.clear();
-            reset_mock_state_calls(state);
+            state.tracked = false;
         }
     });
+    crate::timer::js_mock_timers_reset();
     undefined_value()
 }
 
-extern "C" fn mock_restore_all_thunk(_closure: *const ClosureHeader) -> f64 {
+fn restore_tracked_mocks() {
     let ids = MOCK_STATES.with(|states| {
         states
             .borrow()
             .iter()
+            .filter(|state| state.tracked)
             .map(|state| state.id)
             .collect::<Vec<_>>()
     });
     for id in ids {
         restore_mock_state(id);
     }
+}
+
+extern "C" fn mock_restore_all_thunk(_closure: *const ClosureHeader) -> f64 {
+    restore_tracked_mocks();
     undefined_value()
 }
 
