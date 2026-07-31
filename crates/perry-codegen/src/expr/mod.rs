@@ -148,10 +148,10 @@ pub(crate) use scalar_slot_root::{
     root_scalar_replaced_slot, root_scalar_replaced_slot_unconditional,
 };
 pub(crate) use shadow_slot::{
-    current_closure_ptr_value, emit_persistent_shadow_root_barrier,
-    emit_shadow_slot_bind_for_local, emit_shadow_slot_clear, emit_shadow_slot_update_for_expr,
-    enable_persistent_shadow_slot_for_array_alias, expr_is_known_non_pointer_shadow_value,
-    try_current_closure_ptr_value,
+    current_closure_ptr_value, emit_deferred_param_shadow_binds,
+    emit_persistent_shadow_root_barrier, emit_shadow_slot_bind_for_local, emit_shadow_slot_clear,
+    emit_shadow_slot_update_for_expr, enable_persistent_shadow_slot_for_array_alias,
+    expr_is_known_non_pointer_shadow_value, try_current_closure_ptr_value,
 };
 
 /// One in-flight inline-constructor return target. See

@@ -460,6 +460,18 @@ pub(super) fn compile_function(
     //  - `Boxed`/`F64` → exactly today's binding (a raw f64 IS its box).
     let mut spec_i32_param_slots: HashMap<u32, String> = HashMap::new();
     let mut bound_param_slots: HashSet<u32> = HashSet::new();
+    // #7090: `(slot_idx, param_slot)` for each parameter that needs a GC-root
+    // bind, recorded here and emitted once `FnCtx` exists (see
+    // `emit_deferred_param_shadow_binds`). The bind itself is unchanged; only
+    // *who emits it* moves, because the inline form needs a lowering context
+    // that can create basic blocks and this loop holds a raw `&mut LlBlock`.
+    //
+    // Deferring is emission-order-identical: nothing is appended to `blk`
+    // between this loop and the `FnCtx` construction below, so the binds still
+    // land at the very top of block 0's post-prologue instruction stream with
+    // no intervening IR — in particular nothing that could allocate, and so no
+    // window in which an incoming argument is unrooted.
+    let mut deferred_param_binds: Vec<(u32, String)> = Vec::new();
     let locals: HashMap<u32, String> = {
         let blk = lf.block_mut(0).unwrap();
         let mut map = HashMap::new();
@@ -516,10 +528,7 @@ pub(super) fn compile_function(
             let slot = super::arguments::store_param_slot(blk, p, &boxed_vars, &arg_name);
             if let Some(slot_idx) = shadow_slot_map.get(&p.id).copied() {
                 bound_param_slots.insert(slot_idx);
-                blk.call_void(
-                    "js_shadow_slot_bind",
-                    &[(I32, &slot_idx.to_string()), (PTR, &slot)],
-                );
+                deferred_param_binds.push((slot_idx, slot.clone()));
             }
             map.insert(p.id, slot);
         }
@@ -861,6 +870,12 @@ pub(super) fn compile_function(
         known_noalias_buffer_locals: native_facts.known_noalias_buffer_locals(),
         buffer_alias_base,
     };
+
+    // #7090: the parameter root binds the prologue loop deferred. Emitted here,
+    // as the first thing after `FnCtx` exists and before any other lowering, so
+    // the instruction stream is the same as when the loop emitted the calls
+    // itself — but now with a context that can create the inline form's blocks.
+    crate::expr::emit_deferred_param_shadow_binds(&mut ctx, &deferred_param_binds);
 
     let wrapper_name = format!("__perry_wrap_{}", public_llvm_name);
     super::arguments::materialize_arguments_object(

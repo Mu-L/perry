@@ -179,6 +179,93 @@ fn shadow_frame_handle_lines(
     ]
 }
 
+/// The inline equivalent of `js_shadow_frame_pop(handle)` (#7090).
+///
+/// # Why this is emitted as text rather than through the block builder
+///
+/// The pop is spliced in by a rewrite over the *rendered* IR, because returns
+/// reach this point from every lowering path (`Stmt::Return`, implicit returns,
+/// hand-emitted `ret`s) and only the finished text sees all of them. There is
+/// no `FnCtx` here and no block builder — but a basic block is just a label in
+/// the text, so the same fast-path/slow-path diamond #7088 uses for stores is
+/// available by terminating the current block with a `br` and opening new
+/// labels. That is what this does; the `ret` the caller is about to write lands
+/// in the final `done` block.
+///
+/// # It mirrors the runtime function statement for statement
+///
+/// ```text
+/// let base = frame_handle as usize;
+/// if base >= s.len { return }              // -> the `ult` guard below
+/// s.frame_top = (*s.ptr.add(base)).value;  // -> load entry.value, store frame_top
+/// s.set_slots_len(base);                   // -> store len
+/// ```
+///
+/// The bounds guard is **kept**, not assumed away. It is what stopped a
+/// NaN-boxed value threaded into this argument from aborting the process on
+/// Windows release builds, and skipping a malformed pop only over-approximates
+/// the root set. The null-state arm keeps the `extern "C"` call for any path
+/// that could reach a return before the frame push ran.
+///
+/// GC contract: a pop publishes no new root, so there is no value to shade and
+/// no rewritable location to record. It only restores `frame_top` and shrinks
+/// `len` — both plain words of the state struct, written here through exactly
+/// the offsets the runtime writes them through.
+fn shadow_frame_pop_lines(seq: u32, handle_reg: &str, state_slot: &str) -> Vec<String> {
+    use crate::expr::shadow_inline::{
+        SHADOW_ENTRY_SHIFT, SHADOW_STATE_FRAME_TOP_OFFSET, SHADOW_STATE_LEN_OFFSET,
+        SHADOW_STATE_PTR_OFFSET,
+    };
+    let r = |what: &str| format!("%shadow_pop_{}_{}", what, seq);
+    let l = |what: &str| format!("shadow_pop_{}_{}", what, seq);
+    let (st, isnull) = (r("st"), r("isnull"));
+    let (lenp, len, ok) = (r("lenp"), r("len"), r("ok"));
+    let (bufp, buf, off) = (r("bufp"), r("buf"), r("off"));
+    let (entry, prev) = (r("entry"), r("prev"));
+    let (topp, lenp2) = (r("topp"), r("lenp2"));
+    let (slow, chk, doit, done) = (l("slow"), l("chk"), l("do"), l("done"));
+    vec![
+        format!("  {} = load ptr, ptr {}", st, state_slot),
+        format!("  {} = icmp eq ptr {}, null", isnull, st),
+        format!("  br i1 {}, label %{}, label %{}", isnull, slow, chk),
+        format!("{}:", slow),
+        format!("  call void @js_shadow_frame_pop(i64 {})", handle_reg),
+        format!("  br label %{}", done),
+        format!("{}:", chk),
+        format!(
+            "  {} = getelementptr inbounds i8, ptr {}, i64 {}",
+            lenp, st, SHADOW_STATE_LEN_OFFSET
+        ),
+        format!("  {} = load i64, ptr {}", len, lenp),
+        format!("  {} = icmp ult i64 {}, {}", ok, handle_reg, len),
+        format!("  br i1 {}, label %{}, label %{}", ok, doit, done),
+        format!("{}:", doit),
+        format!(
+            "  {} = getelementptr inbounds i8, ptr {}, i64 {}",
+            bufp, st, SHADOW_STATE_PTR_OFFSET
+        ),
+        format!("  {} = load ptr, ptr {}", buf, bufp),
+        format!("  {} = shl i64 {}, {}", off, handle_reg, SHADOW_ENTRY_SHIFT),
+        format!(
+            "  {} = getelementptr inbounds i8, ptr {}, i64 {}",
+            entry, buf, off
+        ),
+        format!("  {} = load i64, ptr {}", prev, entry),
+        format!(
+            "  {} = getelementptr inbounds i8, ptr {}, i64 {}",
+            topp, st, SHADOW_STATE_FRAME_TOP_OFFSET
+        ),
+        format!("  store i64 {}, ptr {}", prev, topp),
+        format!(
+            "  {} = getelementptr inbounds i8, ptr {}, i64 {}",
+            lenp2, st, SHADOW_STATE_LEN_OFFSET
+        ),
+        format!("  store i64 {}, ptr {}", handle_reg, lenp2),
+        format!("  br label %{}", done),
+        format!("{}:", done),
+    ]
+}
+
 /// Location of a function's `js_shadow_frame_push` line, so its slot-count
 /// operand can be rewritten in place after the fact.
 struct ShadowFramePush {
@@ -698,12 +785,24 @@ impl LlFunction {
                     }
                     if let Some(handle_slot) = &self.shadow_frame_slot {
                         let load_reg = format!("%shadow_pop_l_{}", seq);
-                        seq += 1;
                         out.push_str(&format!("  {} = load i64, ptr {}\n", load_reg, handle_slot));
-                        out.push_str(&format!(
-                            "  call void @js_shadow_frame_pop(i64 {})\n",
-                            load_reg
-                        ));
+                        match self.shadow_state_slot.as_deref() {
+                            // #7090: inline the pop against this activation's
+                            // cached state pointer.
+                            Some(state_slot)
+                                if crate::codegen::helpers::inline_shadow_slot_enabled() =>
+                            {
+                                for line in shadow_frame_pop_lines(seq, &load_reg, state_slot) {
+                                    out.push_str(&line);
+                                    out.push('\n');
+                                }
+                            }
+                            _ => out.push_str(&format!(
+                                "  call void @js_shadow_frame_pop(i64 {})\n",
+                                load_reg
+                            )),
+                        }
+                        seq += 1;
                     }
                 }
                 out.push_str(line);

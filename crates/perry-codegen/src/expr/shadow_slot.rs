@@ -186,6 +186,34 @@ pub(crate) fn enable_persistent_shadow_slot_for_array_alias(
     );
 }
 
+/// Emit the parameter GC-root binds that `codegen::function` deferred out of
+/// its raw-`LlBlock` prologue loop (#7090).
+///
+/// Why they are deferred rather than emitted in place: the inline form needs a
+/// fast-path/slow-path diamond, and creating basic blocks needs a `FnCtx`. The
+/// prologue loop holds a `&mut LlBlock` and has no such context — that is the
+/// whole of the "structural blocker" #7088 stopped at. Nothing is appended to
+/// block 0 between that loop and the `FnCtx` construction, so moving the
+/// emission point changes *which code emits the bind*, not where the bind lands
+/// in the instruction stream, and not the order of anything around it. In
+/// particular no allocation can happen in the gap, so there is no window in
+/// which an incoming argument is unrooted.
+///
+/// The bind itself is the one #7088 already ships for body stores, guards and
+/// gated root-shading barrier included; the `extern "C"` call is still emitted
+/// when the inline form declines.
+pub(crate) fn emit_deferred_param_shadow_binds(ctx: &mut FnCtx<'_>, binds: &[(u32, String)]) {
+    for (slot_idx, param_slot) in binds {
+        if super::shadow_inline::emit_inline_slot_bind(ctx, *slot_idx, param_slot) {
+            continue;
+        }
+        ctx.block().call_void(
+            "js_shadow_slot_bind",
+            &[(I32, &slot_idx.to_string()), (PTR, param_slot)],
+        );
+    }
+}
+
 pub(crate) fn emit_shadow_slot_bind_for_local(ctx: &mut FnCtx<'_>, local_id: u32) {
     let Some(slot_idx) = ctx.shadow_slot_map.get(&local_id).copied() else {
         return;
