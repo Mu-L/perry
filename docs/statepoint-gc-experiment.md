@@ -177,6 +177,51 @@ contract. A fast path first needs an explicit frame-pointer/unwind ABI for
 generated and intervening runtime frames, plus fallback and cross-architecture
 tests.
 
+### Follow-up: the explicit-safepoint collection contract (PERRY_GC_SAFEPOINT_ONLY)
+
+The prerequisite that gated this experiment — the #7114 temp-root
+correctness fix — landed on main during the first prototype session, so the
+contract experiment ran after rebasing onto it.
+
+**The contract.** A collection that skips the conservative stack scan
+consumes only precise roots; with native stack maps active, precise frame
+roots exist only at mapped PCs. Therefore such a collection may only begin
+at a declared safepoint (a loop back-edge poll or the outermost
+microtask-pump boundary) — anywhere else it must scan conservatively. The
+runtime already routes moving minors to those safepoints (the #7024
+deferral machinery), so today the property is *emergent*: it holds because
+every possibly-collecting call happens to be mapped. The contract makes it
+*enforced* — a thread-local declared-safepoint flag plus a check at the
+root-scan subphase — and enforcement is what makes it sound to stop mapping
+call sites.
+
+Two enforcement levels: `PERRY_GC_SAFEPOINT_ONLY=1` (heal — an undeclared
+precise-root cycle gets the conservative scan forced for that cycle, which
+restores liveness and keeps it non-moving) and `=strict` (panic — the gate
+mode that proves the enforcement is live, per the four-ways-a-gate-cannot-
+fail rule). Manual `gc()` and the alloc-point slack valve force the scan
+already and are exempt by construction. Under the contract, loop polls also
+drain non-nursery triggers so full collections migrate to declared
+safepoints.
+
+**What it unmaps.** A new audited `GcCallEffect::AllocNoReentry` class:
+helpers that may allocate (arming a trigger) but never collect synchronously
+and never re-enter generated JS. Under the contract their call sites need no
+statepoint — any trigger they arm either defers to a declared safepoint or
+collects behind the forced scan. First audited set: singleton closure
+allocation, class-object allocation, `js_array_push_f64`, `js_array_length`,
+`js_array_slice_values`.
+
+**The census result that bounds the idea.** On `batch.ts`, 217 statepoints
+break down as roughly 85 property-access diamonds (getter re-entry possible
+— must stay mapped), ~40 coercion/setter/throw paths (re-entry — stay), ~10
+generated-to-generated calls and polls (stay by definition), and only ~25-30
+pure-allocation sites the contract can unmap. **Re-entry, not allocation, is
+what bounds the contract's reach on object-heavy code.** Deleting the
+property-access calls is representation selection's job (`Ptr<Shape>`); the
+contract unmaps what allocation traffic remains. The two campaigns compose
+rather than compete.
+
 ### Work deliberately left gated
 
 This follow-up does not alter temporary-root semantics, collection scheduling,
