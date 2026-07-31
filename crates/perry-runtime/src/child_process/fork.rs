@@ -181,7 +181,7 @@ pub extern "C" fn js_child_process_fork(module_ptr: i64, args_ptr: i64, opts_ptr
     cp_apply_argv0(&mut command, opts_val);
     cp_apply_options(&mut command, opts_val);
     cp_apply_detached(&mut command, opts_val);
-    let launched = match cp_apply_live_stdio(&mut command, &stdio_kinds) {
+    let launch = match cp_apply_live_stdio(&mut command, &stdio_kinds) {
         Ok(extra_readers) => fork_launch(
             cp,
             stdout_obj,
@@ -204,18 +204,22 @@ pub extern "C" fn js_child_process_fork(module_ptr: i64, args_ptr: i64, opts_ptr
             opts_val,
             ipc_fd,
         ),
-        Err(_) => false,
+        Err(error) => Err(error),
     };
-    if !launched {
+    if let Err(error) = launch {
         // Spawn failure: emit a deferred `error`, leave `connected` false.
-        let msg = format!("fork failed: {exec_path}");
-        let mp = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
-        let err = crate::error::js_error_new_with_message(mp);
-        cp_set_field(
-            cp,
-            b"__cpError",
-            crate::value::js_nanbox_pointer(err as i64),
+        let code = cp_io_error_code(&error);
+        let syscall = format!("spawn {exec_path}");
+        let err = cp_make_error(
+            &format!("{syscall} {code}"),
+            &[
+                ("errno", cp_errno_number(code)),
+                ("code", cp_box_string(code)),
+                ("syscall", cp_box_string(&syscall)),
+                ("path", cp_box_string(&exec_path)),
+            ],
         );
+        cp_set_field(cp, b"__cpError", err);
         let emit_closure =
             crate::closure::js_closure_alloc(reactor::cp_emit_spawn_error as *const u8, 1);
         crate::closure::js_closure_set_capture_ptr(emit_closure, 0, cp.to_bits() as i64);
@@ -241,14 +245,14 @@ fn fork_launch(
     abort_signal: Option<f64>,
     opts_val: f64,
     ipc_fd: usize,
-) -> bool {
+) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::UnixStream;
     use std::os::unix::process::CommandExt;
 
     let (parent_sock, child_sock) = match UnixStream::pair() {
         Ok(p) => p,
-        Err(_) => return false,
+        Err(error) => return Err(error),
     };
 
     // The child inherits `child_sock` across fork; dup it onto the IPC fd (which
@@ -291,9 +295,9 @@ fn fork_launch(
                 kill_signal,
             );
             reactor::cp_install_abort_signal(handle, abort_signal, opts_val);
-            true
+            Ok(())
         }
-        Err(_) => false,
+        Err(error) => Err(error),
     }
 }
 
@@ -311,7 +315,7 @@ fn fork_launch(
     abort_signal: Option<f64>,
     opts_val: f64,
     _ipc_fd: usize,
-) -> bool {
+) -> std::io::Result<()> {
     let _ = advanced;
     match command.spawn() {
         Ok(child) => {
@@ -328,8 +332,8 @@ fn fork_launch(
                 kill_signal,
             );
             reactor::cp_install_abort_signal(handle, abort_signal, opts_val);
-            true
+            Ok(())
         }
-        Err(_) => false,
+        Err(error) => Err(error),
     }
 }
