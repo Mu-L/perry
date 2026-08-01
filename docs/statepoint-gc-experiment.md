@@ -496,17 +496,41 @@ with `-lunwind`):
   an unrecognized `--target` value compiles for HOST (Mach-O out of
   `linux-arm64`); the accepted spelling is `linux-aarch64`.
 
-**Small-hardware timing (Pi 5, load ≤0.1, 9 interleaved reps)** — the
-measurement the M1 tie could not predict: shadow 469.2 ms geo-mean,
-statepoints 538.2 ms (**+14.7%**; deep-stack +23%, string-retention +35%,
-array-grow +32%). The M1 parity does NOT transfer to narrow cores. Two
-components: the Linux build walks with the full unwinder (fast chain
-disabled by the fix above — recoverable by deriving the Linux frame
-constant), and genuine small-core cost of spill/reload plus cache-hostile
-record matching. Consequence for the campaign verdict: the shadow stack's
-three-axis optimality now extends to small hardware with a measured
-margin, and any future default-flip must clear a Pi-class gate, not only
-the M1 matrix.
+**Small-hardware timing (Pi 5, load ≤0.1, 9 interleaved reps)**: shadow
+469.2 ms geo-mean, statepoints 538.2 ms (**+14.7%**; deep-stack +23%,
+string-retention +35%, array-grow +32%). The M1 parity does NOT transfer
+to narrow cores.
+
+**Decomposition — the delta is COLLECTOR-SIDE, and specifically the
+unwinder.** Re-running every probe with collections suppressed
+(`PERRY_GC_HEAP_LIMIT` beyond the workload) leaves the deltas essentially
+unchanged (string-retention +35.0% suppressed vs +35.7% normal;
+deep-stack +22.9% vs +22.8%), and `PERRY_GC_DIAG` shows *identical cycle
+counts per probe across arms* — so it is neither mutator codegen cost nor
+collection-frequency skew. Wait: suppression leaving the delta intact
+would normally implicate the mutator — but the `perf` profiles resolve
+it. The statepoint arm's top symbols are dominated by
+`libunwind::CFI_Parser::parseCIE`, `getEncodedP`, `getULEB128`,
+`findFDE` (8.7% + 6.0% + 4.1% + 3.0% on string-retention alone); the
+shadow arm has none. The GC still runs its fixed cycle count under
+suppression (the limit raises the trigger, it does not disable the
+collector), and every one of those cycles walks the stack with the
+platform unwinder because the fast chain is disqualified on Linux. **The
+measured cost is DWARF CFI parsing per collection, not the statepoint
+model.**
+
+That is a configuration cost with two known remedies (an indexed
+walker, or the Linux fast chain via upstream FP-relative spills), and it
+means the Pi number must NOT be read as "statepoints are 15% slower on
+small hardware." An attempt to confirm by relinking against libgcc's
+unwinder instead of zig's bundled libunwind produced segfaulting
+binaries (a hand-rolled link line missing the working recipe's flags) —
+the implementation-vs-model split is therefore *measured to be unwinder
+walking* but the specific unwinder's contribution remains unquantified.
+
+Consequence for the campaign verdict: shadow retains three-axis
+optimality including small hardware, and a future default-flip needs a
+Pi-class gate — but the gap's cause is a named, fixable walker cost.
 
 **Conclusion, stated as the design law this branch keeps re-deriving:**
 *with an optimizing compiler between the source and the safepoint, root
