@@ -1,8 +1,7 @@
 //! `node:cluster` worker port sharing for the Fastify listen site.
 //!
-//! When this process is a `cluster.fork()`ed worker (Node's convention: a
-//! non-empty `NODE_UNIQUE_ID` in the environment, set by the runtime's
-//! `cluster.fork`), the TCP bind goes through SO_REUSEPORT so N workers can
+//! When this process is a `cluster.fork()`ed worker, the TCP bind goes through
+//! SO_REUSEPORT so N workers can
 //! share one port — the kernel load-balances accepts across them, with no
 //! primary-accept hop. The bound address is reported to the primary over the
 //! cluster IPC so `cluster.on('listening')` fires Node-style.
@@ -16,13 +15,12 @@
 
 use std::net::{SocketAddr, TcpListener};
 
-/// True when this process is a `cluster.fork()`ed worker (non-empty
-/// `NODE_UNIQUE_ID` in the environment — the same check the runtime and
-/// perry-ext-http use).
+/// True when this process is a `cluster.fork()`ed worker. The runtime caches
+/// the bootstrap identity before removing Node's internal `NODE_UNIQUE_ID`
+/// variable, so extension crates must use this ABI rather than re-reading the
+/// environment.
 pub(crate) fn is_cluster_worker() -> bool {
-    std::env::var("NODE_UNIQUE_ID")
-        .map(|s| !s.is_empty())
-        .unwrap_or(false)
+    unsafe { perry_cluster_is_worker() != 0 }
 }
 
 /// Bind `addr` with SO_REUSEPORT (+SO_REUSEADDR) so multiple cluster workers can
@@ -70,6 +68,7 @@ extern "C" {
         port: i32,
         address_type: i32,
     );
+    fn perry_cluster_is_worker() -> i32;
 }
 
 /// Report this worker's bound `host:port` to the primary so

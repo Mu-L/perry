@@ -1146,11 +1146,14 @@ pub extern "C" fn js_assimilate_thenable(value: f64) -> f64 {
     let reject_closure = crate::closure::js_closure_alloc(promise_reject_fn as *const u8, 1);
     crate::closure::js_closure_set_capture_ptr(reject_closure, 0, promise_i64);
 
-    // The user's `then(onFulfilled, onRejected)` reads each parameter as a
-    // raw f64 closure pointer (matching the convention used by
-    // `js_promise_new_with_executor`).
-    let resolve_f64 = f64::from_bits(resolve_closure as u64);
-    let reject_f64 = f64::from_bits(reject_closure as u64);
+    // These callbacks cross a user-visible JS call boundary. Keep them as
+    // ordinary NaN-boxed function values: a thenable is allowed to forward
+    // either callback (for example `return this.execute().then(onF, onR)`),
+    // and Promise.prototype.then's callable check must still recognize it.
+    // Raw closure-pointer bits only work for the private Promise-executor ABI
+    // and become an uncallable number once forwarded by user code.
+    let resolve_f64 = crate::value::js_nanbox_pointer(resolve_closure as i64);
+    let reject_f64 = crate::value::js_nanbox_pointer(reject_closure as i64);
 
     // Invoke `value.then(resolve, reject)` via the vtable. Mirrors
     // `call_vtable_method` in object.rs: NaN-box `this` with POINTER_TAG so

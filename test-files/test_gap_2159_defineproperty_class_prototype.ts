@@ -28,7 +28,11 @@ console.log("a.y():", (a as any).y());
 //    `this.execute()` finds the target class's own `execute`.
 class QueryPromise {
   catch(this: any, onR?: any) { return this.then(undefined, onR); }
-  then(this: any, onF?: any, onR?: any) { return this.execute().then(onF, onR); }
+  then(this: any, onF?: any, onR?: any) {
+    console.log("then this array:", Array.isArray(this));
+    console.log("typeof then this.execute:", typeof this.execute);
+    return this.execute().then(onF, onR);
+  }
 }
 class Builder {
   execute = async () => ["row1", "row2", "row3"];
@@ -50,6 +54,9 @@ applyMixins(Builder, [QueryPromise]);
 const b = new Builder();
 console.log("typeof b.then:", typeof (b as any).then);
 console.log("typeof b.catch:", typeof (b as any).catch);
+console.log("typeof b.execute:", typeof b.execute);
+console.log("typeof [].then:", typeof ([] as any).then);
+console.log("typeof Object.prototype.then:", typeof (Object.prototype as any).then);
 
 // 3. `await <thenable>` assimilation — the inherited `then` must be
 //    callable so the await loop sees a real thenable and routes through

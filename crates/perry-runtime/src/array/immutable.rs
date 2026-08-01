@@ -2,6 +2,35 @@
 use super::*;
 use crate::closure::ClosureHeader;
 
+fn uint8array_buffer_snapshot(arr: *const ArrayHeader) -> Option<Vec<u8>> {
+    let addr = arr as usize;
+    if !crate::buffer::is_registered_buffer(addr) || !crate::buffer::is_uint8array_buffer(addr) {
+        return None;
+    }
+    unsafe {
+        let buffer = arr as *const crate::buffer::BufferHeader;
+        let len = (*buffer).length as usize;
+        let data = crate::buffer::resolve_span_data_ptr(buffer);
+        Some(std::slice::from_raw_parts(data, len).to_vec())
+    }
+}
+
+fn uint8array_buffer_from_bytes(bytes: &[u8]) -> *mut ArrayHeader {
+    let buffer = crate::buffer::buffer_alloc(bytes.len() as u32);
+    unsafe {
+        (*buffer).length = bytes.len() as u32;
+        if !bytes.is_empty() {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                crate::buffer::buffer_data_mut(buffer),
+                bytes.len(),
+            );
+        }
+    }
+    crate::buffer::mark_as_uint8array(buffer as usize);
+    buffer as *mut ArrayHeader
+}
+
 /// Throw a Node-compatible `RangeError("Invalid index : <idx>")` used by
 /// `Array.prototype.with` for out-of-range / non-finite indexes.
 #[cold]
@@ -34,6 +63,10 @@ pub extern "C" fn js_array_to_reversed(arr: *const ArrayHeader) -> *mut ArrayHea
     if arr.is_null() {
         return js_array_alloc(0);
     }
+    if let Some(mut bytes) = uint8array_buffer_snapshot(arr) {
+        bytes.reverse();
+        return uint8array_buffer_from_bytes(&bytes);
+    }
     if crate::typedarray::lookup_typed_array_kind(arr as usize).is_some() {
         return crate::typedarray::js_typed_array_to_reversed(
             arr as *const crate::typedarray::TypedArrayHeader,
@@ -58,6 +91,10 @@ pub extern "C" fn js_array_to_reversed(arr: *const ArrayHeader) -> *mut ArrayHea
 #[no_mangle]
 pub extern "C" fn js_array_to_sorted_default(arr: *const ArrayHeader) -> *mut ArrayHeader {
     let arr = clean_arr_ptr(arr);
+    if let Some(mut bytes) = uint8array_buffer_snapshot(arr) {
+        bytes.sort_unstable();
+        return uint8array_buffer_from_bytes(&bytes);
+    }
     if !arr.is_null() && crate::typedarray::lookup_typed_array_kind(arr as usize).is_some() {
         return crate::typedarray::js_typed_array_to_sorted_default(
             arr as *const crate::typedarray::TypedArrayHeader,
@@ -103,6 +140,28 @@ pub extern "C" fn js_array_to_sorted_with_comparator(
         return js_array_to_sorted_default(arr);
     }
     let arr = clean_arr_ptr(arr);
+    if let Some(mut bytes) = uint8array_buffer_snapshot(arr) {
+        // User code in the comparator can allocate and move its closure. Keep
+        // the callback in the runtime root set and refresh its address for
+        // every comparison.
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let comparator_handle = scope.root_raw_const_ptr(comparator);
+        bytes.sort_by(|a, b| {
+            let result = crate::closure::js_closure_call2(
+                comparator_handle.get_raw_const_ptr::<ClosureHeader>(),
+                *a as f64,
+                *b as f64,
+            );
+            if result < 0.0 {
+                std::cmp::Ordering::Less
+            } else if result > 0.0 {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+        return uint8array_buffer_from_bytes(&bytes);
+    }
     if !arr.is_null() && crate::typedarray::lookup_typed_array_kind(arr as usize).is_some() {
         return crate::typedarray::js_typed_array_to_sorted_with_comparator(
             arr as *const crate::typedarray::TypedArrayHeader,

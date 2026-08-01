@@ -665,17 +665,27 @@ pub(super) fn compile_method(
         if class.constructor.is_none()
             && (class.extends_name.is_some() || class.extends_expr.is_some())
         {
+            // Registered class refs (`const Ctor = C; new Ctor()`) replay this
+            // standalone synthesized constructor rather than taking lower_new's
+            // static path. Keep the native-base stamping decision identical to
+            // that path: an unknown builtin Ident is retained as both
+            // `extends_name` and `extends_expr`, but it is not a callable
+            // userland parent. In particular, routing EventTarget through the
+            // dynamic dispatcher throws "EventTarget is not a function".
+            let native_instance_base =
+                crate::lower_call::native_instance_base_in_chain(&ctx, class);
             let builtin_parent_runtime = match class.extends_name.as_deref() {
                 Some("Writable") => Some("js_node_stream_writable_subclass_init"),
                 Some("Duplex") => Some("js_node_stream_duplex_subclass_init"),
                 Some("Transform") => Some("js_node_stream_transform_subclass_init"),
                 _ => None,
             };
-            let mut effective_parent: Option<&str> = if builtin_parent_runtime.is_some() {
-                None
-            } else {
-                class.extends_name.as_deref()
-            };
+            let mut effective_parent: Option<&str> =
+                if builtin_parent_runtime.is_some() || native_instance_base.is_some() {
+                    None
+                } else {
+                    class.extends_name.as_deref()
+                };
             while let Some(pname) = effective_parent {
                 let Some(pc) = ctx.classes.get(pname).copied() else {
                     break;
@@ -896,6 +906,29 @@ pub(super) fn compile_method(
                     .call(DOUBLE, runtime_fn, &[(DOUBLE, &this_box), (DOUBLE, &opts)]);
             }
 
+            if let Some(base) = native_instance_base {
+                let undef_lit =
+                    crate::nanbox::double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
+                let mut lowered_args: Vec<String> = Vec::with_capacity(method.params.len());
+                for p in &method.params {
+                    if let Some(slot) = ctx.locals.get(&p.id).cloned() {
+                        lowered_args.push(ctx.block().load(DOUBLE, &slot));
+                    } else {
+                        lowered_args.push(undef_lit.clone());
+                    }
+                }
+                let this_box = match ctx.this_stack.last().cloned() {
+                    Some(slot) => ctx.block().load(DOUBLE, &slot),
+                    None => undef_lit,
+                };
+                crate::lower_call::emit_native_instance_base_init(
+                    &mut ctx,
+                    base,
+                    &this_box,
+                    &lowered_args,
+                );
+            }
+
             // Wall 51: a no-own-ctor class with a DYNAMIC / cross-module parent
             // (`class X extends _mod.Parent {}`, captured as `extends_expr`) that
             // the inline walk above could NOT resolve to a local/imported ctor
@@ -909,7 +942,10 @@ pub(super) fn compile_method(
             // .pathname` threw. Forward this synthesized ctor's params to the
             // runtime dynamic-parent super dispatcher, mirroring the explicit
             // `Expr::SuperCall` dynamic-parent path in `expr/this_super_call.rs`.
-            if builtin_parent_runtime.is_none() && class.extends_expr.is_some() {
+            if builtin_parent_runtime.is_none()
+                && native_instance_base.is_none()
+                && class.extends_expr.is_some()
+            {
                 if let Some(cid) = ctx.class_ids.get(&class.name).copied().filter(|c| *c != 0) {
                     let undef_lit =
                         crate::nanbox::double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));

@@ -38,6 +38,7 @@ pub(crate) enum NativeInstanceBase {
     Set,
     Event,
     CustomEvent,
+    EventTarget,
     DomException,
 }
 
@@ -57,6 +58,7 @@ pub(crate) fn native_instance_base(name: &str) -> Option<NativeInstanceBase> {
         "Set" => Some(NativeInstanceBase::Set),
         "Event" => Some(NativeInstanceBase::Event),
         "CustomEvent" => Some(NativeInstanceBase::CustomEvent),
+        "EventTarget" | "globalThis.EventTarget" => Some(NativeInstanceBase::EventTarget),
         "DOMException" => Some(NativeInstanceBase::DomException),
         _ => None,
     }
@@ -122,6 +124,11 @@ pub(crate) fn emit_native_instance_base_init(
             // The bare emitter seeds no state from its options bag, so the args
             // (already lowered for their side effects) are not forwarded.
             crate::expr::lower_event_emitter_subclass_init(ctx, this_box);
+        }
+        NativeInstanceBase::EventTarget => {
+            // EventTarget state is installed lazily on first listener or
+            // dispatch operation. The registered class-parent edge is the
+            // complete constructor effect for a plain subclass instance.
         }
         NativeInstanceBase::Map | NativeInstanceBase::Set => {
             let kind: i32 = if base == NativeInstanceBase::Map {

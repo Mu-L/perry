@@ -124,12 +124,13 @@ pub extern "C" fn js_array_grow(arr: *mut ArrayHeader, min_capacity: u32) -> *mu
         // check that mirrors clean_arr_ptr's HEAP_MIN to skip pointers
         // that don't have a real GcHeader behind them (e.g. test-mode
         // synthetic pointers, longlived-arena edge cases).
-        // #1136: iOS family device allocates via libsystem_malloc in the
-        // same low range as Android/Linux; mirror `clean_arr_ptr`'s
-        // platform split so growth forwarding can install a stub for
-        // arrays that live below 2 TB.
+        // #1136: macOS and iOS-family devices can allocate through mimalloc /
+        // libsystem_malloc in the same low range as Android/Linux. Mirror
+        // `value::addr_class::is_valid_obj_ptr`'s platform split so growth
+        // forwarding can install a stub for arrays that live below 2 TB.
         #[cfg(any(
             target_os = "android",
+            target_os = "macos",
             target_os = "linux",
             target_os = "windows",
             target_os = "ios",
@@ -140,6 +141,7 @@ pub extern "C" fn js_array_grow(arr: *mut ArrayHeader, min_capacity: u32) -> *mu
         const HEAP_MIN: usize = 0x1000;
         #[cfg(not(any(
             target_os = "android",
+            target_os = "macos",
             target_os = "linux",
             target_os = "windows",
             target_os = "ios",

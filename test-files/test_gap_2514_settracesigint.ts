@@ -1,4 +1,5 @@
-// #2514 — util.setTraceSigInt(enable): boolean → undefined; non-boolean throws.
+// #2514 — util.setTraceSigInt(enable) returns undefined. Current Node accepts
+// non-boolean values even though its API documentation types this as boolean.
 import { setTraceSigInt } from "node:util";
 
 console.log(typeof setTraceSigInt);

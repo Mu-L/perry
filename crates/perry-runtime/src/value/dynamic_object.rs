@@ -69,37 +69,11 @@ pub extern "C" fn js_value_length_f64(value: f64) -> f64 {
         if crate::value::addr_class::is_handle_band(handle) {
             return 0.0;
         }
-        // Heap window: macOS mimalloc lands in 3-5 TB, but Android scudo,
-        // Linux glibc, Windows mimalloc, and iOS-family device
-        // libsystem_malloc all allocate much lower (often hundreds of GB
-        // or less, and on iOS device often in the single-digit GB or even
-        // sub-GB range). Using the macOS-tight 2 TB floor on those
-        // platforms null-s every real pointer — on iOS device this is the
-        // bug behind #1136 (`.length` on an array returned from
-        // `String.split()` collapses to 0, so `for…of` loops zero times
-        // and `segments.length === 0` is wrongly true). See clean_arr_ptr
-        // for the same platform split.
-        #[cfg(any(
-            target_os = "android",
-            target_os = "linux",
-            target_os = "windows",
-            target_os = "ios",
-            target_os = "tvos",
-            target_os = "watchos",
-            target_os = "visionos",
-        ))]
-        let heap_min: usize = 0x1000;
-        #[cfg(not(any(
-            target_os = "android",
-            target_os = "linux",
-            target_os = "windows",
-            target_os = "ios",
-            target_os = "tvos",
-            target_os = "watchos",
-            target_os = "visionos",
-        )))]
-        let heap_min: usize = 0x200_0000_0000;
-        if handle < heap_min || (handle as u64) >= 0x8000_0000_0000 {
+        // Use the centralized platform heap window. In particular, current
+        // macOS mimalloc can place arena blocks well below 2 TB just like the
+        // mobile/Linux allocators; duplicating the old macOS-tight floor here
+        // made legitimate low-address arrays report length 0.
+        if !crate::value::addr_class::is_valid_obj_ptr(handle as *const u8) {
             return 0.0;
         }
         if let Some(value) = unsafe {
@@ -189,31 +163,9 @@ pub extern "C" fn js_value_length_f64(value: f64) -> f64 {
     // sometimes hands their pointer through as `bitcast i64 → double`
     // without a POINTER_TAG. Without this path, `Int32Array.length`
     // returned 0 because the value's top16 was 0, not 0x7FFD.
-    // #1136: mirror the platform split above for raw-pointer-bitcast
-    // values too, so a Buffer/TypedArray pointer handed through as
-    // `bitcast i64 → double` on iOS device still resolves to its real
-    // length via the registry lookups below.
-    #[cfg(any(
-        target_os = "android",
-        target_os = "linux",
-        target_os = "windows",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos",
-        target_os = "visionos",
-    ))]
-    let raw_heap_min: u64 = 0x1000;
-    #[cfg(not(any(
-        target_os = "android",
-        target_os = "linux",
-        target_os = "windows",
-        target_os = "ios",
-        target_os = "tvos",
-        target_os = "watchos",
-        target_os = "visionos",
-    )))]
-    let raw_heap_min: u64 = 0x200_0000_0000;
-    if top16 == 0 && bits >= raw_heap_min && bits < 0x8000_0000_0000 {
+    // #1136: mirror the centralized platform split for raw-pointer-bitcast
+    // values too, so low-address Buffer/TypedArray pointers still resolve.
+    if top16 == 0 && crate::value::addr_class::is_valid_obj_ptr(bits as usize as *const u8) {
         let handle = bits as usize;
         if let Some(value) = unsafe {
             crate::typedarray_props::typed_array_get_property_value_by_name(handle, "length")
@@ -410,6 +362,33 @@ pub unsafe extern "C" fn js_dynamic_object_get_property(
             return (*set_ptr).size as f64;
         }
         return f64::from_bits(TAG_UNDEFINED);
+    }
+
+    // Arrays are exotic cells, not ObjectHeaders. In particular their
+    // `capacity` occupies the offset where an ObjectHeader stores `class_id`.
+    // Reinterpreting an array here can therefore collide with a user class and
+    // return one of that class's methods (a capacity-2 array was mistaken for
+    // QueryPromise and acquired its `then` method). Handle own named properties
+    // and length, then stop; callers that need Array.prototype methods use the
+    // array-specific dispatch path.
+    if !crate::typedarray::is_offheap_sidetable_alloc(ptr as usize) {
+        let gc_header = (ptr as usize - crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
+        if matches!(
+            (*gc_header).obj_type,
+            crate::gc::GC_TYPE_ARRAY | crate::gc::GC_TYPE_LAZY_ARRAY
+        ) {
+            if property_name == "length" {
+                return crate::array::js_array_length(ptr as *const crate::array::ArrayHeader)
+                    as f64;
+            }
+            if let Some(value) = crate::array::array_named_property_get_by_name(
+                ptr as *const crate::array::ArrayHeader,
+                property_name,
+            ) {
+                return value;
+            }
+            return f64::from_bits(TAG_UNDEFINED);
+        }
     }
 
     // #1545: Promise `then`/`catch`/`finally` value-reads return a bound
@@ -759,6 +738,29 @@ mod length_handle_band_tests {
                 &mut cache,
             ),
             1.0
+        );
+    }
+
+    #[test]
+    fn typed_array_length_accepts_raw_and_boxed_platform_addresses() {
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let array = scope.root_raw_mut_ptr(crate::typedarray::typed_array_alloc(
+            crate::typedarray::KIND_UINT8,
+            3,
+        ));
+        let address = array.get_raw_const_ptr::<crate::typedarray::TypedArrayHeader>() as usize;
+        assert!(addr_class::is_valid_obj_ptr(address as *const u8));
+
+        let boxed = crate::value::js_nanbox_pointer(address as i64);
+        assert_eq!(js_value_length_f64(boxed), 3.0);
+        assert_eq!(js_value_length_f64(f64::from_bits(address as u64)), 3.0);
+
+        let heap_array = scope.root_raw_mut_ptr(crate::array::js_array_alloc_with_length(4));
+        let heap_address = heap_array.get_raw_const_ptr::<crate::array::ArrayHeader>() as usize;
+        assert!(addr_class::is_valid_obj_ptr(heap_address as *const u8));
+        assert_eq!(
+            js_value_length_f64(crate::value::js_nanbox_pointer(heap_address as i64)),
+            4.0
         );
     }
 }

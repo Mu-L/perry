@@ -81,6 +81,15 @@ pub fn is_cluster_worker() -> bool {
     cluster_worker_id().is_some()
 }
 
+/// Stable cross-crate worker probe. Native extension crates must not inspect
+/// `NODE_UNIQUE_ID` themselves: the first runtime cluster-property read
+/// consumes that bootstrap-only variable, just as Node does, while this
+/// cached identity remains valid for the process lifetime.
+#[no_mangle]
+pub extern "C" fn perry_cluster_is_worker() -> i32 {
+    is_cluster_worker() as i32
+}
+
 /// Bind a TCP listener with SO_REUSEPORT (+SO_REUSEADDR) so N cluster
 /// workers can share one port (#4914). Callers gate on
 /// [`is_cluster_worker`]; non-worker binds stay on the plain

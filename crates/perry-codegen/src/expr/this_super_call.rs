@@ -46,6 +46,8 @@ pub(crate) fn is_other_builtin_constructor_name(name: &str) -> bool {
             | "BigInt"
             | "Symbol"
             | "Object"
+            | "EventTarget"
+            | "globalThis.EventTarget"
             | "Int8Array"
             | "Uint8Array"
             | "Uint8ClampedArray"
@@ -239,6 +241,19 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     "js_dom_exception_subclass_init",
                     &[(DOUBLE, &this_box), (DOUBLE, &message), (DOUBLE, &name)],
                 );
+                crate::lower_call::apply_field_initializers_recursive(
+                    ctx,
+                    &current_class_name,
+                    crate::lower_call::FieldInitMode::SelfOnly,
+                )?;
+                return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
+            }
+            let is_event_target = ctx
+                .classes
+                .get(&current_class_name)
+                .and_then(|c| c.extends_name.as_deref())
+                .is_some_and(|p| matches!(p, "EventTarget" | "globalThis.EventTarget"));
+            if is_event_target {
                 crate::lower_call::apply_field_initializers_recursive(
                     ctx,
                     &current_class_name,
@@ -678,6 +693,29 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                             None => double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)),
                         };
                         lower_event_emitter_subclass_init(ctx, &this_box);
+                        let current_class_name =
+                            ctx.class_stack.last().cloned().unwrap_or_default();
+                        crate::lower_call::apply_field_initializers_recursive(
+                            ctx,
+                            &current_class_name,
+                            crate::lower_call::FieldInitMode::SelfOnly,
+                        )?;
+                        return Ok(double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED)));
+                    }
+                    // `class X extends EventTarget`: the runtime recognizes
+                    // the instance through the registered X → EventTarget
+                    // class-parent edge and lazily installs listener state on
+                    // first use. `super(...)` therefore only evaluates its
+                    // ignored arguments and unlocks this class's field
+                    // initializers; treating EventTarget as an ordinary
+                    // callable throws "EventTarget is not a function".
+                    if matches!(
+                        parent_name.as_str(),
+                        "EventTarget" | "globalThis.EventTarget"
+                    ) {
+                        for a in super_args {
+                            let _ = lower_expr(ctx, a)?;
+                        }
                         let current_class_name =
                             ctx.class_stack.last().cloned().unwrap_or_default();
                         crate::lower_call::apply_field_initializers_recursive(

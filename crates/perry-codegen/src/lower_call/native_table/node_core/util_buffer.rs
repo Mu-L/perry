@@ -177,7 +177,7 @@ pub(crate) const NODE_CORE_UTIL_BUFFER_ROWS: &[NativeModSig] = &[
         args: &[NA_F64],
         ret: NR_F64,
     },
-    // #2514: util.setTraceSigInt(enable) → validate boolean, return undefined.
+    // #2514: util.setTraceSigInt(enable) → return undefined.
     NativeModSig {
         module: "util",
         has_receiver: false,

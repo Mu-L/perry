@@ -385,3 +385,133 @@ pub extern "C" fn js_typed_array_find_last_index(
         -1.0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uint8_fixture() -> *mut TypedArrayHeader {
+        let ta = typed_array_alloc(KIND_UINT8, 5);
+        for (index, value) in [5.0, 4.0, 3.0, 2.0, 1.0].into_iter().enumerate() {
+            unsafe { store_at(ta, index, value) };
+        }
+        ta
+    }
+
+    fn values(ta: *const TypedArrayHeader) -> Vec<f64> {
+        (0..5).map(|index| unsafe { load_at(ta, index) }).collect()
+    }
+
+    #[test]
+    fn uint8_immutable_transforms_preserve_element_storage() {
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let source = scope.root_raw_mut_ptr(uint8_fixture());
+        let sorted = scope.root_raw_mut_ptr(js_typed_array_to_sorted_default(
+            source.get_raw_const_ptr::<TypedArrayHeader>(),
+        ));
+        let reversed = scope.root_raw_mut_ptr(js_typed_array_to_reversed(
+            source.get_raw_const_ptr::<TypedArrayHeader>(),
+        ));
+        let sorted_via_array = crate::array::js_array_to_sorted_default(
+            source.get_raw_const_ptr::<crate::array::ArrayHeader>(),
+        );
+        let sorted_via_array = scope.root_raw_mut_ptr(sorted_via_array as *mut TypedArrayHeader);
+        let reversed_via_array = crate::array::js_array_to_reversed(
+            source.get_raw_const_ptr::<crate::array::ArrayHeader>(),
+        );
+        let reversed_via_array =
+            scope.root_raw_mut_ptr(reversed_via_array as *mut TypedArrayHeader);
+
+        assert_eq!(
+            values(sorted.get_raw_const_ptr()),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0]
+        );
+        assert_eq!(
+            values(reversed.get_raw_const_ptr()),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0]
+        );
+        assert_eq!(
+            values(sorted_via_array.get_raw_const_ptr()),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0]
+        );
+        assert_eq!(
+            values(reversed_via_array.get_raw_const_ptr()),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0]
+        );
+        assert_eq!(
+            values(source.get_raw_const_ptr()),
+            vec![5.0, 4.0, 3.0, 2.0, 1.0]
+        );
+
+        let input = scope.root_raw_mut_ptr(crate::array::js_array_alloc_with_length(5));
+        for (index, value) in [5.0, 4.0, 3.0, 2.0, 1.0].into_iter().enumerate() {
+            crate::array::js_array_set_f64(
+                input.get_raw_mut_ptr::<crate::array::ArrayHeader>(),
+                index as u32,
+                value,
+            );
+        }
+        let compact = scope.root_raw_mut_ptr(crate::buffer::js_uint8array_from_array(
+            input.get_raw_const_ptr::<crate::array::ArrayHeader>(),
+        ));
+        assert!(crate::buffer::is_registered_buffer(
+            compact.get_raw_const_ptr::<crate::buffer::BufferHeader>() as usize
+        ));
+        assert!(crate::buffer::is_uint8array_buffer(
+            compact.get_raw_const_ptr::<crate::buffer::BufferHeader>() as usize
+        ));
+        assert_eq!(
+            crate::array::clean_arr_ptr(compact.get_raw_const_ptr::<crate::array::ArrayHeader>())
+                as usize,
+            compact.get_raw_const_ptr::<crate::buffer::BufferHeader>() as usize
+        );
+        unsafe {
+            assert_eq!(
+                std::slice::from_raw_parts(
+                    crate::buffer::resolve_span_data_ptr(compact.get_raw_const_ptr()),
+                    5,
+                ),
+                &[5, 4, 3, 2, 1]
+            );
+        }
+        let compact_sorted = crate::array::js_array_to_sorted_default(
+            compact.get_raw_const_ptr::<crate::array::ArrayHeader>(),
+        ) as *mut crate::buffer::BufferHeader;
+        let compact_sorted = scope.root_raw_mut_ptr(compact_sorted);
+        assert!(crate::buffer::is_registered_buffer(
+            compact_sorted.get_raw_const_ptr::<crate::buffer::BufferHeader>() as usize
+        ));
+        assert!(crate::buffer::is_uint8array_buffer(
+            compact_sorted.get_raw_const_ptr::<crate::buffer::BufferHeader>() as usize
+        ));
+        unsafe {
+            assert_eq!(
+                std::slice::from_raw_parts(
+                    crate::buffer::buffer_data(compact_sorted.get_raw_const_ptr()),
+                    5,
+                ),
+                &[1, 2, 3, 4, 5]
+            );
+        }
+
+        let compact_reversed = crate::array::js_array_to_reversed(
+            compact.get_raw_const_ptr::<crate::array::ArrayHeader>(),
+        ) as *mut crate::buffer::BufferHeader;
+        let compact_reversed = scope.root_raw_mut_ptr(compact_reversed);
+        assert!(crate::buffer::is_registered_buffer(
+            compact_reversed.get_raw_const_ptr::<crate::buffer::BufferHeader>() as usize
+        ));
+        assert!(crate::buffer::is_uint8array_buffer(
+            compact_reversed.get_raw_const_ptr::<crate::buffer::BufferHeader>() as usize
+        ));
+        unsafe {
+            assert_eq!(
+                std::slice::from_raw_parts(
+                    crate::buffer::buffer_data(compact_reversed.get_raw_const_ptr()),
+                    5,
+                ),
+                &[1, 2, 3, 4, 5]
+            );
+        }
+    }
+}
