@@ -824,7 +824,11 @@ pub(super) fn resolve_package_source_entry(
         }
     }
 
-    // For subpaths, try src/<subpath>.ts
+    // For subpaths, try src/<subpath>.ts first. If that shorthand does not
+    // exist, respect package.json "exports" for the subpath before considering
+    // the package root. Falling back to src/index.ts for a subpath misroutes
+    // imports like `@tanstack/router-core/isServer` to the root barrel and
+    // leaves callers linked against symbols that the root never exports.
     if let Some(sub) = subpath {
         let src_path = package_dir.join("src").join(sub);
         if let Some(resolved) = resolve_with_extensions(&src_path) {
@@ -832,6 +836,9 @@ pub(super) fn resolve_package_source_entry(
                 return Some(resolved);
             }
         }
+
+        let normal_entry = normal_entry?;
+        return prefer_ts_source_for_package_entry(package_dir, normal_entry);
     }
 
     // Try src/index.ts (most common TS source entry)
@@ -844,24 +851,38 @@ pub(super) fn resolve_package_source_entry(
 
     // Try using normal entry resolution but prefer TS over JS
     let normal_entry = normal_entry?;
-    if is_js_file(&normal_entry) {
-        // Try .ts equivalent of the .js entry
-        let ts_path = normal_entry.with_extension("ts");
-        if ts_path.exists() && !is_hybrid_cjs_emit_input(&ts_path) {
+    prefer_ts_source_for_package_entry(package_dir, normal_entry)
+}
+
+fn prefer_ts_source_for_package_entry(
+    package_dir: &Path,
+    normal_entry: PathBuf,
+) -> Option<PathBuf> {
+    if !is_js_file(&normal_entry) {
+        return Some(normal_entry);
+    }
+
+    // Try native TypeScript equivalents of the JS entry first, in the
+    // same preference order used by resolve_with_extensions.
+    for ext in ["ts", "tsx", "mts"] {
+        let ts_path = normal_entry.with_extension(ext);
+        if ts_path.is_file() && !is_hybrid_cjs_emit_input(&ts_path) {
             return Some(ts_path);
         }
-        // Check src/ directory mirror of lib/ or dist/ path
-        if let Ok(rel) = normal_entry.strip_prefix(package_dir) {
-            let rel_str = rel.to_string_lossy();
-            if rel_str.starts_with("lib") || rel_str.starts_with("dist") {
-                let stripped = if rel_str.starts_with("lib") {
-                    rel.strip_prefix("lib")
-                } else {
-                    rel.strip_prefix("dist")
-                };
-                if let Ok(rest) = stripped {
-                    let src_equiv = package_dir.join("src").join(rest).with_extension("ts");
-                    if src_equiv.exists() && !is_hybrid_cjs_emit_input(&src_equiv) {
+    }
+    // Check src/ directory mirror of lib/ or dist/ path
+    if let Ok(rel) = normal_entry.strip_prefix(package_dir) {
+        let rel_str = rel.to_string_lossy();
+        if rel_str.starts_with("lib") || rel_str.starts_with("dist") {
+            let stripped = if rel_str.starts_with("lib") {
+                rel.strip_prefix("lib")
+            } else {
+                rel.strip_prefix("dist")
+            };
+            if let Ok(rest) = stripped {
+                for ext in ["ts", "tsx", "mts"] {
+                    let src_equiv = package_dir.join("src").join(rest).with_extension(ext);
+                    if src_equiv.is_file() && !is_hybrid_cjs_emit_input(&src_equiv) {
                         return Some(src_equiv);
                     }
                 }

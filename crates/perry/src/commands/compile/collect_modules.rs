@@ -1,13 +1,8 @@
 //! Module discovery + transitive import walk.
-//!
-//! Tier 2.1 follow-up (v0.5.341) — extracts `collect_modules` (~380
-//! LOC) from `compile.rs`. Walks the import graph from the entry
-//! file, lowers every TypeScript module to HIR, classifies each as
-//! native-compiled vs JS-runtime-loaded, and accumulates the result
-//! in `CompilationContext.native_modules` / `js_modules`. Runs
-//! per-module HIR passes (inline_functions, transform_generators)
-//! before adding the module to the context. Source hashes feed the
-//! V2.2 codegen cache key derivation.
+//! Walks the import graph, lowers TypeScript to HIR, classifies native-compiled
+//! versus JS-runtime-loaded modules, and accumulates them in the compilation context.
+//! Per-module HIR passes run before insertion, and source hashes feed
+//! the V2.2 codegen cache key.
 
 use anyhow::{anyhow, Result};
 use perry_hir::ModuleKind;
@@ -39,6 +34,7 @@ mod feature_detect;
 mod import_helpers;
 mod native_addon;
 mod parse_error;
+mod script_string;
 mod static_require_transform;
 #[cfg(test)]
 mod tests;
@@ -1300,6 +1296,10 @@ fn collect_module_one(
                     .to_string();
                 ctx.native_module_imports.insert(normalized);
             }
+            continue;
+        }
+
+        if script_string::resolve(ctx, &canonical, import, &mut pending)? {
             continue;
         }
 
