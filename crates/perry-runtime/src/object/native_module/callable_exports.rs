@@ -10,6 +10,10 @@ pub(crate) fn bound_native_callable_export_value(module_name: &str, property_nam
     let module_name = cjs_default_base_module(module_name).unwrap_or(module_name);
     let module_name = assert_instance_base_module(module_name).unwrap_or(module_name);
     let property_name = canonical_native_callable_property(module_name, property_name);
+    // node:inspector/promises is the callback namespace with Session replaced.
+    if module_name == "inspector/promises" && property_name != "Session" {
+        return bound_native_callable_export_value("inspector", property_name);
+    }
     let export_module_name = if property_name == "Assert" && module_name == "assert/strict" {
         "assert"
     } else {
@@ -326,6 +330,17 @@ fn native_callable_export_arity_reference(module: &str, prop: &str) -> Option<u3
             | "webSocketClosed"
             | "webSocketHandshakeResponseReceived",
         ) => Some(1),
+        ("inspector.NetworkResources", "put") => Some(1),
+        (
+            "inspector.DOMStorage",
+            "domStorageItemAdded"
+            | "domStorageItemRemoved"
+            | "domStorageItemUpdated"
+            | "domStorageItemsCleared"
+            | "registerStorage",
+        ) => Some(1),
+        ("inspector.Session", "connect" | "connectToMainThread" | "disconnect") => Some(0),
+        ("inspector.Session" | "inspector/promises.Session", "post") => Some(3),
         (
             "process",
             "setUncaughtExceptionCaptureCallback" | "addUncaughtExceptionCaptureCallback",
@@ -2223,6 +2238,16 @@ static CALLABLE_EXPORT_ARITY_TABLE: &[(&str, &[(&str, u32)])] = &[
     ),
     ("https", &[("Agent", 1), ("get", 3), ("request", 0)]),
     (
+        "inspector.DOMStorage",
+        &[
+            ("domStorageItemAdded", 1),
+            ("domStorageItemRemoved", 1),
+            ("domStorageItemUpdated", 1),
+            ("domStorageItemsCleared", 1),
+            ("registerStorage", 1),
+        ],
+    ),
+    (
         "inspector.Network",
         &[
             ("dataReceived", 1),
@@ -2236,6 +2261,17 @@ static CALLABLE_EXPORT_ARITY_TABLE: &[(&str, &[(&str, u32)])] = &[
             ("webSocketHandshakeResponseReceived", 1),
         ],
     ),
+    ("inspector.NetworkResources", &[("put", 1)]),
+    (
+        "inspector.Session",
+        &[
+            ("connect", 0),
+            ("connectToMainThread", 0),
+            ("disconnect", 0),
+            ("post", 3),
+        ],
+    ),
+    ("inspector/promises.Session", &[("post", 3)]),
     (
         "module",
         &[
