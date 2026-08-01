@@ -483,12 +483,90 @@ fn loaded_stack_map_section() -> Option<&'static [u8]> {
     None
 }
 
-#[cfg(not(target_os = "macos"))]
+/// ELF (#7173): the `.llvm_stackmaps` section of the main executable.
+///
+/// Linker-provided `__start_`/`__stop_` symbols would need weak linkage
+/// (unstable in Rust) or `-rdynamic` (not guaranteed), so instead: read
+/// `/proc/self/exe`'s section headers for `.llvm_stackmaps` (sh_addr,
+/// sh_size) and add the main object's load bias from the first
+/// `dl_iterate_phdr` callback. Runtime-verified gates for this path are
+/// pending a Linux host — tracked in #7173; the parser, index, matching,
+/// and verify machinery above are platform-independent already.
+#[cfg(target_os = "linux")]
+fn loaded_stack_map_section() -> Option<&'static [u8]> {
+    let bytes = std::fs::read("/proc/self/exe").ok()?;
+    let (addr, size) = elf_section_vaddr(&bytes, b".llvm_stackmaps")?;
+    let bias = main_object_load_bias()?;
+    let start = bias.checked_add(addr)?;
+    if start == 0 || size == 0 {
+        return None;
+    }
+    Some(unsafe { std::slice::from_raw_parts(start as *const u8, size) })
+}
+
+/// Minimal ELF64 section-header walk: returns (sh_addr, sh_size) for the
+/// named section. Same defensive read style as the stack-map parser.
+#[cfg(target_os = "linux")]
+fn elf_section_vaddr(bytes: &[u8], name: &[u8]) -> Option<(usize, usize)> {
+    if bytes.get(..4)? != b"\x7fELF" || *bytes.get(4)? != 2 {
+        return None; // not ELF64
+    }
+    let shoff = read_u64(bytes, 0x28)? as usize;
+    let shentsize = read_u16(bytes, 0x3A)? as usize;
+    let shnum = read_u16(bytes, 0x3C)? as usize;
+    let shstrndx = read_u16(bytes, 0x3E)? as usize;
+    let strtab_hdr = shoff.checked_add(shstrndx.checked_mul(shentsize)?)?;
+    let strtab_off = read_u64(bytes, strtab_hdr.checked_add(0x18)?)? as usize;
+    for i in 0..shnum {
+        let hdr = shoff.checked_add(i.checked_mul(shentsize)?)?;
+        let name_off = read_u32(bytes, hdr)? as usize;
+        let name_pos = strtab_off.checked_add(name_off)?;
+        let candidate = bytes.get(name_pos..name_pos.checked_add(name.len())?)?;
+        let terminator = bytes.get(name_pos + name.len()).copied().unwrap_or(1);
+        if candidate == name && terminator == 0 {
+            let addr = read_u64(bytes, hdr.checked_add(0x10)?)? as usize;
+            let size = read_u64(bytes, hdr.checked_add(0x20)?)? as usize;
+            return Some((addr, size));
+        }
+    }
+    None
+}
+
+/// Load bias of the main object: `dlpi_addr` of the first `dl_iterate_phdr`
+/// callback (the executable itself on glibc and musl).
+#[cfg(target_os = "linux")]
+fn main_object_load_bias() -> Option<usize> {
+    #[repr(C)]
+    struct DlPhdrInfo {
+        dlpi_addr: usize,
+        dlpi_name: *const std::os::raw::c_char,
+        // remaining fields unused
+    }
+    unsafe extern "C" {
+        fn dl_iterate_phdr(
+            callback: unsafe extern "C" fn(*mut DlPhdrInfo, usize, *mut c_void) -> i32,
+            data: *mut c_void,
+        ) -> i32;
+    }
+    unsafe extern "C" fn first(info: *mut DlPhdrInfo, _size: usize, data: *mut c_void) -> i32 {
+        unsafe {
+            *data.cast::<usize>() = (*info).dlpi_addr;
+        }
+        1 // stop after the first (main) object
+    }
+    let mut bias = usize::MAX;
+    unsafe {
+        dl_iterate_phdr(first, (&mut bias as *mut usize).cast::<c_void>());
+    }
+    (bias != usize::MAX).then_some(bias)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn loaded_stack_map_section() -> Option<&'static [u8]> {
     None
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod unwind {
     use super::*;
 
@@ -570,7 +648,7 @@ mod unwind {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod unwind {
     use super::*;
 
@@ -596,7 +674,7 @@ mod unwind {
 /// whole scan through the platform unwinder. Slot visitation is idempotent
 /// (a rewritten slot no longer points at a forwarded object), so a partial
 /// fast walk followed by a full unwinder walk is safe.
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
 mod fp_chain {
     use super::*;
 
@@ -608,12 +686,47 @@ mod fp_chain {
         fp
     }
 
+    #[cfg(target_os = "macos")]
     fn stack_top() -> usize {
         unsafe extern "C" {
             fn pthread_self() -> usize;
             fn pthread_get_stackaddr_np(thread: usize) -> *mut c_void;
         }
         unsafe { pthread_get_stackaddr_np(pthread_self()) as usize }
+    }
+
+    /// Linux (#7173): stack bounds via pthread attrs — the returned address
+    /// is the LOW end, so the exclusive top is addr + size. Runtime gates
+    /// pending a Linux host; a failure here returns 0 and the caller falls
+    /// back to the platform unwinder (fail-closed like every other anomaly).
+    #[cfg(target_os = "linux")]
+    fn stack_top() -> usize {
+        unsafe extern "C" {
+            fn pthread_self() -> usize;
+            fn pthread_getattr_np(thread: usize, attr: *mut u8) -> i32;
+            fn pthread_attr_getstack(
+                attr: *const u8,
+                stackaddr: *mut *mut c_void,
+                stacksize: *mut usize,
+            ) -> i32;
+            fn pthread_attr_destroy(attr: *mut u8) -> i32;
+        }
+        // pthread_attr_t is at most 64 bytes on glibc/musl for the supported
+        // targets; over-allocate defensively.
+        let mut attr = [0u8; 128];
+        let mut addr: *mut c_void = std::ptr::null_mut();
+        let mut size: usize = 0;
+        unsafe {
+            if pthread_getattr_np(pthread_self(), attr.as_mut_ptr()) != 0 {
+                return 0;
+            }
+            let ok = pthread_attr_getstack(attr.as_ptr(), &mut addr, &mut size) == 0;
+            pthread_attr_destroy(attr.as_mut_ptr());
+            if !ok {
+                return 0;
+            }
+        }
+        (addr as usize).saturating_add(size)
     }
 
     pub(super) fn visit<F: FnMut(MutableRootSlot)>(
@@ -707,7 +820,7 @@ mod fp_chain {
     }
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg(not(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64")))]
 mod fp_chain {
     use super::*;
 
