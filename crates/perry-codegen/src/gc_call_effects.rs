@@ -99,7 +99,19 @@ pub(crate) fn classify_direct_callee(name: &str) -> GcCallEffect {
         | "js_object_alloc_class_inline_keys"
         | "js_array_push_f64"
         | "js_array_length"
-        | "js_array_slice_values" => GcCallEffect::AllocNoReentry,
+        | "js_array_slice_values"
+        // Second audit round (2026-08-01): ctor-return semantics check
+        // (inspects the returned value, calls nothing), strict-equality
+        // indexOf scan (strict equality never runs user code), and the two
+        // callback-type validators (type check + static-message throw; their
+        // throw path is the audited noreturn funnel). Deliberately NOT
+        // admitted: js_value_length_f64 — its plain-object arm calls
+        // js_object_get_field_by_name_f64, a transitive getter path; and
+        // js_array_get_f64 — hole/accessor paths.
+        | "js_ctor_return_override"
+        | "js_array_indexOf_jsvalue"
+        | "js_validate_array_comparator"
+        | "js_validate_array_map_callback" => GcCallEffect::AllocNoReentry,
         name if name.starts_with("js_throw") => GcCallEffect::NeverReturns,
         _ => GcCallEffect::Unknown,
     }
@@ -144,10 +156,26 @@ mod tests {
 
     #[test]
     fn audited_alloc_helpers_are_contract_only_non_safepoints() {
-        for name in ["js_closure_alloc_singleton", "js_array_push_f64"] {
+        for name in [
+            "js_closure_alloc_singleton",
+            "js_array_push_f64",
+            "js_ctor_return_override",
+            "js_array_indexOf_jsvalue",
+            "js_validate_array_comparator",
+        ] {
             assert_eq!(
                 classify_direct_callee(name),
                 GcCallEffect::AllocNoReentry,
+                "{name}"
+            );
+        }
+        // Transitive re-entry paths found by the body audit must stay out:
+        // js_value_length_f64 reaches js_object_get_field_by_name_f64 for
+        // plain objects; js_array_get_f64 has hole/accessor paths.
+        for name in ["js_value_length_f64", "js_array_get_f64"] {
+            assert_eq!(
+                classify_direct_callee(name),
+                GcCallEffect::Unknown,
                 "{name}"
             );
         }
