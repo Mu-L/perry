@@ -40,7 +40,7 @@ warnings (or hard failures, opt-in) when a feature like
 `privileged: true` can't be honored on the chosen runtime. See
 [Cross-Backend Determinism](./determinism.md) for the architecture.
 
-```typescript
+```typescript,no-test
 {{#include ../../examples/stdlib/container/snippets.ts:backend-detect}}
 ```
 
@@ -57,7 +57,7 @@ so a single program can use multiple.
 | 3 | Programmatic pin | TS-runtime pin before first op | `await setBackend('podman')` |
 | 4 | Capability-aware | pick the best backend **for the spec** | `JSON.parse(selectBackendFor(JSON.stringify(spec)))` |
 
-```typescript
+```typescript,no-test
 import {
   setBackend, setBackends, getBackend, getBackendPriority,
   getAvailableBackends, selectBackendFor, up,

@@ -103,11 +103,14 @@ pub(crate) fn invalidate_array_index_fast_path() {
 pub fn scan_prototype_addr_cache_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
     for cache in [&ARRAY_PROTO_ADDR, &OBJECT_PROTO_ADDR] {
         let cached = cache.load(Ordering::Relaxed);
+        // GC_STORE_AUDIT(ROOT): the visitor rewrites this atomic GC root after
+        // relocation; null and the uninitialized sentinel are skipped.
         if cached == usize::MAX || cached == 0 {
             continue;
         }
         let mut addr = cached;
         if visitor.visit_usize_slot(&mut addr) {
+            // GC_STORE_AUDIT(ROOT): publish the visitor-rewritten root.
             cache.store(addr, Ordering::Relaxed);
         }
     }

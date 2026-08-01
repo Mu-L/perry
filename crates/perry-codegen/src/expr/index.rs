@@ -337,6 +337,7 @@ pub(crate) fn lower_index_set_fast(
                 blk.store(DOUBLE, val_double, &element_ptr);
             } else {
                 let numeric_value = canonicalize_raw_f64_numeric_store_value(blk, val_double);
+                // GC_STORE_AUDIT(POINTER_FREE): canonical raw-f64 payload.
                 blk.store(DOUBLE, &numeric_value, &element_ptr);
             }
         } else {
@@ -485,6 +486,7 @@ pub(crate) fn lower_index_set_fast(
                 blk.store(DOUBLE, val_double, &element_ptr);
             } else {
                 let numeric_value = canonicalize_raw_f64_numeric_store_value(blk, val_double);
+                // GC_STORE_AUDIT(POINTER_FREE): canonical raw-f64 payload.
                 blk.store(DOUBLE, &numeric_value, &element_ptr);
             }
             // Bump length: store idx+1 to arr_ptr+0.
@@ -520,6 +522,7 @@ pub(crate) fn lower_index_set_fast(
             blk.store(DOUBLE, val_double, &element_ptr);
         } else {
             let numeric_value = canonicalize_raw_f64_numeric_store_value(blk, val_double);
+            // GC_STORE_AUDIT(POINTER_FREE): canonical raw-f64 payload.
             blk.store(DOUBLE, &numeric_value, &element_ptr);
         }
         let new_len = blk.add(I32, &idx_i32, "1");

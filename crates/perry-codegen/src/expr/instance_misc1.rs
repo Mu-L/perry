@@ -1498,6 +1498,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                                 ctx.current_block = store_idx;
                                 {
                                     let blk = ctx.block();
+                                    // GC_STORE_AUDIT(POINTER_FREE): the finite-number guard
+                                    // proves `new` is an unboxed f64, never a GC pointer.
                                     blk.store(DOUBLE, &new, &field_ptr);
                                     blk.br(&merge_label);
                                 }

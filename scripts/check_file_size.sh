@@ -136,6 +136,39 @@ crates/perry-stdlib/src/streams.rs
 # phase/debt/budget groups should be split together in the tracked #1435 file
 # decomposition rather than mixed into an unrelated runtime fast-path PR.
 crates/perry-runtime/src/gc/policy.rs
+# --- Release-readiness audit (2026-08): coupled trunks and breadth-heavy
+# regression surfaces that had crossed the cap on main without updating this
+# gate. Keep them explicit here so further growth remains review-visible; their
+# topical decomposition belongs to the tracked #1435 structural follow-up. ---
+# Typed ABI clone selection/lowering and the numeric index-get decision tree
+# thread shared proof state through large single dispatch functions.
+crates/perry-codegen/src/codegen/typed_abi.rs
+crates/perry-codegen/src/expr/index_get.rs
+# Native-module call lowering and declaration-block lowering are central SWC
+# dispatch trees; splitting their match-arm families requires shared contexts.
+crates/perry-hir/src/lower/expr_call/native_module.rs
+crates/perry-hir/src/lower_decl/block.rs
+# Array-like generic semantics are one coupled ToObject/property-chain surface.
+crates/perry-runtime/src/array/generic.rs
+# GC regression suites are breadth-heavy, one test per layout/root invariant;
+# production code is unaffected and coverage should not be trimmed for LOC.
+crates/perry-runtime/src/gc/tests/layout_trace.rs
+crates/perry-runtime/src/gc/tests/runtime_roots.rs
+# Node test-module dispatch and the native-module callable/constant tables are
+# exhaustive API surfaces; split by API family in the #1435 follow-up.
+crates/perry-runtime/src/node_submodules/test.rs
+crates/perry-runtime/src/object/native_module/callable_export_check.rs
+crates/perry-runtime/src/object/native_module/callable_exports.rs
+crates/perry-runtime/src/object/native_module/constants.rs
+# Small overages in process environment, network, and TLS/worker dispatch
+# trunks; each shares live registries and callback/root-scanner state.
+crates/perry-runtime/src/process/env_misc.rs
+crates/perry-ext-net/src/lib.rs
+crates/perry-stdlib/src/tls.rs
+crates/perry-stdlib/src/worker_threads.rs
+# Platform library/tool discovery is one cross-target policy surface with many
+# cfg-specific branches; decompose by host platform under #1435.
+crates/perry/src/commands/compile/library_search.rs
 EOF
 )
 

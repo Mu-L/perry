@@ -388,6 +388,8 @@ pub(crate) fn try_lower_proven_view_checked_store(
             idx_i64
         };
         let elem_ptr = blk.gep(I8, &data_ptr, &[(I64, &byte_off)]);
+        // GC_STORE_AUDIT(POINTER_FREE): proven typed-array views store only
+        // unboxed numeric bytes in their backing buffer.
         match view.elem {
             BufferElem::I8 | BufferElem::U8 => {
                 let byte = blk.trunc(I32, &value_native.value, I8);
@@ -395,16 +397,20 @@ pub(crate) fn try_lower_proven_view_checked_store(
             }
             BufferElem::I16 | BufferElem::U16 => {
                 let half = blk.trunc(I32, &value_native.value, I16);
+                // GC_STORE_AUDIT(POINTER_FREE): unboxed typed-array bytes.
                 blk.store(I16, &half, &elem_ptr);
             }
             BufferElem::I32 | BufferElem::U32 => {
+                // GC_STORE_AUDIT(POINTER_FREE): unboxed typed-array bytes.
                 blk.store(I32, &value_native.value, &elem_ptr);
             }
             BufferElem::F32 => {
                 let narrow = blk.fptrunc(DOUBLE, &value_native.value, F32);
+                // GC_STORE_AUDIT(POINTER_FREE): unboxed typed-array bytes.
                 blk.store(F32, &narrow, &elem_ptr);
             }
             BufferElem::F64 => {
+                // GC_STORE_AUDIT(POINTER_FREE): unboxed typed-array bytes.
                 blk.store(DOUBLE, &value_native.value, &elem_ptr);
             }
             BufferElem::U8Clamped => unreachable!("gated above"),

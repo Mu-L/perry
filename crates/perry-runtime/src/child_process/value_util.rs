@@ -100,7 +100,7 @@ pub(crate) fn cp_box_string(s: &str) -> f64 {
 /// route through the unified accessor which materializes SSO bytes.
 pub(crate) fn cp_value_to_string(value: f64) -> Option<String> {
     let ptr = crate::value::js_get_string_pointer_unified(value) as *const StringHeader;
-    if ptr.is_null() || (ptr as usize) < 0x1000 {
+    if !crate::value::addr_class::is_plausible_heap_addr(ptr as usize) {
         return None;
     }
     unsafe {
@@ -118,7 +118,7 @@ pub(crate) fn cp_value_to_bytes(value: f64) -> Vec<u8> {
     let bits = value.to_bits();
     if JSValue::from_bits(bits).is_pointer() {
         let raw = (bits & crate::value::POINTER_MASK) as usize;
-        if raw >= 0x10000 {
+        if crate::value::addr_class::is_above_handle_band(raw) {
             if crate::buffer::is_registered_buffer(raw) {
                 let buf = raw as *const crate::buffer::BufferHeader;
                 unsafe {
@@ -178,11 +178,10 @@ pub(crate) unsafe fn cp_read_arg_strings(args_ptr: i64) -> Vec<String> {
     // args list (Node accepts `null`/`undefined`/`{}` as no args). Without this
     // guard `spawnSync("echo", null)` dereferences a bogus pointer and crashes.
     let raw = args_ptr as usize;
-    if raw < 0x10000 {
+    let Some(header) = crate::value::addr_class::try_read_gc_header(raw) else {
         return out;
-    }
-    let header = (raw as *const u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader;
-    let t = (*header).obj_type;
+    };
+    let t = header.obj_type;
     if t != crate::gc::GC_TYPE_ARRAY && t != crate::gc::GC_TYPE_LAZY_ARRAY {
         return out;
     }
@@ -219,10 +218,10 @@ pub(crate) fn cp_args_from_value(value: f64) -> Vec<String> {
 /// has unboxed them: when the third argument is absent, a plain object in the
 /// second slot is the options object, not an argv list.
 pub(crate) fn cp_options_from_raw_args(args_ptr: i64, opts_ptr: i64) -> f64 {
-    if opts_ptr > 0x10000 {
+    if crate::value::addr_class::is_above_handle_band(opts_ptr as usize) {
         return cp_box_ptr(opts_ptr as *const u8);
     }
-    if args_ptr <= 0x10000 {
+    if args_ptr <= 0 || crate::value::addr_class::is_handle_band(args_ptr as usize) {
         return cp_undefined();
     }
     let args = cp_box_ptr(args_ptr as *const u8);

@@ -596,6 +596,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                                     // exponent) — no canonicalization call,
                                     // no barrier (pointer-free by proof).
                                     let blk = ctx.block();
+                                    // GC_STORE_AUDIT(POINTER_FREE): guarded unboxed f64.
                                     blk.store(DOUBLE, &val_double, &field_ptr);
                                     blk.br(&merge_label);
                                 }

@@ -129,7 +129,7 @@ pub(crate) unsafe fn options_with_file_types(options_value: f64) -> bool {
     } else {
         return false;
     };
-    if raw_ptr < 0x1000 {
+    if !crate::value::addr_class::is_plausible_heap_addr(raw_ptr) {
         return false;
     }
     let obj_ptr = raw_ptr as *const crate::object::ObjectHeader;
@@ -181,7 +181,7 @@ pub(crate) unsafe fn options_field_value(
     } else {
         return None;
     };
-    if raw_ptr < 0x1000 {
+    if !crate::value::addr_class::is_plausible_heap_addr(raw_ptr) {
         return None;
     }
     let obj_ptr = raw_ptr as *const crate::object::ObjectHeader;
@@ -214,7 +214,7 @@ pub(crate) unsafe fn options_field_value(
     } else {
         return None;
     };
-    if refreshed_ptr < 0x1000 {
+    if !crate::value::addr_class::is_plausible_heap_addr(refreshed_ptr) {
         return None;
     }
     let refreshed_obj_ptr = refreshed_ptr as *const crate::object::ObjectHeader;

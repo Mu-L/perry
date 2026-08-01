@@ -98,6 +98,7 @@ pub extern "C" fn js_array_grow(arr: *mut ArrayHeader, min_capacity: u32) -> *mu
             let new_elems =
                 (new_ptr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut u64;
             for i in old_capacity as usize..new_capacity as usize {
+                // GC_STORE_AUDIT(INIT): fresh growth slack receives TAG_HOLE.
                 ptr::write(new_elems.add(i), crate::value::TAG_HOLE);
             }
         }

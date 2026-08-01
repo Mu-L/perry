@@ -64,7 +64,7 @@ perry compile server.ts --embed "./dist/**" -o myapp
 
 Embedded files are reachable at runtime three ways:
 
-```ts
+```typescript,no-test
 import { embeddedFiles, readEmbedded, isStandaloneExecutable } from "perry";
 import { readFileSync } from "fs";
 

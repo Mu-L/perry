@@ -52,6 +52,7 @@ pub extern "C" fn js_array_alloc(capacity: u32) -> *mut ArrayHeader {
         // scan misreads as live from-space pointers.
         let elements_ptr = (ptr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut u64;
         for i in 0..actual_capacity as usize {
+            // GC_STORE_AUDIT(INIT): fresh array slack is initialized to TAG_HOLE.
             std::ptr::write(elements_ptr.add(i), crate::value::TAG_HOLE);
         }
         set_array_numeric_layout(ptr, NumericArrayLayout::RawF64);
