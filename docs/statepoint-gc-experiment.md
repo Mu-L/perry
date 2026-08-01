@@ -355,6 +355,39 @@ only relocation semantics can restore. `asm "~{memory}"` constrains memory
 ordering, not dataflow; no barrier discipline reaches values the optimizer
 carries in registers and rematerializes.
 
+## Real-app remeasurement (test-drizzle-pg, 133 modules, 2026-08-01)
+
+#7108's size model, re-taken as a direct measurement on the same
+application with every in-branch reduction live:
+
+| Arm | file | `__text` | `__llvm_stackmaps` |
+|---|---:|---:|---:|
+| shadow (default) | 28,474,576 | 20,376,748 | 0 |
+| statepoint | 32,206,720 | 20,227,252 | 4,025,336 |
+| statepoint + contract | 32,008,560 | 20,226,728 | **3,832,384** |
+
+Two model corrections, one in each direction. The metadata came in at
+**3.83 MB — below the refined model band's 4.5 MB floor** (the audit,
+noreturn elision, and contract compose better on real dependency code than
+the all-roots-live worst case assumed). But the text actually recovered is
+**150 KB, not the 439 KB** #7108 reported — that figure measured
+`PERRY_SHADOW_STACK=0` (rooting fully off) as the floor, while real
+statepoint codegen keeps spill/reload work. Net file-size cost of the best
+native arm on a real app: **+3.53 MB (+12.4%) versus shadow — a ~25×
+imbalance that no audited elision closes.** The contract's real-app effect
+is −4.8% metadata (probe-scale was −8.8%; dependency code has
+proportionally fewer audited-helper sites).
+
+**Standing verdict, now measured on every axis:** the shadow stack is the
+three-axis optimum shipping today — wall-clock tied within timer
+quantization, RSS tied, file-size won by 3.5 MB on a real application.
+The statepoint backend is correctness-superior (the forgot-to-root class
+is structurally impossible), speed-competitive, and 59% leaner in metadata
+than its own first prototype — and its remaining 25× size gap is proven
+(not projected) to close only through repsel promotion shrinking the
+maybe-pointer root set, or RS4GC managed-pointer SSA. Both are tracked;
+neither is this branch's to deliver.
+
 **Conclusion, stated as the design law this branch keeps re-deriving:**
 *with an optimizing compiler between the source and the safepoint, root
 metadata without relocation semantics is unsound — per-call plain maps
