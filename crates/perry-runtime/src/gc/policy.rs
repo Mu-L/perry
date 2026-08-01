@@ -722,6 +722,40 @@ pub(super) fn gc_safepoint_only_contract() -> SafepointOnlyContract {
     })
 }
 
+/// Contract enforcement chokepoint, called once at every synchronous
+/// collection entry. When an undeclared precise-root collection is about to
+/// begin, heal mode returns a scan-override guard that must be held for the
+/// WHOLE collection: it flips the thread-local override that every consumer
+/// of `conservative_stack_scan_decision()` reads — the root-scan subphase,
+/// copying-minor eligibility, and the evacuation verifier alike. A previous
+/// revision healed by overriding a local variable inside the root-scan
+/// subphase only; copying-minor eligibility still read the global decision,
+/// concluded there were no conservative roots to pin, and forced evacuation
+/// moved objects that raw native-stack words still pointed at.
+pub(super) fn contract_scan_heal_guard() -> Option<super::roots::ManualGcScanGuard> {
+    if gc_safepoint_only_contract() == SafepointOnlyContract::Off {
+        return None;
+    }
+    if !super::roots::native_stack_maps_active()
+        || GC_AT_DECLARED_SAFEPOINT.with(Cell::get)
+    {
+        return None;
+    }
+    if matches!(
+        super::roots::conservative_stack_scan_decision(),
+        super::roots::ConservativeStackScanDecision::Scan
+    ) {
+        return None;
+    }
+    if gc_safepoint_only_contract() == SafepointOnlyContract::Strict {
+        panic!(
+            "PERRY_GC_SAFEPOINT_ONLY: precise-root collection began outside \
+             a declared safepoint"
+        );
+    }
+    Some(super::roots::ManualGcScanGuard::force_full_scan())
+}
+
 /// RAII marker for a declared-safepoint drain. Nesting-safe: restores the
 /// previous value so a poll firing inside a manual `gc()` cannot clear it.
 pub(super) struct DeclaredSafepointGuard {

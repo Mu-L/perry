@@ -571,35 +571,7 @@ impl RootScanCycleState {
                     self.subphase = RootScanSubphase::MutableSlots;
                     return false;
                 }
-                let mut conservative_scan_decision = conservative_stack_scan_decision();
-                // PERRY_GC_SAFEPOINT_ONLY contract: a collection that skips
-                // the conservative scan consumes only precise roots, and with
-                // native stack maps active those exist only at mapped PCs —
-                // so it may begin only at a declared safepoint (loop poll,
-                // outermost microtask boundary). Heal mode forces the scan
-                // for the offending cycle (sound and non-moving); strict
-                // mode panics so gates can prove the enforcement is live.
-                // The alloc-point valve and manual gc() already force the
-                // scan and are exempt by construction.
-                if !matches!(
-                    conservative_scan_decision,
-                    ConservativeStackScanDecision::Scan
-                ) && super::roots::native_stack_maps_active()
-                    && !super::policy::GC_AT_DECLARED_SAFEPOINT.with(std::cell::Cell::get)
-                {
-                    match super::policy::gc_safepoint_only_contract() {
-                        super::policy::SafepointOnlyContract::Off => {}
-                        super::policy::SafepointOnlyContract::Heal => {
-                            conservative_scan_decision = ConservativeStackScanDecision::Scan;
-                        }
-                        super::policy::SafepointOnlyContract::Strict => {
-                            panic!(
-                                "PERRY_GC_SAFEPOINT_ONLY: precise-root collection \
-                                 began outside a declared safepoint"
-                            );
-                        }
-                    }
-                }
+                let conservative_scan_decision = conservative_stack_scan_decision();
                 // #5029: minors retain old-gen conservative discoveries
                 // pin-only (no trace) — see try_mark_conservative_word.
                 let conservative_root_stats = mark_stack_roots_for_decision(

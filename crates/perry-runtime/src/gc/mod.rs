@@ -102,6 +102,10 @@ pub fn gc_collect_minor() -> u64 {
 }
 
 pub(super) fn gc_collect_minor_with_trigger(trigger: GcTriggerSnapshot) -> GcCollectOutcome {
+    // PERRY_GC_SAFEPOINT_ONLY: held for the whole collection so every
+    // consumer of the scan decision (root scan, copying eligibility,
+    // evacuation pinning, verifier) sees the same healed answer.
+    let _contract_heal = policy::contract_scan_heal_guard();
     gc_drain_active_budgeted_cycle();
     // Barriers-off ⇒ the remembered set is not being maintained, and a
     // minor's black-leafed old parents would hide live children. Route
@@ -314,6 +318,10 @@ fn gc_collect_inner_with_trigger(trigger: GcTriggerSnapshot) -> GcCollectOutcome
 }
 
 fn gc_collect_full_mark_sweep_with_trigger(trigger: GcTriggerSnapshot) -> GcCollectOutcome {
+    // PERRY_GC_SAFEPOINT_ONLY: see gc_collect_minor_with_trigger. Manual
+    // gc() engages its own force_full_scan first, which this detects as
+    // already-Scan and no-ops.
+    let _contract_heal = policy::contract_scan_heal_guard();
     gc_drain_active_budgeted_cycle();
     GC_TRIGGER_BUMPED.with(|c| c.set(false));
     GcCycleState::new_full(trigger).run_to_completion()

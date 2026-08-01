@@ -836,31 +836,6 @@ impl CopiedMinorEligibility {
                 malloc_sweep_due,
             );
         }
-        // PERRY_GC_SAFEPOINT_ONLY contract: this is the MOVING path, the one
-        // the contract exists to police. A copying minor consumes precise
-        // roots, so outside a declared safepoint it must not run: heal mode
-        // falls back (the non-moving cycle then has its scan forced by the
-        // cycle.rs heal, which is why reusing the ConservativeStack reason is
-        // accurate); strict mode panics so gates can prove enforcement.
-        if !matches!(
-            super::policy::gc_safepoint_only_contract(),
-            super::policy::SafepointOnlyContract::Off
-        ) && super::roots::native_stack_maps_active()
-            && !super::policy::GC_AT_DECLARED_SAFEPOINT.with(std::cell::Cell::get)
-        {
-            if super::policy::gc_safepoint_only_contract()
-                == super::policy::SafepointOnlyContract::Strict
-            {
-                panic!(
-                    "PERRY_GC_SAFEPOINT_ONLY: copying minor began outside a \
-                     declared safepoint"
-                );
-            }
-            return Self::fallback(
-                CopiedMinorFallbackReason::ConservativeStack,
-                malloc_sweep_due,
-            );
-        }
         let ptrs = CopyingPointerSet::new();
         let (copy_only_reason, legacy_root_stats) = Self::copy_only_root_preflight_reason(&ptrs);
         if let Some(reason) = copy_only_reason {
