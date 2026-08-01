@@ -290,6 +290,127 @@ fn source_fingerprint_follows_workspace_dep_closure() {
     );
 }
 
+/// The GC-iteration "stale runtime" trap: perry-runtime / perry-stdlib are the
+/// crates a runtime dev edits most, yet the pre-existing fingerprint coverage
+/// only exercised the routed ext crates. A CONTENT edit to a runtime/stdlib
+/// source file must rotate the fingerprint even when the file's mtime does NOT
+/// advance (a `git checkout`, `cp -p`, or cache restore can hand back a fresh
+/// checkout whose sources look "older" than a cached archive) — the #5892/#5930
+/// content fingerprint is exactly what makes that safe, where the mtime gate
+/// alone is blind. Rewriting identical bytes must NOT rotate it, so the common
+/// no-edit rebuild stays a fast cache hit.
+#[test]
+fn source_fingerprint_tracks_runtime_and_stdlib_content_not_mtimes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    minimal_auto_workspace(dir.path());
+
+    let fp0 = auto_optimized_source_fingerprint(dir.path(), &[]);
+
+    // mtime-only churn (identical bytes, later write time) must not rotate the
+    // key — this is the no-edit fast path the freshness gate relies on.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    write_file(
+        &dir.path().join("crates/perry-runtime/src/lib.rs"),
+        b"pub fn rt() {}\n",
+    );
+    assert_eq!(
+        fp0,
+        auto_optimized_source_fingerprint(dir.path(), &[]),
+        "rewriting identical runtime bytes must not rotate the fingerprint"
+    );
+
+    // A content edit to an EXISTING perry-runtime source file must rotate it.
+    // Editing in place (rather than adding a new file) is what makes this
+    // assertion depend on the file CONTENT hash: a fingerprint that hashed only
+    // the path set would still rotate on an added file, and the test could not
+    // fail. See `runtime_source_edit_rotates_build_stamp_and_fails_freshness`
+    // for the same reasoning applied to the freshness gate.
+    write_file(
+        &dir.path().join("crates/perry-runtime/src/lib.rs"),
+        b"pub fn rt_changed() {}\n",
+    );
+    let fp_rt = auto_optimized_source_fingerprint(dir.path(), &[]);
+    assert_ne!(
+        fp0, fp_rt,
+        "a perry-runtime source edit must rotate the fingerprint"
+    );
+
+    // Same guarantee for perry-stdlib.
+    write_file(
+        &dir.path().join("crates/perry-stdlib/src/lib.rs"),
+        b"pub fn stdlib_changed() {}\n",
+    );
+    let fp_std = auto_optimized_source_fingerprint(dir.path(), &[]);
+    assert_ne!(
+        fp_rt, fp_std,
+        "a perry-stdlib source edit must rotate the fingerprint"
+    );
+}
+
+/// Ties the runtime-source fingerprint to the freshness gate the compile driver
+/// actually consults: a content edit to perry-runtime rotates the build stamp,
+/// so a `target/perry-auto-<hash>` dir stamped for the OLD source can never pass
+/// `auto_optimized_archives_are_fresh` — no manual `rm libperry_runtime.a`.
+///
+/// The stamp gate is the ONLY thing this test lets answer "stale": the archives
+/// are planted *after* the source edit, so every source is older than them and
+/// the mtime half of `auto_optimized_archives_are_fresh` votes "fresh". That
+/// ordering is deliberate — plant them first and the edit's own mtime makes the
+/// gate reject on the mtime path alone, so the assertion would still pass with
+/// the stamp comparison deleted and the test could never fail (the repo's
+/// "a gate must assert its subject was live" rule). It is also the real-world
+/// case the content fingerprint exists for: a `git checkout` / `cp -p` / CI
+/// cache restore hands back sources whose mtimes never advance past a cached
+/// archive.
+#[test]
+fn runtime_source_edit_rotates_build_stamp_and_fails_freshness() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    minimal_auto_workspace(dir.path());
+
+    let fp_before = auto_optimized_source_fingerprint(dir.path(), &[]);
+    let stamp_before = auto_optimized_build_stamp("key", None, &[], &[], &fp_before);
+
+    // Content edit to an EXISTING runtime source file (in place, so the
+    // assertion rides on the content hash rather than on the path set).
+    write_file(
+        &dir.path().join("crates/perry-runtime/src/lib.rs"),
+        b"pub fn rt_v2() {}\n",
+    );
+
+    // Only now plant the archives + the stamp recorded for the PRE-edit source,
+    // so their mtimes are newer than every source and the mtime half of the gate
+    // says "fresh". Anything but the stamp mismatch would let this pass.
+    let runtime = dir
+        .path()
+        .join("target/perry-auto/release/libperry_runtime.a");
+    let stdlib = dir
+        .path()
+        .join("target/perry-auto/release/libperry_stdlib.a");
+    let stamp_path = dir.path().join("target/perry-auto/.perry-auto-build.stamp");
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    write_file(&runtime, b"!<arch>\n");
+    write_file(&stdlib, b"!<arch>\n");
+    write_file(&stamp_path, stamp_before.as_bytes());
+
+    let fp_after = auto_optimized_source_fingerprint(dir.path(), &[]);
+    let stamp_after = auto_optimized_build_stamp("key", None, &[], &[], &fp_after);
+    assert_ne!(
+        stamp_before, stamp_after,
+        "a runtime source edit must rotate the build stamp"
+    );
+    assert!(
+        !auto_optimized_archives_are_fresh(
+            dir.path(),
+            &runtime,
+            &stdlib,
+            &[],
+            &stamp_path,
+            &stamp_after,
+        ),
+        "archives stamped for the pre-edit runtime source must not pass the freshness gate"
+    );
+}
+
 /// Closes #507. The well-known flip's "shared tokio" allowlist
 /// must match the set of perry-ext-* crates whose own
 /// `Cargo.toml` pulls tokio. If a new wrapper is added that uses
