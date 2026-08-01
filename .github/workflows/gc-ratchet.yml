@@ -168,6 +168,10 @@ jobs:
           # Deterministic link: use the prebuilt full stdlib rather than letting
           # the auto-optimizer rebuild a workload-specific archive mid-run.
           PERRY_NO_AUTO_OPTIMIZE: "1"
+          # The pinned baseline measures the moving collector. Keep that mode
+          # explicit now that ordinary binaries default loop polling off; a
+          # zero-cycle measurement would make the ratchet vacuous.
+          PERRY_GC_MOVING_LOOP_POLLS: "1"
         run: |
           set -euo pipefail
           mkdir -p .bench-results

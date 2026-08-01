@@ -8,8 +8,9 @@
 //! Functionally identical to `crates/perry-stdlib/src/axios.rs`.
 
 use perry_ffi::{
-    alloc_string, get_handle, json_stringify, read_string, register_handle, spawn_blocking,
-    with_handle, Handle, JsPromise, JsString, JsValue, Promise, StringHeader,
+    alloc_string, get_handle, json_stringify, read_string, register_handle,
+    spawn_blocking_with_reactor, with_handle, Handle, JsPromise, JsString, JsValue, Promise,
+    StringHeader,
 };
 
 /// #598: read the body argument as a JSON string. axios in npm-land
@@ -90,7 +91,7 @@ where
         }
     };
 
-    spawn_blocking(move || {
+    spawn_blocking_with_reactor(move || {
         let result: Result<AxiosResponseHandle, String> = tokio::runtime::Handle::current()
             .block_on(async move {
                 let client = reqwest::Client::new();

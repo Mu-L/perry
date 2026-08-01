@@ -11,7 +11,7 @@
 //! visual styles (the Fluent look) on Windows 10/11. See issue #4681 /
 //! discussion #3486.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(target_os = "windows")]
@@ -44,6 +44,13 @@ pub(super) fn add_system_libs(cmd: &mut Command) {
         .arg("shlwapi.lib")
         .arg("ole32.lib")
         .arg("comctl32.lib")
+        // Static Rust archives do not propagate windows-rs `#[link]`
+        // metadata to Perry's final link. SetWindowTheme, UuidCreate, and the
+        // print-dialog import thunks are all reachable from the Windows UI
+        // archive even for small widget programs.
+        .arg("uxtheme.lib")
+        .arg("rpcrt4.lib")
+        .arg("winspool.lib")
         .arg("advapi32.lib")
         .arg("comdlg32.lib")
         .arg("ws2_32.lib")
@@ -75,6 +82,50 @@ pub(super) fn add_system_libs(cmd: &mut Command) {
         .arg("winhttp.lib");
 }
 
+/// Locate and append webview2-com's native loader archive.
+///
+/// `perry-ui-windows.lib` retains the WebView widget FFI entry points, but a
+/// Rust `staticlib` does not carry the dependency's `rustc-link-search`/
+/// `rustc-link-lib` metadata into Perry's later application link. Cargo copies
+/// the loader to `target/<profile>/build/webview2-com-sys-*/out/<arch>`; pass
+/// that concrete archive to link.exe so every Windows UI program has a
+/// resolvable WebView2 entry point.
+pub(super) fn add_webview2_loader(cmd: &mut Command, runtime_lib: &Path, target: Option<&str>) {
+    let arch = match target.unwrap_or_default() {
+        triple if triple.contains("aarch64") || triple.contains("arm64") => "arm64",
+        triple if triple.starts_with("i686-") || triple.starts_with("i586-") => "x86",
+        _ => "x64",
+    };
+    let Some(profile_dir) = runtime_lib.parent() else {
+        return;
+    };
+    let build_dir = profile_dir.join("build");
+    let Ok(entries) = std::fs::read_dir(&build_dir) else {
+        return;
+    };
+    let mut candidates: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("webview2-com-sys-")
+        })
+        .map(|entry| {
+            entry
+                .path()
+                .join("out")
+                .join(arch)
+                .join("WebView2LoaderStatic.lib")
+        })
+        .filter(|path| path.is_file())
+        .collect();
+    candidates.sort();
+    if let Some(loader) = candidates.pop() {
+        cmd.arg(loader);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +140,22 @@ mod tests {
             .collect();
         assert!(args.iter().any(|arg| arg == "shlwapi.lib"));
         assert!(args.iter().any(|arg| arg == "winhttp.lib"));
+        assert!(args.iter().any(|arg| arg == "uxtheme.lib"));
+        assert!(args.iter().any(|arg| arg == "rpcrt4.lib"));
+        assert!(args.iter().any(|arg| arg == "winspool.lib"));
+    }
+
+    #[test]
+    fn webview2_loader_survives_the_staticlib_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("release");
+        let loader = profile.join("build/webview2-com-sys-test/out/x64/WebView2LoaderStatic.lib");
+        std::fs::create_dir_all(loader.parent().unwrap()).unwrap();
+        std::fs::write(&loader, b"fixture").unwrap();
+        let runtime = profile.join("perry_runtime.lib");
+        let mut command = Command::new("link.exe");
+        add_webview2_loader(&mut command, &runtime, Some("x86_64-pc-windows-msvc"));
+        assert!(command.get_args().any(|arg| arg == loader.as_os_str()));
     }
 }
 

@@ -664,6 +664,11 @@ pub struct LoweringContext {
     /// rewrite recognize `m.call(arr, ...)` (the receiver of `.call` is a plain
     /// identifier, not a member/literal) and synthesize `arr.map(...)`.
     pub(crate) builtin_proto_method_locals: HashMap<String, String>,
+    /// Subset whose borrowed method originated on `String.prototype` or a
+    /// string literal. Array and String share names such as `slice`; preserving
+    /// the origin prevents the generic Array-like rewrite from stealing String
+    /// semantics at a later `.call`/`.apply`.
+    pub(crate) builtin_proto_method_string_locals: HashSet<String>,
     /// Issue #76 — locals known to hold a WebAssembly instance handle (i.e.
     /// `const x = WebAssembly.instantiate(...)`). Used to route
     /// `x.exports.<method>(...)` to `Expr::WebAssemblyCallExport` only when

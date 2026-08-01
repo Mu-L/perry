@@ -1794,15 +1794,12 @@ pub(crate) fn ordinary_function_prototype_value_for_read(func_value: f64) -> Opt
     // `ReadStream.prototype = Object.create(fs$ReadStream.prototype)`, and
     // pino's `Object.setPrototypeOf(prototype, EventEmitter.prototype)`.
     //
-    // A bound-native export is a constructor class when its method name uses
-    // Node's constructor-cased convention (a leading uppercase ASCII letter,
-    // e.g. `ReadStream`/`EventEmitter`/`Server`) AND it isn't explicitly
-    // marked non-constructable (built-in prototype methods like
-    // `String.prototype.charAt` carry that flag). Such exports are cached
-    // singleton closures (NATIVE_CALLABLE_EXPORTS), so the synthetic-class
-    // path below gives them a stable `.prototype` object. Non-constructor
-    // bound methods (`fs.readFile`, `path.join`, …) keep `prototype ===
-    // undefined`, matching Node's built-in non-constructor functions.
+    // Current Node exposes an own prototype object on native-module callable
+    // exports including lower-case functions such as `fs.readFile`. Use the
+    // registry identity rather than a capitalization heuristic; genuinely
+    // non-constructable builtins are explicitly marked and rejected above.
+    // These exports are cached singleton closures (NATIVE_CALLABLE_EXPORTS),
+    // so the synthetic-class path below gives them a stable prototype object.
     {
         let jv = crate::value::JSValue::from_bits(func_value.to_bits());
         if jv.is_pointer() {
@@ -1816,17 +1813,11 @@ pub(crate) fn ordinary_function_prototype_value_for_read(func_value: f64) -> Opt
                 ) {
                     return None;
                 }
-                let is_native_class_export = unsafe {
+                let is_native_callable_export = unsafe {
                     super::super::native_module::bound_native_callable_module_and_method(func_value)
                 }
-                .map(|(_module, method)| {
-                    method
-                        .as_bytes()
-                        .first()
-                        .is_some_and(|b| b.is_ascii_uppercase())
-                })
-                .unwrap_or(false);
-                if !is_native_class_export {
+                .is_some();
+                if !is_native_callable_export {
                     return None;
                 }
             }

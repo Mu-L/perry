@@ -43,6 +43,14 @@ pub unsafe extern "C" fn js_handle_method_dispatch(
         return v;
     }
 
+    // Cheerio document/selection handles lose their static type as soon as an
+    // intermediate is stored in an `any`-typed local. Route those calls through
+    // the same method surface as the statically lowered path.
+    #[cfg(feature = "bundled-cheerio")]
+    if let Some(v) = crate::cheerio::dispatch_cheerio(handle, method_name, &args) {
+        return v;
+    }
+
     // Dispatchers below gate on registry membership plus method vocabulary
     // because native handle id spaces are not unified (#91).
 

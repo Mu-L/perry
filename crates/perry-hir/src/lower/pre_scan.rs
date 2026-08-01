@@ -123,8 +123,15 @@ pub(crate) fn pre_scan_weakref_locals(ast_module: &ast::Module, ctx: &mut Loweri
                         init_unwrapped,
                     )
                 {
-                    ctx.builtin_proto_method_locals
-                        .insert(ident.id.sym.to_string(), method);
+                    let local_name = ident.id.sym.to_string();
+                    if crate::lower::expr_call::intrinsics::is_string_builtin_prototype_method_ref(
+                        ctx,
+                        init_unwrapped,
+                    ) {
+                        ctx.builtin_proto_method_string_locals
+                            .insert(local_name.clone());
+                    }
+                    ctx.builtin_proto_method_locals.insert(local_name, method);
                 }
             }
         }

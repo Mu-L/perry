@@ -466,10 +466,10 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // So does a `static { … }` block, for the plainer reason that its
             // body is arbitrary user code — which is why `block_fns` is computed
             // HERE rather than at its loop below: the predicate has to see it.
-            // A class expression whose only statics are inert (`static x = 1`)
-            // but which carries a static block otherwise pushed no root at all,
-            // and the block's body could then relocate the object out from under
-            // the register the final `nanbox_pointer_inline` reads.
+            // Every named static also requires protection: even an inert
+            // initializer is followed by `js_object_set_field_by_name`, which
+            // can grow the keys array and collect before the next store or the
+            // final `nanbox_pointer_inline` reads the class object.
             let block_fns = static_block_fns(ctx, template);
             // #7211: `!named_statics.is_empty()` is the disjunct the original
             // predicate was missing, and its absence is the interesting part.

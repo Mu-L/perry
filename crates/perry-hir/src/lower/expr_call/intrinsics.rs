@@ -26,7 +26,7 @@ mod native_arena;
 mod precompile_wasm;
 mod require;
 
-pub(crate) use apply_call::as_builtin_proto_method_ref;
+pub(crate) use apply_call::{as_builtin_proto_method_ref, is_string_builtin_prototype_method_ref};
 pub(super) use apply_call::{
     try_builtin_prototype_method_apply_call, try_iife_call_rewrite,
     try_native_module_method_apply_call,

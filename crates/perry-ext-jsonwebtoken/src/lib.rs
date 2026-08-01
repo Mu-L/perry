@@ -169,6 +169,49 @@ pub unsafe extern "C" fn js_jwt_sign_rs256(
     )
 }
 
+/// Sign using an algorithm selected at runtime.
+///
+/// The compiler emits this entry point when the `algorithm` option is not an
+/// inline literal. Keep the extension wrapper's surface in sync with the
+/// bundled stdlib implementation: optimized-library selection replaces the
+/// stdlib archive with this crate, so omitting the symbol otherwise produces a
+/// link failure for valid `jsonwebtoken` programs.
+#[no_mangle]
+pub unsafe extern "C" fn js_jwt_sign_dyn(
+    alg_ptr: *const StringHeader,
+    payload_ptr: *const StringHeader,
+    secret_ptr: *const StringHeader,
+    expires_in_secs: f64,
+    kid_ptr: *const StringHeader,
+) -> i64 {
+    let algorithm = read_str(alg_ptr).unwrap_or_else(|| "HS256".to_string());
+    match algorithm.as_str() {
+        "ES256" => js_jwt_sign_es256(payload_ptr, secret_ptr, expires_in_secs, kid_ptr),
+        "RS256" => js_jwt_sign_rs256(payload_ptr, secret_ptr, expires_in_secs, kid_ptr),
+        _ => js_jwt_sign(payload_ptr, secret_ptr, expires_in_secs, kid_ptr),
+    }
+}
+
+unsafe fn verify_common(
+    token_ptr: *const StringHeader,
+    key: DecodingKey,
+    algorithm: Algorithm,
+) -> *mut StringHeader {
+    let Some(token) = read_str(token_ptr) else {
+        return std::ptr::null_mut();
+    };
+    let mut validation = Validation::new(algorithm);
+    validation.required_spec_claims = std::collections::HashSet::new();
+    validation.validate_exp = true;
+    match decode::<Claims>(&token, &key, &validation) {
+        Ok(token_data) => {
+            let json = serde_json::to_string(&token_data.claims).unwrap_or_else(|_| "{}".into());
+            alloc_string(&json).as_raw()
+        }
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 /// `jwt.verify(token, secret)` — HS256. Returns the claims as a
 /// JSON string.
 ///
@@ -181,32 +224,58 @@ pub unsafe extern "C" fn js_jwt_verify(
     token_ptr: *const StringHeader,
     secret_ptr: *const StringHeader,
 ) -> *mut StringHeader {
-    let Some(token) = read_str(token_ptr) else {
-        return std::ptr::null_mut();
-    };
     let Some(secret) = read_str(secret_ptr) else {
         return std::ptr::null_mut();
     };
+    verify_common(
+        token_ptr,
+        DecodingKey::from_secret(secret.as_bytes()),
+        Algorithm::HS256,
+    )
+}
 
-    let key = DecodingKey::from_secret(secret.as_bytes());
-    let mut validation = Validation::new(Algorithm::HS256);
-    // Match Node's `jsonwebtoken`: validate the `exp` claim whenever it is
-    // present (so expired tokens are rejected), but do not *require* exp — a
-    // token that legitimately omits expiry still verifies. `required_spec_claims`
-    // stays empty for the latter; `validate_exp = true` enforces the former.
-    //
-    // This previously read `validate_exp = false`, which accepted expired
-    // tokens indefinitely (GHSA-5324-c68v-8w62 / CVE-2026-53777) — the same
-    // bug already fixed in crates/perry-stdlib/src/jsonwebtoken.rs.
-    validation.required_spec_claims = std::collections::HashSet::new();
-    validation.validate_exp = true;
+/// Verify an ES256 token with a PEM-encoded public key.
+#[no_mangle]
+pub unsafe extern "C" fn js_jwt_verify_es256(
+    token_ptr: *const StringHeader,
+    pem_ptr: *const StringHeader,
+) -> *mut StringHeader {
+    let Some(pem) = read_str(pem_ptr) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(key) = DecodingKey::from_ec_pem(pem.as_bytes()) else {
+        return std::ptr::null_mut();
+    };
+    verify_common(token_ptr, key, Algorithm::ES256)
+}
 
-    match decode::<Claims>(&token, &key, &validation) {
-        Ok(token_data) => {
-            let json = serde_json::to_string(&token_data.claims).unwrap_or_else(|_| "{}".into());
-            alloc_string(&json).as_raw()
-        }
-        Err(_) => std::ptr::null_mut(),
+/// Verify an RS256 token with a PEM-encoded public key.
+#[no_mangle]
+pub unsafe extern "C" fn js_jwt_verify_rs256(
+    token_ptr: *const StringHeader,
+    pem_ptr: *const StringHeader,
+) -> *mut StringHeader {
+    let Some(pem) = read_str(pem_ptr) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(key) = DecodingKey::from_rsa_pem(pem.as_bytes()) else {
+        return std::ptr::null_mut();
+    };
+    verify_common(token_ptr, key, Algorithm::RS256)
+}
+
+/// Verify using an algorithm selected at runtime.
+#[no_mangle]
+pub unsafe extern "C" fn js_jwt_verify_dyn(
+    alg_ptr: *const StringHeader,
+    token_ptr: *const StringHeader,
+    secret_ptr: *const StringHeader,
+) -> *mut StringHeader {
+    let algorithm = read_str(alg_ptr).unwrap_or_else(|| "HS256".to_string());
+    match algorithm.as_str() {
+        "ES256" => js_jwt_verify_es256(token_ptr, secret_ptr),
+        "RS256" => js_jwt_verify_rs256(token_ptr, secret_ptr),
+        _ => js_jwt_verify(token_ptr, secret_ptr),
     }
 }
 

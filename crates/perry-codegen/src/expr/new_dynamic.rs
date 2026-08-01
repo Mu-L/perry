@@ -492,6 +492,15 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                                 for a in args {
                                     let _ = lower_expr(ctx, a)?;
                                 }
+                                // The returned codec object dispatches its
+                                // instance methods through the V8 native-module
+                                // table. Direct constructor lowering alone does
+                                // not otherwise install that table.
+                                if let Some(s) =
+                                    crate::nm_install::nm_install_symbol("v8.Serializer")
+                                {
+                                    ctx.block().call_void(s, &[]);
+                                }
                                 let is_default = property == "DefaultSerializer";
                                 let flag =
                                     crate::nanbox::double_literal(f64::from_bits(if is_default {
@@ -515,6 +524,11 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                                 };
                                 for extra in args.iter().skip(1) {
                                     let _ = lower_expr(ctx, extra)?;
+                                }
+                                if let Some(s) =
+                                    crate::nm_install::nm_install_symbol("v8.Deserializer")
+                                {
+                                    ctx.block().call_void(s, &[]);
                                 }
                                 return Ok(ctx.block().call(
                                     DOUBLE,

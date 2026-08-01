@@ -433,7 +433,7 @@ pub(crate) fn try_builtin_prototype_method_apply_call(
     //     ref, e.g. `const m = [].map` (#3144).
     // `method_prop` is the `IdentName` for the resolved method; we reuse it as
     // the synthesized member's `.prop`.
-    let method_prop: ast::IdentName = match outer.obj.as_ref() {
+    let (method_prop, string_method_origin): (ast::IdentName, bool) = match outer.obj.as_ref() {
         ast::Expr::Member(inner) => {
             let ast::MemberProp::Ident(method_ident) = &inner.prop else {
                 return Ok(None);
@@ -468,7 +468,10 @@ pub(crate) fn try_builtin_prototype_method_apply_call(
             if is_string_prototype_generic_method(inner.obj.as_ref(), method_ident.sym.as_ref()) {
                 return Ok(None);
             }
-            method_ident.clone()
+            (
+                method_ident.clone(),
+                is_string_builtin_prototype_receiver(ctx, inner.obj.as_ref()),
+            )
         }
         ast::Expr::Ident(id) => match ctx.builtin_proto_method_locals.get(id.sym.as_ref()) {
             Some(name) => {
@@ -477,7 +480,11 @@ pub(crate) fn try_builtin_prototype_method_apply_call(
                 // (avoids needing a synthetic span).
                 let mut prop = outer_prop.clone();
                 prop.sym = name.as_str().into();
-                prop
+                (
+                    prop,
+                    ctx.builtin_proto_method_string_locals
+                        .contains(id.sym.as_ref()),
+                )
             }
             // Not a tracked builtin-method local: leave unrelated
             // `someFn.call(...)` untouched.
@@ -534,10 +541,15 @@ pub(crate) fn try_builtin_prototype_method_apply_call(
     // dedicated generic helpers because they must write back to the original
     // receiver rather than a materialized clone. Unsupported mutators fall
     // through to the member call below (unchanged behavior).
-    if let Some(folded) =
-        try_arraylike_receiver_method(ctx, method_prop.sym.as_ref(), &this_arg.expr, &rest_args)?
-    {
-        return Ok(Some(folded));
+    if !string_method_origin {
+        if let Some(folded) = try_arraylike_receiver_method(
+            ctx,
+            method_prop.sym.as_ref(),
+            &this_arg.expr,
+            &rest_args,
+        )? {
+            return Ok(Some(folded));
+        }
     }
 
     // Synthesize `(thisArg).<method>(rest_args)`: use the resolved method
@@ -750,6 +762,32 @@ pub(crate) fn as_builtin_proto_method_ref(
         Some(method.sym.to_string())
     } else {
         None
+    }
+}
+
+/// Whether a tracked builtin method value originated on String.prototype (or
+/// a string literal). Kept separately from the method name because Array and
+/// String deliberately overlap on `slice`, `concat`, and friends.
+pub(crate) fn is_string_builtin_prototype_method_ref(
+    ctx: &LoweringContext,
+    init: &ast::Expr,
+) -> bool {
+    let ast::Expr::Member(member) = init else {
+        return false;
+    };
+    is_string_builtin_prototype_receiver(ctx, member.obj.as_ref())
+}
+
+fn is_string_builtin_prototype_receiver(ctx: &LoweringContext, recv: &ast::Expr) -> bool {
+    match recv {
+        ast::Expr::Lit(ast::Lit::Str(_)) => true,
+        ast::Expr::Member(member) => {
+            matches!(&member.prop, ast::MemberProp::Ident(p) if p.sym.as_ref() == "prototype")
+                && matches!(member.obj.as_ref(), ast::Expr::Ident(base) if base.sym.as_ref() == "String")
+                && ctx.lookup_local("String").is_none()
+                && ctx.lookup_func("String").is_none()
+        }
+        _ => false,
     }
 }
 

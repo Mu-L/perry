@@ -378,9 +378,16 @@ pub(crate) fn try_const_fold_function_construct_kind(
     }
 
     let outer_strict = ctx.current_strict;
+    // CreateDynamicFunction parses in the global realm. A surrounding module
+    // or strict function must not leak through the lexical strict-mode stack:
+    // without clearing it, a sloppy `new Function("a", "arguments[0] = 1")`
+    // receives an unmapped, restricted `arguments` object even though the
+    // emitted closure itself is marked non-strict.
+    let outer_strict_stack = std::mem::take(&mut ctx.strict_mode_stack);
     ctx.current_strict = false;
     let lowered_result = lower_fn_expr(ctx, fn_expr);
     ctx.current_strict = outer_strict;
+    ctx.strict_mode_stack = outer_strict_stack;
     let lowered = match lowered_result {
         Ok(l) => l,
         Err(e) => {
