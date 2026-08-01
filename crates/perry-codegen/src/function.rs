@@ -645,8 +645,9 @@ impl LlFunction {
             ""
         };
         let gc_strategy = if self.stack_map_requested
-            && crate::codegen::helpers::statepoints_enabled()
             && !self.has_try
+            && (crate::codegen::helpers::statepoints_enabled()
+                || crate::codegen::helpers::rs4gc_enabled())
         {
             " gc \"statepoint-example\""
         } else {
@@ -759,7 +760,9 @@ impl LlFunction {
         // lazily-reserved scalar root and every call site is visible.
         //
         let ir = if self.stack_map_requested {
-            let backend = if crate::codegen::helpers::statepoints_enabled() && !self.has_try {
+            let backend = if crate::codegen::helpers::rs4gc_enabled() && !self.has_try {
+                PreciseRootBackend::Rs4gc
+            } else if crate::codegen::helpers::statepoints_enabled() && !self.has_try {
                 PreciseRootBackend::Statepoint
             } else {
                 PreciseRootBackend::StackMap
@@ -956,8 +959,18 @@ fn stack_map_active_slots(
 enum PreciseRootBackend {
     StackMap,
     Statepoint,
-
-
+    /// `PERRY_RS4GC=1` (#7174): retype every root alloca to
+    /// `ptr addrspace(1)` with cast surgery at its load/store sites, tag the
+    /// function `gc "statepoint-example"`, mark audited non-collecting
+    /// callees `"gc-leaf-function"` at the call site, and emit NO per-call
+    /// safepoint machinery — `opt -passes='function(mem2reg),
+    /// rewrite-statepoints-for-gc'` promotes the allocas to SSA and inserts
+    /// every statepoint, relocation, and downstream-use rewrite itself.
+    /// After mem2reg, each former load site is a cast site, which is exactly
+    /// the placement RS4GC needs to rewrite uses with relocated values.
+    /// Fail-closed: any use of a root alloca outside the recognized
+    /// load/store shapes bails the whole function to the Statepoint backend.
+    Rs4gc,
 }
 
 impl PreciseRootBackend {
@@ -965,10 +978,135 @@ impl PreciseRootBackend {
         match self {
             Self::StackMap => "stack-map",
             Self::Statepoint => "statepoint",
+            Self::Rs4gc => "rs4gc",
         }
     }
 }
 
+
+/// RS4GC surgery (#7174): retype root allocas to `ptr addrspace(1)` and cast
+/// at every recognized load/store site. Returns `None` when any root alloca
+/// appears in an unrecognized shape (the caller falls back to the explicit
+/// statepoint backend for the whole function).
+fn lower_roots_for_rs4gc(
+    lines: &[&str],
+    root_ptrs: &[String],
+) -> Option<String> {
+    let roots: std::collections::HashSet<&str> = root_ptrs.iter().map(String::as_str).collect();
+    let mut out = String::with_capacity(lines.len() * 48 + root_ptrs.len() * 96);
+    let mut cast_counter = 0usize;
+
+    for line in lines {
+        if parse_shadow_bind(line).is_some() || parse_shadow_set(line).is_some() {
+            continue;
+        }
+        let trimmed = line.trim_start();
+
+        // Root-alloca definition: retype + null-init (mem2reg needs a
+        // dominating definition for paths that read before the first bind,
+        // same reason the i64 zero-init existed).
+        // Root locals are emitted as `alloca double` (the NaN-box home) or
+        // occasionally `alloca i64`; both become an addrspace(1) slot.
+        if let Some(reg) = trimmed
+            .strip_suffix("= alloca i64")
+            .or_else(|| trimmed.strip_suffix("= alloca double"))
+            .map(str::trim_end)
+            .filter(|reg| roots.contains(reg))
+        {
+            out.push_str(&format!("  {reg} = alloca ptr addrspace(1)\n"));
+            out.push_str(&format!("  store ptr addrspace(1) null, ptr {reg}\n"));
+            continue;
+        }
+
+        let mut handled = false;
+        for ptr in root_ptrs {
+            if let Some(rest) = trimmed.strip_prefix("store i64 ") {
+                if let Some(value) = rest.strip_suffix(&format!(", ptr {ptr}")) {
+                    let value = value.trim();
+                    if value == "0" {
+                        out.push_str(&format!("  store ptr addrspace(1) null, ptr {ptr}\n"));
+                    } else {
+                        cast_counter += 1;
+                        out.push_str(&format!(
+                            "  %rs4gc.s{cast_counter} = inttoptr i64 {value} to ptr addrspace(1)\n  store ptr addrspace(1) %rs4gc.s{cast_counter}, ptr {ptr}\n"
+                        ));
+                    }
+                    handled = true;
+                    break;
+                }
+            }
+            if let Some(rest) = trimmed.strip_prefix("store double ") {
+                if let Some(value) = rest.strip_suffix(&format!(", ptr {ptr}")) {
+                    let value = value.trim();
+                    cast_counter += 1;
+                    out.push_str(&format!(
+                        "  %rs4gc.b{cast_counter} = bitcast double {value} to i64\n  %rs4gc.s{cast_counter} = inttoptr i64 %rs4gc.b{cast_counter} to ptr addrspace(1)\n  store ptr addrspace(1) %rs4gc.s{cast_counter}, ptr {ptr}\n"
+                    ));
+                    handled = true;
+                    break;
+                }
+            }
+            if trimmed == format!("{} = load i64, ptr {ptr}", trimmed.split(' ').next().unwrap_or("")) {
+                let result = trimmed.split(' ').next().unwrap_or("");
+                out.push_str(&format!(
+                    "  {result}.rs4p = load ptr addrspace(1), ptr {ptr}\n  {result} = ptrtoint ptr addrspace(1) {result}.rs4p to i64\n"
+                ));
+                handled = true;
+                break;
+            }
+            if trimmed == format!("{} = load double, ptr {ptr}", trimmed.split(' ').next().unwrap_or("")) {
+                let result = trimmed.split(' ').next().unwrap_or("");
+                out.push_str(&format!(
+                    "  {result}.rs4p = load ptr addrspace(1), ptr {ptr}\n  {result}.rs4i = ptrtoint ptr addrspace(1) {result}.rs4p to i64\n  {result} = bitcast i64 {result}.rs4i to double\n"
+                ));
+                handled = true;
+                break;
+            }
+        }
+        if handled {
+            continue;
+        }
+
+        // Fail closed: any other appearance of a root alloca name.
+        if root_ptrs.iter().any(|ptr| {
+            line.contains(ptr.as_str())
+                && line
+                    .split(|c: char| !(c.is_alphanumeric() || c == '%' || c == '_' || c == '.'))
+                    .any(|tok| tok == ptr)
+        }) {
+            return None;
+        }
+
+        // Audited non-collecting callees become RS4GC leaf calls: the pass
+        // will not treat them as safepoints, transferring the call-effect
+        // table wholesale. AllocNoReentry keeps its contract gating.
+        let is_call = trimmed.starts_with("call ")
+            || trimmed.contains(" = call ")
+            || trimmed.starts_with("tail call ")
+            || trimmed.contains(" = tail call ");
+        if is_call && trimmed.ends_with(')') && !trimmed.contains("call void asm ") {
+            if let Some(callee) = direct_callee_name(line) {
+                let leaf = match crate::gc_call_effects::classify_direct_callee(callee) {
+                    crate::gc_call_effects::GcCallEffect::CannotCollect
+                    | crate::gc_call_effects::GcCallEffect::NeverReturns => true,
+                    crate::gc_call_effects::GcCallEffect::AllocNoReentry => {
+                        crate::codegen::helpers::gc_safepoint_only_contract_enabled()
+                    }
+                    crate::gc_call_effects::GcCallEffect::Unknown => false,
+                };
+                if leaf && !callee.starts_with("llvm.") {
+                    out.push_str(line.trim_end());
+                    out.push_str(" \"gc-leaf-function\"\n");
+                    continue;
+                }
+            }
+        }
+
+        out.push_str(line);
+        out.push('\n');
+    }
+    Some(out)
+}
 
 #[derive(Debug, Eq, PartialEq)]
 struct DirectCall<'a> {
@@ -1241,6 +1379,24 @@ fn lower_precise_roots_to_native_stack(
             crate::statepoint_report::record(report);
         }
         return out;
+    }
+
+    if backend == PreciseRootBackend::Rs4gc {
+        if let Some(out) = lower_roots_for_rs4gc(&lines, &root_ptrs) {
+            if let Some(mut report) = report {
+                report.note_call(root_ptrs.len());
+                crate::statepoint_report::record(report);
+            }
+            return out;
+        }
+        // A root alloca is used in a shape the surgery does not recognize —
+        // fail closed to the explicit statepoint backend for this function.
+        return lower_precise_roots_to_native_stack(
+            ir,
+            function_name,
+            slot_count,
+            PreciseRootBackend::Statepoint,
+        );
     }
 
     let mut out = String::with_capacity(ir.len() + root_ptrs.len() * 128);

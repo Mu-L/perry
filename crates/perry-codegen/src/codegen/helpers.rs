@@ -94,10 +94,28 @@ pub(crate) fn statepoints_enabled() -> bool {
     )
 }
 
+/// `PERRY_RS4GC=1` — research pipeline for #7174: root allocas become
+/// `ptr addrspace(1)`, functions are tagged `gc "statepoint-example"`, and
+/// each module is piped through `opt -passes='function(mem2reg),
+/// rewrite-statepoints-for-gc'` before clang. LLVM then inserts every
+/// statepoint, relocation, and downstream-use rewrite itself — replacing the
+/// explicit bridge's hand emission and its conservative CFG-union liveness.
+/// Requires an `opt` binary (`PERRY_LLVM_OPT`, Homebrew LLVM, or PATH).
+pub(crate) fn rs4gc_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        matches!(
+            std::env::var("PERRY_RS4GC").as_deref(),
+            Ok("1") | Ok("on") | Ok("true")
+        )
+    })
+}
+
 /// Whether precise roots should use a native-stack metadata backend rather
 /// than Perry's heap-backed shadow frame.
 pub(crate) fn native_stack_roots_enabled() -> bool {
-    statepoints_enabled()
+    statepoints_enabled() || rs4gc_enabled()
 }
 
 /// `PERRY_GC_SAFEPOINT_ONLY=1` — the explicit-safepoint collection contract

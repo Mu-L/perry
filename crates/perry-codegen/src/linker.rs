@@ -453,7 +453,71 @@ fn build_clang_compile_plan(
 /// more reliably from disk than from stdin), invoke `clang -c`, read the
 /// resulting `.o`, and clean up both on success. On failure the temp files
 /// are left behind for debugging — the caller can `grep /tmp/perry_llvm_*`.
+/// #7174 research pipe: run `opt -passes='function(mem2reg),
+/// rewrite-statepoints-for-gc'` over the module before clang when
+/// `PERRY_RS4GC=1`. mem2reg promotes the retyped `ptr addrspace(1)` root
+/// allocas into SSA (their only uses are the surgery's loads/stores, so
+/// promotion always succeeds), and RS4GC then owns every statepoint,
+/// relocation, and downstream-use rewrite. Fails the compile loudly when no
+/// `opt` is available or the pass pipeline errors — a silent skip would be a
+/// vacuous mode.
+fn maybe_rs4gc_preprocess(ll_text: &str) -> Result<Option<String>> {
+    if !crate::codegen::helpers::rs4gc_enabled() {
+        return Ok(None);
+    }
+    let opt = std::env::var("PERRY_LLVM_OPT")
+        .map(PathBuf::from)
+        .ok()
+        .filter(|p| p.exists())
+        .or_else(|| {
+            ["/opt/homebrew/opt/llvm/bin/opt", "/usr/local/opt/llvm/bin/opt"]
+                .iter()
+                .map(PathBuf::from)
+                .find(|p| p.exists())
+        })
+        .or_else(|| which_in_path("opt"))
+        .context(
+            "PERRY_RS4GC=1 requires an LLVM `opt` binary: set PERRY_LLVM_OPT, \
+             install Homebrew LLVM, or put `opt` on PATH",
+        )?;
+    let mut child = Command::new(&opt)
+        .args([
+            "-passes=default<O2>,rewrite-statepoints-for-gc",
+            "-S",
+            "-",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn {}", opt.display()))?;
+    use std::io::Write as _;
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(ll_text.as_bytes())?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "PERRY_RS4GC: opt pipeline failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(Some(String::from_utf8(output.stdout)?))
+}
+
+fn which_in_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(name))
+            .find(|p| p.exists())
+    })
+}
+
 pub fn compile_ll_to_object(ll_text: &str, target_triple: Option<&str>) -> Result<Vec<u8>> {
+    let rs4gc_ll = maybe_rs4gc_preprocess(ll_text)?;
+    let ll_text: &str = rs4gc_ll.as_deref().unwrap_or(ll_text);
     compile_ll_to_object_in(
         &env::temp_dir(),
         ll_text,
