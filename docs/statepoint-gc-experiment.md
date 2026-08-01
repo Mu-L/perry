@@ -297,10 +297,39 @@ delta scales with generated code, per #7108's 13.3% on a real app).
 Standing conclusion after this matrix: on wall-clock, RSS, and compile
 time, statepoints are at worst tied with the shadow stack on this
 hardware; metadata remains the only losing axis, and it is the axis
-repsel promotion shrinks. The plain-map arm no longer earns its keep as
-anything but a control: statepoints match it within quantization, and it
-is structurally unsound (`Register R#1`). Small-hardware and Linux
-numbers still require the ELF scanner port.
+repsel promotion shrinks. Small-hardware and Linux numbers still require
+the ELF scanner port.
+
+## Post-matrix follow-through (2026-08-01, `897e0f53b`)
+
+Two changes landed after the matrix, both gate-verified (16/16 forced
+evacuation + walker-verify, strict-enforcement gate fires, RSS flat):
+
+1. **The plain-map user mode is deleted** per the GC knob kill-policy:
+   after the quiet matrix it was a losing configuration (statepoints match
+   it within timer quantization), and it is structurally unsound — LLVM's
+   stackmap intrinsic can record a root slot's address as `Register R#N`,
+   caller-saved and unrecoverable at collection time, so those roots are
+   invisible to the collector by construction. The lowering survives only
+   as statepoint mode's internal `try`/setjmp fallback; shrinking that
+   fallback set is the remaining correctness work for the backend.
+2. **Noreturn call sites carry no metadata** (`GcCallEffect::NeverReturns`):
+   every `js_throw*` helper funnels into `exception::js_throw` (`-> !`), so
+   control never returns, no relocation is ever consumed, and the frame's
+   roots are dead past the call. Sound in any mode; deeper frames carry
+   their own records.
+
+Metadata trajectory on `batch.ts` statepoints, all without any
+representation-selection improvement: 442 (first prototype) → 217
+(call-effect audit) → 198 (noreturn elision) → **181 under the contract —
+−59% total**. Each remaining big step is identified: the property-access
+diamonds (~85 sites) fall to repsel `Ptr<Shape>`, and the v3 format itself
+wastes ~36 B/record on constant locations plus ~12 B/root on base/derived
+duplication that a Perry-owned compact section could reclaim — but the
+compact-section design needs either post-link fixup surgery or a
+per-function (not per-safepoint) precision model, both of which are real
+projects with open soundness questions, recorded here so the next session
+starts from the design constraints rather than rediscovering them.
 
 ## Which statepoint design this tests
 
