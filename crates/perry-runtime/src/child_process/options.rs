@@ -301,13 +301,10 @@ pub(crate) fn cp_apply_live_stdio(
                     readers.push((fd, read));
                 }
                 CpStdio::Ignore => {
-                    let Ok(null) = std::fs::OpenOptions::new()
+                    let null = std::fs::OpenOptions::new()
                         .read(true)
                         .write(true)
-                        .open("/dev/null")
-                    else {
-                        continue;
-                    };
+                        .open("/dev/null")?;
                     unsafe {
                         command.pre_exec(move || {
                             if libc::dup2(null.as_raw_fd(), fd as i32) < 0
