@@ -1,0 +1,57 @@
+# #7173: native-root (statepoint) GC verification on Linux.
+#
+# Runs the gc-ratchet probe matrix in statepoint mode under forced
+# evacuation + evacuation verification, byte-diffed against the pinned Node
+# oracle, natively on the Linux runner — the same matrix the branch runs on
+# macOS, webserver-class x86-64, and the Pi 5. Two liveness asserts keep
+# this from being a gate that cannot fail (CLAUDE.md's four ways):
+# the binary must carry a non-empty .llvm_stackmaps section, and at least
+# one probe must report a copying collection.
+name: gc-native-roots
+on:
+  push:
+    branches: [exp/stackmap-viability]
+  workflow_dispatch:
+
+jobs:
+  statepoint-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gc-native-roots
+      - name: Build compiler and static runtime (perry-dev profile)
+        run: |
+          export RUSTFLAGS="-Cforce-frame-pointers=yes"
+          cargo build --profile perry-dev -p perry -p perry-runtime-static -p perry-stdlib-static
+      - name: Probe matrix, statepoint mode, forced evacuation
+        run: |
+          set -euo pipefail
+          export PERRY_RUNTIME_DIR="$PWD/target/perry-dev"
+          export PERRY_NO_AUTO_OPTIMIZE=1
+          pass=0
+          for probe in benchmarks/gc_ratchet/probes/*.ts; do
+            name=$(basename "$probe" .ts)
+            node --expose-gc --experimental-strip-types "$probe" > "/tmp/$name.oracle"
+            PERRY_STATEPOINTS=1 ./target/perry-dev/perry "$probe" -o "/tmp/$name"
+            # Liveness assert 1: the subject (stackmap section) must exist.
+            readelf -S "/tmp/$name" | grep -q "\.llvm_stackmaps" \
+              || { echo "::error::$name has no .llvm_stackmaps section — statepoint mode was not live"; exit 1; }
+            PERRY_STATEPOINTS=1 PERRY_GC_FORCE_EVACUATE=1 PERRY_GC_VERIFY_EVACUATION=1 \
+              "/tmp/$name" > "/tmp/$name.out" 2> "/tmp/$name.err"
+            diff "/tmp/$name.oracle" "/tmp/$name.out" \
+              || { echo "::error::$name output diverged from the pinned oracle"; exit 1; }
+            pass=$((pass+1))
+          done
+          echo "statepoint forced-evacuation matrix: $pass/8"
+          [ "$pass" -eq 8 ]
+          # Liveness assert 2: at least one probe actually collected
+          # (gcmetric lines are emitted on stderr by every probe).
+          grep -l "#gcmetric" /tmp/0*.err >/dev/null \
+            || { echo "::error::no probe emitted gc metrics — the collector never ran"; exit 1; }
