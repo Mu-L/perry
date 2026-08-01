@@ -322,14 +322,51 @@ evacuation + walker-verify, strict-enforcement gate fires, RSS flat):
 Metadata trajectory on `batch.ts` statepoints, all without any
 representation-selection improvement: 442 (first prototype) → 217
 (call-effect audit) → 198 (noreturn elision) → **181 under the contract —
-−59% total**. Each remaining big step is identified: the property-access
-diamonds (~85 sites) fall to repsel `Ptr<Shape>`, and the v3 format itself
-wastes ~36 B/record on constant locations plus ~12 B/root on base/derived
-duplication that a Perry-owned compact section could reclaim — but the
-compact-section design needs either post-link fixup surgery or a
-per-function (not per-safepoint) precision model, both of which are real
-projects with open soundness questions, recorded here so the next session
-starts from the design constraints rather than rediscovering them.
+−59% total**. The remaining big step is the property-access diamonds
+(~85 sites), which fall to repsel `Ptr<Shape>`.
+
+## The compact per-function experiment — a measured NEGATIVE result
+
+The per-function precision model was then built and disproven
+(implementation at `bd066d62b`, deleted from the tip afterward — an unsound
+mode must not survive as a configuration a future bisect will trust).
+
+**The thesis**: one entry stackmap per generated function recording every
+root alloca as a stable Direct location; calls carry only memory barriers;
+a `__perry_gen_end` sentinel object linked last bounds the generated region
+so the runtime can match frames by region instead of per-safepoint PCs.
+**The size result was real**: 424–680 B of metadata per probe binary versus
+5.3–8.9 KB for statepoints — 10–13× — with `__text` mostly smaller too.
+
+**The correctness result kills it.** A ten-line churn loop
+(object escapes into a ring, two field reads) deterministically computes
+wrong values. The forensics chain, recorded because each step eliminated a
+plausible-but-wrong theory: retention-clear lowering (no effect),
+callee-saved register clobbers at barriers (no effect, bit-identical
+failure), dead-slot zeroing before every GC-capable call (no effect,
+bit-identical), and finally disabling the walker's visits entirely —
+**still bit-identical corruption**, proving the stack-map machinery was
+never the vector. The corrupted fields contain forwarding-stub and
+header-age-bit patterns: the mutator reads from-space through a stale
+pointer that lives in optimized SSA, not in any root slot. The same module
+compiles to **79 `gc.relocate`s** under the statepoint backend — each one a
+place where LLVM held a heap-derived value whose post-collection identity
+only relocation semantics can restore. `asm "~{memory}"` constrains memory
+ordering, not dataflow; no barrier discipline reaches values the optimizer
+carries in registers and rematerializes.
+
+**Conclusion, stated as the design law this branch keeps re-deriving:**
+*with an optimizing compiler between the source and the safepoint, root
+metadata without relocation semantics is unsound — per-call plain maps
+merely made the window small enough for probes to pass, and per-function
+compact maps made it wide enough to fail in ten lines.* This upgrades
+#7108's argument ("only statepoint describes the frame during the call")
+from analysis to demonstration, and it means the metadata floor for a
+sound non-statepoint scheme does not exist: the choice is statepoint-style
+relocation (per-safepoint records, ~2× plain maps, the measured −59%
+trajectory) or the shadow stack. The compact 10–13× is only reachable via
+`RewriteStatepointsForGC`-style managed-pointer SSA — the toolchain
+decision #7108 costed — or repsel shrinking the recorded set.
 
 ## Which statepoint design this tests
 

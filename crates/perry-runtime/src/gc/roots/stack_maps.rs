@@ -19,15 +19,9 @@ use std::ffi::c_void;
 use std::sync::OnceLock;
 
 const STACK_MAP_VERSION: u8 = 3;
-const LOCATION_REGISTER: u8 = 1;
 const LOCATION_DIRECT: u8 = 2;
 const LOCATION_INDIRECT: u8 = 3;
 const MAX_SAFEPOINT_RETURN_DELTA: usize = 16;
-/// Mirrors `perry_codegen::function::COMPACT_SENTINEL_STACKMAP_ID`: the
-/// record ID of the `__perry_gen_end` sentinel that a compact-roots build
-/// links after every generated object. Its presence flips region matching
-/// on, and its PC is the exclusive upper bound of generated code.
-const COMPACT_SENTINEL_STACKMAP_ID: u64 = 0x9E44_C0DE_0DEC_1DED;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StackMapLocation {
     dwarf_reg: u16,
@@ -37,7 +31,6 @@ struct StackMapLocation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StackMapRecord {
     pc: usize,
-    id: u64,
     /// The containing function's total frame size from the stack-map header.
     /// LLVM's AArch64 frame places the `[x29, x30]` pair at the top of the
     /// frame, so a chain walker can reconstruct the body SP as
@@ -59,17 +52,8 @@ struct StackMapIndex {
     chain_walkable: bool,
     min_pc: usize,
     max_pc: usize,
-    /// `Some(gen_end_pc)` when the `__perry_gen_end` sentinel is present:
-    /// this is a compact-roots build, frames match by function region
-    /// (greatest record PC at or below the return address, bounded by
-    /// `gen_end_pc`) instead of the ±16-byte per-safepoint heuristic.
-    compact_gen_end: Option<usize>,
-    /// Locations the parser had to drop because LLVM recorded them in a
-    /// register. Harmlessly redundant in per-safepoint modes (statepoint
-    /// spills are memory); fatal in compact mode, where the entry record is
-    /// the only description of the frame — checked at init.
-    dropped_register_locations: usize,
 }
+
 
 static STACK_MAPS: OnceLock<StackMapIndex> = OnceLock::new();
 
@@ -141,25 +125,13 @@ fn stack_maps() -> &'static StackMapIndex {
         let Some(section) = loaded_stack_map_section() else {
             return StackMapIndex::default();
         };
-        let (mut records, dropped) = parse_concatenated_stack_maps(section).unwrap_or_default();
+        let mut records = parse_concatenated_stack_maps(section).unwrap_or_default();
         records.sort_unstable_by_key(|record| record.pc);
-        let index = index_records(records, dropped);
-        if index.compact_gen_end.is_some() && index.dropped_register_locations != 0 {
-            // A compact build's entry record is the ONLY description of its
-            // frame. A register-recorded root would be silently invisible to
-            // the collector, so this configuration must not run at all.
-            panic!(
-                "PERRY_COMPACT_ROOTS: {} register-recorded root location(s) \
-                 in a compact-roots image — refusing to run with invisible \
-                 roots",
-                index.dropped_register_locations
-            );
-        }
-        index
+        index_records(records)
     })
 }
 
-fn index_records(records: Vec<StackMapRecord>, dropped_register_locations: usize) -> StackMapIndex {
+fn index_records(records: Vec<StackMapRecord>) -> StackMapIndex {
     let chain_walkable = records.iter().all(|record| {
         record.locations.iter().all(|location| {
             location.dwarf_reg == DWARF_REG_FP_AARCH64
@@ -168,49 +140,11 @@ fn index_records(records: Vec<StackMapRecord>, dropped_register_locations: usize
     });
     let min_pc = records.first().map_or(usize::MAX, |record| record.pc);
     let max_pc = records.last().map_or(0, |record| record.pc);
-    let compact_gen_end = records
-        .iter()
-        .find(|record| record.id == COMPACT_SENTINEL_STACKMAP_ID)
-        .map(|record| record.pc);
     StackMapIndex {
         records,
         chain_walkable,
         min_pc,
         max_pc,
-        compact_gen_end,
-        dropped_register_locations,
-    }
-}
-
-impl StackMapIndex {
-    /// The records describing the frame whose return address is `ip`.
-    ///
-    /// Compact builds match by function region: the greatest record PC at or
-    /// below `ip`, valid only inside `[first record, __perry_gen_end)` — a
-    /// foreign (runtime) frame can never match because generated code is
-    /// linked contiguously ahead of the sentinel. Per-safepoint builds keep
-    /// the ±16-byte nearest-PC match, which can select several records at
-    /// one PC.
-    fn match_records(&self, ip: usize) -> &[StackMapRecord] {
-        if let Some(gen_end) = self.compact_gen_end {
-            if ip < self.min_pc || ip >= gen_end {
-                return &[];
-            }
-            let idx = self.records.partition_point(|record| record.pc <= ip);
-            let Some(idx) = idx.checked_sub(1) else {
-                return &[];
-            };
-            return &self.records[idx..idx + 1];
-        }
-        let Some(candidate_pc) = closest_record_pc(&self.records, ip) else {
-            return &[];
-        };
-        if ip.abs_diff(candidate_pc) > MAX_SAFEPOINT_RETURN_DELTA {
-            return &[];
-        }
-        let first = self.records.partition_point(|record| record.pc < candidate_pc);
-        let last = self.records.partition_point(|record| record.pc <= candidate_pc);
-        &self.records[first..last]
     }
 }
 
@@ -230,6 +164,24 @@ fn closest_record_pc(maps: &[StackMapRecord], ip: usize) -> Option<usize> {
         (Some(before), None) => Some(before),
         (None, Some(after)) => Some(after),
         (None, None) => None,
+    }
+}
+
+impl StackMapIndex {
+    /// The records describing the frame whose return address is `ip`: the
+    /// ±16-byte nearest-PC match, which can select several records at one PC
+    /// (plain maps sit just before the call, statepoints exactly at the
+    /// return address).
+    fn match_records(&self, ip: usize) -> &[StackMapRecord] {
+        let Some(candidate_pc) = closest_record_pc(&self.records, ip) else {
+            return &[];
+        };
+        if ip.abs_diff(candidate_pc) > MAX_SAFEPOINT_RETURN_DELTA {
+            return &[];
+        }
+        let first = self.records.partition_point(|record| record.pc < candidate_pc);
+        let last = self.records.partition_point(|record| record.pc <= candidate_pc);
+        &self.records[first..last]
     }
 }
 
@@ -295,9 +247,8 @@ fn verify_visit(
     stats
 }
 
-fn parse_concatenated_stack_maps(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, usize)> {
+fn parse_concatenated_stack_maps(bytes: &[u8]) -> Option<Vec<StackMapRecord>> {
     let mut all = Vec::new();
-    let mut dropped_registers = 0usize;
     let mut base = 0usize;
     while base < bytes.len() {
         // Linkers preserve the input section's 8-byte alignment. Ignore a
@@ -305,18 +256,17 @@ fn parse_concatenated_stack_maps(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, u
         if bytes[base..].iter().all(|byte| *byte == 0) {
             break;
         }
-        let (mut records, consumed, dropped) = parse_one_stack_map(&bytes[base..])?;
+        let (mut records, consumed) = parse_one_stack_map(&bytes[base..])?;
         if consumed == 0 {
             return None;
         }
         all.append(&mut records);
-        dropped_registers = dropped_registers.saturating_add(dropped);
         base = base.checked_add(consumed)?;
     }
-    Some((all, dropped_registers))
+    Some(all)
 }
 
-fn parse_one_stack_map(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, usize, usize)> {
+fn parse_one_stack_map(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, usize)> {
     if read_u8(bytes, 0)? != STACK_MAP_VERSION {
         return None;
     }
@@ -344,10 +294,8 @@ fn parse_one_stack_map(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, usize, usiz
     }
 
     let mut out = Vec::with_capacity(record_count);
-    let mut dropped_registers = 0usize;
     for (function_address, function_stack_size, function_record_count) in functions {
         for _ in 0..function_record_count {
-            let record_id = read_u64(bytes, offset)?;
             let instruction_offset = read_u32(bytes, offset + 8)? as usize;
             let location_count = read_u16(bytes, offset + 14)? as usize;
             offset = offset.checked_add(16)?;
@@ -358,9 +306,6 @@ fn parse_one_stack_map(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, usize, usiz
                 let size = read_u16(bytes, offset + 2)?;
                 let dwarf_reg = read_u16(bytes, offset + 4)?;
                 let location_offset = read_i32(bytes, offset + 8)?;
-                if kind == LOCATION_REGISTER && size == 8 {
-                    dropped_registers = dropped_registers.saturating_add(1);
-                }
                 if matches!(kind, LOCATION_DIRECT | LOCATION_INDIRECT) && size == 8 {
                     let location = StackMapLocation {
                         dwarf_reg,
@@ -393,13 +338,12 @@ fn parse_one_stack_map(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, usize, usiz
 
             out.push(StackMapRecord {
                 pc: function_address.checked_add(instruction_offset)?,
-                id: record_id,
                 stack_size: function_stack_size,
                 locations,
             });
         }
     }
-    Some((out, offset, dropped_registers))
+    Some((out, offset))
 }
 
 fn align_up(value: usize, alignment: usize) -> Option<usize> {
@@ -689,12 +633,7 @@ mod fp_chain {
             ..NativeStackWalkStats::default()
         };
         let low_pc = index.min_pc.saturating_sub(MAX_SAFEPOINT_RETURN_DELTA);
-        // Compact builds: a frame's return address can sit anywhere inside
-        // the last real function's body, past its entry record — the
-        // sentinel PC is the true upper bound.
-        let high_pc = index
-            .compact_gen_end
-            .unwrap_or_else(|| index.max_pc.saturating_add(MAX_SAFEPOINT_RETURN_DELTA));
+        let high_pc = index.max_pc.saturating_add(MAX_SAFEPOINT_RETURN_DELTA);
         let mut fp = current_frame_pointer();
         while fp != 0 {
             if fp & 0xF != 0 || fp.checked_add(16)? > top {
@@ -828,14 +767,12 @@ mod tests {
     #[test]
     fn parses_direct_mutable_frame_location() {
         let bytes = one_map(0x1000, 42, 0x10, -8);
-        let (records, consumed, dropped) = parse_one_stack_map(&bytes).expect("valid stack map");
-        assert_eq!(dropped, 0);
+        let (records, consumed) = parse_one_stack_map(&bytes).expect("valid stack map");
         assert_eq!(consumed, bytes.len());
         assert_eq!(
             records,
             vec![StackMapRecord {
                 pc: 0x1010,
-                id: 42,
                 stack_size: 32,
                 locations: vec![StackMapLocation {
                     dwarf_reg: 29,
@@ -849,8 +786,7 @@ mod tests {
     fn parses_linker_concatenated_input_sections() {
         let mut bytes = one_map(0x1000, 42, 0x10, -8);
         bytes.extend_from_slice(&one_map(0x2000, 43, 0x20, -16));
-        let (records, dropped) = parse_concatenated_stack_maps(&bytes).expect("concatenated maps");
-        assert_eq!(dropped, 0);
+        let records = parse_concatenated_stack_maps(&bytes).expect("concatenated maps");
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].pc, 0x1010);
         assert_eq!(records[1].pc, 0x2020);
@@ -864,14 +800,12 @@ mod tests {
             0x20,
             &[(LOCATION_INDIRECT, -16), (LOCATION_INDIRECT, -16)],
         );
-        let (records, consumed, dropped) = parse_one_stack_map(&bytes).expect("valid statepoint map");
-        assert_eq!(dropped, 0);
+        let (records, consumed) = parse_one_stack_map(&bytes).expect("valid statepoint map");
         assert_eq!(consumed, bytes.len());
         assert_eq!(
             records,
             vec![StackMapRecord {
                 pc: 0x1020,
-                id: 7,
                 stack_size: 32,
                 locations: vec![StackMapLocation {
                     dwarf_reg: 29,
@@ -896,7 +830,6 @@ mod tests {
     fn chain_walkable_index_accepts_fp_and_sized_sp_locations_only() {
         let fp_record = StackMapRecord {
             pc: 0x1000,
-            id: 0,
             stack_size: 0,
             locations: vec![StackMapLocation {
                 dwarf_reg: DWARF_REG_FP_AARCH64,
@@ -905,7 +838,6 @@ mod tests {
         };
         let sp_record = StackMapRecord {
             pc: 0x2000,
-            id: 0,
             stack_size: 160,
             locations: vec![StackMapLocation {
                 dwarf_reg: DWARF_REG_SP_AARCH64,
@@ -914,7 +846,6 @@ mod tests {
         };
         let frameless_sp_record = StackMapRecord {
             pc: 0x3000,
-            id: 0,
             stack_size: 0,
             locations: vec![StackMapLocation {
                 dwarf_reg: DWARF_REG_SP_AARCH64,
@@ -923,7 +854,6 @@ mod tests {
         };
         let other_reg_record = StackMapRecord {
             pc: 0x4000,
-            id: 0,
             stack_size: 160,
             locations: vec![StackMapLocation {
                 dwarf_reg: 1,
@@ -931,63 +861,19 @@ mod tests {
             }],
         };
 
-        let walkable = index_records(vec![fp_record.clone(), sp_record.clone()], 0);
+        let walkable = index_records(vec![fp_record.clone(), sp_record.clone()]);
         assert!(walkable.chain_walkable);
         assert_eq!(walkable.min_pc, 0x1000);
         assert_eq!(walkable.max_pc, 0x2000);
 
         assert!(
-            !index_records(vec![fp_record.clone(), frameless_sp_record], 0).chain_walkable,
+            !index_records(vec![fp_record.clone(), frameless_sp_record]).chain_walkable,
             "an SP location without a usable frame size must disable the fast walk"
         );
         assert!(
-            !index_records(vec![fp_record, other_reg_record], 0).chain_walkable,
+            !index_records(vec![fp_record, other_reg_record]).chain_walkable,
             "any non-FP/SP register must disable the fast walk"
         );
-    }
-
-    #[test]
-    fn compact_index_matches_by_function_region() {
-        let fp_loc = |offset| StackMapLocation {
-            dwarf_reg: DWARF_REG_FP_AARCH64,
-            offset,
-        };
-        let f1 = StackMapRecord {
-            pc: 0x1000,
-            id: 0,
-            stack_size: 48,
-            locations: vec![fp_loc(-8)],
-        };
-        let f2 = StackMapRecord {
-            pc: 0x2000,
-            id: 0,
-            stack_size: 32,
-            locations: vec![fp_loc(-16)],
-        };
-        let sentinel = StackMapRecord {
-            pc: 0x3000,
-            id: COMPACT_SENTINEL_STACKMAP_ID,
-            stack_size: 16,
-            locations: Vec::new(),
-        };
-
-        let compact = index_records(vec![f1.clone(), f2, sentinel], 0);
-        assert_eq!(compact.compact_gen_end, Some(0x3000));
-        // Deep inside a function body, far past any ±16 window.
-        assert_eq!(compact.match_records(0x1abc)[0].pc, 0x1000);
-        assert_eq!(compact.match_records(0x2ff8)[0].pc, 0x2000);
-        // Outside the generated region: below the first function, at or
-        // beyond the sentinel — foreign frames must never match.
-        assert!(compact.match_records(0x0fff).is_empty());
-        assert!(compact.match_records(0x3000).is_empty());
-        assert!(compact.match_records(0x9000).is_empty());
-
-        // Without the sentinel the classic ±16 per-safepoint rule holds and
-        // a mid-body address matches nothing.
-        let classic = index_records(vec![f1], 0);
-        assert!(classic.compact_gen_end.is_none());
-        assert!(classic.match_records(0x1abc).is_empty());
-        assert_eq!(classic.match_records(0x1008)[0].pc, 0x1000);
     }
 
     #[test]
@@ -995,13 +881,11 @@ mod tests {
         let maps = vec![
             StackMapRecord {
                 pc: 0x1000,
-                id: 0,
                 stack_size: 32,
                 locations: Vec::new(),
             },
             StackMapRecord {
                 pc: 0x1020,
-                id: 0,
                 stack_size: 32,
                 locations: Vec::new(),
             },

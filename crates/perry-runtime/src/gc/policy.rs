@@ -536,7 +536,7 @@ impl GcCollectionKind {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) enum GcTriggerKind {
     ArenaBytes,
     MallocCount,
