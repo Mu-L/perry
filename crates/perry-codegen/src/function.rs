@@ -757,7 +757,20 @@ impl LlFunction {
         // Research backend: turn the existing shadow-slot binding IR into
         // native-frame stack maps only after lowering is complete, when every
         // lazily-reserved scalar root and every call site is visible.
-        let ir = if self.stack_map_requested {
+        //
+        // Compact mode lowers EVERY generated function — rootless ones get a
+        // zero-operand entry record so the runtime's region matching can
+        // never attribute their frames to a neighboring rooted function. It
+        // also has no has_try exclusion: with no per-call rewriting there is
+        // nothing to conflict with the setjmp lowering.
+        let ir = if crate::codegen::helpers::compact_roots_enabled() {
+            lower_precise_roots_to_native_stack(
+                &ir,
+                &self.name,
+                self.stack_map_slot_count,
+                PreciseRootBackend::CompactEntry,
+            )
+        } else if self.stack_map_requested {
             let backend = if crate::codegen::helpers::statepoints_enabled() && !self.has_try {
                 PreciseRootBackend::Statepoint
             } else {
@@ -955,6 +968,20 @@ fn stack_map_active_slots(
 enum PreciseRootBackend {
     StackMap,
     Statepoint,
+    /// Compact per-function mode (`PERRY_COMPACT_ROOTS=1`): ONE stackmap
+    /// intrinsic in the entry block records every root alloca as a stable
+    /// Direct FP-relative location; calls carry only zero-instruction memory
+    /// barriers (store-before / reload-after), no per-safepoint metadata.
+    /// Precision drops from per-safepoint to per-function — sound because
+    /// every root alloca is zero-initialized at entry, so visiting a stale
+    /// slot can only over-retain, never corrupt. Metadata cost falls from
+    /// ~64 B/safepoint + 24 B/root-pair to ~40 B/function + 12 B/slot.
+    ///
+    /// The walker matches frames by function REGION: every generated
+    /// function (rooted or not) carries an entry record, and a sentinel
+    /// `__perry_gen_end` object linked last bounds the region, so a foreign
+    /// frame can never false-match a generated record.
+    CompactEntry,
 }
 
 impl PreciseRootBackend {
@@ -962,8 +989,24 @@ impl PreciseRootBackend {
         match self {
             Self::StackMap => "stack-map",
             Self::Statepoint => "statepoint",
+            Self::CompactEntry => "compact-entry",
         }
     }
+}
+
+/// Record ID of the `__perry_gen_end` sentinel. Its presence in the parsed
+/// section is what flips the runtime walker into compact region matching,
+/// and its PC is the exclusive upper bound of generated code.
+pub const COMPACT_SENTINEL_STACKMAP_ID: u64 = 0x9E44_C0DE_0DEC_1DED;
+
+/// A textual-IR basic-block label line (`entry.0:` — one token, ends with a
+/// colon, not a comment).
+fn is_block_label(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && trimmed.ends_with(':')
+        && !trimmed.contains(' ')
+        && !trimmed.starts_with(';')
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1228,11 +1271,23 @@ fn lower_precise_roots_to_native_stack(
         )
     });
     if root_ptrs.is_empty() {
-        let out = ir
-            .lines()
-            .filter(|line| parse_shadow_bind(line).is_none() && parse_shadow_set(line).is_none())
-            .map(|line| format!("{line}\n"))
-            .collect();
+        let mut out = String::with_capacity(ir.len() + 96);
+        let mut entry_record_emitted = backend != PreciseRootBackend::CompactEntry;
+        for line in ir.lines() {
+            if parse_shadow_bind(line).is_some() || parse_shadow_set(line).is_some() {
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+            // Compact mode: a rootless function still needs its entry record
+            // as a region boundary for the runtime's frame matching.
+            if !entry_record_emitted && is_block_label(line) {
+                out.push_str(
+                    "  call void (i64, i32, ...) @llvm.experimental.stackmap(i64 0, i32 0)\n",
+                );
+                entry_record_emitted = true;
+            }
+        }
         if let Some(report) = report {
             crate::statepoint_report::record(report);
         }
@@ -1243,8 +1298,25 @@ fn lower_precise_roots_to_native_stack(
     let mut available = std::collections::HashSet::<String>::new();
     let mut initialized = std::collections::HashSet::<String>::new();
     let mut map_id = 0u64;
+    let mut compact_entry_emitted = backend != PreciseRootBackend::CompactEntry;
+    let mut labels_seen = 0usize;
 
     for (line_idx, line) in lines.iter().enumerate() {
+        // Compact mode requires every root alloca to be recordable from the
+        // entry block. A block-local slot (rare scalar-replacement shapes)
+        // would leave the entry record incomplete, so the whole function
+        // falls back to the per-safepoint statepoint backend instead.
+        if !compact_entry_emitted && is_block_label(line) {
+            labels_seen += 1;
+            if labels_seen >= 2 {
+                return lower_precise_roots_to_native_stack(
+                    ir,
+                    function_name,
+                    slot_count,
+                    PreciseRootBackend::Statepoint,
+                );
+            }
+        }
         if parse_shadow_bind(line).is_some() {
             // Compile-time marker only. The real slot is already populated by
             // the local store immediately preceding this old bind.
@@ -1282,6 +1354,20 @@ fn lower_precise_roots_to_native_stack(
                 out.push_str(&format!("  store i64 0, ptr {ptr}\n"));
                 initialized.insert(ptr.clone());
             }
+        }
+
+        // Compact mode: the moment every root alloca exists (still inside
+        // the entry block, or the label check above would have bailed), emit
+        // the function's single stackmap with the whole slot set. Escaping
+        // every root address through the intrinsic also pins the allocas as
+        // address-taken for the rest of the pipeline.
+        if !compact_entry_emitted && initialized.len() == root_ptrs.len() {
+            let operands: Vec<String> = root_ptrs.iter().map(|p| format!("ptr {p}")).collect();
+            out.push_str(&format!(
+                "  call void (i64, i32, ...) @llvm.experimental.stackmap(i64 0, i32 0, {})\n",
+                operands.join(", ")
+            ));
+            compact_entry_emitted = true;
         }
 
         // Insert before calls, not after. Rebuild the tail when the line just
@@ -1346,6 +1432,17 @@ fn lower_precise_roots_to_native_stack(
         // Move the call line behind the intrinsic.
         let call_len = line.len() + 1;
         out.truncate(out.len() - call_len);
+        if backend == PreciseRootBackend::CompactEntry {
+            // No per-safepoint metadata. The pre-call barrier forces live
+            // root stores to be materialized before the callee can collect;
+            // the post-call barrier forces reloads of anything the collector
+            // may have rewritten in the entry-recorded slots.
+            out.push_str("  call void asm sideeffect \"\", \"~{memory}\"()\n");
+            out.push_str(line);
+            out.push('\n');
+            out.push_str("  call void asm sideeffect \"\", \"~{memory}\"()\n");
+            continue;
+        }
         if backend == PreciseRootBackend::Statepoint {
             if let Some(call) = parse_direct_statepoint_call(line) {
                 emit_statepoint(&mut out, &call, &live, map_id);
@@ -1385,6 +1482,71 @@ mod stack_map_tests {
 
     fn lower_statepoints(input: &str, slots: u32) -> String {
         lower_precise_roots_to_native_stack(input, "probe", slots, PreciseRootBackend::Statepoint)
+    }
+
+    fn lower_compact(input: &str, slots: u32) -> String {
+        lower_precise_roots_to_native_stack(input, "probe", slots, PreciseRootBackend::CompactEntry)
+    }
+
+    #[test]
+    fn compact_emits_one_entry_record_and_barrier_wrapped_calls() {
+        let input = r#"define i64 @probe(i64 %arg) {
+entry.0:
+  %r0 = alloca i64
+  store i64 %arg, ptr %r0
+  call void @js_shadow_slot_bind(i32 0, ptr %r0)
+  %r1 = call i64 @may_collect()
+  call void @may_collect_again()
+  ret i64 %r1
+}
+"#;
+        let output = lower_compact(input, 1);
+        // Exactly one stackmap, in the entry block, carrying the whole slot set.
+        assert_eq!(output.matches("@llvm.experimental.stackmap").count(), 1);
+        assert!(output.contains("stackmap(i64 0, i32 0, ptr %r0)"));
+        let map_at = output.find("@llvm.experimental.stackmap").unwrap();
+        let first_call = output.find("@may_collect()").unwrap();
+        assert!(map_at < first_call, "entry record must precede the first call");
+        // Calls carry pre+post barriers and no metadata.
+        assert!(output.contains(
+            "call void asm sideeffect \"\", \"~{memory}\"()\n  %r1 = call i64 \
+             @may_collect()\n  call void asm sideeffect \"\", \"~{memory}\"()"
+        ));
+        assert!(!output.contains("gc.statepoint"));
+    }
+
+    #[test]
+    fn compact_rootless_function_still_gets_a_region_record() {
+        let input = r#"define void @probe() {
+entry.0:
+  call void @leaf()
+  ret void
+}
+"#;
+        let output = lower_compact(input, 0);
+        assert_eq!(output.matches("@llvm.experimental.stackmap").count(), 1);
+        assert!(output.contains("stackmap(i64 0, i32 0)\n  call void @leaf()"));
+    }
+
+    #[test]
+    fn compact_falls_back_to_statepoints_for_block_local_slots() {
+        let input = r#"define void @probe(i1 %cond) {
+entry.0:
+  br i1 %cond, label %then.1, label %exit.2
+then.1:
+  %r0 = alloca i64
+  store i64 5, ptr %r0
+  call void @js_shadow_slot_bind(i32 0, ptr %r0)
+  call void @may_collect()
+  br label %exit.2
+exit.2:
+  ret void
+}
+"#;
+        let output = lower_compact(input, 1);
+        // Block-local root alloca: the compact entry record cannot cover it,
+        // so the function must take the per-safepoint statepoint backend.
+        assert!(output.contains("gc.statepoint"));
     }
 
     #[test]

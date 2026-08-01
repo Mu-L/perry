@@ -94,10 +94,26 @@ pub(crate) fn statepoints_enabled() -> bool {
     )
 }
 
+/// `PERRY_COMPACT_ROOTS=1` — compact per-function native-root metadata
+/// (research). One entry stackmap per generated function records every root
+/// alloca as a stable Direct location; calls carry only memory barriers.
+/// See `PreciseRootBackend::CompactEntry`. Takes precedence over
+/// `PERRY_STATEPOINTS` when both are set.
+pub(crate) fn compact_roots_enabled() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        matches!(
+            std::env::var("PERRY_COMPACT_ROOTS").as_deref(),
+            Ok("1") | Ok("on") | Ok("true")
+        )
+    })
+}
+
 /// Whether precise roots should use a native-stack metadata backend rather
 /// than Perry's heap-backed shadow frame.
 pub(crate) fn native_stack_roots_enabled() -> bool {
-    statepoints_enabled()
+    statepoints_enabled() || compact_roots_enabled()
 }
 
 /// `PERRY_GC_SAFEPOINT_ONLY=1` — the explicit-safepoint collection contract

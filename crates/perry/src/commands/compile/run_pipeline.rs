@@ -5885,6 +5885,37 @@ pub fn run_with_parse_cache(
         None
     };
 
+    // Compact-roots sentinel (`PERRY_COMPACT_ROOTS=1`): a tiny object linked
+    // AFTER every generated object. Its stackmap record's PC is the exclusive
+    // upper bound of generated __text (ld64 lays same-section atoms out in
+    // input order), which is what makes the runtime's per-function region
+    // matching unable to attribute a runtime/foreign frame to the last
+    // generated function. Its magic record ID doubles as the runtime's
+    // "this is a compact build" signal.
+    if matches!(
+        std::env::var("PERRY_COMPACT_ROOTS").as_deref(),
+        Ok("1") | Ok("on") | Ok("true")
+    ) {
+        let sentinel_id = perry_codegen::COMPACT_SENTINEL_STACKMAP_ID as i64;
+        let sentinel_ll = format!(
+            "module asm \".no_dead_strip __LLVM_StackMaps\"\n\n\
+             define void @__perry_gen_end() \"frame-pointer\"=\"non-leaf\" {{\n\
+             entry:\n\
+             \x20 call void (i64, i32, ...) @llvm.experimental.stackmap(i64 {sentinel_id}, i32 0)\n\
+             \x20 ret void\n\
+             }}\n\n\
+             declare void @llvm.experimental.stackmap(i64, i32, ...)\n\n\
+             @llvm.used = appending global [1 x ptr] [ptr @__perry_gen_end], section \"llvm.metadata\"\n"
+        );
+        let sentinel_bytes =
+            perry_codegen::linker::compile_ll_to_object(&sentinel_ll, target.as_deref())?;
+        let sentinel_path = object_output_dir.join("_perry_gen_end.o");
+        fs::write(&sentinel_path, &sentinel_bytes)?;
+        obj_cleanup_paths.push(sentinel_path.clone());
+        obj_paths.push(sentinel_path);
+        obj_fingerprints.push(None);
+    }
+
     // Build & run the per-platform link command. Tier 2.1 final extraction
     // (v0.5.342) — see crates/perry/src/commands/compile/link.rs.
     let link_cache_status = build_and_run_link(

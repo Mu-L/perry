@@ -11,6 +11,7 @@ pub(crate) mod collectors;
 pub mod expr;
 pub mod ext_registry;
 pub mod function;
+pub use function::COMPACT_SENTINEL_STACKMAP_ID;
 pub(crate) mod gc_call_effects;
 pub mod linker;
 pub(crate) mod loop_purity;
