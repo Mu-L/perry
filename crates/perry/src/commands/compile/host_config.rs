@@ -24,6 +24,39 @@ use crate::OutputFormat;
 use super::audit_manifest::allowlist_matches;
 use super::{CompilationContext, CompileArgs};
 
+/// Whether a `perry.compilePackages` / `perry.allow.compilePackages` value
+/// is the "trust everything reachable" single switch — either the boolean
+/// `true` or the string `"auto"` / `"all"`. Both are sugar for the
+/// universal `["*"]` wildcard (#3527), letting a zero-config project opt in
+/// without hand-enumerating its dependency graph. An explicit array is
+/// unaffected (returns false and is parsed name-by-name).
+fn compile_packages_means_auto(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::String(s) => {
+            let s = s.trim().to_ascii_lowercase();
+            s == "auto" || s == "all"
+        }
+        _ => false,
+    }
+}
+
+fn parse_boolean_switch(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" => Some(true),
+        "0" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn should_auto_grant_compile_allow(
+    has_universal_route: bool,
+    allow_was_explicit: bool,
+    env_forces_deny: bool,
+) -> bool {
+    has_universal_route && !allow_was_explicit && !env_forces_deny
+}
+
 pub(super) fn apply_pkg_and_toml_config(
     args: &CompileArgs,
     project_root: &Path,
@@ -34,6 +67,18 @@ pub(super) fn apply_pkg_and_toml_config(
     BTreeMap<String, BTreeMap<String, String>>,
 )> {
     let mut fp_contract_explicit = false;
+    // Whether the host pinned a `perry.compilePackages` value at all (an
+    // array, a scalar switch, or `false`/`[]` to compile nothing). When it
+    // did NOT, the auto-compile default kicks in further below — perry
+    // compiles the whole reachable node_modules graph without an allowlist
+    // (owner policy: perry is a compiler, not a supply-chain gate). An
+    // explicit value — including the empty forms — opts out of that default.
+    let mut compile_packages_explicit = false;
+    // An explicit allow policy remains authoritative when routing defaults to
+    // auto. In particular, `allow.compilePackages: false` / `[]` is a real
+    // fail-closed choice and must not be replaced with an implicit `"*"`.
+    let mut allow_compile_packages_explicit = false;
+    let mut allow_perry_features_forces_deny = false;
 
     // #2309: tree-shaking opt-in via env var (checked unconditionally, even
     // with no host package.json). `perry.experiments.treeShake: true` in the
@@ -100,32 +145,59 @@ pub(super) fn apply_pkg_and_toml_config(
                             }
                         }
                     }
-                    if let Some(arr) = allow.get("compilePackages").and_then(|v| v.as_array()) {
-                        for entry in arr {
-                            if let Some(s) = entry.as_str() {
-                                ctx.allow_compile_packages.push(s.to_string());
+                    if let Some(allow_compile) = allow.get("compilePackages") {
+                        allow_compile_packages_explicit = true;
+                        // Scalar sugar: `true` / `"auto"` = universal trust
+                        // (`"*"`), the companion to `compilePackages: "auto"`.
+                        if compile_packages_means_auto(allow_compile) {
+                            ctx.allow_compile_packages.push("*".to_string());
+                        } else if let Some(arr) = allow_compile.as_array() {
+                            for entry in arr {
+                                if let Some(s) = entry.as_str() {
+                                    ctx.allow_compile_packages.push(s.to_string());
+                                }
                             }
                         }
                     }
                 }
-                if let Some(compile_pkgs) = pkg
-                    .get("perry")
-                    .and_then(|p| p.get("compilePackages"))
-                    .and_then(|a| a.as_array())
+                if let Some(compile_pkgs_val) =
+                    pkg.get("perry").and_then(|p| p.get("compilePackages"))
                 {
+                    // The key is present — the host is pinning routing
+                    // explicitly, so suppress the auto-compile default (even
+                    // for `false` / `[]`, which mean "compile nothing").
+                    compile_packages_explicit = true;
                     // #497: collect compilePackages entries here but
                     // defer the allowlist check until after env-var
                     // overrides apply (otherwise
                     // `PERRY_ALLOW_PERRY_FEATURES=1` couldn't unblock
                     // a build whose host hasn't opted in via
                     // package.json yet).
-                    for pkg_name in compile_pkgs {
-                        if let Some(name) = pkg_name.as_str() {
-                            match format {
-                                OutputFormat::Text => println!("  Compile package: {}", name),
-                                OutputFormat::Json => {}
+                    //
+                    // Single trust-switch sugar: `"compilePackages": "auto"`
+                    // (or `true`) is shorthand for the universal `["*"]`
+                    // wildcard — "trust every reachable node_modules dep" —
+                    // so a zero-config project need not hand-enumerate its
+                    // graph. It expands to concrete installed names further
+                    // below (same path as a literal `"*"`), and is still
+                    // gated by `perry.allow.compilePackages`.
+                    if compile_packages_means_auto(compile_pkgs_val) {
+                        match format {
+                            OutputFormat::Text => {
+                                println!("  Compile package: auto (trust all reachable deps)")
                             }
-                            ctx.compile_packages.insert(name.to_string());
+                            OutputFormat::Json => {}
+                        }
+                        ctx.compile_packages.insert("*".to_string());
+                    } else if let Some(compile_pkgs) = compile_pkgs_val.as_array() {
+                        for pkg_name in compile_pkgs {
+                            if let Some(name) = pkg_name.as_str() {
+                                match format {
+                                    OutputFormat::Text => println!("  Compile package: {}", name),
+                                    OutputFormat::Json => {}
+                                }
+                                ctx.compile_packages.insert(name.to_string());
+                            }
                         }
                     }
                 }
@@ -482,8 +554,12 @@ pub(super) fn apply_pkg_and_toml_config(
     // where editing `package.json` isn't an option (one-off CI run,
     // bisect script, etc.). `=0` enforces the refusal even when
     // `package.json` opted in (fail-closed CI gate).
-    match std::env::var("PERRY_ALLOW_PERRY_FEATURES") {
-        Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => {
+    match std::env::var("PERRY_ALLOW_PERRY_FEATURES")
+        .ok()
+        .as_deref()
+        .and_then(parse_boolean_switch)
+    {
+        Some(true) => {
             if !ctx.allow_native_library.iter().any(|s| s == "*") {
                 ctx.allow_native_library.push("*".to_string());
             }
@@ -491,9 +567,10 @@ pub(super) fn apply_pkg_and_toml_config(
                 ctx.allow_compile_packages.push("*".to_string());
             }
         }
-        Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => {
+        Some(false) => {
             ctx.allow_native_library.clear();
             ctx.allow_compile_packages.clear();
+            allow_perry_features_forces_deny = true;
         }
         _ => {}
     }
@@ -629,6 +706,31 @@ pub(super) fn apply_pkg_and_toml_config(
     perry_hir::set_eval_strict_mode(ctx.strict_eval);
     perry_hir::set_unimplemented_strict_mode(ctx.strict_unimplemented);
 
+    // Auto-compile default (owner policy): a project that does not pin a
+    // `perry.compilePackages` value gets its whole reachable node_modules
+    // graph compiled — perry is a compiler, not a supply-chain gate, so
+    // "unlisted" is not a hard error, it just compiles (and a dependency that
+    // genuinely can't compile surfaces as an ordinary compile error). This is
+    // exactly `compilePackages: "auto"`: inject the universal `"*"`, which the
+    // expansion just below turns into concrete installed names (native-shimmed
+    // packages are skipped, so bundled bindings still win). Opt out with an
+    // explicit list, or `compilePackages: false` / `[]` to compile nothing and
+    // restore the V8-free gate's "listed only" behavior.
+    if !compile_packages_explicit {
+        ctx.compile_packages.insert("*".to_string());
+    }
+    // Universal routing with no explicit allow policy ⇒ universal allow. An
+    // explicit package.json allow value (including false/[]) or the CI
+    // fail-closed env override remains authoritative and is validated below.
+    if should_auto_grant_compile_allow(
+        ctx.compile_packages.iter().any(|p| p == "*"),
+        allow_compile_packages_explicit,
+        allow_perry_features_forces_deny,
+    ) && !ctx.allow_compile_packages.iter().any(|p| p == "*")
+    {
+        ctx.allow_compile_packages.push("*".to_string());
+    }
+
     // #3527 (blocker #4): materialize `"*"` / `"@scope/*"` wildcard entries
     // in `perry.compilePackages` into concrete installed package names.
     //
@@ -709,8 +811,9 @@ pub(super) fn apply_pkg_and_toml_config(
     // parse loop populated `ctx.compile_packages` above; we validate
     // after env-var overrides). Every entry that flowed in needs a
     // match in `ctx.allow_compile_packages` — the two-key opt-in.
-    // Default-empty allowlist = nothing allowed = matches the
-    // "greenfield projects: nothing allowed" acceptance bullet.
+    // With auto routing, an omitted allow policy is granted automatically;
+    // an explicit allow policy (or `PERRY_ALLOW_PERRY_FEATURES=0`) remains a
+    // real constraint and is checked here.
     for name in ctx.compile_packages.iter() {
         if !allowlist_matches(name, &ctx.allow_compile_packages) {
             anyhow::bail!(
@@ -1017,6 +1120,47 @@ pub(super) fn apply_pkg_and_toml_config(
 
     let _ = (perry_toml, toml_root);
     Ok((i18n_config, i18n_translations))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_switch_accepts_only_documented_values() {
+        for value in [
+            serde_json::json!(true),
+            serde_json::json!("auto"),
+            serde_json::json!(" ALL "),
+        ] {
+            assert!(compile_packages_means_auto(&value), "value: {value}");
+        }
+        for value in [
+            serde_json::json!(false),
+            serde_json::json!("yes"),
+            serde_json::json!([]),
+        ] {
+            assert!(!compile_packages_means_auto(&value), "value: {value}");
+        }
+    }
+
+    #[test]
+    fn boolean_switch_is_explicit_and_case_insensitive() {
+        assert_eq!(parse_boolean_switch("1"), Some(true));
+        assert_eq!(parse_boolean_switch(" TRUE "), Some(true));
+        assert_eq!(parse_boolean_switch("0"), Some(false));
+        assert_eq!(parse_boolean_switch("False"), Some(false));
+        assert_eq!(parse_boolean_switch("yes"), None);
+        assert_eq!(parse_boolean_switch(""), None);
+    }
+
+    #[test]
+    fn auto_allow_never_overrides_an_explicit_deny() {
+        assert!(should_auto_grant_compile_allow(true, false, false));
+        assert!(!should_auto_grant_compile_allow(true, true, false));
+        assert!(!should_auto_grant_compile_allow(true, false, true));
+        assert!(!should_auto_grant_compile_allow(false, false, false));
+    }
 }
 
 fn parse_fp_contract_mode(value: &str, source: &str) -> Result<FpContractMode> {

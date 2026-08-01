@@ -31,6 +31,7 @@ use super::{
     ParseCache,
 };
 
+mod binding_faithfulness;
 mod crypto_ns;
 mod dynamic_glob;
 mod eval_worker;
@@ -43,14 +44,13 @@ mod static_require_transform;
 mod tests;
 mod wasm_asset;
 
+use binding_faithfulness::audit_native_binding_choice;
 use dynamic_glob::expand_dynamic_import_glob;
 use eval_worker::materialize_eval_worker_source;
+pub(super) use import_helpers::known_node_submodule_key;
 use import_helpers::{
     cached_resolve_import_with_lexical_base, collect_js_module_imports, env_defines_for_lowering,
 };
-// Re-exported at `pub(super)` because `compile.rs` (the parent module) calls
-// `collect_modules::known_node_submodule_key` directly.
-pub(super) use import_helpers::known_node_submodule_key;
 use native_addon::{refuse_compile_package_native_addon, refuse_node_addon_binary};
 use parse_error::annotate_parse_error;
 use static_require_transform::transform_static_literal_requires;
@@ -1180,6 +1180,7 @@ fn collect_module_one(
 
         if import.is_native {
             import.module_kind = ModuleKind::NativeRust;
+            audit_native_binding_choice(&import.source, entry_path, &canonical, ctx)?;
             if import.source == "perry/ui" {
                 ctx.needs_ui = true;
             }
