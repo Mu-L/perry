@@ -405,6 +405,35 @@ cost is, as the repsel campaign already measured from the other side,
 bookkeeping for values that cannot yet be proven non-pointers — one more
 place every road converges on representation selection.
 
+## RS4GC pipeline slice (#7174) — running, fully gated, 2026-08-01
+
+`PERRY_RS4GC=1` exists and passes the complete gate matrix: 8/8 probes
+under forced evacuation + verification and 8/8 under walker-verify, with
+`RewriteStatepointsForGC` inserting every statepoint, relocation, and
+downstream-use rewrite over surgically-retyped `ptr addrspace(1)` root
+SSA. Requirements established empirically:
+
+- **Version-matched toolchain**: LLVM 22 `opt` output is unparseable by
+  Apple clang 21 — `PERRY_LLVM_CLANG` must point at the same LLVM's clang.
+- **Statepoint placement must precede cast-merging optimization.**
+  `default<O2>` before RS4GC fails 3/8 probes: GVN/CSE merges the per-site
+  `ptrtoint`/`bitcast` chains across future statepoint sites, recreating
+  the stale-double hazard. `function(mem2reg)` alone is the sound
+  pre-pass; clang's full optimization AFTER statepoint insertion is safe
+  by construction. This is the same design law again, now stated
+  positively: relocation semantics must be present before the optimizer
+  is allowed to move heap-derived values.
+- **Two vacuous-green runs preceded the real one**: the fail-closed
+  surgery bail (recognizer knew only the unit-test `alloca i64` idiom;
+  real roots are `alloca double`) silently routed every function to the
+  explicit bridge. Caught by record-count comparison (200 vs 55), not by
+  any probe — assert surgery liveness before believing an RS4GC A/B.
+
+Not yet competitive: metadata (probe 01: 8,072 B vs the audited bridge's
+5,320 B) — mem2reg-only liveness is conservative and the leaf-attribute
+transfer needs verification. That is the next #7174 increment, now with a
+green baseline to A/B against.
+
 **Conclusion, stated as the design law this branch keeps re-deriving:**
 *with an optimizing compiler between the source and the safepoint, root
 metadata without relocation semantics is unsound — per-call plain maps

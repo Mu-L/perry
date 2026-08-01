@@ -482,7 +482,7 @@ fn maybe_rs4gc_preprocess(ll_text: &str) -> Result<Option<String>> {
         )?;
     let mut child = Command::new(&opt)
         .args([
-            "-passes=default<O2>,rewrite-statepoints-for-gc",
+            "-passes=function(mem2reg),rewrite-statepoints-for-gc",
             "-S",
             "-",
         ])
