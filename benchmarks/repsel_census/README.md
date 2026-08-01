@@ -236,11 +236,46 @@ Per knob, with that knob at `0` and every other at its default:
    some object.
 
 Rule 1 catches the first defect, rule 2 the second (it leaves every count
-untouched). Two controls guard the diff: the compiler must be deterministic
-(**it is not on aarch64 Linux** — the LLVM module name embeds pid + nanotime, so
-the emission half is skipped there rather than reporting 26 phantoms), and both
-`X=1` and an env var the compiler does not read must reproduce the default
-object bit-for-bit.
+untouched). Two controls guard the diff: the compiler must be deterministic, and
+both `X=1` and an env var the compiler does not read must reproduce the default
+object bit-for-bit. A determinism failure aborts the run — it is not a host
+property to route around (see below).
+
+## Emission determinism (#7131)
+
+Every object comparison on this page assumes the compiler is a function of its
+inputs. On ELF it was not: the temp `.ll` name carried pid + wall-clock nanos,
+and clang records a translation unit's **source basename** into the object as an
+`STT_FILE` symbol, so two identical compiles differed by exactly those digits —
+26/26 census workloads on a Raspberry Pi 5, 12 bytes apart on `suite_01_startup`:
+
+```
+run1  STT_FILE  perry_llvm_217502_1785528949373123236_0.ll
+run2  STT_FILE  perry_llvm_217533_1785528951945773193_0.ll
+```
+
+Mach-O does not record that name in the `.o` at all, which is why macOS looked
+clean while carrying the same defect — and why this cannot be reviewed on a Mac.
+#7135 content-addressed the `.ll` basename.
+
+Check it before trusting any object-level result on a host you have not measured
+on (the whole corpus twice is ~7 s):
+
+```bash
+python3 scripts/compiler_output_regression.py census-determinism \
+    --perry <path/to/perry> --repeat 2 --jobs 4
+```
+
+Repeats run **concurrently** on purpose. Identical IR now shares one
+content-addressed `.ll`, so racing it is part of the subject — and that is what
+caught #7135's other half, where the `.o` name lost its pid and two `perry`
+processes compiling the same file deleted each other's object.
+
+The knob-isolation gate runs the same control inline and **fails** on a
+disagreement. It used to skip its emission half instead, which meant the half
+that caught the `PERRY_CANONICAL_STR_LOCALS` defect could not run on Linux at
+all — the host where object-hash A/B is most useful, because it is the one with
+an unprivileged instruction-retired counter.
 
 One documented exception, downward only: `PERRY_INT_VALUED_LOCALS=0` lowers
 `canonical-i32` on `fixture_int_valued_ta` (3 → 2), because
