@@ -43,6 +43,7 @@ mod this_as_value;
 mod uppercase_strings;
 
 // Public re-exports for the visible API (`pub fn emit_i64_function` etc.).
+pub use cjs_scaffolding::{census as cjs_preamble_census, CjsPreambleCensus};
 pub use clamp_detect::{
     detect_clamp3, detect_clamp_u8, is_integer_specializable, returns_i32_identity_arg,
     returns_integer,
