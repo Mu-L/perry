@@ -429,10 +429,19 @@ SSA. Requirements established empirically:
   explicit bridge. Caught by record-count comparison (200 vs 55), not by
   any probe — assert surgery liveness before believing an RS4GC A/B.
 
-Not yet competitive: metadata (probe 01: 8,072 B vs the audited bridge's
-5,320 B) — mem2reg-only liveness is conservative and the leaf-attribute
-transfer needs verification. That is the next #7174 increment, now with a
-green baseline to A/B against.
+Probe-scale metadata trails the bridge (probe 01: 8,072 B vs 5,320 B —
+the zero-live statepoint record constant dominates small functions), but
+the real-app measurement flips the hierarchy: on `test-drizzle-pg`,
+RS4GC `__text` is 20,128,708 — **248 KB below shadow and 98 KB below the
+explicit bridge** — and metadata is 3,875,416 B, within 3.1% of the
+audited bridge's 3,757,520. Total file: 31,957,792, the smallest native
+arm measured. SSA liveness pruning compensates for the record constant at
+scale exactly as predicted. Leaf-attribute transfer verified by record
+count (200 → 103 on probe 01). RS4GC is therefore already the preferred
+native backend on every axis measured except probe-scale metadata, while
+carrying the structural correctness model — the explicit bridge becomes a
+deletion candidate once RS4GC grows has_try coverage and a leaner
+zero-live-record story (upstream pass option recorded on #7174).
 
 **Conclusion, stated as the design law this branch keeps re-deriving:**
 *with an optimizing compiler between the source and the safepoint, root
