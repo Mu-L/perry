@@ -532,6 +532,40 @@ Consequence for the campaign verdict: shadow retains three-axis
 optimality including small hardware, and a future default-flip needs a
 Pi-class gate — but the gap's cause is a named, fixable walker cost.
 
+## Real-application scale (Claude Code 2.1.112, 2026-08-01)
+
+The campaign's origin target — the real 13 MB minified `@anthropic-ai/claude-code`
+bundle — compiles and runs natively under the shadow stack (204,103,064 B
+binary, `__text` 149.4 MB, 115.1 MB RSS, `--version` correct, 82 min).
+
+**The explicit statepoint bridge cannot compile it**, and the reason is a
+scaling defect worth recording precisely:
+
+- Statepoint lowering roughly doubles module IR: **1,083 MB, 16,748
+  functions (~66 KB/fn)** for a 13 MB input.
+- `clang -c` rejects the oversized unit outright: *"file … is too large for
+  Clang to process."*
+- **Adding codegen units does not fix it.** `decide_codegen_units` sizes by
+  *callable count* (`ceil(fns / 6000)`), never by IR bytes; and
+  `render_codegen_units` replicates **all shared string constants and
+  globals into every unit**. At `PERRY_CODEGEN_UNITS=16` each unit still
+  rendered ~370–436 MB, and unit 10/16 failed the same way — while total
+  emitted IR ballooned past 6 GB (which also exhausted the disk mid-run
+  and killed an earlier attempt).
+
+Two independent fixes fall out, both mode-agnostic wins: size codegen units
+by estimated IR bytes rather than callable count, and emit shared
+strings/globals **once** with external declarations in sibling units
+instead of replicating them. The second is what makes splitting actually
+scale for string-heavy minified bundles.
+
+Fairness note for anyone extending this: unit count changes cross-unit
+inlining scope, so a statepoint arm forced to N units must be compared
+against a shadow arm at the *same* N, not against the auto-chosen count.
+The `-Os` downgrade (`module IR > 6 MB`) is NOT a confound — it applies to
+both arms, since shadow IR for the same program cannot be smaller than the
+statepoint arm's 1,083 MB.
+
 **Conclusion, stated as the design law this branch keeps re-deriving:**
 *with an optimizing compiler between the source and the safepoint, root
 metadata without relocation semantics is unsound — per-call plain maps
