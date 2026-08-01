@@ -216,6 +216,10 @@ pub(crate) fn is_cluster_emitter_method(prop: &str) -> bool {
             | "emit"
             | "eventNames"
             | "listenerCount"
+            | "listeners"
+            | "rawListeners"
+            | "getMaxListeners"
+            | "setMaxListeners"
     )
 }
 
@@ -233,6 +237,7 @@ fn native_callable_export_arity_reference(module: &str, prop: &str) -> Option<u3
         ("cluster", "fork" | "disconnect" | "setupPrimary" | "setupMaster" | "Worker") => Some(1),
         ("cluster", "emit") => Some(1),
         ("cluster", "eventNames") => Some(0),
+        ("cluster", "getMaxListeners") => Some(0),
         (
             "cluster",
             "on"
@@ -244,6 +249,7 @@ fn native_callable_export_arity_reference(module: &str, prop: &str) -> Option<u3
             | "off"
             | "listenerCount",
         ) => Some(2),
+        ("cluster", "listeners" | "rawListeners" | "setMaxListeners") => Some(1),
         ("cluster", "removeAllListeners") => Some(1),
         // #6563: node-pty `spawn(file, args, options)`.
         ("node-pty", "spawn") => Some(3),
@@ -1883,6 +1889,18 @@ pub(crate) unsafe fn nm_attach_child_process(
     }
 }
 
+pub(crate) unsafe fn nm_attach_cluster(
+    property_name: &str,
+    value: f64,
+    _closure_addr: usize,
+) -> f64 {
+    if property_name == "Worker" {
+        crate::cluster::ensure_worker_constructor(value)
+    } else {
+        value
+    }
+}
+
 #[allow(unused_mut)]
 pub(crate) unsafe fn nm_attach_sqlite(
     property_name: &str,
@@ -2128,14 +2146,18 @@ static CALLABLE_EXPORT_ARITY_TABLE: &[(&str, &[(&str, u32)])] = &[
             ("emit", 1),
             ("eventNames", 0),
             ("fork", 1),
+            ("getMaxListeners", 0),
             ("listenerCount", 2),
+            ("listeners", 1),
             ("off", 2),
             ("on", 2),
             ("once", 2),
             ("prependListener", 2),
             ("prependOnceListener", 2),
+            ("rawListeners", 1),
             ("removeAllListeners", 1),
             ("removeListener", 2),
+            ("setMaxListeners", 1),
             ("setupMaster", 1),
             ("setupPrimary", 1),
         ],
