@@ -1869,18 +1869,7 @@ pub extern "C" fn js_gc_loop_safepoint() {
     if !GC_SAFEPOINT_PENDING.with(Cell::get) && !super::gc_zeal_enabled() {
         return;
     }
-    if GC_SAFEPOINT_PENDING.with(Cell::get) {
-        gc_safepoint_moving_minor();
-        return;
-    }
-    // Under the safepoint-only contract, non-nursery (full/old-gen) triggers
-    // should preferentially drain at declared safepoints, where precise roots
-    // make the conservative heal unnecessary. The dueness check inside
-    // `gc_check_trigger` is cheap and this branch is research-mode only.
-    if gc_safepoint_only_contract() != SafepointOnlyContract::Off {
-        let _declared = DeclaredSafepointGuard::enter();
-        gc_check_trigger();
-    }
+    gc_safepoint_moving_minor();
 }
 
 struct BudgetedGcStepGuard;

@@ -200,9 +200,11 @@ precise-root cycle gets the conservative scan forced for that cycle, which
 restores liveness and keeps it non-moving) and `=strict` (panic — the gate
 mode that proves the enforcement is live, per the four-ways-a-gate-cannot-
 fail rule). Manual `gc()` and the alloc-point slack valve force the scan
-already and are exempt by construction. Under the contract, loop polls also
-drain non-nursery triggers so full collections migrate to declared
-safepoints.
+already and are exempt by construction. (An earlier revision also drained
+non-nursery triggers at every allocating loop back-edge; that turned churn
+loops into per-iteration collection work — O(n²) — and was deleted. The heal
+alone is sufficient: undeclared full collections simply pay one conservative
+scan.)
 
 **What it unmaps.** A new audited `GcCallEffect::AllocNoReentry` class:
 helpers that may allocate (arming a trigger) but never collect synchronously
