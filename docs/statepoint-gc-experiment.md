@@ -214,6 +214,20 @@ collects behind the forced scan. First audited set: singleton closure
 allocation, class-object allocation, `js_array_push_f64`, `js_array_length`,
 `js_array_slice_values`.
 
+**Measured results (loaded host, correctness-grade).** All gates green at
+`4e3d5c70e`: 16/16 probe cells (forced evacuation + walker-verify under the
+contract), strict-mode enforcement fired on the deliberately unsound
+configuration (`PERRY_GC_SCAVENGE=1` + polls off — a precise-root minor at
+an unmapped alloc point aborts with the contract panic), and max RSS is
+unchanged by deferral (27/27 MB and 36/36 MB on the two churn-heaviest
+probes). The audited five-helper set removes 7.8% of `batch.ts` statepoints
+(217 → 200) and 7.5% of relocations. Getting the contract here found and
+fixed three implementation bugs, each caught by a gate: enforcement that
+missed the copying-minor path, a heal that overrode a local decision while
+copying eligibility read the global one (real memory corruption under
+forced evacuation), and a per-poll trigger drain that turned churn loops
+into O(n²) collection work. All three fixes deleted code.
+
 **The census result that bounds the idea.** On `batch.ts`, 217 statepoints
 break down as roughly 85 property-access diamonds (getter re-entry possible
 — must stay mapped), ~40 coercion/setter/throw paths (re-entry — stay), ~10
