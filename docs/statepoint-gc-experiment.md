@@ -470,6 +470,38 @@ load-bearing, dependency-JS recovery) or `Ptr<Shape>`-class promotions
 feeding a typed-slot story, not wider scalar coverage. Recorded so
 neither campaign builds on the uncorrected assumption.
 
+## Linux verification and the small-hardware numbers (#7173, 2026-08-01)
+
+Runtime verification on two granted Linux hosts, cross-built from macOS
+(perry `--target linux`/`linux-aarch64` `--no-link` for ELF probe objects;
+`cargo zigbuild` archives with `-Cforce-frame-pointers=yes`; `zig cc` link
+with `-lunwind`):
+
+- **x86-64 (Ubuntu, idle prod webserver): 8/8** forced-evacuation probes
+  byte-matched to the pinned oracles, first run — first execution of the
+  ELF section discovery and Linux unwinder path.
+- **aarch64 (Raspberry Pi 5): 8/8 after one caught defect.** The
+  verify-walker mode fired exactly as designed: the Darwin SP
+  reconstruction (`SP = FP + 16 − stack_size`) is wrong on aarch64-Linux
+  (frame pair at the bottom, not the top) — fast walk and unwinder
+  disagreed by the layout delta on one slot. Fix: SP-relative locations
+  disqualify the fast chain off-Darwin until the Linux constant is derived;
+  the unwinder serves meanwhile. A silent-fallback foot-gun was also found:
+  an unrecognized `--target` value compiles for HOST (Mach-O out of
+  `linux-arm64`); the accepted spelling is `linux-aarch64`.
+
+**Small-hardware timing (Pi 5, load ≤0.1, 9 interleaved reps)** — the
+measurement the M1 tie could not predict: shadow 469.2 ms geo-mean,
+statepoints 538.2 ms (**+14.7%**; deep-stack +23%, string-retention +35%,
+array-grow +32%). The M1 parity does NOT transfer to narrow cores. Two
+components: the Linux build walks with the full unwinder (fast chain
+disabled by the fix above — recoverable by deriving the Linux frame
+constant), and genuine small-core cost of spill/reload plus cache-hostile
+record matching. Consequence for the campaign verdict: the shadow stack's
+three-axis optimality now extends to small hardware with a measured
+margin, and any future default-flip must clear a Pi-class gate, not only
+the M1 matrix.
+
 **Conclusion, stated as the design law this branch keeps re-deriving:**
 *with an optimizing compiler between the source and the safepoint, root
 metadata without relocation semantics is unsound — per-call plain maps
