@@ -1,16 +1,12 @@
 #!/usr/bin/env bash
 # Tier 1 — cargo_workspace
 #
-# Runs `cargo test --release --workspace` with the CLAUDE.md UI exclusions.
-# Per the canonical command in that file:
-#
-#   cargo test --release --workspace \
-#     --exclude perry-ui-ios --exclude perry-ui-tvos --exclude perry-ui-watchos \
-#     --exclude perry-ui-visionos --exclude perry-ui-android \
-#     --exclude perry-ui-windows --exclude perry-ui-gtk4
-#
-# Linux/Windows hosts swap the host's UI crate back in (so perry-ui-gtk4 is
-# tested on Linux but not macOS, etc.) — same logic as tier 0.
+# Runs every host-compatible package's release tests. Packages are deliberately
+# tested one Cargo invocation at a time: a multi-package workspace invocation
+# unifies perry-runtime features, so perry-ext-fetch's
+# `external-fetch-symbols` leaks into unrelated test binaries that do not link
+# the fetch implementation and they fail with undefined `js_fetch_*` symbols.
+# This mirrors the full cargo-test CI job's package isolation rule.
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -25,29 +21,76 @@ SUMMARY="$TIER_DIR/summary.json"
 host="$(sweep_host_detect)"
 
 EXCLUDES_COMMON=(
-    --exclude perry-ui-ios
-    --exclude perry-ui-tvos
-    --exclude perry-ui-watchos
-    --exclude perry-ui-visionos
-    --exclude perry-ui-android
+    perry-ui-ios
+    perry-ui-tvos
+    perry-ui-watchos
+    perry-ui-visionos
+    perry-ui-android
 )
 case "$host" in
-    macos)   EXCLUDES=("${EXCLUDES_COMMON[@]}" --exclude perry-ui-windows --exclude perry-ui-gtk4) ;;
-    linux)   EXCLUDES=("${EXCLUDES_COMMON[@]}" --exclude perry-ui-macos --exclude perry-ui-windows) ;;
-    windows) EXCLUDES=("${EXCLUDES_COMMON[@]}" --exclude perry-ui-macos --exclude perry-ui-gtk4) ;;
+    macos)   EXCLUDES=("${EXCLUDES_COMMON[@]}" perry-ui-windows perry-ui-gtk4) ;;
+    linux)   EXCLUDES=("${EXCLUDES_COMMON[@]}" perry-ui-macos perry-ui-windows) ;;
+    windows) EXCLUDES=("${EXCLUDES_COMMON[@]}" perry-ui-macos perry-ui-gtk4) ;;
     *)       EXCLUDES=("${EXCLUDES_COMMON[@]}") ;;
 esac
+
+is_excluded() {
+    local candidate="$1"
+    local excluded
+    for excluded in "${EXCLUDES[@]}"; do
+        [[ "$candidate" == "$excluded" ]] && return 0
+    done
+    return 1
+}
 
 start="$(date +%s)"
 {
     echo "tier 1 cargo_workspace — host=$host"
-    echo "command: cargo test --release --workspace ${EXCLUDES[*]}"
+    echo "command: cargo test --release -p <package> (serial, excluding: ${EXCLUDES[*]})"
     echo
 } > "$LOG"
 
+package_list="$(
+    cd "$REPO_ROOT" && cargo metadata --no-deps --format-version 1 |
+        python3 -c 'import json, sys; print("\n".join(sorted(p["name"] for p in json.load(sys.stdin)["packages"])))'
+)"
+metadata_rc=$?
+
 set +e
-(cd "$REPO_ROOT" && cargo test --release --workspace "${EXCLUDES[@]}") >> "$LOG" 2>&1
-rc=$?
+rc=$metadata_rc
+failed_packages=()
+if [[ "$rc" -eq 0 ]]; then
+    # Perry integration tests compile with PERRY_NO_AUTO_OPTIMIZE=1 and link
+    # these archives directly. Build the wrappers separately so the standalone
+    # runtime archive retains its runtime-only feature set.
+    (cd "$REPO_ROOT" && cargo build --release -p perry-runtime-static) >> "$LOG" 2>&1
+    rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+        (cd "$REPO_ROOT" && cargo build --release -p perry-stdlib-static) >> "$LOG" 2>&1
+        rc=$?
+    fi
+fi
+if [[ "$rc" -eq 0 ]]; then
+    while IFS= read -r package; do
+        [[ -z "$package" ]] && continue
+        is_excluded "$package" && continue
+        echo "=== cargo test --release -p $package ===" >> "$LOG"
+        if [[ "$package" == "perry-runtime" ]]; then
+            (cd "$REPO_ROOT" && RUST_TEST_THREADS=1 cargo test --release -p "$package") >> "$LOG" 2>&1
+        else
+            (cd "$REPO_ROOT" && cargo test --release -p "$package") >> "$LOG" 2>&1
+        fi
+        package_rc=$?
+        if [[ "$package_rc" -ne 0 ]]; then
+            rc=$package_rc
+            failed_packages+=("$package")
+        fi
+        # Release test executables are large and are not inputs to later package
+        # builds. Keep libraries/proc macros, prune only completed executables.
+        find "$REPO_ROOT/target/release/deps" -maxdepth 1 -type f -perm -111 \
+            ! -name '*.dylib' -delete 2>/dev/null || true
+    done <<< "$package_list"
+fi
 set -e
 
 # Try to extract per-crate test counts from the log.
@@ -72,6 +115,7 @@ EOF
 if [[ "$rc" -eq 0 ]]; then
     sweep_tier_emit "$OUT" 1 "cargo_workspace" "PASS" "$dur" "$total_passed crate-suites passed"
 else
+    failed_list="${failed_packages[*]:-setup}"
     sweep_tier_emit "$OUT" 1 "cargo_workspace" "FAIL" "$dur" \
-        "cargo test exited $rc ($total_failed crate-suites failed of $((total_passed + total_failed)))"
+        "cargo test exited $rc ($total_failed crate-suites failed; packages: $failed_list)"
 fi

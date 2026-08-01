@@ -1,0 +1,8 @@
+rows.length=2
+rows[0].name=alice
+rows[1].name=bob
+rawRows.length=2
+rawRows[0][1]=alice
+get(2).name=bob
+run.changes=1
+run.lastInsertRowid=3

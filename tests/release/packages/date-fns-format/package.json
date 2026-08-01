@@ -1,0 +1,16 @@
+{
+  "name": "perry-release-fixture-date-fns-format",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Tier-3 fixture: pinned date-fns format() compile/run coverage.",
+  "dependencies": {
+    "date-fns": "4.4.0"
+  },
+  "perry": {
+    "compilePackages": ["date-fns"],
+    "allow": {
+      "compilePackages": ["date-fns"]
+    }
+  }
+}

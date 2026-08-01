@@ -1,0 +1,7 @@
+objRows.length= 2
+objRows[0].name= alice
+rawRows.length= 2
+rawRows[0][0]= 1
+rawRows[0][1]= alice
+rawRow[0]= 1
+rawRow[1]= alice

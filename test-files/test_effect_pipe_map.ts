@@ -1,4 +1,5 @@
 // Effect.pipe(Effect.map(fn)) chain composition through the V8 boundary.
+// parity-skip: requires the pinned Effect package; covered by Tier 3 effect-basic
 //
 // Pre-fix (PR #992 ships `Effect.succeed(42)` but stops there):
 //   - `Effect.map((x) => x + 1)` lowered via `StaticMethodCall { Effect, map }`

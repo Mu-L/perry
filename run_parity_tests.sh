@@ -601,13 +601,13 @@ else
     PERRY_BIN="$TARGET_DIR/release/perry$PERRY_EXE_SUFFIX"
     echo "Building compiler (release)..."
 fi
-BUILD_PACKAGES=(-p perry -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static)
+EXT_BUILD_PACKAGES=()
 BUILD_FEATURES=()
 needs_wasm_host=0
 # The default `test-files/` corpus (the gap suite) under PERRY_NO_AUTO_OPTIMIZE
 # links the prebuilt `full` stdlib, which is NOT compiled with the
 # `external-*` pump features. Any test whose module routes through a
-# well-known ext wrapper (events / http / net / ws / zlib) then links against
+# well-known ext wrapper (events / fastify / http / net / ws / zlib) then links against
 # a stdlib with no pump and fails — reported as an untriaged NEW gap failure
 # with no hint that the run mode caused it. Measured: 7 such false regressions
 # (test_gap_events_import_4995, 5x http/fetch, test_gap_net_connect_bound_value),
@@ -615,9 +615,10 @@ needs_wasm_host=0
 # do the same here. There is no MODULE_FILTER for this suite, so build the
 # whole well-known set rather than switching on it.
 if [[ -n "${PERRY_NO_AUTO_OPTIMIZE:-}" && "$TEST_SUITE" == "all" ]]; then
-    BUILD_PACKAGES+=(-p perry-ext-events -p perry-ext-http -p perry-ext-net -p perry-ext-ws -p perry-ext-zlib)
+    EXT_BUILD_PACKAGES+=(perry-ext-events perry-ext-fastify perry-ext-http perry-ext-net perry-ext-ws perry-ext-zlib)
     BUILD_FEATURES+=(
         perry-stdlib/external-events-construct
+        perry-stdlib/external-fastify-pump
         perry-stdlib/external-http-server-pump
         perry-stdlib/external-http-client-pump
         perry-stdlib/external-net-pump
@@ -632,7 +633,7 @@ if [[ -n "${PERRY_NO_AUTO_OPTIMIZE:-}" && "$TEST_SUITE" == "node-suite" ]]; then
             # and need the matching stdlib pump hooks compiled into libperry_stdlib.a.
             # HTTP fixtures can also emit net + ws well-known owners via the codegen
             # FFI registry, so build those wrappers too (#4373).
-            BUILD_PACKAGES+=(-p perry-ext-http -p perry-ext-net -p perry-ext-ws)
+            EXT_BUILD_PACKAGES+=(perry-ext-http perry-ext-net perry-ext-ws)
             BUILD_FEATURES+=(perry-stdlib/external-http-server-pump perry-stdlib/external-http-client-pump)
             ;;
     esac
@@ -641,7 +642,7 @@ if [[ -n "${PERRY_NO_AUTO_OPTIMIZE:-}" && "$TEST_SUITE" == "node-suite" ]]; then
             # zlib no-auto node-suite runs still route `node:zlib` through the
             # well-known external archive, so build that archive and the stdlib
             # bridge that drains its stream queue and dispatches stream handles.
-            BUILD_PACKAGES+=(-p perry-ext-zlib)
+            EXT_BUILD_PACKAGES+=(perry-ext-zlib)
             BUILD_FEATURES+=(perry-stdlib/external-zlib-pump)
             ;;
     esac
@@ -680,9 +681,24 @@ if [[ "${#BUILD_FEATURES[@]}" -gt 0 ]]; then
     feature_csv=$(IFS=,; echo "${BUILD_FEATURES[*]}")
     BUILD_FEATURE_ARGS=(--features "$feature_csv")
 fi
-if [[ "$PERRY_SKIP_BUILD" == "0" ]] && ! cargo build --release --quiet "${BUILD_PACKAGES[@]}" "${BUILD_FEATURE_ARGS[@]}" 2>/dev/null; then
-    echo -e "${RED}Failed to build compiler/runtime archives${NC}"
-    exit 1
+if [[ "$PERRY_SKIP_BUILD" == "0" ]]; then
+    # Build the compiler and the two canonical static archives separately.
+    # Cargo features unify across every package in one invocation; combining
+    # the stdlib wrapper with the runtime wrapper leaks stdlib-only features
+    # into libperry_runtime.a and makes later no-auto links depend on symbols
+    # the standalone runtime contract does not provide.
+    if ! cargo build --release --quiet -p perry 2>/dev/null \
+        || ! cargo build --release --quiet -p perry-runtime-static 2>/dev/null \
+        || ! cargo build --release --quiet -p perry-stdlib-static "${BUILD_FEATURE_ARGS[@]}" 2>/dev/null; then
+        echo -e "${RED}Failed to build compiler/runtime archives${NC}"
+        exit 1
+    fi
+    for package in "${EXT_BUILD_PACKAGES[@]}"; do
+        if ! cargo build --release --quiet -p "$package" 2>/dev/null; then
+            echo -e "${RED}Failed to build extension archive: $package${NC}"
+            exit 1
+        fi
+    done
 fi
 if [[ "$PERRY_SKIP_BUILD" == "0" && "$needs_wasm_host" -eq 1 ]]; then
     # WebAssembly metadata fixtures exercise the real host shims. Build the
@@ -863,6 +879,7 @@ for test_file in "${TEST_FILES[@]}"; do
     parity_argv_line=$(sed -n -E 's|^[[:space:]]*//[[:space:]]*parity-argv:[[:space:]]*(.*)$|\1|p' "$test_file" | head -1)
     parity_node_argv_line=$(sed -n -E 's|^[[:space:]]*//[[:space:]]*parity-node-argv:[[:space:]]*(.*)$|\1|p' "$test_file" | head -1)
     parity_env_line=$(sed -n -E 's|^[[:space:]]*//[[:space:]]*parity-env:[[:space:]]*(.*)$|\1|p' "$test_file" | head -1)
+    parity_skip_reason=$(sed -n -E 's|^[[:space:]]*//[[:space:]]*parity-skip:[[:space:]]*(.*)$|\1|p' "$test_file" | head -1)
     test_argv=()
     if [[ -n "$parity_argv_line" ]]; then
         read -r -a test_argv <<< "$parity_argv_line"
@@ -879,6 +896,12 @@ for test_file in "${TEST_FILES[@]}"; do
     # Check if test should be skipped
     if should_skip "$test_name"; then
         echo -e "${YELLOW}SKIP${NC}  $test_id (async/timer test)"
+        ((SKIPPED++))
+        record_result "$test_id" "skipped"
+        continue
+    fi
+    if [[ -n "$parity_skip_reason" ]]; then
+        echo -e "${YELLOW}SKIP${NC}  $test_id ($parity_skip_reason)"
         ((SKIPPED++))
         record_result "$test_id" "skipped"
         continue

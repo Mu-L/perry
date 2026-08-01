@@ -1341,6 +1341,54 @@ idxset.bounded_numeric_merge.5:
         self.assertIn("snapshot_tool_artifacts", packet)
         self.assertIn("rustc_wrapper_scrubbed", packet)
 
+    def test_release_sweep_isolates_workspace_package_features(self):
+        tier = (
+            REPO_ROOT
+            / "scripts"
+            / "release_sweep_tiers"
+            / "tier01_cargo_workspace.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('cargo test --release -p "$package"', tier)
+        self.assertIn("cargo metadata --no-deps --format-version 1", tier)
+        self.assertNotIn("cargo test --release --workspace", tier)
+        self.assertIn("perry-runtime-static", tier)
+        self.assertIn("perry-stdlib-static", tier)
+
+    def test_parity_sweep_supports_specialized_fixture_exclusions(self):
+        runner = (REPO_ROOT / "run_parity_tests.sh").read_text(encoding="utf-8")
+        effect = (REPO_ROOT / "test-files" / "test_effect_pipe_map.ts").read_text(
+            encoding="utf-8"
+        )
+        fastify = (
+            REPO_ROOT / "test-files" / "test_fastify_integration.ts"
+        ).read_text(encoding="utf-8")
+        date_fns = (REPO_ROOT / "test-files" / "test_date_fns_format.ts").read_text(
+            encoding="utf-8"
+        )
+        date_fixture = (
+            REPO_ROOT / "tests" / "release" / "packages" / "date-fns-format" / "fixture.sh"
+        )
+
+        self.assertIn("parity-skip:", runner)
+        self.assertIn("parity_skip_reason", runner)
+        self.assertIn("Tier 3 effect-basic", effect)
+        self.assertIn("Tier 3 fastify-replay", fastify)
+        self.assertIn("Tier 3 date-fns-format", date_fns)
+        self.assertTrue(date_fixture.is_file())
+
+    def test_parity_sweep_isolates_runtime_archive_features(self):
+        runner = (REPO_ROOT / "run_parity_tests.sh").read_text(encoding="utf-8")
+
+        self.assertIn("cargo build --release --quiet -p perry-runtime-static", runner)
+        self.assertIn("cargo build --release --quiet -p perry-stdlib-static", runner)
+        self.assertIn("perry-ext-fastify", runner)
+        self.assertIn("perry-stdlib/external-fastify-pump", runner)
+        self.assertNotIn(
+            "-p perry-runtime -p perry-stdlib -p perry-runtime-static",
+            runner,
+        )
+
     def test_runtime_symbol_guard_roots_numeric_array_helpers(self):
         guard = (REPO_ROOT / "scripts" / "check_runtime_symbols.sh").read_text(
             encoding="utf-8"

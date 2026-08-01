@@ -1,3 +1,4 @@
+// parity-skip: interactive TUI demo; requires a terminal and user input
 // Demo: a Claude-Code-style TUI built entirely on perry/tui.
 import {
     Box, Text, Spinner,

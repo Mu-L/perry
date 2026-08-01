@@ -82,10 +82,7 @@ cargo build --release                          # Build all crates
 cargo build --profile perry-dev -p perry       # Fast local dev build (#5422; perry-dev profile)
 cargo build --release -p perry-runtime -p perry-stdlib  # Rebuild runtime (MUST rebuild stdlib too!)
 cargo build --release -p perry-runtime-static -p perry-stdlib-static  # Emit libperry_{runtime,stdlib}.a (#5422: runtime/stdlib are now rlib-only; the .a comes from these wrapper crates)
-cargo test --release --workspace \
-  --exclude perry-ui-ios --exclude perry-ui-tvos --exclude perry-ui-watchos \
-  --exclude perry-ui-visionos --exclude perry-ui-android --exclude perry-ui-windows \
-  --exclude perry-ui-gtk4   # Run tests (exclude cross-host UI crates on macOS)
+scripts/release_sweep.sh --tier=1              # Release tests, isolated per package to avoid Cargo feature unification
 cargo run --release -- file.ts -o output && ./output    # Compile and run TypeScript
 cargo run --release -- file.ts --print-hir              # Debug: print HIR
 cargo run --release -- file.ts --trace hir --focus fnName  # Debug: focused HIR for one fn (use to localize a miscompile)

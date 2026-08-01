@@ -44,7 +44,7 @@ not two).
 | ID | Name | What it verifies | Host gate |
 |----|------|------------------|-----------|
 | 0  | build_matrix     | `cargo build --release --workspace` on the host | all |
-| 1  | cargo_workspace  | `cargo test --release --workspace` on the host | all |
+| 1  | cargo_workspace  | isolated `cargo test --release -p <package>` across the host-compatible workspace | all |
 | 2  | parity           | gap + edge suites byte-vs-Node                 | all |
 | 3  | real_packages    | npm package fixtures (this directory)          | all |
 | 4  | gc_stress        | RSS plateau under sustained alloc + aggressive GC | all |

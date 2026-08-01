@@ -1,4 +1,5 @@
 // Integration test for Fastify (issue #174). Runs a small server that
+// parity-skip: long-running server fixture; covered by Tier 3 fastify-replay
 // scripts/run_fastify_tests.sh launches in the background, curls, and
 // asserts the response bodies for each route. Port is read from argv
 // so the harness can pick a free port to avoid CI conflicts.

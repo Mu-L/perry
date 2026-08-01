@@ -1,0 +1,7 @@
+interstitial_load: {"success":false,"error":"unsupported-platform"}
+interstitial_show: {"shown":false,"dismissed":false,"error":"unsupported-platform"}
+rewarded_load: {"success":false,"error":"unsupported-platform"}
+rewarded_show: {"earned":false,"dismissed":false,"error":"unsupported-platform"}
+banner_create: 0
+banner_destroy: ok
+request_consent: {"status":"not-determined","error":"unsupported-platform"}

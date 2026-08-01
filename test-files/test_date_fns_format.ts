@@ -1,3 +1,4 @@
+// parity-skip: requires pinned date-fns package; covered by Tier 3 date-fns-format
 // Regression: date-fns format() needs `string.match()` to honor
 // fancy-regex fallback for patterns with backreferences (`(\w)\1*`).
 // Before this fix, `formatStr.match(formattingTokensRegExp)` returned
