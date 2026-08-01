@@ -1,3 +1,4 @@
+import sys
 import time
 
 
@@ -119,13 +120,23 @@ def bench_loop_data_dependent():
     print(f"  checksum: {sum_val:.6f}")
 
 
+BENCHMARKS = {
+    "fibonacci": bench_fibonacci,
+    "loop_overhead": bench_loop_overhead,
+    "loop_data_dependent": bench_loop_data_dependent,
+    "array_write": bench_array_write,
+    "array_read": bench_array_read,
+    "math_intensive": bench_math_intensive,
+    "object_create": bench_object_create,
+    "nested_loops": bench_nested_loops,
+    "accumulate": bench_accumulate,
+}
+
+
 if __name__ == "__main__":
-    bench_fibonacci()
-    bench_loop_overhead()
-    bench_array_write()
-    bench_array_read()
-    bench_math_intensive()
-    bench_object_create()
-    bench_nested_loops()
-    bench_accumulate()
-    bench_loop_data_dependent()
+    if len(sys.argv) > 2 or (len(sys.argv) == 2 and sys.argv[1] not in BENCHMARKS):
+        choices = ", ".join(BENCHMARKS)
+        raise SystemExit(f"usage: {sys.argv[0]} [{choices}]")
+    selected = [sys.argv[1]] if len(sys.argv) == 2 else BENCHMARKS
+    for name in selected:
+        BENCHMARKS[name]()

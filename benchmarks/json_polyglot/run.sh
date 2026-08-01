@@ -614,5 +614,10 @@ component = {
 }
 Path(output_path).write_text(json.dumps(component, indent=2) + "\n")
 PY
+    status=$?
+    if [[ "$status" -ne 0 ]]; then
+        echo "public JSON evidence assembly failed" >&2
+        exit "$status"
+    fi
     echo "Machine-readable results: $PUBLIC_JSON_OUT"
 fi

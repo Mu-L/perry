@@ -972,8 +972,9 @@ pub(crate) unsafe fn stringify_object_inner(ptr: *const u8, buf: &mut String, de
     // path below. The arrayof-objects fast path (stringify_array_depth)
     // uses a separate build_shape_prefix_template that's unaffected.
     // Skip the shape-template fast path when the object has overflow fields
-    // (keys_len > num_fields — see object.rs:32 OVERFLOW_FIELDS, ≥9 stored
-    // fields per #307). The template's per-field key prefix array is built
+    // (keys_len > num_fields — see object.rs:32 OVERFLOW_FIELDS, once a
+    // dynamic object grows past INLINE_SLOT_FLOOR). The template's per-field
+    // key prefix array is built
     // from `min(keys_len, field_count)`, so an overflow object would only
     // emit its first 8 fields. Falling through to the slow path below uses
     // `read_field_bits` which routes overflow reads through
@@ -1030,8 +1031,8 @@ pub(crate) unsafe fn stringify_object_inner(ptr: *const u8, buf: &mut String, de
         *keys_elements.add(f as usize)
     };
     // Closes #307: iterate up to keys_len, not min(num_fields, keys_len).
-    // Parser-built objects with ≥9 fields cap field_count at the inline
-    // alloc_limit (max(field_count, 8) physical slots) and store the overflow
+    // Parser-built objects that grow past INLINE_SLOT_FLOOR cap field_count at
+    // the inline alloc_limit and store the overflow
     // values in OVERFLOW_FIELDS (object.rs:32) — so num_fields can be smaller
     // than keys_len. For inline slots (f < alloc_limit) we still read directly
     // off fields_ptr; for overflow slots we route through `js_object_get_field`
@@ -1453,7 +1454,15 @@ pub(crate) unsafe fn build_shape_prefix_template(first_elem_bits: u64) -> Option
     }
     let keys_len = (*keys_arr).length;
     let field_count = (*obj).field_count;
-    let shape_fields = std::cmp::min(keys_len, field_count);
+    // Dynamic/parser-built objects store properties beyond the inline slot
+    // floor in OVERFLOW_FIELDS.  A template only reads inline slots, so using
+    // min(keys_len, field_count) here silently omitted every overflow key from
+    // every element in a homogeneous array.  Fall back to the generic object
+    // walker, which resolves those values through js_object_get_field.
+    if keys_len > field_count {
+        return None;
+    }
+    let shape_fields = keys_len;
     if shape_fields == 0 || shape_fields > 32 {
         return None;
     }
@@ -1546,7 +1555,7 @@ pub(crate) unsafe fn try_emit_shape_element(
         return false;
     }
     let obj = elem_ptr as *const crate::ObjectHeader;
-    if (*obj).keys_array != template.keys_arr {
+    if (*obj).keys_array != template.keys_arr || (*obj).field_count < template.shape_fields {
         return false;
     }
 

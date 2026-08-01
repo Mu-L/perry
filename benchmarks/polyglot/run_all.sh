@@ -230,13 +230,17 @@ stats_of() {
 # Run each language across all benches. Produces TSV file
 # `$TMPDIR/results_<lang>.tsv` with `bench<TAB>median|p95|stddev|min|max`.
 run_lang() {
-    local lang="$1" cmd="$2"
+    local lang="$1" cmd="$2" select_one="${3:-0}"
     local results="$TMPDIR/results_${lang}.tsv"
     : > "$results"
     for bk in "fibonacci:fibonacci" "loop_overhead:loop_overhead" "loop_data_dependent:loop_data_dependent" "array_write:array_write" "array_read:array_read" "math_intensive:math_intensive" "object_create:object_create" "nested_loops:nested_loops" "accumulate:accumulate"; do
         IFS=: read -r bench key <<< "$bk"
         local stats
-        stats=$(stats_of "$cmd" "$key" "$lang" "$bench")
+        local cell_cmd="$cmd"
+        if [[ "$select_one" == "1" ]]; then
+            cell_cmd="$cmd $bench"
+        fi
+        stats=$(stats_of "$cell_cmd" "$key" "$lang" "$bench")
         printf "%s\t%s\n" "$bench" "$stats" >> "$results"
     done
     echo "  $lang: done"
@@ -315,7 +319,10 @@ run_lang "cpp"    "$TMPDIR/bench_cpp"
 run_lang "swift"  "$TMPDIR/bench_swift"
 run_lang "go"     "$TMPDIR/bench_go"
 run_lang "java"   "java -cp $TMPDIR bench"
-run_lang "python" "python3 bench.py"
+# `bench.py` accepts a benchmark selector. Without it, each of these nine
+# cells reruns the entire Python suite 11 times and discards eight results,
+# turning the Python comparison leg from ~6 minutes into nearly an hour.
+run_lang "python" "python3 bench.py" 1
 
 # Lookup helpers
 field() { echo "$1" | cut -d'|' -f"$2"; }

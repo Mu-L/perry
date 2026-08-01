@@ -739,6 +739,35 @@ mod tests {
     }
 
     #[test]
+    fn stringify_materialized_array_records_preserves_overflow_fields() {
+        // The homogeneous-array template reads inline object slots directly.
+        // Once a parsed record grows past INLINE_SLOT_FLOOR, later properties
+        // live in OVERFLOW_FIELDS and the generic object walker must be used.
+        // The old template used min(keys_len, field_count), dropping `e` from
+        // every record after indexed access forced the lazy array into a tree.
+        let input = br#"[{"a":1,"b":2,"c":3,"d":4,"e":5},{"a":6,"b":7,"c":8,"d":9,"e":10}]"#;
+        let text = js_string_from_bytes(input.as_ptr(), input.len() as u32);
+        let tape = crate::json_tape::build_tape(input).unwrap();
+        let len = crate::json_tape::count_array_length(&tape.entries, 0);
+        let lazy = unsafe { crate::json_tape::alloc_lazy_array(&tape.entries, 0, len, text) };
+        let arr = unsafe { crate::json_tape::force_materialize_lazy(lazy) };
+
+        unsafe {
+            let elements =
+                (arr as *const u8).add(std::mem::size_of::<crate::ArrayHeader>()) as *const u64;
+            let first = (*elements & POINTER_MASK) as *const crate::ObjectHeader;
+            assert!((*(*first).keys_array).length > (*first).field_count);
+        }
+
+        let boxed = crate::value::js_nanbox_pointer(arr as i64);
+        let output = unsafe { js_json_stringify(boxed, TYPE_UNKNOWN) };
+        assert_eq!(
+            unsafe { str_from_header(output).unwrap() },
+            std::str::from_utf8(input).unwrap()
+        );
+    }
+
+    #[test]
     fn direct_parse_array_numeric_layout_preserves_and_downgrades() {
         let numeric_input = br#"[1,2,3]"#;
         let numeric_text = js_string_from_bytes(numeric_input.as_ptr(), numeric_input.len() as u32);
