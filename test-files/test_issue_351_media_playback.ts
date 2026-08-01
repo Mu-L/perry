@@ -94,3 +94,4 @@ crates/perry-runtime/src/media_playback.rs:
   - perry_media_set_volume
   - perry_media_stop
 */
+// parity-skip: Perry native UI/TUI fixture; Node has no oracle and CI compile-smoke covers this surface

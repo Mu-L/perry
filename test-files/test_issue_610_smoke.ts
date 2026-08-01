@@ -26,3 +26,4 @@ App({
         Button("set 5", () => { count.set(5); }),
     ]),
 });
+// parity-skip: Perry native UI/TUI fixture; Node has no oracle and CI compile-smoke covers this surface

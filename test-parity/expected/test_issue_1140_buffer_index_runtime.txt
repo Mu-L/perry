@@ -3,8 +3,8 @@ JS buf[7]=10
 JS buf.length=8
 JS buf.hex=89504e470d0a1a0a
 JS Array.from[0]=137
-JS buf[99]=0
-LISTENING 18994
+JS buf[99]=undefined
+LISTENING 31140
 RT chunk[0]=137
 RT chunk[last]=10
 RT chunk.length=8

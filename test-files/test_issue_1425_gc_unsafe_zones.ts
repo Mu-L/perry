@@ -67,3 +67,4 @@ main().catch(async (err: any) => {
   await app.close();
   wss?.close();
 });
+// parity-skip: externally supervised GC stress fixture; covered by the memory-stability gate

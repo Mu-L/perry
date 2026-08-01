@@ -40,3 +40,4 @@ render(Tabs({
     body: [Text("first"), Text("second")],
 }));
 console.log("\n=== first-tab done ===");
+// parity-skip: Perry native UI/TUI fixture; Node has no oracle and CI compile-smoke covers this surface

@@ -159,18 +159,20 @@ try {
 // PERRY-SKIP: crypto.getCipherInfo — Node prints `[Object: null prototype] { ... }` which Perry won't match
 // try { console.log("getCipherInfo aes-256-cbc:", crypto.getCipherInfo("aes-256-cbc")); } catch (e: any) { console.log("getCipherInfo error:", e.message); }
 
-// getCiphers / getCurves / getHashes — only print length + first 5 joined
+// OpenSSL's complete inventory changes across Node/OpenSSL versions and Perry
+// intentionally exposes a smaller supported subset. Assert shared required
+// algorithms instead of snapshotting unstable counts/order.
 try {
   const ciphers = crypto.getCiphers();
-  console.log("getCiphers length:", ciphers.length, "first5:", ciphers.slice(0, 5).join(","));
+  console.log("getCiphers has aes-256-gcm:", ciphers.includes("aes-256-gcm"));
 } catch (e: any) { console.log("getCiphers error:", e.message); }
 try {
   const curves = crypto.getCurves();
-  console.log("getCurves length:", curves.length, "first5:", curves.slice(0, 5).join(","));
+  console.log("getCurves has prime256v1:", curves.includes("prime256v1"));
 } catch (e: any) { console.log("getCurves error:", e.message); }
 try {
   const hashes = crypto.getHashes();
-  console.log("getHashes length:", hashes.length, "first5:", hashes.slice(0, 5).join(","));
+  console.log("getHashes has sha256:", hashes.includes("sha256"));
 } catch (e: any) { console.log("getHashes error:", e.message); }
 
 // HKDF

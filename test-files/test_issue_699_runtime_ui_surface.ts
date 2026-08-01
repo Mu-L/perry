@@ -271,3 +271,4 @@ crates/perry-runtime/src/tui/state.rs:
   - js_perry_tui_state_get
   - js_perry_tui_state_set
 */
+// parity-skip: Perry native UI/TUI fixture; Node has no oracle and CI compile-smoke covers this surface

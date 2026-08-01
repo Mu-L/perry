@@ -27,7 +27,9 @@
 import { createServer, connect } from "node:net";
 
 const PNG_MAGIC = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-const PORT = 18994;
+// Keep this fixture isolated from test_issue_1123_listen and the fetch incoming
+// message fixture when the parity runner shards tests in parallel.
+const PORT = 31140;
 
 // ── Regression guard for verified-fact #1: JS-constructed Buffer ──────────
 const jsBuf = Buffer.from(PNG_MAGIC);

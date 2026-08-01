@@ -37,3 +37,4 @@ app.post("/json-test", async (request, _reply) => {
 
 await app.listen({ port: PORT, host: "127.0.0.1" });
 console.log(`listening on :${PORT}`);
+// parity-skip: long-running Fastify server; covered by test-files/run_test_issue_1240.sh

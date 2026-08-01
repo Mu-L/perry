@@ -141,3 +141,4 @@ render(
 // Single trailing newline so the next shell prompt doesn't land on
 // top of the footer's last cell.
 console.log("");
+// parity-skip: Perry native UI/TUI fixture; Node has no oracle and CI compile-smoke covers this surface

@@ -1,0 +1,1 @@
+issue #538 background API surface OK

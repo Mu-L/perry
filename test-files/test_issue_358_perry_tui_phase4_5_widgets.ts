@@ -40,3 +40,4 @@ console.log("\n=== select done ===");
 // 5. TextArea — multi-line text, one Text per line.
 render(Box([Text("Notes:"), TextArea("first line\nsecond line\nthird line")]));
 console.log("\n=== textarea done ===");
+// parity-skip: Perry native UI/TUI fixture; Node has no oracle and CI compile-smoke covers this surface

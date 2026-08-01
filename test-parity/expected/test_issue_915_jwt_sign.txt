@@ -1,0 +1,5 @@
+object token typeof: string
+object token len > 0: true
+string token typeof: string
+string token len > 0: true
+issue 915 jwt.sign: ok

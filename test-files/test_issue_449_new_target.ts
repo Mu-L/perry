@@ -8,11 +8,10 @@
 // handle bits instead of NaN-boxed values (rendering as `2e-323` or
 // `NaN` depending on the access path).
 //
-// Fix: fold `new.target.<prop>` and `new.target?.<prop>` directly to
-// a string/undefined literal at HIR lowering time, mirroring the
-// v0.5.502 approach for `import.meta.<prop>`. Bare `new.target` falls
-// through to the existing Object fallback (still truthy, still works
-// for `new.target ? a : b`).
+// Fix: lower `new.target` as its runtime constructor reference and let the
+// ordinary optional-chain nullish guard handle `new.target?.name`. A plain
+// call therefore short-circuits on undefined while constructors (including
+// derived/arrow cases) retain the dynamic leaf target.
 //
 // platforms: macos, linux
 

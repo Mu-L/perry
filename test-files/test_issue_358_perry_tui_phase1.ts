@@ -23,3 +23,4 @@ render(root);
 // Marker line — printed AFTER render() completes, on its own row,
 // so the test runner sees it after any cell-grid output.
 console.log("\nperry/tui render ok");
+// parity-skip: Perry native UI/TUI fixture; Node has no oracle and CI compile-smoke covers this surface

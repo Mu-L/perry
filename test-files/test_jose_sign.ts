@@ -1,3 +1,4 @@
+// perry-parity-skip: requires the optional jose package and JS-runtime integration harness
 // jose JWT compile-as-package smoke. Uses the original task spec - native
 // createSecretKey now wires through to a Uint8Array-marked BufferHeader
 // that the bridge materializes as a real v8::Uint8Array when handed to

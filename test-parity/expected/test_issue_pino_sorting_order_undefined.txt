@@ -1,0 +1,6 @@
+a.value: AAA
+b.value: BBB
+a.tag: constants-shape
+b.tag: tools-shape
+destructured aValue: AAA
+destructured bValue: BBB

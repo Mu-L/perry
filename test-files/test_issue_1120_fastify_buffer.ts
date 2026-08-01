@@ -67,3 +67,4 @@ app.listen({ port: PORT, host: "127.0.0.1" }, (err: any) => {
         console.log("CLOSED");
     }, 1500);
 });
+// parity-skip: long-running Fastify server; covered by test-files/run_test_issue_1120.sh

@@ -48,3 +48,4 @@ render(
     )
 );
 console.log("\n=== flex-basis done ===");
+// parity-skip: Perry native UI/TUI fixture; Node has no oracle and CI compile-smoke covers this surface

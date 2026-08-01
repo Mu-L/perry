@@ -1,0 +1,5 @@
+initial deref: target
+unregister: true
+after deref: undefined
+after removed: undefined
+cleanup: none

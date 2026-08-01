@@ -12,8 +12,8 @@
 // short-circuited to `None` for every bound-native export except a
 // hardcoded http/https whitelist. graceful-fs guards on truthiness of
 // `fs$ReadStream` (truthy) then calls `Object.create(fs$ReadStream.prototype)`
-// → `Object.create(undefined)` → throw. The fix recognizes constructor-cased
-// bound-native exports (leading uppercase, not flagged non-constructable) and
+// → `Object.create(undefined)` → throw. The fix recognizes registered bound
+// native callable exports that are not explicitly marked non-constructable and
 // lets the synthetic-class path materialize a stable `.prototype` object.
 
 import * as fs from "node:fs";
@@ -42,6 +42,6 @@ const prototype: any = { child() { return null; } };
 Object.setPrototypeOf(prototype, (EventEmitter as any).prototype);
 console.log("setPrototypeOf(obj, EventEmitter.prototype) ok:", true);
 
-// 4. Non-constructor native exports keep `prototype === undefined`, matching
-//    Node's built-in non-constructor functions (no spurious synthesis).
+// 4. Node 26 also exposes an own prototype on lower-case native-module
+//    callables such as fs.readFile. Perry follows that current API shape.
 console.log("fs.readFile.prototype is undefined:", (fs as any).readFile.prototype === undefined);

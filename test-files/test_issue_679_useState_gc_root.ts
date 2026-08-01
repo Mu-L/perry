@@ -58,3 +58,4 @@ run(() => {
 console.log("LENGTH=" + postLoop_length);
 console.log("FIRST_STARTS_WITH_first=" + (postLoop_first.indexOf("first-") === 0));
 console.log("LAST_STARTS_WITH_last=" + (postLoop_last.indexOf("last-") === 0));
+// parity-skip: Perry native UI/TUI fixture; Node has no oracle and CI compile-smoke covers this surface

@@ -42,3 +42,4 @@ run(() => {
 });
 
 console.log("LAST_LEN=" + last_len);
+// parity-skip: Perry native UI/TUI fixture; Node has no oracle and CI compile-smoke covers this surface

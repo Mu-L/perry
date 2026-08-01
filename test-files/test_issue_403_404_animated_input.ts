@@ -32,3 +32,4 @@ console.log("\n=== cursor end done ===");
 // 6. Input 1-arg form — cursor as `_` at end (unchanged behavior).
 render(Input("legacy"));
 console.log("\n=== legacy 1-arg done ===");
+// parity-skip: Perry native UI/TUI fixture; Node has no oracle and CI compile-smoke covers this surface

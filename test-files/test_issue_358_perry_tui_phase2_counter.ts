@@ -32,3 +32,4 @@ run(() => Box([Text("count: " + count.get())]));
 // After run() returns, print the final count on the primary screen
 // (alt screen has been left). Tests pipe stdin and grep for FINAL=.
 console.log("FINAL=" + count.get());
+// parity-skip: Perry native UI/TUI fixture; Node has no oracle and CI compile-smoke covers this surface

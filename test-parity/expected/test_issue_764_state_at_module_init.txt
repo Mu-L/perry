@@ -1,0 +1,6 @@
+Initial cell.value = initial
+Before set: callbackFired = 0
+[stateOnChange] fired with: updated-once
+After 1st set: cell.value = updated-once callbackFired = 1 lastSeen = updated-once
+[stateOnChange] fired with: updated-twice
+After 2nd set: cell.value = updated-twice callbackFired = 2 lastSeen = updated-twice

@@ -1,0 +1,2 @@
+iterations completed without crash or hash corruption
+issue 859 regression: ok

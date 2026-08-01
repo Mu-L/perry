@@ -1,3 +1,4 @@
+// perry-parity-skip: requires the optional jose package and JS-runtime integration harness
 // Issue #819: end-to-end sign + verify roundtrip through the V8 fallback.
 //
 // Pre-fix: `js_async_step_chain(value, step)` checked

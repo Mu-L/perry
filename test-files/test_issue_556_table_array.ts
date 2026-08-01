@@ -9,3 +9,4 @@ App({
   height: 200,
   body: VStack(8, [t, Button("noop", () => {})]),
 });
+// parity-skip: Perry native UI/TUI fixture; Node has no oracle and CI compile-smoke covers this surface

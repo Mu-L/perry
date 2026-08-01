@@ -1,0 +1,11 @@
+all_no_params.length = 3
+all_one_str.length = 2
+all_one_str[0].x = a
+all_one_str[0].n = 1
+all_one_str[1].n = 3
+all_mixed.length = 2
+get_one.x = a
+get_one.n = 1
+get_no_params.x = a
+run.changes = 1
+after.n = 99

@@ -1,0 +1,5 @@
+token typeof: string
+decoded typeof: object
+decoded.sub: u-001
+decoded.acc: a-001
+issue 927 jwt.verify: ok

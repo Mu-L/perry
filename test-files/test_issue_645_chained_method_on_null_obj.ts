@@ -1,10 +1,9 @@
-// Closes #645 — chained method calls on a value that fell through
-// `js_native_call_method`'s catch-all used to crash with
-// `TypeError: (number).<method> is not a function`. The runtime
-// returned a literal `0.0` from the `is_valid_obj_ptr` reject path,
-// which the codegen interprets as IEEE-754 number zero — so the next
-// chained call saw a number receiver and the dispatcher's primitive-
-// receiver TypeError fired.
+// Closes #645 — chained method calls on a value that fell through the old
+// `js_native_call_method` catch-all used to turn a sentinel into numeric zero
+// and fail unpredictably later in the chain. Since #648 unknown methods on real
+// objects deliberately throw immediately; the stored expected output asserts
+// that this path remains an ordinary catchable TypeError rather than a signal
+// death or numeric-pointer crash.
 //
 // Repro shape (drizzle's `this.stmt.raw().all(...params)` boiled down
 // to its essentials): a chained method call where the receiver of
@@ -13,12 +12,8 @@
 // methods, every step in the chain must produce a `typeof === "object"`
 // value — not a number — so the chain doesn't crash mid-way.
 //
-// Acceptance: the program runs to completion. Pre-fix it crashed at
-// the second `.method()` with `(number).method is not a function`.
-// We don't compare byte-for-byte with Node here because Node throws
-// at the FIRST `.method()` (its standard semantics); Perry's silent-
-// fall-through behavior is documented and tracked separately as part
-// of the unimplemented-API surface (#648 / #463).
+// Acceptance: the program exits with the pinned TypeError at the first unknown
+// call. Node also throws there, but its source-located diagnostic differs.
 
 const obj: any = {};
 const r1 = obj.nonExistentMethodA();

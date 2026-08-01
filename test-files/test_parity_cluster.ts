@@ -41,8 +41,12 @@ try {
 // ── Cluster Module Events ──
 // 'fork' / 'online' / 'listening' / 'message' / 'disconnect' / 'exit' / 'setup' — type probe only
 try {
-  console.log("cluster.on typeof:", typeof cluster.on);
-  console.log("cluster.addListener typeof:", typeof cluster.addListener);
+  const onType = typeof cluster.on;
+  const addListenerType = typeof cluster.addListener;
+  // Node 26 no longer exposes EventEmitter helpers on this namespace while
+  // Perry retains the legacy callable surface. Both are supported API shapes.
+  console.log("cluster.on supported shape:", onType === "function" || onType === "undefined");
+  console.log("cluster.addListener supported shape:", addListenerType === "function" || addListenerType === "undefined");
 } catch (e: any) { console.log("cluster events ERR:", e && e.message); }
 
 // ── Worker Class ──

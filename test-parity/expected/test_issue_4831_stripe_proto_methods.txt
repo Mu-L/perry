@@ -1,0 +1,5 @@
+typeof stripe.products?.create: function
+typeof stripe.products?.retrieve: function
+stripe.products.create(): called:POST path:init-path
+stripe.products._stripe: sk_test_dummy
+typeof stripe.products._makeRequest: function

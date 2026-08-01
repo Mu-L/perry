@@ -22,3 +22,4 @@ App({
     Image({ url: "https://example.com/a.png", alt: "A" }),
   ]),
 });
+// parity-skip: Perry native UI/TUI fixture; Node has no oracle and CI compile-smoke covers this surface

@@ -43,3 +43,4 @@ console.log("\n--red--");
 
 render(Box([Text("bg!", { backgroundColor: "yellow" })]));
 console.log("\n--bg--");
+// parity-skip: Perry native UI/TUI fixture; Node has no oracle and CI compile-smoke covers this surface

@@ -33,3 +33,4 @@ console.log("\n--padded done--");
 const plain = Box([Text("p1"), Text("p2")]);
 render(plain);
 console.log("\n--plain done--");
+// parity-skip: Perry native UI/TUI fixture; Node has no oracle and CI compile-smoke covers this surface
