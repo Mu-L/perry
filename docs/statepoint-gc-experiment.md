@@ -447,6 +447,29 @@ carrying the structural correctness model — the explicit bridge becomes a
 deletion candidate once RS4GC grows has_try coverage and a leaner
 zero-live-record story (upstream pass option recorded on #7174).
 
+## The repsel-erasure projection, measured — and corrected
+
+Both this campaign and the representation-selection plan share the
+assumption that repsel promotion erases native-root metadata ("each value
+proven non-pointer deletes its records"; the repsel plan itself notes "the
+GC currency was not measured at all"). First measurement, using the #7133
+knob-scoping fixes: `batch.ts` under statepoints with all landed
+promotions on versus `PERRY_CANONICAL_{I32,U32,STR}_LOCALS=0` is
+**byte-identical** — 24,752 B of metadata, 198 statepoints, 363
+relocations, 33 root slots, unchanged.
+
+The correction this forces: the landed promotion classes remove *calls
+and guards* (the performance currency), but they promote values the
+rooter's type analysis already classified non-pointer — so they delete
+zero roots. The metadata-erasure currency is paid only by promotions in
+the maybe-pointer population: untyped locals, temporaries, and dependency
+JS — exactly where repsel coverage is currently weakest (the
+`__esModule` barrier, minified slot reuse). The "repsel erases the 25×
+gap" projection therefore needs either the Track E/F work (types made
+load-bearing, dependency-JS recovery) or `Ptr<Shape>`-class promotions
+feeding a typed-slot story, not wider scalar coverage. Recorded so
+neither campaign builds on the uncorrected assumption.
+
 **Conclusion, stated as the design law this branch keeps re-deriving:**
 *with an optimizing compiler between the source and the safepoint, root
 metadata without relocation semantics is unsound — per-call plain maps
