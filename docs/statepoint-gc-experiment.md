@@ -485,8 +485,14 @@ with `-lunwind`):
   reconstruction (`SP = FP + 16 − stack_size`) is wrong on aarch64-Linux
   (frame pair at the bottom, not the top) — fast walk and unwinder
   disagreed by the layout delta on one slot. Fix: SP-relative locations
-  disqualify the fast chain off-Darwin until the Linux constant is derived;
-  the unwinder serves meanwhile. A silent-fallback foot-gun was also found:
+  disqualify the fast chain off-Darwin — and the follow-up disassembly
+  proved this permanent, not provisional: generated prologues set
+  `x29 = sp + 0x30` and `x29 = sp + 0x60` for stack sizes 128 and 192 —
+  the offset varies per function with the callee-save area below the pair,
+  so no `(FP, stack_size)` formula exists on aarch64-Linux. The unwinder
+  is the sound Linux path; a Linux fast chain requires FP-relative spills
+  from LLVM (upstream) or per-function side metadata (the compact-section
+  ghost). A silent-fallback foot-gun was also found:
   an unrecognized `--target` value compiles for HOST (Mach-O out of
   `linux-arm64`); the accepted spelling is `linux-aarch64`.
 
