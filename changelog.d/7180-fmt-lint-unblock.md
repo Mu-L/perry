@@ -1,0 +1,1 @@
+**`lint` unblocked on `main`.** #7161 landed with a `rustfmt` violation in `crates/perry-runtime/src/gc/tests/triggers.rs`, which fails `cargo fmt --all -- --check` — the `lint` job every PR must pass. Pure formatting, no behaviour change.
