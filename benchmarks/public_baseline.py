@@ -61,8 +61,9 @@ EXPECTED_COMPONENT_BENCHMARKS = {
     },
     "json_polyglot": {"roundtrip", "field_access"},
     "app_patterns": {
-        "buffer_transcode", "date_format_parse", "json_parse_1mb", "json_stringify_1mb",
-        "map_1m", "object_deep_clone", "promise_all_chains", "regex_replace",
+        "batch", "buffer_transcode", "date_format_parse", "json_parse_1mb",
+        "json_stringify_1mb", "map_1m", "object_deep_clone", "promise_all_chains",
+        "regex_replace",
         "string_concat_csv", "string_split_map_join", "string_template_interp",
     },
     "honest_bench": {"image_convolution", "json_pipeline_small", "json_pipeline_full"},
@@ -497,10 +498,17 @@ def _replace_block(text: str, block: str) -> str:
     return before + block + after
 
 
+def _replace_optional_block(text: str, block: str) -> str:
+    """Replace the generated block when present, or preserve an unmarked README."""
+    if README_START not in text and README_END not in text:
+        return text
+    return _replace_block(text, block)
+
+
 def render(artifact: Mapping[str, Any]) -> None:
+    readme = README.read_text(encoding="utf-8")
     README.write_text(
-        _replace_block(README.read_text(encoding="utf-8"), readme_block(artifact)),
-        encoding="utf-8",
+        _replace_optional_block(readme, readme_block(artifact)), encoding="utf-8"
     )
     SUITE_RESULTS.write_text(suite_results(artifact), encoding="utf-8")
 
@@ -532,8 +540,9 @@ def validate_public(artifact: Mapping[str, Any], max_age_days: int) -> None:
 
 def check(artifact: Mapping[str, Any], max_age_days: int) -> None:
     validate_public(artifact, max_age_days)
-    expected_readme = _replace_block(README.read_text(encoding="utf-8"), readme_block(artifact))
-    if expected_readme != README.read_text(encoding="utf-8"):
+    readme = README.read_text(encoding="utf-8")
+    expected_readme = _replace_optional_block(readme, readme_block(artifact))
+    if expected_readme != readme:
         raise ArtifactError("README Node/Bun table has drifted from the public artifact")
     if suite_results(artifact) != SUITE_RESULTS.read_text(encoding="utf-8"):
         raise ArtifactError("suite RESULTS.md has drifted from the public artifact")

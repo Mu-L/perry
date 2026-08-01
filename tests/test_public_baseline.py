@@ -2,11 +2,13 @@ import unittest
 
 from benchmarks.benchmark_gate import ArtifactError, build_artifact
 from benchmarks.public_baseline import (
+    EXPECTED_COMPONENT_BENCHMARKS,
     EXPECTED_SUITE_BENCHMARKS,
     README_END,
     README_START,
     _CARGO_VERSION_RE,
     _replace_block,
+    _replace_optional_block,
     _validate_suite,
     distribution,
     normalize_honest,
@@ -40,6 +42,9 @@ class PublicBaselineTests(unittest.TestCase):
             utc_z_timestamp("2026-07-12T04:03:04+02:00"),
             "2026-07-12T02:03:04Z",
         )
+
+    def test_app_pattern_contract_includes_batch_workload(self):
+        self.assertIn("batch", EXPECTED_COMPONENT_BENCHMARKS["app_patterns"])
 
     def test_honest_component_requires_complete_correct_samples(self):
         metadata = self.honest_metadata()
@@ -146,6 +151,12 @@ class PublicBaselineTests(unittest.TestCase):
             _replace_block(original, block),
             f"before\n{README_START}\nnew\n{README_END}\nafter\n",
         )
+
+    def test_generated_marker_replacement_is_optional_but_not_partial(self):
+        unmarked = "# Perry\n\nHand-curated performance summary.\n"
+        self.assertEqual(_replace_optional_block(unmarked, "generated"), unmarked)
+        with self.assertRaisesRegex(ArtifactError, "markers are missing"):
+            _replace_optional_block(f"{README_START}\n", "generated")
 
     def test_suite_validation_requires_every_workload_and_passing_correctness(self):
         records = []
