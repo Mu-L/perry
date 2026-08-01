@@ -135,7 +135,16 @@ fn index_records(records: Vec<StackMapRecord>) -> StackMapIndex {
     let chain_walkable = records.iter().all(|record| {
         record.locations.iter().all(|location| {
             location.dwarf_reg == DWARF_REG_FP_AARCH64
-                || (location.dwarf_reg == DWARF_REG_SP_AARCH64 && record.stack_size >= 16)
+                // `SP = FP + 16 - stack_size` is the DARWIN AArch64 frame
+                // layout ([x29, x30] at the top of the frame). Verified wrong
+                // on aarch64-Linux by the Pi's verify-walker run: fast walk
+                // and unwinder disagreed by exactly the layout delta on the
+                // same slot. Until the Linux constant is DERIVED (not
+                // ported), SP-relative locations disqualify the fast chain
+                // off-Darwin and the always-correct unwinder serves instead.
+                || (cfg!(target_os = "macos")
+                    && location.dwarf_reg == DWARF_REG_SP_AARCH64
+                    && record.stack_size >= 16)
         })
     });
     let min_pc = records.first().map_or(usize::MAX, |record| record.pc);
