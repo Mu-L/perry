@@ -1316,6 +1316,10 @@ fn lower_precise_roots_to_native_stack(
         let cannot_collect = direct_callee.is_some_and(|callee| {
             match crate::gc_call_effects::classify_direct_callee(callee) {
                 crate::gc_call_effects::GcCallEffect::CannotCollect => true,
+                // Control never returns here: no relocation is consumed and
+                // the frame's roots are dead past the call. Deeper frames
+                // carry their own records.
+                crate::gc_call_effects::GcCallEffect::NeverReturns => true,
                 // Under the explicit-safepoint contract the runtime
                 // guarantees these helpers' triggers never consume this
                 // frame's precise roots (they defer to a declared safepoint

@@ -229,7 +229,7 @@ fn stable_type_key(ty: &perry_hir::types::Type) -> String {
 /// We also mix in environment variables that `perry-codegen` reads
 /// at compile time but that aren't part of `CompileOptions`:
 /// `PERRY_DEBUG_INIT`, `PERRY_DEBUG_SYMBOLS`, `PERRY_LLVM_CLANG`,
-/// `PERRY_WRITE_BARRIERS`, `PERRY_SHADOW_STACK`, `PERRY_STACK_MAPS`,
+/// `PERRY_WRITE_BARRIERS`, `PERRY_SHADOW_STACK`,
 /// `PERRY_STATEPOINTS`,
 /// `PERRY_DISABLE_BUFFER_FAST_PATH`, `PERRY_VERIFY_NATIVE_REGIONS`,
 /// `PERRY_UNBOXED_OBJECT_FIELDS`, and `PERRY_TARGET_CPU`. See the env-var
@@ -760,7 +760,7 @@ fn compute_object_cache_key_with_env(
     //     calls at heap-store sites (codegen.rs / expr.rs).
     //   - PERRY_SHADOW_STACK=0/off/false suppresses generated frame/slot
     //     roots at function entry and pointer local stores.
-    //   - PERRY_STACK_MAPS=1 lowers those precise roots to LLVM native-frame
+    //   - (historical) PERRY_STACK_MAPS lowered precise roots to plain LLVM stackmap records; deleted, statepoint fallback keeps the lowering internal. PERRY_STATEPOINTS=1 lowers roots to native-frame
     //     stack maps instead of the runtime shadow stack.
     //   - PERRY_STATEPOINTS=1 replaces supported calls with LLVM statepoint
     //     relocation sequences and uses native stack maps for the remainder.
@@ -798,10 +798,6 @@ fn compute_object_cache_key_with_env(
     h.field(
         "env_shadow_stack",
         env_var("PERRY_SHADOW_STACK").as_deref().unwrap_or(""),
-    );
-    h.field(
-        "env_stack_maps",
-        env_var("PERRY_STACK_MAPS").as_deref().unwrap_or(""),
     );
     h.field(
         "env_statepoints",

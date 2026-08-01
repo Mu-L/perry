@@ -216,7 +216,7 @@ pub fn render_text(records: &[FunctionRecord]) -> String {
     );
     if records.is_empty() {
         out.push_str(
-            "No native-stack lowering records were emitted. Enable PERRY_STACK_MAPS=1\n\
+            "No native-stack lowering records were emitted. Enable PERRY_STATEPOINTS=1\n\
              or PERRY_STATEPOINTS=1 and ensure codegen is not served from cache.\n",
         );
         return out;

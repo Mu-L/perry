@@ -23,6 +23,14 @@ pub(crate) enum GcCallEffect {
     /// consumed at this call site and it needs no statepoint. Without the
     /// contract these remain safepoints.
     AllocNoReentry,
+    /// The callee never returns to this call site (audited 2026-08-01: every
+    /// `js_throw*` helper funnels into `exception::js_throw`, which is
+    /// `-> !` — the `f64` results are unreachable ABI shape). No relocation
+    /// can ever be consumed downstream and the frame's roots are dead past
+    /// the call, so the site needs no metadata in ANY mode. Values the
+    /// helper itself holds are its own frame's responsibility
+    /// (`RuntimeHandleScope`/temp roots), exactly as for every helper call.
+    NeverReturns,
     Unknown,
 }
 
@@ -92,6 +100,7 @@ pub(crate) fn classify_direct_callee(name: &str) -> GcCallEffect {
         | "js_array_push_f64"
         | "js_array_length"
         | "js_array_slice_values" => GcCallEffect::AllocNoReentry,
+        name if name.starts_with("js_throw") => GcCallEffect::NeverReturns,
         _ => GcCallEffect::Unknown,
     }
 }

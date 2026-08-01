@@ -74,34 +74,19 @@ pub(super) fn shadow_stack_enabled() -> bool {
     })
 }
 
-/// Research-only precise-root backend using LLVM's
-/// `llvm.experimental.stackmap` intrinsic.
-///
-/// `PERRY_STACK_MAPS=1` keeps the existing pointer-local/liveness analysis but
-/// changes the storage and discovery mechanism: roots remain in their native
-/// frame allocas and LLVM records those writable locations at call sites. The
-/// runtime can then unwind the native stack and visit the exact slots without
-/// a parallel heap-backed shadow stack.
-///
-/// This is intentionally opt-in while the experiment establishes correctness,
-/// target coverage, and performance. It is independent of
-/// `PERRY_SHADOW_STACK=0`: the latter still disables precise-root analysis
-/// entirely, while this selects the backend used when that analysis is on.
-pub(crate) fn stack_maps_enabled() -> bool {
-    matches!(
-        std::env::var("PERRY_STACK_MAPS").as_deref(),
-        Ok("1") | Ok("on") | Ok("true")
-    )
-}
-
 /// Research-only moving-GC backend using LLVM's explicit statepoint
-/// relocation sequence.
+/// relocation sequence (`PERRY_STATEPOINTS=1`).
 ///
-/// This is separate from `PERRY_STACK_MAPS` so the two native-stack
-/// prototypes can be measured independently. Statepoint mode still consumes
-/// LLVM's stack-map section at runtime, but supported calls are represented
-/// by `gc.statepoint` / `gc.result` / `gc.relocate` instead of a standalone
-/// metadata marker plus compiler memory barriers.
+/// The standalone plain-stack-map mode (`PERRY_STACK_MAPS`) was deleted per
+/// the GC knob kill-policy after the quiet-host matrix: statepoints matched
+/// it within timer quantization, and it is structurally unsound — LLVM's
+/// stackmap intrinsic can record a root slot's address as `Register R#N`
+/// (caller-saved, unrecoverable at collection time), making those roots
+/// invisible to the collector by construction. The plain-map LOWERING
+/// survives only as this mode's internal fallback for `try`/setjmp
+/// functions and unsupported call forms. The Register hazard exists there
+/// too, which is why shrinking the fallback set is the remaining
+/// correctness work for this backend, tracked in the experiment doc.
 pub(crate) fn statepoints_enabled() -> bool {
     matches!(
         std::env::var("PERRY_STATEPOINTS").as_deref(),
@@ -112,7 +97,7 @@ pub(crate) fn statepoints_enabled() -> bool {
 /// Whether precise roots should use a native-stack metadata backend rather
 /// than Perry's heap-backed shadow frame.
 pub(crate) fn native_stack_roots_enabled() -> bool {
-    stack_maps_enabled() || statepoints_enabled()
+    statepoints_enabled()
 }
 
 /// `PERRY_GC_SAFEPOINT_ONLY=1` — the explicit-safepoint collection contract
