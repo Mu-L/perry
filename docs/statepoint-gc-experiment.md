@@ -437,7 +437,11 @@ explicit bridge** — and metadata is 3,875,416 B, within 3.1% of the
 audited bridge's 3,757,520. Total file: 31,957,792, the smallest native
 arm measured. SSA liveness pruning compensates for the record constant at
 scale exactly as predicted. Leaf-attribute transfer verified by record
-count (200 → 103 on probe 01). RS4GC is therefore already the preferred
+count (200 → 103 on probe 01). Runtime (8 probes × 9 interleaved reps, loaded host, arms share load —
+directional): shadow 218.1 ms geo-mean, bridge+contract 216.3 ms (−0.83%),
+RS4GC 216.1 ms (−0.93%) — the fastest arm measured. Max RSS: flat with
+shadow on the four churn-heaviest probes (27/27, 36/36, 37/38, 25/25 MB).
+RS4GC is therefore already the preferred
 native backend on every axis measured except probe-scale metadata, while
 carrying the structural correctness model — the explicit bridge becomes a
 deletion candidate once RS4GC grows has_try coverage and a leaner
