@@ -1,6 +1,6 @@
 // Auto-generated from Perry's API manifest (#465). Do not edit by hand.
 // Source: perry-api-manifest::API_MANIFEST
-// Coverage: 1998 entries across 121 modules
+// Coverage: 2000 entries across 122 modules
 
 type PerryU32 = number & { readonly __perryU32?: never };
 type PerryU64 = number & { readonly __perryU64?: never };
@@ -1932,6 +1932,13 @@ declare module "ioredis" {
   export class Redis { [key: string]: any; }
   /** stdlib */
   export function createClient(p0: any): any;
+}
+
+declare module "iovalkey" {
+  /** stdlib */
+  export class Redis { [key: string]: any; }
+  /** stdlib */
+  export function createClient(...args: any[]): any;
 }
 
 declare module "iroh" {
