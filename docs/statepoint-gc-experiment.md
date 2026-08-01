@@ -321,8 +321,8 @@ evacuation + walker-verify, strict-enforcement gate fires, RSS flat):
 
 Metadata trajectory on `batch.ts` statepoints, all without any
 representation-selection improvement: 442 (first prototype) → 217
-(call-effect audit) → 198 (noreturn elision) → **181 under the contract —
-−59% total**. The remaining big step is the property-access diamonds
+(call-effect audit) → 198 (noreturn elision) → 181 (contract) → **172 after
+the second audit round — −61% total**. The remaining big step is the property-access diamonds
 (~85 sites), which fall to repsel `Ptr<Shape>`.
 
 ## The compact per-function experiment — a measured NEGATIVE result
@@ -364,7 +364,8 @@ application with every in-branch reduction live:
 |---|---:|---:|---:|
 | shadow (default) | 28,474,576 | 20,376,748 | 0 |
 | statepoint | 32,206,720 | 20,227,252 | 4,025,336 |
-| statepoint + contract | 32,008,560 | 20,226,728 | **3,832,384** |
+| statepoint + contract | 32,008,560 | 20,226,728 | 3,832,384 |
+| + second audit round | 31,925,984 | 20,223,400 | **3,757,520** |
 
 Two model corrections, one in each direction. The metadata came in at
 **3.83 MB — below the refined model band's 4.5 MB floor** (the audit,
