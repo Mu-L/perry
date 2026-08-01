@@ -249,6 +249,59 @@ prerequisite lands, the next experiment is to assert that moving collections
 occur only at declared safepoints and then measure whether the conservative
 scanner can be deleted.
 
+## Quiet-host matrix (2026-08-01, reserved Mac mini)
+
+First measurement of this experiment not taken on a loaded host: Apple M1
+(4P+4E), macOS 26.5.1, the gc-ratchet pinned-baseline platform, reserved
+with baseline load 1.4–1.9 from release infrastructure only (recorded
+per-rep). Artifacts shipped SHA-pinned from `4e3d5c70e` (no cargo on the
+host); all four arms hash-distinct per probe; 8×4 forced-evacuation preflight
+plus walker-verify and the strict-enforcement gate all green there before
+any timing. 11 interleaved reps, rotated arm order, `/usr/bin/time -l`.
+Caveat: 10 ms timer granularity puts ±1 quantum (≈2–9% on these probe
+durations) on any single cell; medians were stable across reps.
+
+Runtime, median seconds (spread), delta vs shadow:
+
+| Probe | Shadow | Plain map | Statepoint | Contract |
+|---|---:|---:|---:|---:|
+| Nursery churn | 0.160 | 0.160 (+0.0%) | 0.160 (+0.0%) | 0.160 (+0.0%) |
+| Survivor promotion | 0.190 | 0.180 (−5.3%) | 0.190 (+0.0%) | 0.190 (+0.0%) |
+| Cross-gen writes | 0.190 | 0.180 (−5.3%) | 0.180 (−5.3%) | 0.190 (+0.0%) |
+| **Dead after deep stack** | 0.430 | 0.410 (−4.7%) | **0.410 (−4.7%)** | 0.410 (−4.7%) |
+| Closure capture | 0.140 | 0.130 (−7.1%) | 0.130 (−7.1%) | 0.130 (−7.1%) |
+| String retention | 0.110 | 0.110 (+0.0%) | 0.120 (+9.1%, one quantum) | 0.120 |
+| Array grow/evacuate | 0.150 | 0.150 (+0.0%) | 0.150 (+0.0%) | 0.150 (+0.0%) |
+| Map/set side tables | 0.430 | 0.430 (+0.0%) | 0.430 (+0.0%) | 0.430 (+0.0%) |
+
+Geometric means vs shadow: plain maps −2.83%, statepoints −1.10%,
+contract −0.43%.
+
+**The deep-stack weakness is closed.** The probe that was ~20% slower on
+the loaded host is now 4.7% *faster* than shadow, and the attribution is
+exact: the same statepoint binary with `PERRY_STACKMAP_WALKER=unwind` runs
+at 0.430 — precise shadow parity — so the x29-chain walker is the entire
+difference.
+
+Max RSS: every cell within ±0.8% of shadow (ratchet-comparable platform).
+Uncached `batch.ts` compile: shadow 0.590 s, statepoints 0.570 s (−3.4%) —
+the loaded-host "+5.3% slower to compile" claim did not survive quiet
+measurement and is withdrawn.
+
+Metadata (`__llvm_stackmaps`, summed over the eight probes): plain maps
+42,936 B, statepoints 81,104 B (1.89×), contract 73,952 B (−8.8% vs
+statepoint). Generated `__text` is ~5.8 KB smaller across the eight
+binaries in the native arms (probe code is small; the shadow-stack text
+delta scales with generated code, per #7108's 13.3% on a real app).
+
+Standing conclusion after this matrix: on wall-clock, RSS, and compile
+time, statepoints are at worst tied with the shadow stack on this
+hardware; metadata remains the only losing axis, and it is the axis
+repsel promotion shrinks. The plain-map arm no longer earns its keep as
+anything but a control: statepoints match it within quantization, and it
+is structurally unsound (`Register R#1`). Small-hardware and Linux
+numbers still require the ELF scanner port.
+
 ## Which statepoint design this tests
 
 This is the explicit bridge, not LLVM's `RewriteStatepointsForGC` pipeline.
