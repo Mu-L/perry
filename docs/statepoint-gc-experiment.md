@@ -388,6 +388,22 @@ than its own first prototype — and its remaining 25× size gap is proven
 maybe-pointer root set, or RS4GC managed-pointer SSA. Both are tracked;
 neither is this branch's to deliver.
 
+### The transfer question, also measured: can the audit shrink the SHADOW stack?
+
+The audited call-effect facts apply to shadow bookkeeping in principle — a
+function whose every call is provably non-collecting needs no shadow frame
+at all, by the same soundness argument the statepoint elisions passed gates
+with. Census on the real app's traced IR (instrument validated against
+#7108's function totals): **118 of 1,535 shadow-framed functions qualify
+(7.7%), covering only 4.0% of shadow-op IR lines.** The elidable functions
+are small leaves; the cost lives in large functions with genuine collecting
+calls. Whole-frame elision would recover well under 1% of generated text —
+recorded here as measured-and-not-pursued (finer per-region elision is
+complexity the win does not justify). The shadow stack's remaining text
+cost is, as the repsel campaign already measured from the other side,
+bookkeeping for values that cannot yet be proven non-pointers — one more
+place every road converges on representation selection.
+
 **Conclusion, stated as the design law this branch keeps re-deriving:**
 *with an optimizing compiler between the source and the safepoint, root
 metadata without relocation semantics is unsound — per-call plain maps
