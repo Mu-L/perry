@@ -4734,6 +4734,24 @@ pub fn run_with_parse_cache(
         }
     }
 
+    // Issue #76 follow-up — auto-provision the wasmi host staticlib. A
+    // program that references `WebAssembly.*` sets `ctx.needs_wasm_runtime`
+    // (feature_detect.rs), which links `libperry_wasm_host.a`. That archive
+    // lives in the standalone `perry-wasm-host` crate and is built by NOTHING
+    // in the normal compile path — not the auto-optimize runtime/stdlib
+    // rebuild, not codegen — so a bare `perry compile` used to die with
+    // `libperry_wasm_host.a not found` until a human ran
+    // `cargo build --release -p perry-wasm-host`. Build it on demand here so
+    // both the symbol-stub scan below and the final link resolve it. No-op
+    // when it already exists (or when the program doesn't use wasm).
+    let use_wasm_host = ctx.needs_wasm_runtime || args.enable_wasm_runtime;
+    let wasm_host_lib_resolved = if use_wasm_host {
+        find_wasm_host_library(target.as_deref())
+            .or_else(|| build_wasm_host_library(target.as_deref(), format, verbose))
+    } else {
+        None
+    };
+
     // Auto-mode: pick the smallest matching (features, panic) profile
     // for this binary and rebuild perry-runtime + perry-stdlib in a
     // hash-keyed target dir. Both halves fall back to the prebuilt full
@@ -4775,12 +4793,7 @@ pub fn run_with_parse_cache(
         // being linked, scan its archive so the `perry_wasm_host_*` symbols
         // are recognised as defined and we don't synthesise empty stubs that
         // would shadow the real implementations.
-        let use_wasm_host = ctx.needs_wasm_runtime || args.enable_wasm_runtime;
-        let wasm_host_lib_path = if use_wasm_host {
-            find_wasm_host_library(target.as_deref())
-        } else {
-            None
-        };
+        let wasm_host_lib_path = wasm_host_lib_resolved.clone();
         let mut all_scan_paths: Vec<PathBuf> = obj_paths.clone();
         if let Some(ref p) = runtime_lib_path {
             all_scan_paths.push(p.clone());
@@ -5456,10 +5469,8 @@ pub fn run_with_parse_cache(
         if let Some(p) = &stdlib_lib_resolved {
             push_archive(&mut link_archives, "stdlib", p);
         }
-        if ctx.needs_wasm_runtime || args.enable_wasm_runtime {
-            if let Some(p) = find_wasm_host_library(target.as_deref()) {
-                push_archive(&mut link_archives, "wasm-host", &p);
-            }
+        if let Some(p) = &wasm_host_lib_resolved {
+            push_archive(&mut link_archives, "wasm-host", p);
         }
         if ctx.needs_ui {
             if let Some(p) = find_ui_library(target.as_deref()) {
@@ -5791,8 +5802,8 @@ pub fn run_with_parse_cache(
     // a hard error when codegen detected `WebAssembly.*` usage, otherwise the
     // flag-only case silently degrades to None (the user will hit a link
     // error on first use, with the symbol name as the breadcrumb).
-    let wasm_host_lib = if ctx.needs_wasm_runtime || args.enable_wasm_runtime {
-        match find_wasm_host_library(target.as_deref()) {
+    let wasm_host_lib = if use_wasm_host {
+        match wasm_host_lib_resolved {
             Some(lib) => {
                 if let OutputFormat::Text = format {
                     println!("Using wasmi WebAssembly host runtime");
