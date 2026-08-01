@@ -21,8 +21,11 @@ use crate::value::{js_nanbox_get_pointer, js_nanbox_pointer, JSValue, TAG_UNDEFI
 use crate::StringHeader;
 
 /// Class id reserved for String iterators. Sits just past the Set iterator id
-/// (0xFFFF0008) in the 0xFFFF prefix reserved for runtime-defined classes.
-pub const STRING_ITERATOR_CLASS_ID: u32 = 0xFFFF_0009;
+/// RegExp String Iterator id (0xFFFF000A) in the 0xFFFF prefix reserved for
+/// runtime-defined classes. `0xFFFF0009` belongs to the TC39 Iterator-helper
+/// object; sharing it made every helper method dispatch through the String
+/// Iterator arm and return `undefined`.
+pub const STRING_ITERATOR_CLASS_ID: u32 = 0xFFFF_000B;
 
 unsafe fn alloc_iterator(cp_array: *mut ArrayHeader) -> f64 {
     let obj = js_object_alloc(STRING_ITERATOR_CLASS_ID, 2);

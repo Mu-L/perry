@@ -24,12 +24,14 @@ var g3 = new G();
 g3.w = 7;  // no own "w" — must route to the prototype setter
 out.push("t2=" + log2.join(",") + "|" + g3.w + "|" + g1.w);
 
-// 3) Freeze AFTER warm-up: writes must be dropped (sloppy mode) on the frozen instance only.
+// 3) Freeze AFTER warm-up: Reflect.set reports the blocked write without the
+// module's strict-mode assignment throwing, so the instance-local result can
+// still be compared.
 function H() { this.q = 1; }
 var h1 = new H(), h2 = new H();
 for (var i = 0; i < 50000; i++) { h1.q = i; }
 Object.freeze(h2);
-h2.q = 123;
+Reflect.set(h2, "q", 123);
 out.push("t3=" + h2.q + "|" + h1.q);
 
 // 4) Non-writable data property on the prototype after warm-up blocks fresh instances' stores.
@@ -38,7 +40,7 @@ var k1 = new K();
 for (var i = 0; i < 50000; i++) { k1.m = i; }
 Object.defineProperty(Object.getPrototypeOf(k1), "n", { value: 42, writable: false });
 var k2 = new K();
-k2.n = 7;  // inherited non-writable — sloppy-mode silent no-op, no own prop
+Reflect.set(k2, "n", 7);  // inherited non-writable — no own prop
 out.push("t4=" + k2.n + "|" + Object.prototype.hasOwnProperty.call(k2, "n"));
 
 console.log(out.join(" "));

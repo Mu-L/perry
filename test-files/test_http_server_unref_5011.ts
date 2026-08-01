@@ -1,4 +1,4 @@
-const http = require('http');
+import * as http from 'node:http';
 const s = http.createServer(() => {});
 console.log(typeof s.unref(), s.unref() === s);
 console.log(typeof s.ref(), s.ref() === s);

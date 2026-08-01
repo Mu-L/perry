@@ -1245,10 +1245,16 @@ pub extern "C" fn js_instanceof(value: f64, class_id: u32) -> f64 {
         // Request` is true, matching a bare handle.
         if jsval.is_pointer() {
             let raw = jsval.as_pointer::<u8>() as usize;
-            if let Some(id) = unsafe { crate::object::fetch_subclass_handle_id(raw) } {
-                if let Some(probe) = crate::object::fetch_handle_kind_probe() {
-                    if unsafe { probe(id as usize) } == want {
-                        return true_val;
+            // A bare fetch value is a POINTER_TAG-wrapped small registry id.
+            // A cross-brand check (for example `response instanceof Request`)
+            // reaches this fallback after its kind probe misses; never treat
+            // that small id as an ObjectHeader and dereference it.
+            if crate::value::addr_class::is_above_handle_band(raw) {
+                if let Some(id) = unsafe { crate::object::fetch_subclass_handle_id(raw) } {
+                    if let Some(probe) = crate::object::fetch_handle_kind_probe() {
+                        if unsafe { probe(id as usize) } == want {
+                            return true_val;
+                        }
                     }
                 }
             }

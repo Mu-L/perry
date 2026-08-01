@@ -873,6 +873,37 @@ pub(crate) unsafe fn run_class_constructor_on_this_flat(
     args_ptr: *const f64,
     args_len: usize,
 ) -> bool {
+    run_class_constructor_on_this_flat_impl(parent_cid, None, this_raw, args_ptr, args_len)
+}
+
+/// The heap-class-object counterpart of [`run_class_constructor_on_this_flat`].
+/// A class expression evaluated inside a factory carries its captures on that
+/// particular class object, not in the template-wide declaration snapshot.
+/// Dynamic `super()` must therefore replay the parent constructor with the
+/// parent VALUE as its capture receiver (`class Child extends makeBase(x)`).
+pub(crate) unsafe fn run_class_object_constructor_on_this_flat(
+    parent_value: f64,
+    parent_cid: u32,
+    this_raw: i64,
+    args_ptr: *const f64,
+    args_len: usize,
+) -> bool {
+    run_class_constructor_on_this_flat_impl(
+        parent_cid,
+        Some(parent_value),
+        this_raw,
+        args_ptr,
+        args_len,
+    )
+}
+
+unsafe fn run_class_constructor_on_this_flat_impl(
+    parent_cid: u32,
+    parent_value: Option<f64>,
+    this_raw: i64,
+    args_ptr: *const f64,
+    args_len: usize,
+) -> bool {
     if this_raw == 0 || parent_cid == 0 {
         return false;
     }
@@ -928,7 +959,21 @@ pub(crate) unsafe fn run_class_constructor_on_this_flat(
                 }
             }
             for slot in 0..sig_caps as usize {
-                final_args.push(caps.get(slot).map(|b| f64::from_bits(*b)).unwrap_or(undef));
+                let capture = if cur == parent_cid {
+                    if let Some(receiver) = parent_value {
+                        // Per-evaluation class-expression captures win even
+                        // when the slot intentionally contains `undefined`.
+                        js_class_capture_value_for_receiver(receiver, cur, slot as u32)
+                    } else {
+                        caps.get(slot).map(|b| f64::from_bits(*b)).unwrap_or(undef)
+                    }
+                } else {
+                    // Captures on the leaf class object belong only to that
+                    // template. If constructor lookup walked to an ancestor,
+                    // use that ancestor's declaration snapshot instead.
+                    caps.get(slot).map(|b| f64::from_bits(*b)).unwrap_or(undef)
+                };
+                final_args.push(capture);
             }
             let _ = call_vtable_method(
                 ctor_ptr,

@@ -6,7 +6,9 @@
 //! aren't valid UTF-8, so the wrapper can't go through the standard
 //! `read_string` / `alloc_string` path.
 
-use flate2::read::{GzEncoder, MultiGzDecoder, ZlibDecoder, ZlibEncoder};
+use flate2::read::{
+    DeflateDecoder, DeflateEncoder, GzEncoder, MultiGzDecoder, ZlibDecoder, ZlibEncoder,
+};
 use flate2::Compression;
 use perry_ffi::{alloc_buffer, BufferHeader, ErrorKind};
 use std::io::{Error as IoError, ErrorKind as IoErrorKind, Read};
@@ -64,6 +66,20 @@ fn deflate_bytes_with(data: &[u8], level: Compression) -> std::io::Result<Vec<u8
 
 fn inflate_bytes(data: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut decoder = ZlibDecoder::new(data);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed)?;
+    Ok(decompressed)
+}
+
+fn deflate_raw_bytes_with(data: &[u8], level: Compression) -> std::io::Result<Vec<u8>> {
+    let mut encoder = DeflateEncoder::new(data, level);
+    let mut compressed = Vec::new();
+    encoder.read_to_end(&mut compressed)?;
+    Ok(compressed)
+}
+
+fn inflate_raw_bytes(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut decoder = DeflateDecoder::new(data);
     let mut decompressed = Vec::new();
     decoder.read_to_end(&mut decompressed)?;
     Ok(decompressed)
@@ -132,6 +148,43 @@ pub unsafe extern "C" fn js_zlib_deflate_sync(data_bits: i64, opts: f64) -> *mut
 pub unsafe extern "C" fn js_zlib_inflate_sync(data_bits: i64) -> *mut BufferHeader {
     stream::js_zlib_validate_buffer_arg(data_bits); // #3662
     match stream::read_input_from_bits(data_bits).map(|d| inflate_bytes(&d)) {
+        Some(Ok(out)) => alloc_buffer(&out),
+        Some(Err(err)) => throw_deflate_decode_error(err),
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// `zlib.deflateRawSync(data, options?)`.
+///
+/// The well-known zlib wrapper must export every symbol codegen can emit when
+/// it replaces the bundled stdlib codec. These raw variants were present only
+/// in `perry-stdlib`, so auto-optimized programs linked the wrapper and then
+/// failed with an undefined symbol.
+///
+/// # Safety
+/// `data_value` is a raw NaN-boxed JS value; `opts` is an options object or
+/// `undefined`.
+#[no_mangle]
+pub unsafe extern "C" fn js_zlib_deflate_raw_sync(data_value: f64, opts: f64) -> *mut BufferHeader {
+    let data_bits = data_value.to_bits() as i64;
+    stream::js_zlib_validate_options(opts, 8);
+    stream::js_zlib_validate_buffer_arg(data_bits);
+    let level = stream::compression_from_opts(opts);
+    match stream::read_input_from_bits(data_bits).map(|d| deflate_raw_bytes_with(&d, level)) {
+        Some(Ok(out)) => alloc_buffer(&out),
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// `zlib.inflateRawSync(data)`.
+///
+/// # Safety
+/// `data_value` is a raw NaN-boxed string/Buffer/TypedArray value.
+#[no_mangle]
+pub unsafe extern "C" fn js_zlib_inflate_raw_sync(data_value: f64) -> *mut BufferHeader {
+    let data_bits = data_value.to_bits() as i64;
+    stream::js_zlib_validate_buffer_arg(data_bits);
+    match stream::read_input_from_bits(data_bits).map(|d| inflate_raw_bytes(&d)) {
         Some(Ok(out)) => alloc_buffer(&out),
         Some(Err(err)) => throw_deflate_decode_error(err),
         _ => std::ptr::null_mut(),
@@ -228,6 +281,13 @@ mod tests {
             .read_to_end(&mut raw)
             .unwrap();
         assert!(inflate_bytes(&raw).is_err());
+    }
+
+    #[test]
+    fn raw_deflate_round_trips() {
+        let input = b"raw deflate raw deflate raw deflate";
+        let compressed = deflate_raw_bytes_with(input, Compression::best()).unwrap();
+        assert_eq!(inflate_raw_bytes(&compressed).unwrap(), input);
     }
 
     // End-to-end TS smoke tests cover the FFI Buffer allocation path.

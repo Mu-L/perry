@@ -864,8 +864,8 @@ pub unsafe extern "C" fn js_fetch_or_value_super(
                     );
                     if parent_cid != 0 {
                         if let Some(obj) = subclass_this_object_ptr(this_box) {
-                            super::super::class_constructors::run_class_constructor_on_this_flat(
-                                parent_cid, obj as i64, args_ptr, args_len,
+                            super::super::class_constructors::run_class_object_constructor_on_this_flat(
+                                parent_val, parent_cid, obj as i64, args_ptr, args_len,
                             );
                             return undef;
                         }
@@ -878,8 +878,8 @@ pub unsafe extern "C" fn js_fetch_or_value_super(
                     let parent_cid = crate::object::js_object_get_class_id(p as *const _);
                     if parent_cid != 0 {
                         if let Some(obj) = subclass_this_object_ptr(this_box) {
-                            super::super::class_constructors::run_class_constructor_on_this_flat(
-                                parent_cid, obj as i64, args_ptr, args_len,
+                            super::super::class_constructors::run_class_object_constructor_on_this_flat(
+                                parent_val, parent_cid, obj as i64, args_ptr, args_len,
                             );
                         }
                     }

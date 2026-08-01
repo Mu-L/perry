@@ -628,6 +628,20 @@ pub(crate) fn lower_stmt(ctx: &mut FnCtx<'_>, stmt: &Stmt) -> Result<()> {
 
 fn emit_preallocate_boxes(ctx: &mut FnCtx<'_>, ids: &[u32], tdz: bool) -> Result<()> {
     for id in ids {
+        // A promoted module binding already has one shared storage location:
+        // `@perry_global_*`.  Ordinary hoist preallocation must not also create
+        // a function-local box for it.  Closures deliberately filter module
+        // globals out of their capture arrays and read the global directly;
+        // creating a local box here made the later `let` initialize that box
+        // while closure writes went to the global.  The entry body then
+        // preferred the shadowing local slot and observed the raw box pointer
+        // instead of the value (#3086's block-scoped `events` accumulator).
+        //
+        // Keep TDZ preallocation unchanged for now: unlike `js_box_get_bits`,
+        // a direct global load does not yet perform the TAG_TDZ check.
+        if !tdz && ctx.module_globals.contains_key(id) {
+            continue;
+        }
         if ctx.locals.contains_key(id) {
             // A previous PreallocateBoxes (or an unusual nesting)
             // already set this up -- skip to keep the existing slot.

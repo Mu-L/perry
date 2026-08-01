@@ -82,23 +82,11 @@
     "category": "gap-categorical",
     "reason": "console write validation — categorical console gap; standing per #5917."
   },
-  "test_gap_diagchannel_3082_3084_3085_3086": {
-    "issue": "3082",
-    "added": "2026-07-04",
-    "category": "bug-open",
-    "reason": "diagnostics_channel cluster (#3082/#3084/#3085/#3086); standing per #5917."
-  },
   "test_gap_dyn_index_get_denormal_safe": {
     "issue": "5917",
     "added": "2026-07-04",
     "category": "bug-open",
     "reason": "dynamic index-get denormal safety; standing per #5917 diff."
-  },
-  "test_gap_fetch_instanceof_5433": {
-    "issue": "5433",
-    "added": "2026-07-04",
-    "category": "bug-open",
-    "reason": "fetch Response/Request instanceof (#5433); standing per #5917."
   },
   "test_gap_fetch_response_json_init": {
     "issue": "5917",
@@ -111,12 +99,6 @@
     "added": "2026-07-04",
     "category": "module-inventory",
     "reason": "global API surface inventory; standing per #5917."
-  },
-  "test_gap_iterator_helpers_2874": {
-    "issue": "2874",
-    "added": "2026-07-04",
-    "category": "bug-open",
-    "reason": "iterator helpers (#2874); standing per #5917."
   },
   "test_gap_module_const_local_shadow": {
     "issue": "5917",
@@ -135,12 +117,6 @@
     "added": "2026-07-04",
     "category": "bug-open",
     "reason": "Object static-method tail; standing per #5917 (cf. #5588 lineage)."
-  },
-  "test_gap_perfhooks_3088_3008_3010_3011": {
-    "issue": "3088",
-    "added": "2026-07-04",
-    "category": "module-inventory",
-    "reason": "perf_hooks cluster (#3088/#3008/#3010/#3011); standing per #5917."
   },
   "test_gap_sqlite_3183plus": {
     "issue": "3183",
@@ -172,12 +148,6 @@
     "category": "gap-categorical",
     "reason": "Symbol surface tail; standing per #5917."
   },
-  "test_gap_stream_tee_tick_parity": {
-    "issue": "6477",
-    "added": "2026-07-20",
-    "category": "bug-open",
-    "reason": "Web Streams tee cold-start fires one extra microtask tick before the first branch read on a pre-buffered+closed source (t2 vs Node's t1). Delicate cadence calibration (post-#6657 tee/pipe tick parity); a naive fix risks the Next.js Flight byte-parity #6657 tuned. Deferred to the streams pull-ordering work in #6477."
-  },
   "test_gap_v8_2_3680plus": {
     "issue": "3680",
     "added": "2026-07-04",
@@ -196,12 +166,6 @@
     "category": "gap-bisect",
     "reason": "yield* inherited-iterator `this` — tracked via #5917 standing-tail worklist (eyeball-for-newness pair)."
   },
-  "test_gap_zlib_3285_params": {
-    "issue": "3285",
-    "added": "2026-07-04",
-    "category": "bug-open",
-    "reason": "zlib params (#3285); standing per #5917."
-  },
   "test_gap_readline_3698plus": {
     "issue": "3698",
     "added": "2026-07-04",
@@ -213,35 +177,5 @@
     "added": "2026-07-13",
     "category": "bug-open",
     "reason": "DisposableStack/Symbol.dispose surface incomplete: `.disposed` returns undefined where Node returns false/true, and the dispose path leaves the adopt/defer callback count at 0. NEWLY VISIBLE, not a regression: DisposableStack is Node 24+, so under CI's old Node 22 pin *node itself* exited non-zero, the harness classified the test `node_fail`, and it was dropped from the gate entirely. Raising the oracle to 26 (.node-version) makes the pre-existing gap observable for the first time. Perry's implementation lives in crates/perry-runtime/src/disposable.rs. Flips to PASS when #6364 lands."
-  },
-  "test_gap_zlib_4917_level": {
-    "issue": "6847",
-    "added": "2026-07-26",
-    "category": "toolchain",
-    "reason": "auto-opt pairs the ext-zlib provider archive with a feature-stripped stdlib rebuild: undefined js_zlib_deflate_raw_sync + panic_unwind symbols on a COLD object cache (warm /tmp caches mask it, which is how it went unnoticed). Compiles fine with PERRY_NO_AUTO_OPTIMIZE=1. Not a parity regression."
-  },
-  "test_gap_zlib_fs_assert_2935_2752_2971": {
-    "issue": "6847",
-    "added": "2026-07-26",
-    "category": "toolchain",
-    "reason": "auto-opt pairs the ext-zlib provider archive with a feature-stripped stdlib rebuild: undefined js_zlib_deflate_raw_sync + panic_unwind symbols on a COLD object cache (warm /tmp caches mask it, which is how it went unnoticed). Compiles fine with PERRY_NO_AUTO_OPTIMIZE=1. Not a parity regression."
-  },
-  "test_gap_3662_node_argvalidation": {
-    "issue": "6847",
-    "added": "2026-07-26",
-    "category": "toolchain",
-    "reason": "auto-opt pairs the ext-zlib provider archive with a feature-stripped stdlib rebuild: undefined js_zlib_deflate_raw_sync + panic_unwind symbols on a COLD object cache (warm /tmp caches mask it, which is how it went unnoticed). Compiles fine with PERRY_NO_AUTO_OPTIMIZE=1. Not a parity regression."
-  },
-  "test_gap_constants_tail_3683plus": {
-    "issue": "6847",
-    "added": "2026-07-26",
-    "category": "toolchain",
-    "reason": "auto-opt pairs the ext-zlib provider archive with a feature-stripped stdlib rebuild: undefined js_zlib_deflate_raw_sync + panic_unwind symbols on a COLD object cache (warm /tmp caches mask it, which is how it went unnoticed). Compiles fine with PERRY_NO_AUTO_OPTIMIZE=1. Not a parity regression."
-  },
-  "test_gap_handle_band_object_ops": {
-    "issue": "6847",
-    "added": "2026-07-26",
-    "category": "toolchain",
-    "reason": "auto-opt pairs the ext-zlib provider archive with a feature-stripped stdlib rebuild: undefined js_zlib_deflate_raw_sync + panic_unwind symbols on a COLD object cache (warm /tmp caches mask it, which is how it went unnoticed). Compiles fine with PERRY_NO_AUTO_OPTIMIZE=1. Not a parity regression."
   }
 }

@@ -95,18 +95,11 @@ unsafe fn iterator_step(iter_f64: f64) -> (f64, bool) {
     }
     let iter_obj = iter_ptr as *const ObjectHeader;
 
-    let next_key = js_string_from_bytes(b"next".as_ptr(), 4);
-    let next_val = js_object_get_field_by_name(iter_obj, next_key);
-    let next_ptr = if next_val.is_undefined() {
-        std::ptr::null::<ClosureHeader>()
-    } else {
-        js_nanbox_get_pointer(f64::from_bits(next_val.bits())) as *const ClosureHeader
-    };
-    let use_field = !next_ptr.is_null() && is_closure_ptr(next_ptr as usize);
-
-    let result_f64 = if use_field {
-        js_closure_call1(next_ptr, f64::from_bits(TAG_UNDEFINED))
-    } else {
+    let result_f64 = if crate::array::is_builtin_iterator_class_id(iter_ptr as usize) {
+        // Built-in iterator `next` methods live on their shared family
+        // prototypes.  A named lookup therefore returns a thunk that expects
+        // `this` through the native method dispatcher; calling that closure as
+        // a bare field leaves `this` undefined and fails its brand check.
         crate::object::js_native_call_method(
             iter_f64,
             b"next".as_ptr() as *const i8,
@@ -114,6 +107,25 @@ unsafe fn iterator_step(iter_f64: f64) -> (f64, bool) {
             std::ptr::null(),
             0,
         )
+    } else {
+        let next_key = js_string_from_bytes(b"next".as_ptr(), 4);
+        let next_val = js_object_get_field_by_name(iter_obj, next_key);
+        let next_ptr = if next_val.is_undefined() {
+            std::ptr::null::<ClosureHeader>()
+        } else {
+            js_nanbox_get_pointer(f64::from_bits(next_val.bits())) as *const ClosureHeader
+        };
+        if !next_ptr.is_null() && is_closure_ptr(next_ptr as usize) {
+            js_closure_call1(next_ptr, f64::from_bits(TAG_UNDEFINED))
+        } else {
+            crate::object::js_native_call_method(
+                iter_f64,
+                b"next".as_ptr() as *const i8,
+                4,
+                std::ptr::null(),
+                0,
+            )
+        }
     };
 
     let result_ptr = js_nanbox_get_pointer(result_f64);
@@ -488,5 +500,25 @@ pub unsafe fn dispatch_iterator_helper_method(
             }
         }
         _ => f64::from_bits(TAG_UNDEFINED),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn builtin_iterator_class_ids_are_unique() {
+        let mut ids = [
+            crate::buffer::BUFFER_ITERATOR_CLASS_ID,
+            crate::array::ARRAY_ITERATOR_CLASS_ID,
+            crate::collection_iter_object::MAP_ITERATOR_CLASS_ID,
+            crate::collection_iter_object::SET_ITERATOR_CLASS_ID,
+            super::ITERATOR_HELPER_CLASS_ID,
+            crate::regex::REGEXP_STRING_ITERATOR_CLASS_ID,
+            crate::string::STRING_ITERATOR_CLASS_ID,
+        ];
+        ids.sort_unstable();
+        for pair in ids.windows(2) {
+            assert_ne!(pair[0], pair[1], "iterator class ids must not overlap");
+        }
     }
 }

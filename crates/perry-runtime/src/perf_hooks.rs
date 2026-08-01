@@ -566,14 +566,16 @@ pub extern "C" fn js_perf_mark(name_val: f64, options_val: f64) -> f64 {
             // startTime, when present, must be a finite number (Node:
             // ERR_INVALID_ARG_TYPE → a TypeError).
             if option_present(opts, "startTime") {
-                match option_number(opts, "startTime") {
+                let start_time_value = option_value(opts, "startTime");
+                match num_of(start_time_value) {
                     Some(st) => {
                         validate_user_timing_timestamp(st);
                         start_time = st;
                     }
-                    None => throw_type_error_with_code(
-                        "The \"startTime\" option must be of type number",
-                        "ERR_INVALID_ARG_TYPE",
+                    None => crate::validators::throw_invalid_arg_type(
+                        "startTime",
+                        "of type number",
+                        f64::from_bits(start_time_value.bits()),
                     ),
                 }
             }
@@ -605,10 +607,7 @@ pub extern "C" fn js_perf_measure(name_val: f64, arg2: f64, arg3: f64) -> f64 {
     unsafe {
         let name_jv = JSValue::from_bits(name_val.to_bits());
         let Some(name) = string_of(name_jv) else {
-            throw_type_error_with_code(
-                "The \"name\" argument must be of type string",
-                "ERR_INVALID_ARG_TYPE",
-            );
+            crate::validators::throw_invalid_arg_type("name", "of type string", name_val);
         };
         let arg2_jv = JSValue::from_bits(arg2.to_bits());
 
@@ -1261,15 +1260,12 @@ pub extern "C" fn js_perf_observer_observe(obs_val: f64, opts: f64) -> f64 {
         let opts_jv = JSValue::from_bits(opts.to_bits());
         if opts_jv.is_undefined() {
             throw_type_error_with_code(
-                "The \"options\" argument must be specified",
+                "The \"options.entryTypes\" and \"options.type\" arguments must be specified",
                 "ERR_MISSING_ARGS",
             );
         }
         let Some(opts_obj) = as_object_ptr(opts) else {
-            throw_type_error_with_code(
-                "The \"options\" argument must be of type object",
-                "ERR_INVALID_ARG_TYPE",
-            );
+            crate::validators::throw_invalid_arg_type("options", "of type object", opts);
         };
 
         let entry_types_v = option_value(opts_obj, "entryTypes");
@@ -1278,22 +1274,26 @@ pub extern "C" fn js_perf_observer_observe(obs_val: f64, opts: f64) -> f64 {
         let has_type = !type_v.is_undefined();
         if !has_entry_types && !has_type {
             throw_type_error_with_code(
-                "The \"options.entryTypes\" or \"options.type\" argument must be specified",
+                "The \"options.entryTypes\" and \"options.type\" arguments must be specified",
                 "ERR_MISSING_ARGS",
             );
         }
         if has_entry_types && has_type {
+            let received = crate::builtins::format_jsvalue(f64::from_bits(entry_types_v.bits()), 0);
             throw_type_error_with_code(
-                "The \"options.entryTypes\" and \"options.type\" arguments cannot both be specified",
+                &format!(
+                    "The property 'options.entryTypes' options.entryTypes can not set with options.type together. Received {received}"
+                ),
                 "ERR_INVALID_ARG_VALUE",
             );
         }
 
         if has_entry_types {
             if !is_array_value(entry_types_v) {
-                throw_type_error_with_code(
-                    "The \"options.entryTypes\" argument must be an instance of Array",
-                    "ERR_INVALID_ARG_TYPE",
+                crate::validators::throw_invalid_arg_type(
+                    "options.entryTypes",
+                    "string[]",
+                    f64::from_bits(entry_types_v.bits()),
                 );
             }
             let arr = array_ptr_from_value(entry_types_v);
@@ -1314,9 +1314,10 @@ pub extern "C" fn js_perf_observer_observe(obs_val: f64, opts: f64) -> f64 {
 
         if has_type {
             let Some(s) = string_of(type_v) else {
-                throw_type_error_with_code(
-                    "The \"options.type\" argument must be of type string",
-                    "ERR_INVALID_ARG_TYPE",
+                crate::validators::throw_invalid_arg_type(
+                    "options.type",
+                    "of type string",
+                    f64::from_bits(type_v.bits()),
                 );
             };
             if let Some(code) = entry_type_code(&s) {

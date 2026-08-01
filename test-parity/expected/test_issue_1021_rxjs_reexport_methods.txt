@@ -1,0 +1,4 @@
+subscribe:plain
+subscribe:seed:next:value
+error:boom
+closed

@@ -751,6 +751,14 @@ start_echo_server() {
         echo "Warning: $ECHO_SERVER_SCRIPT not found — test_net_min / test_net_socket will fail parity"
         return
     fi
+    # Sharded parity runs can share one companion server.  Detect an existing
+    # healthy listener before spawning so we never retain the PID of a child
+    # that immediately exits with EADDRINUSE (and later risk signalling a
+    # recycled, unrelated PID from the cleanup trap).
+    if wait_for_tcp_port 127.0.0.1 17891 1 0; then
+        echo "Echo server already available on 127.0.0.1:17891; reusing it"
+        return
+    fi
     "$PYTHON_CMD" "$ECHO_SERVER_SCRIPT" &
     ECHO_SERVER_PID=$!
     # Poll up to 5 s (50 × 100 ms) for the server to accept connections.

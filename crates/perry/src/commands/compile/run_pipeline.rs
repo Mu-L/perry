@@ -102,6 +102,51 @@ fn imported_class_from_hir(
     }
 }
 
+/// Fill the ABI arity of imported synthesized default constructors.
+///
+/// HIR deliberately leaves `class Child extends Parent {}` without an own
+/// constructor. Codegen nevertheless emits a standalone Child constructor
+/// whose signature adopts the nearest constructor-bearing ancestor's arity so
+/// it can implement `constructor(...args) { super(...args) }`. Import metadata
+/// used to report only `class.constructor`, so a consumer declared that symbol
+/// with zero post-`this` parameters and dropped every user argument. Resolve
+/// the same inherited arity after the transitive parent closure has populated
+/// `imported_classes`.
+fn fill_imported_synthesized_constructor_arities(
+    imported_classes: &mut [perry_codegen::ImportedClass],
+) {
+    let resolved: Vec<Option<usize>> = imported_classes
+        .iter()
+        .map(|class| {
+            if class.has_own_constructor || class.parent_name.is_none() {
+                return None;
+            }
+            let mut parent_name = class.parent_name.as_deref();
+            let mut depth = 0usize;
+            while let Some(name) = parent_name {
+                let parent = imported_classes.iter().find(|candidate| {
+                    candidate.local_alias.as_deref().unwrap_or(&candidate.name) == name
+                })?;
+                if parent.has_own_constructor || parent.constructor_param_count > 0 {
+                    return Some(parent.constructor_param_count);
+                }
+                parent_name = parent.parent_name.as_deref();
+                depth += 1;
+                if depth >= 32 {
+                    return None;
+                }
+            }
+            None
+        })
+        .collect();
+
+    for (class, inherited_arity) in imported_classes.iter_mut().zip(resolved) {
+        if let Some(arity) = inherited_arity {
+            class.constructor_param_count = arity;
+        }
+    }
+}
+
 /// Same as [`run`] but accepts an optional in-memory [`ParseCache`] that
 /// `perry dev` uses to reuse parsed ASTs across rebuilds in a single session.
 /// Pass `None` for the batch-compile path.
@@ -4088,6 +4133,8 @@ pub fn run_with_parse_cache(
                     }
                 }
             }
+
+            fill_imported_synthesized_constructor_arities(&mut imported_classes);
 
             // Type aliases from all modules
             let type_alias_map: std::collections::HashMap<String, perry_hir::types::Type> =

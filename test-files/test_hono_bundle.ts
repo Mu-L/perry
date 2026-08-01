@@ -6,6 +6,7 @@
 // so by itself the test only proves the compiler doesn't choke on the
 // `import { Hono } from 'hono';` line. The real bundle-walks-recursively
 // validation lives in /tmp/perry-hono in the PR notes.
+// parity-skip: requires the hono package; covered by the Tier 3 Hono project fixture
 import { Hono } from 'hono';
 const app = new Hono();
 app.get('/', (c) => c.text('Hi'));

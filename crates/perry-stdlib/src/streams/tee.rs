@@ -287,6 +287,24 @@ pub(super) unsafe fn tee_schedule_pull(source: usize) {
 /// extra hop. CHAINED cycles and producer-side arrivals keep their existing
 /// calibrated cadence throughout.
 pub(super) unsafe fn tee_schedule_pull_demand(source: usize) {
+    // A default stream that was fully buffered and closed before `tee()` has
+    // no live source-pull stage to await.  Node 26 resolves its first branch
+    // read after the ordinary tee fan-out hop; charging the live-source cold
+    // pipeline's extra hop puts the first pair one microtask late (#6477).
+    // Keep byte streams and still-live producers on the calibrated two-hop
+    // path below: their clone/pull scheduling is covered by the RSC cadence
+    // fixtures and is intentionally different.
+    let buffered_closed_default = {
+        let streams = READABLE_STREAMS.lock().unwrap();
+        streams
+            .get(&source)
+            .map(|s| !s.is_byte_stream && s.state == ReadableState::Closed && !s.chunks.is_empty())
+            .unwrap_or(false)
+    };
+    if buffered_closed_default {
+        tee_schedule_pull(source);
+        return;
+    }
     if TEE_STARTED.lock().unwrap().contains(&source) {
         tee_schedule_pull(source);
         return;
