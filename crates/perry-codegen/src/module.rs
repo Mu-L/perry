@@ -803,9 +803,29 @@ impl LlModule {
             }
             ir.push('\n');
 
-            // Declares for everything this unit references but does not define.
+            // Declares for everything this unit REFERENCES but does not
+            // define. Emitting the whole module's declaration list into every
+            // unit left a per-unit floor that splitting cannot reduce: a
+            // 24-function benchmark carried 2,972 declares (149 KB) per unit,
+            // and the 13 MB Claude Code bundle carried ~16,700 — which is how
+            // units stayed above a gigabyte and hit clang's 2^31 source-location
+            // ceiling ("translation unit is too large ... ran out of source
+            // locations") regardless of unit count. Referenced names include
+            // those reached through the initializers of the globals this unit
+            // emits, so the closure computed above feeds this filter too.
+            // `collect_symbol_refs` yields `@name`; `decl_by_name` is keyed on
+            // the bare name, so strip the sigil or nothing ever matches.
+            let mut needed: HashSet<&str> = bucket_refs[bi]
+                .iter()
+                .map(|nm| nm.trim_start_matches('@'))
+                .collect();
+            for gi in &bucket_needs[bi] {
+                for nm in &global_refs[*gi] {
+                    needed.insert(nm.trim_start_matches('@'));
+                }
+            }
             for (name, decl) in &decl_by_name {
-                if defined.contains(name) {
+                if defined.contains(name) || !needed.contains(*name) {
                     continue;
                 }
                 ir.push_str(decl);
@@ -900,7 +920,16 @@ mod tests {
                     "referencing unit must define or externally declare the global"
                 );
             }
-            assert!(u.contains("declare void @js_console_log_number(double)"));
+            // Declares are now scoped to what a unit references (the
+            // whole-module declaration list was a per-unit floor that
+            // splitting could not reduce). A unit that calls the helper must
+            // still declare it.
+            if u.contains("call void @js_console_log_number") {
+                assert!(
+                    u.contains("declare void @js_console_log_number(double)"),
+                    "a unit calling the helper must declare it"
+                );
+            }
             assert!(u.contains("target triple = \"arm64-apple-macosx15.0.0\""));
         }
     }
@@ -1052,7 +1081,12 @@ mod tests {
         m.declare_function("js_is_truthy", I32, &[DOUBLE]);
         for k in 0..2 {
             let f = m.define_function(format!("perry_fn_m__f{k}"), DOUBLE, vec![]);
-            f.create_block("entry").ret(DOUBLE, "0.0");
+            let b = f.create_block("entry");
+            // Reference the helper so the declare is genuinely needed: declares
+            // are scoped per unit now, and a test whose units never call the
+            // helper would assert nothing about its attribute group.
+            b.call(I32, "js_is_truthy", &[(DOUBLE, "0.0")]);
+            b.ret(DOUBLE, "0.0");
         }
         let units = m.render_codegen_units(2);
         assert_eq!(units.len(), 2);
