@@ -26,6 +26,15 @@ use super::temp_root::{lower_operand_pair_rooted, temp_root_release};
 use super::{is_known_finite, lower_expr, FnCtx};
 
 fn lower_arithmetic_operand(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<(String, bool)> {
+    // A tracked fresh typed-array view with a proven element bound already
+    // produces a native numeric value. Preserve that representation through
+    // the arithmetic boundary instead of materializing it through generic
+    // IndexGet and then emitting a redundant `js_number_coerce`.
+    if let Expr::IndexGet { object, index } = expr {
+        if let Some(value) = super::lower_typed_array_load(ctx, object, index)? {
+            return Ok((super::materialize_js_value_without_record(ctx, value), true));
+        }
+    }
     // #6884: a statically typed numeric TypedArray read is Number|undefined,
     // not an unconditional raw f64. In arithmetic context the OOB `undefined`
     // must become canonical NaN. Sink that conversion into the OOB/cold arms

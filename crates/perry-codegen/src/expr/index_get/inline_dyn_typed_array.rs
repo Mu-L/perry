@@ -5,6 +5,7 @@
 //! visibility of the entry point is widened to `pub(super)` so the trunk's
 //! call sites keep compiling).
 
+use crate::native_value::{BoundsState, BufferAccessMode, LoweredValue, MaterializationReason};
 use crate::types::{DOUBLE, F32, I1, I16, I32, I64, I8};
 
 use super::FnCtx;
@@ -334,7 +335,28 @@ pub(super) fn lower_inline_dyn_typed_array_get(
         .map(|(v, l)| (v.as_str(), l.as_str()))
         .collect();
     incoming_refs.push((slow_val.as_str(), slow_end_label.as_str()));
-    ctx.block().phi(DOUBLE, &incoming_refs)
+    let merged = ctx.block().phi(DOUBLE, &incoming_refs);
+    let lowered = if coerce_slow_to_number {
+        LoweredValue::f64(merged.clone())
+    } else {
+        LoweredValue::js_value(merged.clone())
+    };
+    ctx.record_lowered_value_with_access_mode(
+        "TypedArrayGet",
+        None,
+        "TypedArrayGet.inline_dynamic_guarded",
+        &lowered,
+        Some(BoundsState::Guarded {
+            guard_id: "typed_array_kind_cache_and_bounds".to_string(),
+        }),
+        None,
+        Some(BufferAccessMode::CheckedNative),
+        Some(MaterializationReason::RuntimeApi),
+        false,
+        false,
+        vec!["typed_array_fallback=js_dyn_index_get".to_string()],
+    );
+    merged
 }
 
 /// Emit one per-kind small-integer (1/2-byte) typed-array element load block for

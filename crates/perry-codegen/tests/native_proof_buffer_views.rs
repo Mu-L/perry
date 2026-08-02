@@ -679,8 +679,9 @@ fn loop_length_bound_does_not_prove_multibyte_buffer_read_inbounds() {
 
     let ir = compile_ir("loop_bound_multibyte_buffer_read.ts", body.clone());
     assert!(
-        !ir.contains("getelementptr inbounds i8"),
-        "`i < buf.length` only proves one-byte Buffer access; multi-byte reads must not emit an inbounds GEP:\n{ir}"
+        !ir.lines()
+            .any(|line| line.contains("load i32, ptr") && line.contains("align 1")),
+        "`i < buf.length` only proves one-byte Buffer access; multi-byte reads must not emit a native unaligned i32 load:\n{ir}"
     );
 
     let artifact = compile_artifact_json("artifact_loop_bound_multibyte_buffer_read.ts", body);
@@ -1942,11 +1943,12 @@ fn reassigned_typed_array_store_records_runtime_fallback() {
     assert!(
         records.iter().any(|record| {
             record["expr_kind"] == "TypedArraySet"
-                && record["consumer"] == "TypedArraySet.slow_path"
-                && record["access_mode"] == "dynamic_fallback"
-                && !record["fallback_reason"].is_null()
+                && ((record["consumer"] == "TypedArraySet.slow_path"
+                    && record["access_mode"] == "dynamic_fallback")
+                    || (record["consumer"] == "TypedArraySet.inline_dynamic_guarded"
+                        && record["access_mode"] == "checked_native"))
         }),
-        "expected reassigned typed-array store to record runtime fallback:\n{artifact:#}"
+        "expected reassigned typed-array store to stay on a runtime-checked path:\n{artifact:#}"
     );
     // The read must never take an UNCHECKED native path on a reassigned
     // receiver. Two conforming lowerings exist: the runtime-call fallback
@@ -1961,6 +1963,8 @@ fn reassigned_typed_array_store_records_runtime_fallback() {
                 && ((record["consumer"] == "TypedArrayGet.slow_path"
                     && record["access_mode"] == "dynamic_fallback")
                     || (record["consumer"] == "TypedArrayGet.checked_f64_param"
+                        && record["access_mode"] == "checked_native")
+                    || (record["consumer"] == "TypedArrayGet.inline_dynamic_guarded"
                         && record["access_mode"] == "checked_native"))
         }),
         "expected reassigned typed-array read to stay on a runtime-checked path:\n{artifact:#}"

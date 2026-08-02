@@ -875,14 +875,16 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // `_tlv_get_addr`). Pre-fix this fell all the way through to
             // `js_typed_feedback_object_set_index_polymorphic`, whose
             // `typed_array_set_numeric_index` path dominated the bcrypt profile.
-            // The gate is narrow (only Any/Unknown receiver + numeric index) so
-            // every statically-typed array / typed-array / object fast path below
-            // is preserved.
+            // The gate is narrow (Any/Unknown, or a reassigned local whose
+            // declared type can no longer be trusted) so every stable statically-
+            // typed array / typed-array / object fast path below is preserved.
             let recv_ty = crate::type_analysis::static_type_of(ctx, object);
             let recv_unknown = matches!(
                 recv_ty,
                 None | Some(perry_hir::types::Type::Any) | Some(perry_hir::types::Type::Unknown)
             );
+            let recv_reassigned =
+                matches!(object.as_ref(), Expr::LocalGet(id) if ctx.reassigned_locals.contains(id));
             // The index may be numeric, a runtime string, or (rarely) a runtime
             // symbol — `js_dyn_index_set` triages all three. We only keep the
             // statically-known string-literal / symbol keys on their dedicated
@@ -896,7 +898,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 index.as_ref(),
                 Expr::String(_) | Expr::WtfString(_) | Expr::SymbolFor(_)
             ) || is_string_expr(ctx, index);
-            if recv_unknown && !index_is_static_string_or_symbol {
+            if (recv_unknown || recv_reassigned) && !index_is_static_string_or_symbol {
                 let obj_box = lower_expr(ctx, object)?;
                 let idx_d = lower_expr(ctx, index)?;
                 // Keep the RHS on the js_value_bits evidence contract even on
@@ -1942,7 +1944,24 @@ fn lower_inline_dyn_typed_array_set(
     ctx.current_block = merge_idx;
     // All paths produce `val_double` as the expression result (matching
     // `js_dyn_index_set`'s `return value`), so no phi is needed.
-    val_double.to_string()
+    let result = val_double.to_string();
+    let lowered = LoweredValue::js_value(result.clone());
+    ctx.record_lowered_value_with_access_mode(
+        "TypedArraySet",
+        None,
+        "TypedArraySet.inline_dynamic_guarded",
+        &lowered,
+        Some(BoundsState::Guarded {
+            guard_id: "typed_array_kind_cache_and_bounds".to_string(),
+        }),
+        None,
+        Some(BufferAccessMode::CheckedNative),
+        Some(MaterializationReason::RuntimeApi),
+        false,
+        false,
+        vec!["typed_array_fallback=js_dyn_index_set".to_string()],
+    );
+    result
 }
 
 /// Emit one per-kind integer typed-array element store block for

@@ -1003,14 +1003,17 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // subnormal f64 — the load-bearing bug behind hono's
             // mergePath template-literal logic that mixes `s?.[0]` /
             // `s?.at(-1)` / `s?.slice(1)` on `(s: any)` parameters.
-            // The gate is narrow (only Type::Any/Unknown) so existing
-            // TypedArray, Object-with-numeric-keys, and class-instance
-            // fast paths keep their inline-offset reads.
+            // The gate is narrow (Type::Any/Unknown, or a reassigned local
+            // whose declared type can no longer be trusted) so existing stable
+            // TypedArray, Object-with-numeric-keys, and class-instance fast
+            // paths keep their inline-offset reads.
             let recv_ty = crate::type_analysis::static_type_of(ctx, object);
             let recv_unknown = matches!(
                 recv_ty,
                 None | Some(perry_hir::types::Type::Any) | Some(perry_hir::types::Type::Unknown)
             );
+            let recv_reassigned =
+                matches!(object.as_ref(), Expr::LocalGet(id) if ctx.reassigned_locals.contains(id));
             // #5525: route every non-static-string/symbol read on an unknown
             // receiver through `js_dyn_index_get` (numeric, runtime-string, and
             // runtime-symbol are all triaged in the runtime). The earlier
@@ -1022,7 +1025,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 index.as_ref(),
                 Expr::String(_) | Expr::WtfString(_) | Expr::SymbolFor(_)
             ) || is_string_expr(ctx, index);
-            if recv_unknown && !index_is_static_string_or_symbol {
+            if (recv_unknown || recv_reassigned) && !index_is_static_string_or_symbol {
                 let obj_box = lower_expr(ctx, object)?;
                 let idx_d = lower_expr(ctx, index)?;
                 // #5525 follow-up: guarded inline typed-array element load at the

@@ -52,6 +52,10 @@ start="$(date +%s)"
 
 # Keep metadata failure on the structured-result path even if this script is
 # invoked by a caller that enabled errexit before sourcing it.
+case "$-" in
+    *e*) had_errexit=1 ;;
+    *) had_errexit=0 ;;
+esac
 set +e
 package_list="$(
     cd "$REPO_ROOT" && cargo metadata --no-deps --format-version 1 |
@@ -101,7 +105,11 @@ if [[ "$rc" -eq 0 ]]; then
         failed_packages+=("no-packages-tested")
     fi
 fi
-set -e
+if [[ "$had_errexit" -eq 1 ]]; then
+    set -e
+else
+    set +e
+fi
 
 # Try to extract per-crate test counts from the log.
 # `cargo test` prints lines like "test result: ok. 12 passed; 0 failed; 0 ignored ..."

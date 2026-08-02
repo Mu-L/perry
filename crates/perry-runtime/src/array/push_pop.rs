@@ -121,38 +121,11 @@ pub extern "C" fn js_array_grow(arr: *mut ArrayHeader, min_capacity: u32) -> *mu
         // ptr. Unlike GC-evacuation originals, array-growth stubs stay
         // retained because stale array references rely on clean_arr_ptr
         // following this chain.
-        // Only valid for arena-allocated arrays (which have a GcHeader
-        // 8 bytes before the user pointer); guard with a heap-bounds
-        // check that mirrors clean_arr_ptr's HEAP_MIN to skip pointers
-        // that don't have a real GcHeader behind them (e.g. test-mode
-        // synthetic pointers, longlived-arena edge cases).
-        // #1136: macOS and iOS-family devices can allocate through mimalloc /
-        // libsystem_malloc in the same low range as Android/Linux. Mirror
-        // `value::addr_class::is_valid_obj_ptr`'s platform split so growth
-        // forwarding can install a stub for arrays that live below 2 TB.
-        #[cfg(any(
-            target_os = "android",
-            target_os = "macos",
-            target_os = "linux",
-            target_os = "windows",
-            target_os = "ios",
-            target_os = "tvos",
-            target_os = "watchos",
-            target_os = "visionos",
-        ))]
-        const HEAP_MIN: usize = 0x1000;
-        #[cfg(not(any(
-            target_os = "android",
-            target_os = "macos",
-            target_os = "linux",
-            target_os = "windows",
-            target_os = "ios",
-            target_os = "tvos",
-            target_os = "watchos",
-            target_os = "visionos",
-        )))]
-        const HEAP_MIN: usize = 0x200_0000_0000;
-        if (arr as usize) >= HEAP_MIN + crate::gc::GC_HEADER_SIZE {
+        // Only valid for arena-allocated arrays (which have a GcHeader before
+        // the user pointer). Reuse the canonical address classifier so native
+        // handles and platform-specific low-pointer ranges are rejected before
+        // any GcHeader field is read.
+        if crate::value::addr_class::is_plausible_heap_addr(arr as usize) {
             // Only forward arrays that came from the GC arena. A
             // non-array obj_type would mean something has gone wrong
             // upstream; bail out without forwarding rather than corrupt
