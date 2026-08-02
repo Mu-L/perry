@@ -383,6 +383,13 @@ pub(crate) fn build_and_run_link(
     } else {
         well_known_libs.to_vec()
     };
+    // Exact stdlib/runtime archives already placed on the link line.  The
+    // Apple UI de-duplication pass may localize bundled definitions against
+    // these archives, so it must see only libraries that are genuinely linked
+    // (not merely available on disk).  We also repeat them after the UI
+    // archive below: ld64 scans archives left-to-right, and UI members can
+    // introduce fresh references after the first scan has already passed.
+    let mut ui_link_reference_libs: Vec<PathBuf> = Vec::new();
     if !skip_runtime {
         if ctx.needs_stdlib || is_windows {
             // On Windows/MSVC, always try to link stdlib because codegen unconditionally
@@ -429,7 +436,11 @@ pub(crate) fn build_and_run_link(
                     }
                 }
                 // Tier-3 (tvOS/watchOS) std-duplication dedup; no-op elsewhere.
-                cmd.arg(dedup_stdlib_for_tier3(target, stdlib));
+                let stdlib_for_link = dedup_stdlib_for_tier3(target, stdlib);
+                cmd.arg(&stdlib_for_link);
+                if !is_windows {
+                    ui_link_reference_libs.push(stdlib_for_link);
+                }
                 // #466 Phase 4 step 2: well-known bindings normally join the
                 // link line right after perry-stdlib so they cover the exact
                 // `_js_*` symbol gap that was just opened by stripping the
@@ -462,7 +473,10 @@ pub(crate) fn build_and_run_link(
                     } else {
                         runtime_lib.to_path_buf()
                     };
-                    cmd.arg(dedup_runtime_for_tier3(target, &runtime_for_link, stdlib));
+                    let runtime_for_link =
+                        dedup_runtime_for_tier3(target, &runtime_for_link, stdlib);
+                    cmd.arg(&runtime_for_link);
+                    ui_link_reference_libs.push(runtime_for_link);
                 }
             } else {
                 if ctx.needs_stdlib {
@@ -500,6 +514,9 @@ pub(crate) fn build_and_run_link(
                 runtime_lib.to_path_buf()
             };
             cmd.arg(&runtime_for_link);
+            if !is_windows {
+                ui_link_reference_libs.push(runtime_for_link);
+            }
         }
     } else if ctx.needs_stdlib {
         // Android + UI: runtime is provided by UI lib, but stdlib must still be linked
@@ -511,6 +528,7 @@ pub(crate) fn build_and_run_link(
                 }
             }
             cmd.arg(stdlib);
+            ui_link_reference_libs.push(stdlib.clone());
             // #466 Phase 4 step 2: see the parallel comment in the
             // non-Android branch above.
             for wk in &well_known_libs {
@@ -1024,10 +1042,10 @@ pub(crate) fn build_and_run_link(
                 if is_linux || is_windows {
                     trimmed
                 } else {
-                    let mut linked_refs: Vec<&Path> = vec![runtime_lib];
-                    if let Some(ref s) = stdlib_lib {
-                        linked_refs.push(s.as_path());
-                    }
+                    let linked_refs: Vec<&Path> = ui_link_reference_libs
+                        .iter()
+                        .map(PathBuf::as_path)
+                        .collect();
                     match dedup_ui_lib_against_linked_libs(&trimmed, &linked_refs) {
                         Ok(deduped) => deduped,
                         Err(e) => {
@@ -1049,6 +1067,20 @@ pub(crate) fn build_and_run_link(
                 windows_link::add_webview2_loader(&mut cmd, runtime_lib, target);
             } else {
                 cmd.arg(&ui_lib);
+                // The de-duplicated Apple UI archive can introduce references
+                // to globals that were localized because one of these linked
+                // archives provides the canonical copy.  Repeat the exact
+                // archives after UI so ld64 gets a second chance to resolve
+                // those newly introduced references.  This is essential for
+                // Rust std symbols such as `Stdout::flush`; without the repeat,
+                // runtime-only UI docs fail even though a suitable archive is
+                // present (and must not be localized against an unlinked
+                // stdlib in the first place).
+                if !is_linux && !is_android && !is_visionos {
+                    for reference in &ui_link_reference_libs {
+                        cmd.arg(reference);
+                    }
+                }
             }
 
             if is_watchos {
