@@ -939,19 +939,33 @@ pub(crate) fn build_and_run_link(
         // links: a runtime-only program that genuinely needs one of these
         // fails AT LINK TIME with an undefined symbol (deterministic,
         // caught by the parity suites), never at runtime.
-        if (cfg!(target_os = "macos") || is_cross_macos)
-            && !is_harmonyos
-            && (ctx.needs_stdlib || ctx.needs_ui || ctx.needs_plugins || ctx.needs_geisterhand)
-        {
-            cmd.arg("-framework")
-                .arg("Security")
-                .arg("-framework")
-                .arg("CoreFoundation")
-                .arg("-framework")
-                .arg("SystemConfiguration")
-                .arg("-liconv")
-                .arg("-lresolv")
-                .arg("-lobjc");
+        if (cfg!(target_os = "macos") || is_cross_macos) && !is_harmonyos {
+            let needs_full_frameworks =
+                ctx.needs_stdlib || ctx.needs_ui || ctx.needs_plugins || ctx.needs_geisterhand;
+            if needs_full_frameworks {
+                cmd.arg("-framework")
+                    .arg("Security")
+                    .arg("-framework")
+                    .arg("CoreFoundation")
+                    .arg("-framework")
+                    .arg("SystemConfiguration")
+                    .arg("-liconv")
+                    .arg("-lresolv")
+                    .arg("-lobjc");
+                if ctx.uses_i18n {
+                    cmd.arg("-framework").arg("Foundation");
+                }
+            } else if ctx.uses_i18n {
+                // Runtime-only i18n binaries call CoreFoundation to discover
+                // the host locale and Objective-C Foundation to inspect the
+                // app bundle's preferred localization. Keep the ordinary
+                // runtime-only link free of these launch-costly frameworks.
+                cmd.arg("-framework")
+                    .arg("Foundation")
+                    .arg("-framework")
+                    .arg("CoreFoundation")
+                    .arg("-lobjc");
+            }
         }
 
         // On Linux (native, not cross-compiling to macOS), link against system libraries

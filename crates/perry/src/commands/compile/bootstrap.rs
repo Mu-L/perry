@@ -1202,6 +1202,7 @@ pub(super) fn apply_i18n_pass(
     format: OutputFormat,
 ) -> Option<perry_transform::i18n::I18nStringTable> {
     if let Some(config) = i18n_config {
+        ctx.uses_i18n = true;
         let table =
             perry_transform::i18n::apply_i18n(&mut ctx.native_modules, config, i18n_translations);
         // Report diagnostics

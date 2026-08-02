@@ -568,6 +568,10 @@ pub struct CompilationContext {
     pub needs_plugins: bool,
     /// Whether perry-stdlib is needed (heavy native modules like fastify, mysql2, etc.)
     pub needs_stdlib: bool,
+    /// Whether the i18n transform is active for this build. On macOS, even a
+    /// runtime-only program then needs Foundation/CoreFoundation and libobjc
+    /// for host-locale detection.
+    pub uses_i18n: bool,
     /// Project root (where we start looking for node_modules)
     pub project_root: PathBuf,
     /// Root for cache artifacts. Usually the package/config root or current
@@ -1073,6 +1077,7 @@ impl CompilationContext {
             harmonyos_index_ets: None,
             needs_plugins: false,
             needs_stdlib: false,
+            uses_i18n: false,
             cache_root: project_root.clone(),
             cache_dir: super::object_cache::resolve_cache_dir(&project_root, None),
             project_root,
