@@ -94,6 +94,43 @@ pub(crate) fn extract_options_fields(ctx: &FnCtx<'_>, e: &Expr) -> Option<Vec<(S
                 .collect();
             Some(pairs)
         }
+        // Object literals containing method syntax are lowered by HIR into a
+        // source-ordered one-argument IIFE that fills an initially empty
+        // object.  Native APIs still need to see those inline option fields:
+        // `super({ start(controller) { ... } })` for a ReadableStream subclass
+        // is the motivating case.  Decode only the simple static-key form;
+        // spreads, computed keys, accessors, and receiver-bound methods retain
+        // their runtime IIFE semantics and deliberately fall through.
+        Expr::Call { callee, args, .. } => {
+            let Expr::Closure { params, body, .. } = callee.as_ref() else {
+                return None;
+            };
+            let [param] = params.as_slice() else {
+                return None;
+            };
+            if !matches!(args.as_slice(), [Expr::Object(props)] if props.is_empty()) {
+                return None;
+            }
+
+            let mut fields = Vec::new();
+            for stmt in body {
+                match stmt {
+                    perry_hir::Stmt::Expr(Expr::IndexSet {
+                        object,
+                        index,
+                        value,
+                    }) if matches!(object.as_ref(), Expr::LocalGet(id) if *id == param.id) => {
+                        let Expr::String(name) = index.as_ref() else {
+                            return None;
+                        };
+                        fields.push((name.clone(), value.as_ref().clone()));
+                    }
+                    perry_hir::Stmt::Return(Some(Expr::LocalGet(id))) if *id == param.id => {}
+                    _ => return None,
+                }
+            }
+            Some(fields)
+        }
         _ => None,
     }
 }
