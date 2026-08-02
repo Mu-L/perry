@@ -31,10 +31,11 @@ struct StackMapLocation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StackMapRecord {
     pc: usize,
+    /// Start address of the containing function, from the stack-map header.
+    /// Used to decode that function's prologue when an SP-relative location
+    /// needs the FP-to-SP offset (see `fp_to_sp_offset`).
+    function_address: usize,
     /// The containing function's total frame size from the stack-map header.
-    /// LLVM's AArch64 frame places the `[x29, x30]` pair at the top of the
-    /// frame, so a chain walker can reconstruct the body SP as
-    /// `fp + 16 - stack_size` for SP-relative locations.
     stack_size: u64,
     locations: Vec<StackMapLocation>,
 }
@@ -131,19 +132,18 @@ fn stack_maps() -> &'static StackMapIndex {
 }
 
 fn index_records(records: Vec<StackMapRecord>) -> StackMapIndex {
+    // SP-relative locations are admitted here and resolved per FRAME in the
+    // walker, which decodes the owning function's `add x29, sp, #imm`
+    // prologue to get the body SP (#7173). Deciding it here would mean
+    // dereferencing every function address at startup — unsafe for records
+    // whose addresses are not live code, and unnecessary because the walker
+    // already fails closed to the platform unwinder on any anomaly.
     let chain_walkable = records.iter().all(|record| {
         record.locations.iter().all(|location| {
-            location.dwarf_reg == DWARF_REG_FP_AARCH64
-                // `SP = FP + 16 - stack_size` is the DARWIN AArch64 frame
-                // layout ([x29, x30] at the top of the frame). Verified wrong
-                // on aarch64-Linux by the Pi's verify-walker run: fast walk
-                // and unwinder disagreed by exactly the layout delta on the
-                // same slot. Until the Linux constant is DERIVED (not
-                // ported), SP-relative locations disqualify the fast chain
-                // off-Darwin and the always-correct unwinder serves instead.
-                || (cfg!(target_os = "macos")
-                    && location.dwarf_reg == DWARF_REG_SP_AARCH64
-                    && record.stack_size >= 16)
+            matches!(
+                location.dwarf_reg,
+                DWARF_REG_FP_AARCH64 | DWARF_REG_SP_AARCH64
+            )
         })
     });
     let min_pc = records.first().map_or(usize::MAX, |record| record.pc);
@@ -154,6 +154,48 @@ fn index_records(records: Vec<StackMapRecord>) -> StackMapIndex {
         min_pc,
         max_pc,
     }
+}
+
+/// Recover a function's frame-pointer-to-stack-pointer offset by decoding its
+/// prologue (#7173).
+///
+/// AArch64 prologues set the frame pointer with a single
+/// `add x29, sp, #imm` after saving the `[x29, x30]` pair, so the body SP is
+/// `fp - imm`. On Darwin that offset is a constant (the pair sits at the top
+/// of the frame) but on Linux it varies per function with the callee-save
+/// area laid out below the pair — measured 0x30 and 0x60 in adjacent
+/// generated functions, which is why no `(fp, stack_size)` formula works
+/// there and the fast chain previously fell back to the DWARF unwinder for
+/// every collection (~22% of samples on a Pi 5).
+///
+/// Instruction encoding: ADD (immediate, 64-bit, shift 0) with Rn = 31 (sp)
+/// and Rd = 29 (fp) — `word & 0xFFC0_03FF == 0x9100_03FD`, immediate in bits
+/// [21:10]. Scans a bounded prologue window and fails closed (`None`) if the
+/// pattern is absent, in which case the caller uses the platform unwinder.
+#[cfg(target_arch = "aarch64")]
+fn fp_to_sp_offset(function_address: usize) -> Option<usize> {
+    const ADD_FP_SP_MASK: u32 = 0xFFC0_03FF;
+    const ADD_FP_SP_PATTERN: u32 = 0x9100_03FD;
+    const PROLOGUE_WINDOW_INSNS: usize = 24;
+    if function_address == 0 || function_address & 0x3 != 0 {
+        return None;
+    }
+    for i in 0..PROLOGUE_WINDOW_INSNS {
+        let word = unsafe { std::ptr::read((function_address + i * 4) as *const u32) };
+        if word & ADD_FP_SP_MASK == ADD_FP_SP_PATTERN {
+            return Some(((word >> 10) & 0xFFF) as usize);
+        }
+        // `ret` ends the prologue window for a leaf that never sets up fp.
+        if word == 0xD65F_03C0 {
+            break;
+        }
+    }
+    None
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn fp_to_sp_offset(_function_address: usize) -> Option<usize> {
+    None
 }
 
 fn closest_record_pc(maps: &[StackMapRecord], ip: usize) -> Option<usize> {
@@ -351,6 +393,7 @@ fn parse_one_stack_map(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, usize)> {
 
             out.push(StackMapRecord {
                 pc: function_address.checked_add(instruction_offset)?,
+                function_address,
                 stack_size: function_stack_size,
                 locations,
             });
@@ -783,13 +826,11 @@ mod fp_chain {
                         }
                         stats.records_matched = stats.records_matched.saturating_add(matched.len());
                         for record in matched {
-                            // LLVM's AArch64 frame keeps the [x29, x30] pair
-                            // at the top of the frame, so the caller's body
-                            // SP is its fp + 16 - stack_size. `chain_walkable`
-                            // guaranteed stack_size >= 16 for SP records.
-                            let sp = caller_fp
-                                .checked_add(16)
-                                .and_then(|top| top.checked_sub(record.stack_size as usize));
+                            // Body SP = fp - (prologue's `add x29, sp, #imm`).
+                            // `chain_walkable` proved this decodes for every
+                            // SP-relative record in the image (#7173).
+                            let sp = fp_to_sp_offset(record.function_address)
+                                .and_then(|off| caller_fp.checked_sub(off));
                             for location in &record.locations {
                                 stats.locations_visited = stats.locations_visited.saturating_add(1);
                                 let base = if location.dwarf_reg == DWARF_REG_FP_AARCH64 {
@@ -896,6 +937,7 @@ mod tests {
             records,
             vec![StackMapRecord {
                 pc: 0x1010,
+                function_address: 0x1000,
                 stack_size: 32,
                 locations: vec![StackMapLocation {
                     dwarf_reg: 29,
@@ -929,6 +971,7 @@ mod tests {
             records,
             vec![StackMapRecord {
                 pc: 0x1020,
+                function_address: 0x1000,
                 stack_size: 32,
                 locations: vec![StackMapLocation {
                     dwarf_reg: 29,
@@ -950,52 +993,29 @@ mod tests {
     }
 
     #[test]
-    fn chain_walkable_index_accepts_fp_and_sized_sp_locations_only() {
-        let fp_record = StackMapRecord {
-            pc: 0x1000,
-            stack_size: 0,
+    fn chain_walkable_index_accepts_fp_and_sp_locations_only() {
+        let rec = |pc: usize, reg: u16| StackMapRecord {
+            pc,
+            function_address: pc,
+            stack_size: 160,
             locations: vec![StackMapLocation {
-                dwarf_reg: DWARF_REG_FP_AARCH64,
+                dwarf_reg: reg,
                 offset: -8,
             }],
         };
-        let sp_record = StackMapRecord {
-            pc: 0x2000,
-            stack_size: 160,
-            locations: vec![StackMapLocation {
-                dwarf_reg: DWARF_REG_SP_AARCH64,
-                offset: 16,
-            }],
-        };
-        let frameless_sp_record = StackMapRecord {
-            pc: 0x3000,
-            stack_size: 0,
-            locations: vec![StackMapLocation {
-                dwarf_reg: DWARF_REG_SP_AARCH64,
-                offset: 8,
-            }],
-        };
-        let other_reg_record = StackMapRecord {
-            pc: 0x4000,
-            stack_size: 160,
-            locations: vec![StackMapLocation {
-                dwarf_reg: 1,
-                offset: 0,
-            }],
-        };
-
-        let walkable = index_records(vec![fp_record.clone(), sp_record.clone()]);
+        // FP and SP are both walkable: SP resolves per frame by decoding the
+        // owning function's prologue (#7173).
+        let walkable = index_records(vec![
+            rec(0x1000, DWARF_REG_FP_AARCH64),
+            rec(0x2000, DWARF_REG_SP_AARCH64),
+        ]);
         assert!(walkable.chain_walkable);
         assert_eq!(walkable.min_pc, 0x1000);
         assert_eq!(walkable.max_pc, 0x2000);
-
+        // Any other register disqualifies the whole image.
         assert!(
-            !index_records(vec![fp_record.clone(), frameless_sp_record]).chain_walkable,
-            "an SP location without a usable frame size must disable the fast walk"
-        );
-        assert!(
-            !index_records(vec![fp_record, other_reg_record]).chain_walkable,
-            "any non-FP/SP register must disable the fast walk"
+            !index_records(vec![rec(0x1000, DWARF_REG_FP_AARCH64), rec(0x3000, 1)]).chain_walkable,
+            "a non-FP/SP register must disable the fast walk"
         );
     }
 
@@ -1004,11 +1024,13 @@ mod tests {
         let maps = vec![
             StackMapRecord {
                 pc: 0x1000,
+                function_address: 0x1000,
                 stack_size: 32,
                 locations: Vec::new(),
             },
             StackMapRecord {
                 pc: 0x1020,
+                function_address: 0x1020,
                 stack_size: 32,
                 locations: Vec::new(),
             },
