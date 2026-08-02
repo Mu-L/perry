@@ -31,9 +31,13 @@ pub(crate) fn lower_runtime_property_get_by_name(
     let dispatch_global = ctx.strings.static_dispatch_global(key_idx);
     let blk = ctx.block();
     let obj_bits = blk.bitcast_double_to_i64(&recv_box);
-    // The helper takes a raw `*const ObjectHeader`, so strip the NaN-box
-    // POINTER_TAG to a canonical pointer.
-    let obj_handle = blk.and(I64, &obj_bits, crate::nanbox::POINTER_MASK_I64);
+    // Preserve the boxed receiver bits here.  The runtime by-id helper accepts
+    // the same dual representation as its by-name target: an ordinary object
+    // may be POINTER_TAG-boxed, while static-accessor `this` is an INT32_TAG
+    // class reference.  Masking indiscriminately turns the latter into a tiny
+    // raw integer and loses constructor dynamic properties (`this._label`).
+    // The set-by-id sibling already forwards the full bits for the same reason.
+    let obj_handle = obj_bits;
     let property_id = crate::strings::emit_static_dispatch_id(blk, &dispatch_global);
     Ok(blk.call(
         DOUBLE,

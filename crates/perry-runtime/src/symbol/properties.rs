@@ -294,11 +294,12 @@ fn next_request_meta_sym_key() -> usize {
 unsafe fn set_symbol_property(obj_f64: f64, sym_f64: f64, value_f64: f64) -> f64 {
     if let Some(acc) = accessors::symbol_accessor_property(obj_f64, sym_f64) {
         if acc.set != 0 {
-            let closure =
-                (acc.set & crate::value::POINTER_MASK) as *const crate::closure::ClosureHeader;
-            if !closure.is_null() {
-                crate::closure::js_closure_call1(closure, value_f64);
-            }
+            // Symbol-keyed accessors have the same OrdinarySetWithOwnDescriptor
+            // receiver semantics as string-keyed accessors.  Use the shared
+            // invoker so a regular object-literal setter observes `this ===
+            // receiver` (and so strict/sloppy coercion plus closure rebinding
+            // stay identical across the two key kinds).
+            crate::object::invoke_accessor_setter(acc.set, obj_f64, value_f64);
         }
         return value_f64;
     }

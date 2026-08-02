@@ -13248,6 +13248,10 @@ fn static_property_access_on_computed_class_uses_property_id_wrappers() {
         ir.contains("call double @js_object_get_field_by_property_id_f64"),
         "computed-member class static property reads should use property-id ABI:\n{ir}"
     );
+    assert!(
+        !ir.contains(" = and i64 "),
+        "property-id reads must preserve boxed receiver tags (notably static-accessor `this`):\n{ir}"
+    );
 }
 
 #[test]
