@@ -566,6 +566,52 @@ The `-Os` downgrade (`module IR > 6 MB`) is NOT a confound — it applies to
 both arms, since shadow IR for the same program cannot be smaller than the
 statepoint arm's 1,083 MB.
 
+## Pi 5 re-measurement after the prologue-decode walker + main rebase (2026-08-02)
+
+The small-hardware regression is **closed and inverted**. Same host (Pi 5,
+aarch64 Linux, load <1), same method (9 interleaved reps, per-probe
+medians), both arms cross-built from one tree and one runtime archive:
+
+| Probe | before: shadow / statepoint | after: shadow / statepoint |
+|---|---:|---:|
+| Nursery churn | 385.7 / 402.0 (+4.2%) | 392.4 / 391.9 (−0.1%) |
+| Survivor promotion | 448.4 / 446.7 (−0.4%) | 286.1 / 277.1 (−3.1%) |
+| Cross-gen writes | 428.4 / 461.0 (+7.6%) | 374.8 / 367.4 (−2.0%) |
+| Dead after deep stack | 932.1 / 1145.0 (+22.8%) | 1039.2 / 1017.6 (−2.1%) |
+| Closure capture | 334.6 / 361.6 (+8.0%) | 449.8 / 436.3 (−3.0%) |
+| String retention | 275.7 / 374.1 (+35.7%) | 240.9 / 240.5 (−0.2%) |
+| Array grow/evacuate | 362.8 / 483.1 (+33.1%) | 226.9 / 225.6 (−0.6%) |
+| Map/set side tables | 978.9 / 1139.9 (+16.4%) | 1070.3 / 1040.8 (−2.8%) |
+| **geometric mean** | **+14.72%** | **−1.74%** |
+
+Correctness first, as always: 8/8 under forced evacuation + verification
+and 8/8 under `PERRY_STACKMAP_WALKER=verify` (fast x29 walk and the
+platform unwinder visit the identical slot set) — the prologue-decoded SP
+is right on the architecture where the constant-based approach was proven
+impossible.
+
+**Attribution, stated honestly: the walker is NOT the cause of the
+improvement.** A direct A/B on the two worst probes — same binary, fast
+chain versus `PERRY_STACKMAP_WALKER=unwind` — is a dead heat (0.24 s vs
+0.24 s; 1.01 s vs 1.01 s). The DWARF CFI parsing that `perf` measured at
+~22% of samples is simply no longer hot. The other variable between the
+two runs is the rebase onto main's 64 commits of GC work (root-store
+dominance #7192, from-space protection and zeal #7196, and #7148's precise
+safepoint drains replacing conservative-scan fallbacks), which plausibly
+reduced how often the native stack is walked at all. Shadow itself got
+faster on the same probes (469.2 → 429.2 ms geo), which is consistent with
+that explanation and inconsistent with "the walker fixed it".
+
+So: the prologue decode is *correct and verified* and removes a real
+fallback, but the measured win belongs to main's GC hardening. Both are
+recorded rather than conflated.
+
+★ One instrument failure worth recording: a first attempt to count GC
+cycles reported **0 cycles for both arms**, which would have made the whole
+comparison vacuous. It was a grep pattern that no longer matched main's
+changed diagnostic format — raw output shows 81.9 MB freed across 79 arena
+blocks. Never trust a count without looking at what produced it.
+
 **Conclusion, stated as the design law this branch keeps re-deriving:**
 *with an optimizing compiler between the source and the safepoint, root
 metadata without relocation semantics is unsound — per-call plain maps
