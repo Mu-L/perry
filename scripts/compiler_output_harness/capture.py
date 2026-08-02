@@ -114,6 +114,13 @@ def resolve_benchmark_runs(args: argparse.Namespace) -> int:
     return runs
 
 
+def resolve_warmup_runs(args: argparse.Namespace) -> int:
+    runs = int(getattr(args, "warmup_runs", 0))
+    if runs < 0:
+        raise HarnessError("--warmup-runs must be non-negative")
+    return runs
+
+
 def _compile_env(clang: str, *, enable_gc_trace: bool = False) -> dict[str, str]:
     env = {**os.environ, "PERRY_LLVM_KEEP_IR": "1", "PERRY_NO_CACHE": "1"}
     env["PERRY_LLVM_CLANG"] = clang
@@ -200,6 +207,7 @@ def capture(args: argparse.Namespace) -> int:
     clang = resolve_clang(args.clang)
     analysis_extra_clang_args = list(args.clang_arg or [])
     runs = resolve_benchmark_runs(args)
+    warmup_runs = resolve_warmup_runs(args)
     trace_budget_fields = set(
         workload_info.get("runtime_budgets", {})
     ).intersection(TRACE_RUNTIME_BUDGET_FIELDS)
@@ -358,6 +366,7 @@ def capture(args: argparse.Namespace) -> int:
             binary,
             out_dir=out_dir,
             runs=runs,
+            warmup_runs=warmup_runs,
             timeout=args.run_timeout,
             enable_gc_trace=not args.no_gc_trace,
             benchmark_mode=args.benchmark_mode,
@@ -414,6 +423,7 @@ def capture(args: argparse.Namespace) -> int:
         "benchmark_settings": {
             "benchmark_mode": args.benchmark_mode,
             "runs": runs,
+            "warmup_runs": warmup_runs,
             "user_supplied_runs": args.runs is not None,
         },
         "tool_versions": {

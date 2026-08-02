@@ -539,20 +539,22 @@ def run_benchmark(
     *,
     out_dir: Path,
     runs: int,
+    warmup_runs: int,
     timeout: int,
     enable_gc_trace: bool,
     benchmark_mode: str,
 ) -> dict[str, Any]:
-    rows = []
-    for idx in range(1, runs + 1):
-        stdout_path = out_dir / f"benchmark-run-{idx}.stdout"
-        stderr_path = out_dir / f"benchmark-run-{idx}.stderr"
-        before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-        import os
+    import os
 
-        env = os.environ.copy()
-        if enable_gc_trace:
-            env["PERRY_GC_TRACE"] = "1"
+    env = os.environ.copy()
+    if enable_gc_trace:
+        env["PERRY_GC_TRACE"] = "1"
+
+    def run_once(idx: int, *, warmup: bool) -> dict[str, Any]:
+        prefix = "benchmark-warmup" if warmup else "benchmark-run"
+        stdout_path = out_dir / f"{prefix}-{idx}.stdout"
+        stderr_path = out_dir / f"{prefix}-{idx}.stderr"
+        before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
         result = run_command(
             [str(binary)],
             cwd=out_dir,
@@ -563,21 +565,28 @@ def run_benchmark(
             check=False,
         )
         after = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-        rows.append(
-            {
-                "run": idx,
-                "exit_code": result.exit_code,
-                "wall_ms": result.duration_ms,
-                "max_rss_kb_delta": max(0, after - before),
-                "stdout_path": str(stdout_path),
-                "stderr_path": str(stderr_path),
-                "stdout_first": result.stdout[:240],
-                "stdout_last": result.stdout[-240:],
-                "gc_trace_enabled": bool(enable_gc_trace),
-                "gc_trace_summary": summarize_gc_trace(result.stderr),
-            }
-        )
+        return {
+            "run": idx,
+            "exit_code": result.exit_code,
+            "wall_ms": result.duration_ms,
+            "max_rss_kb_delta": max(0, after - before),
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+            "stdout_first": result.stdout[:240],
+            "stdout_last": result.stdout[-240:],
+            "gc_trace_enabled": bool(enable_gc_trace),
+            "gc_trace_summary": summarize_gc_trace(result.stderr),
+        }
+
+    warmups = [run_once(idx, warmup=True) for idx in range(1, warmup_runs + 1)]
+    failed_warmups = [row["run"] for row in warmups if row["exit_code"] != 0]
+    if failed_warmups:
+        raise HarnessError(f"benchmark warmup runs failed: {failed_warmups}")
+
+    rows = [run_once(idx, warmup=False) for idx in range(1, runs + 1)]
     summary = benchmark_summary(rows, benchmark_mode)
+    summary["warmup_runs"] = warmups
+    summary["successful_warmup_runs"] = len(warmups)
     summary["gc_trace_enabled"] = bool(enable_gc_trace)
     return summary
 

@@ -23,6 +23,7 @@ sys.modules[SPEC.name] = HARNESS
 SPEC.loader.exec_module(HARNESS)
 
 from compiler_output_harness import capture as CAPTURE_MODULE
+from compiler_output_harness import analyzers as ANALYZERS_MODULE
 from compiler_output_harness.capture import SUITES
 
 
@@ -1207,12 +1208,15 @@ idxset.bounded_numeric_merge.5:
                 "smoke",
                 "--runs",
                 "1",
+                "--warmup-runs",
+                "1",
                 "--perf-counters",
                 "off",
                 "--gate",
             ]
         )
         self.assertEqual(args.suite, "native-abi-proof")
+        self.assertEqual(args.warmup_runs, 1)
         self.assertTrue(args.gate)
 
     def test_native_abi_proof_suite_includes_native_memory_workloads(self):
@@ -1329,6 +1333,7 @@ idxset.bounded_numeric_merge.5:
         self.assertIn("tests/test_native_abi_evidence_packet_smoke.sh", tier)
         self.assertIn("PERRY_BIN", tier)
         self.assertIn("--runs 5", smoke)
+        self.assertIn("--warmup-runs 1", packet)
         self.assertIn("--gate", smoke)
         self.assertIn("scripts/check_runtime_symbols.sh", packet)
         self.assertIn('export RUSTC_WRAPPER=""', packet)
@@ -2717,6 +2722,43 @@ idxset.bounded_numeric_merge.5:
         self.assertEqual(summary["stat_quality"], "timing")
         self.assertIsNotNone(summary["stddev_wall_ms"])
         self.assertAlmostEqual(summary["p95_wall_ms"], 48.0)
+
+    def test_benchmark_warmup_is_recorded_but_excluded_from_timing(self):
+        durations = iter((999.0, 10.0, 20.0))
+        original_run_command = ANALYZERS_MODULE.run_command
+
+        def fake_run_command(argv, **kwargs):
+            duration = next(durations)
+            return HARNESS.CommandResult(
+                argv=list(argv),
+                cwd=str(kwargs["cwd"]),
+                exit_code=0,
+                duration_ms=duration,
+                stdout="ok\n",
+                stderr="",
+                stdout_path=str(kwargs["stdout_path"]),
+                stderr_path=str(kwargs["stderr_path"]),
+            )
+
+        ANALYZERS_MODULE.run_command = fake_run_command
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                summary = ANALYZERS_MODULE.run_benchmark(
+                    Path(temp) / "fixture",
+                    out_dir=Path(temp),
+                    runs=2,
+                    warmup_runs=1,
+                    timeout=30,
+                    enable_gc_trace=False,
+                    benchmark_mode="smoke",
+                )
+        finally:
+            ANALYZERS_MODULE.run_command = original_run_command
+
+        self.assertEqual(summary["successful_warmup_runs"], 1)
+        self.assertEqual(summary["warmup_runs"][0]["wall_ms"], 999.0)
+        self.assertEqual([row["wall_ms"] for row in summary["runs"]], [10.0, 20.0])
+        self.assertEqual(summary["median_wall_ms"], 15.0)
 
     def test_fma_fixture_requires_fma_when_requested(self):
         ir = """

@@ -39,6 +39,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     capture_p.add_argument("--runs", type=int)
     capture_p.add_argument(
+        "--warmup-runs",
+        type=int,
+        default=0,
+        help="untimed process launches before benchmark samples (default: 0)",
+    )
+    capture_p.add_argument(
         "--benchmark-mode",
         choices=sorted(DEFAULT_BENCHMARK_RUNS),
         default="smoke",
@@ -74,6 +80,12 @@ def build_parser() -> argparse.ArgumentParser:
     suite_p.add_argument("--target")
     suite_p.add_argument("--clang-arg", action="append")
     suite_p.add_argument("--runs", type=int)
+    suite_p.add_argument(
+        "--warmup-runs",
+        type=int,
+        default=0,
+        help="untimed process launches per workload before benchmark samples (default: 0)",
+    )
     suite_p.add_argument(
         "--benchmark-mode",
         choices=sorted(DEFAULT_BENCHMARK_RUNS),

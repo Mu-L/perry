@@ -400,6 +400,7 @@ then
       --out-dir "$OUT_ABS/compiler-output/native-abi-proof" \
       --perry "$PERRY_BIN_RESOLVED" \
       --runs "$RUNS" \
+      --warmup-runs 1 \
       --benchmark-mode smoke \
       --gate \
       --perf-counters off \
