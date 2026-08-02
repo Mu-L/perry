@@ -1265,4 +1265,43 @@ mod tests {
             "a local refined to Symbol must keep its shadow slot"
         );
     }
+
+    #[test]
+    fn flat_const_row_and_scalar_aliases_do_not_take_shadow_slots() {
+        let stmts = vec![
+            Stmt::Let {
+                id: 30,
+                name: "kernel".to_string(),
+                ty: Type::Array(Box::new(Type::Array(Box::new(Type::Number)))),
+                mutable: false,
+                init: Some(Expr::Array(vec![Expr::Array(vec![
+                    Expr::Integer(1),
+                    Expr::Integer(2),
+                ])])),
+            },
+            Stmt::Let {
+                id: 31,
+                name: "row".to_string(),
+                ty: Type::Any,
+                mutable: false,
+                init: Some(Expr::IndexGet {
+                    object: Box::new(Expr::LocalGet(30)),
+                    index: Box::new(Expr::Integer(0)),
+                }),
+            },
+            Stmt::Let {
+                id: 32,
+                name: "element".to_string(),
+                ty: Type::Any,
+                mutable: false,
+                init: Some(Expr::IndexGet {
+                    object: Box::new(Expr::LocalGet(31)),
+                    index: Box::new(Expr::Integer(1)),
+                }),
+            },
+        ];
+
+        let slots = collect_pointer_typed_locals(&[], &stmts, &HashSet::from([30]));
+        assert_eq!(slots, HashMap::from([(30, 0)]));
+    }
 }

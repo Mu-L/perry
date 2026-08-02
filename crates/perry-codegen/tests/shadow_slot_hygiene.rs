@@ -873,19 +873,22 @@ fn flat_const_row_aliases_do_not_reserve_shadow_slots() {
     .expect("LLVM IR should be UTF-8");
     let main_ir = function_slice(&ir, "main");
 
-    // PRE-EXISTING RED, not caused by #7088: verified by running this suite
-    // against pristine `origin/main` sources, where the same assertion fails
-    // with three reserved slots instead of one. Two row aliases now take a
-    // persistent shadow slot each. This suite runs nightly/at-tag rather than
-    // per-PR, which is how it went red unnoticed. Kept asserting the intended
-    // property, with the string updated for `js_shadow_frame_enter`.
+    // The pre-lowering local map has one slot (the table; covered directly by
+    // pointer_locals' collector test). Lowering the nested array literal then
+    // reserves two more slots for its scalar-replaced row storage. Those are
+    // intentional moving-GC roots, not slots for `krow` or `k`.
     assert!(
-        main_ir.contains("call ptr @js_shadow_frame_enter(i32 1)"),
-        "only the flat-const table root should reserve a shadow slot"
+        main_ir.contains("call ptr @js_shadow_frame_enter(i32 3)"),
+        "the flat-const table plus two scalar-replaced row roots should size the frame"
     );
+
+    let flat_read = main_ir
+        .find("ptr @perry_flat_entry_flat_const_shadow_ts__30")
+        .expect("flat-const alias chain should lower through the rodata table");
     assert!(
-        !main_ir.contains("call void @js_shadow_slot_set(i32 1"),
-        "row aliases of flat-const tables must not touch shadow slots"
+        !main_ir[flat_read..].contains("call void @js_shadow_slot_bind")
+            && !main_ir[flat_read..].contains("call void @js_shadow_slot_set"),
+        "row and scalar aliases of a flat-const table must not touch shadow slots"
     );
 }
 
