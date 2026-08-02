@@ -1091,8 +1091,7 @@ fn lower_roots_for_rs4gc(
         // emit zero-instruction asm barriers.
         if is_call && trimmed.ends_with(')') && trimmed.contains(" asm ") {
             out.push_str(line.trim_end());
-            out.push_str(" "gc-leaf-function"
-");
+            out.push_str(" \"gc-leaf-function\"\n");
             continue;
         }
         if is_call && trimmed.ends_with(')') && !trimmed.contains(" asm ") {
@@ -1380,6 +1379,28 @@ fn lower_precise_roots_to_native_stack(
             root_ptrs.len(),
         )
     });
+    // RS4GC runs BEFORE the empty-roots early return on purpose: a function
+    // can reserve slots (so it carries `gc "statepoint-example"`) yet bind
+    // none, and it still contains inline asm that RS4GC would rewrite into an
+    // invalid statepoint. Found on the Claude Code bundle, where the early
+    // return skipped leaf-marking and the verifier aborted with "Cannot take
+    // the address of an inline asm!".
+    if backend == PreciseRootBackend::Rs4gc {
+        if let Some(out) = lower_roots_for_rs4gc(&lines, &root_ptrs) {
+            if let Some(mut report) = report {
+                report.note_call(root_ptrs.len());
+                crate::statepoint_report::record(report);
+            }
+            return out;
+        }
+        return lower_precise_roots_to_native_stack(
+            ir,
+            function_name,
+            slot_count,
+            PreciseRootBackend::Statepoint,
+        );
+    }
+
     if root_ptrs.is_empty() {
         let out = ir
             .lines()
@@ -1390,24 +1411,6 @@ fn lower_precise_roots_to_native_stack(
             crate::statepoint_report::record(report);
         }
         return out;
-    }
-
-    if backend == PreciseRootBackend::Rs4gc {
-        if let Some(out) = lower_roots_for_rs4gc(&lines, &root_ptrs) {
-            if let Some(mut report) = report {
-                report.note_call(root_ptrs.len());
-                crate::statepoint_report::record(report);
-            }
-            return out;
-        }
-        // A root alloca is used in a shape the surgery does not recognize —
-        // fail closed to the explicit statepoint backend for this function.
-        return lower_precise_roots_to_native_stack(
-            ir,
-            function_name,
-            slot_count,
-            PreciseRootBackend::Statepoint,
-        );
     }
 
     let mut out = String::with_capacity(ir.len() + root_ptrs.len() * 128);
