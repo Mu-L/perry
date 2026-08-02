@@ -125,7 +125,17 @@ fn module_with_init(name: &str, init: Vec<Stmt>) -> Module {
     }
 }
 
+fn enable_moving_loop_polls() {
+    // #7161 made loop polls opt-in while the moving-minor rooting audit was in
+    // progress.  This entire test binary exercises poll placement, so opt in
+    // once before any worker compiles IR. `Once` also prevents one test thread
+    // from mutating the environment while another is reading the gate.
+    static ENABLE: std::sync::Once = std::sync::Once::new();
+    ENABLE.call_once(|| std::env::set_var("PERRY_GC_MOVING_LOOP_POLLS", "1"));
+}
+
 fn ir_for(name: &str, init: Vec<Stmt>) -> String {
+    enable_moving_loop_polls();
     String::from_utf8(compile_module(&module_with_init(name, init), entry_opts()).unwrap())
         .expect("LLVM IR should be UTF-8")
 }
@@ -133,6 +143,7 @@ fn ir_for(name: &str, init: Vec<Stmt>) -> String {
 /// Same, but `exported` names are exported module variables — which is what
 /// promotes a module-level `let` to a `@perry_global_*` slot.
 fn ir_for_with_exported_vars(name: &str, init: Vec<Stmt>, exported: &[&str]) -> String {
+    enable_moving_loop_polls();
     let mut m = module_with_init(name, init);
     m.exported_objects = exported.iter().map(|s| s.to_string()).collect();
     String::from_utf8(compile_module(&m, entry_opts()).unwrap()).expect("LLVM IR should be UTF-8")

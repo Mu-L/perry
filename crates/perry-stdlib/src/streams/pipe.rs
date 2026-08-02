@@ -1017,15 +1017,31 @@ mod tests {
     #[test]
     fn pipe_keeps_locks_until_async_abort_settles() {
         let _serial = crate::streams::tests::serial_guard();
-        let action = js_promise_new();
-        let callback =
-            perry_runtime::closure::js_closure_alloc(pending_abort_action as *const u8, 1);
+        // This test runs late in the full stdlib suite, when any of the setup
+        // allocations below can trigger a copying minor. Keep every GC pointer
+        // that remains live in this Rust frame relocatable; the stream and
+        // promise registries take over only after each value is installed.
+        let scope = perry_runtime::gc::RuntimeHandleScope::new();
+        let action = scope.root_raw_mut_ptr(js_promise_new());
+        let callback = scope.root_raw_mut_ptr(perry_runtime::closure::js_closure_alloc(
+            pending_abort_action as *const u8,
+            1,
+        ));
         perry_runtime::closure::js_register_closure_arity(pending_abort_action as *const u8, 1);
-        perry_runtime::closure::js_closure_set_capture_ptr(callback, 0, action as i64);
+        perry_runtime::closure::js_closure_set_capture_ptr(
+            callback.get_raw_mut_ptr::<ClosureHeader>(),
+            0,
+            action.get_raw_mut_ptr::<Promise>() as i64,
+        );
         let readable = alloc_readable(0, 0, 0, 1.0);
-        let writable = alloc_writable(0, 0, callback as i64, 1.0);
+        let writable = alloc_writable(
+            0,
+            0,
+            callback.get_raw_mut_ptr::<ClosureHeader>() as i64,
+            1.0,
+        );
         let locks = acquire_pipe_locks(readable, writable).unwrap();
-        let promise = js_promise_new();
+        let promise = scope.root_raw_mut_ptr(js_promise_new());
         let state = PipeState {
             locks,
             prevent_close: false,
@@ -1035,9 +1051,20 @@ mod tests {
             abort_listener: f64::from_bits(TAG_UNDEFINED),
         };
 
-        unsafe { abort_destination_and_reject(readable, writable, promise, state, TAG_UNDEFINED) };
+        unsafe {
+            abort_destination_and_reject(
+                readable,
+                writable,
+                promise.get_raw_mut_ptr::<Promise>(),
+                state,
+                TAG_UNDEFINED,
+            )
+        };
         perry_runtime::promise::js_promise_run_microtasks();
-        assert_eq!(perry_runtime::promise::js_promise_state(promise), 0);
+        assert_eq!(
+            perry_runtime::promise::js_promise_state(promise.get_raw_mut_ptr::<Promise>()),
+            0
+        );
         assert_eq!(
             READABLE_STREAMS
                 .lock()
@@ -1057,9 +1084,15 @@ mod tests {
             Some(locks.writer_id)
         );
 
-        js_promise_resolve(action, f64::from_bits(TAG_UNDEFINED));
+        js_promise_resolve(
+            action.get_raw_mut_ptr::<Promise>(),
+            f64::from_bits(TAG_UNDEFINED),
+        );
         perry_runtime::promise::js_promise_run_microtasks();
-        assert_eq!(perry_runtime::promise::js_promise_state(promise), 2);
+        assert_eq!(
+            perry_runtime::promise::js_promise_state(promise.get_raw_mut_ptr::<Promise>()),
+            2
+        );
         assert!(READABLE_STREAMS
             .lock()
             .unwrap()

@@ -82,6 +82,12 @@ console.log("checksum:", checksum);
 
     let compile = Command::new(perry_bin())
         .current_dir(dir.path())
+        // #7161 deliberately made moving loop polls opt-in while the remaining
+        // root-publication gaps were audited.  This regression exercises the
+        // moving-minor deferral path specifically, so enable the matching
+        // codegen and runtime gates explicitly rather than depending on the
+        // process-wide CI environment.
+        .env("PERRY_GC_MOVING_LOOP_POLLS", "1")
         .arg("compile")
         .arg(&entry)
         .arg("-o")
@@ -100,6 +106,7 @@ console.log("checksum:", checksum);
         .current_dir(dir.path())
         // 8 MB is the pressure setting `scripts/gc_repsel_matrix.sh` uses, and
         // the one on which the copying minor was measured to never run.
+        .env("PERRY_GC_MOVING_LOOP_POLLS", "1")
         .env("PERRY_GC_HEAP_LIMIT", "8")
         .env("PERRY_GC_DIAG", "1")
         .output()
