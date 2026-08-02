@@ -114,7 +114,7 @@ class PerryActivity : Activity() {
         // Request any dangerous runtime permissions declared in the manifest
         // before starting native code, so they're available when needed.
         val needed = getDangerousPermissionsToRequest()
-        if (needed.isNotEmpty()) {
+        if (!isPerryUiTestMode() && needed.isNotEmpty()) {
             requestPermissions(needed.toTypedArray(), PERMISSION_REQUEST_CODE)
         } else {
             startNative()
@@ -221,6 +221,27 @@ class PerryActivity : Activity() {
             isDaemon = true
             start()
         }
+
+        // Emulator/release sweeps launch with these intent extras rather than
+        // process environment variables. Let the native app render briefly,
+        // emit a stable logcat witness, then close the Activity. Uninstalling
+        // the package after the witness terminates any cached native process.
+        if (isPerryUiTestMode()) {
+            val delayMs = intent
+                ?.getIntExtra("PERRY_UI_TEST_EXIT_AFTER_MS", 500)
+                ?.coerceAtLeast(0)
+                ?.toLong()
+                ?: 500L
+            rootLayout.postDelayed({
+                android.util.Log.i("PerryUI", "test-mode exit")
+                finishAndRemoveTask()
+            }, delayMs)
+        }
+    }
+
+    private fun isPerryUiTestMode(): Boolean {
+        val value = intent?.getStringExtra("PERRY_UI_TEST_MODE") ?: return false
+        return value.isNotEmpty() && value != "0" && !value.equals("false", ignoreCase = true)
     }
 
     override fun onResume() {

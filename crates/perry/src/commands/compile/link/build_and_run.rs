@@ -1060,8 +1060,25 @@ pub(crate) fn build_and_run_link(
             } else if is_ios || is_visionos || is_tvos {
                 // UIKit already linked above
             } else if is_android {
-                // Allow multiple definitions from perry-runtime in both UI lib and native libs
+                // Allow multiple definitions from perry-runtime in both UI lib and native libs.
                 cmd.arg("-Wl,--allow-multiple-definition");
+
+                // The Android UI archive force-links perry-ext-sharp, which in
+                // turn uses perry-ffi's native-async ABI. Those C symbols live
+                // in perry-stdlib rather than perry-runtime. A bare UI program
+                // leaves ctx.needs_stdlib=false, and even when it is true the
+                // first archive scan happens before the UI archive introduces
+                // its perry_ffi_* references. Repeat (or add) stdlib after UI
+                // so the final shared object has no unresolved loader symbols.
+                let android_stdlib_for_ui =
+                    stdlib_lib.clone().or_else(|| find_stdlib_library(target));
+                if let Some(ref stdlib) = android_stdlib_for_ui {
+                    cmd.arg(stdlib);
+                } else {
+                    eprintln!(
+                        "Warning: Android UI requires libperry_stdlib.a for perry-ffi symbols"
+                    );
+                }
             } else if is_linux {
                 // Allow multiple definitions from perry-runtime in both stdlib and UI lib
                 cmd.arg("-Wl,--allow-multiple-definition");

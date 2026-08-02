@@ -119,6 +119,31 @@ fi
 OUT_DIR="$REPO_ROOT/target/perry-android-tests"
 mkdir -p "$OUT_DIR"
 
+# `perry compile --target android` produces the native ARM64 shared object,
+# not an installable APK. Package that object with the same Gradle template
+# used by `perry run android`; keep one project warm across all examples so
+# Gradle only has to replace libperry_app.so after the first build.
+ANDROID_TEMPLATE="$REPO_ROOT/crates/perry-ui-android/template"
+ANDROID_WRAPPER_SOURCE="$REPO_ROOT/android-build"
+ANDROID_PACKAGE_DIR="$OUT_DIR/android-package"
+if [[ ! -d "$ANDROID_TEMPLATE" || ! -x "$ANDROID_WRAPPER_SOURCE/gradlew" || \
+      ! -d "$ANDROID_WRAPPER_SOURCE/gradle/wrapper" ]]; then
+    echo "android-emu: Android Gradle template/wrapper missing" >&2
+    exit 2
+fi
+if [[ -d "$ANDROID_PACKAGE_DIR" ]]; then
+    find "$ANDROID_PACKAGE_DIR" -depth -delete
+fi
+mkdir -p "$ANDROID_PACKAGE_DIR/gradle/wrapper"
+cp -R "$ANDROID_TEMPLATE/." "$ANDROID_PACKAGE_DIR/"
+cp "$ANDROID_WRAPPER_SOURCE/gradlew" "$ANDROID_PACKAGE_DIR/gradlew"
+cp "$ANDROID_WRAPPER_SOURCE/gradlew.bat" "$ANDROID_PACKAGE_DIR/gradlew.bat"
+cp -R "$ANDROID_WRAPPER_SOURCE/gradle/wrapper/." "$ANDROID_PACKAGE_DIR/gradle/wrapper/"
+chmod +x "$ANDROID_PACKAGE_DIR/gradlew"
+ANDROID_JNI_DIR="$ANDROID_PACKAGE_DIR/app/src/main/jniLibs/arm64-v8a"
+ANDROID_GRADLE_APK="$ANDROID_PACKAGE_DIR/app/build/outputs/apk/debug/app-debug.apk"
+mkdir -p "$ANDROID_JNI_DIR"
+
 echo "android-emu: AVD=$AVD"
 
 # Boot emulator in background
@@ -163,20 +188,34 @@ while IFS= read -r -d '' src; do
 
     TOTAL=$((TOTAL+1))
     stem="$(basename "${src%.ts}")"
+    native_so="$OUT_DIR/${stem}.so"
     apk="$OUT_DIR/${stem}.apk"
-    pkg_id="com.perry.doctests.${stem}"
+    # The shared warm Gradle project deliberately retains the template's
+    # applicationId. Every iteration uninstalls it before the next fixture.
+    pkg_id="com.perry.template"
 
     echo "=== $rel ==="
     echo "  [+] perry compile --target android"
-    if ! "$PERRY_BIN" compile --target android --app-bundle-id "$pkg_id" "$src" -o "$apk" \
+    if ! "$PERRY_BIN" compile --target android --app-bundle-id "$pkg_id" "$src" -o "$native_so" \
             > "$OUT_DIR/$stem.compile.log" 2>&1; then
         echo "  COMPILE_FAIL"
         FAIL=$((FAIL+1)); FAILURES+=("$rel COMPILE_FAIL")
         continue
     fi
-    if [[ ! -s "$apk" ]]; then
-        echo "  NO_APK"
-        FAIL=$((FAIL+1)); FAILURES+=("$rel NO_APK")
+    if [[ ! -s "$native_so" ]]; then
+        echo "  NO_SHARED_OBJECT"
+        FAIL=$((FAIL+1)); FAILURES+=("$rel NO_SHARED_OBJECT")
+        continue
+    fi
+
+    echo "  [+] Gradle package"
+    if ! cp "$native_so" "$ANDROID_JNI_DIR/libperry_app.so" ||
+       ! (cd "$ANDROID_PACKAGE_DIR" && ./gradlew --console=plain :app:assembleDebug) \
+            > "$OUT_DIR/$stem.package.log" 2>&1 ||
+       [[ ! -s "$ANDROID_GRADLE_APK" ]] ||
+       ! cp "$ANDROID_GRADLE_APK" "$apk"; then
+        echo "  PACKAGE_FAIL"
+        FAIL=$((FAIL+1)); FAILURES+=("$rel PACKAGE_FAIL")
         continue
     fi
 
@@ -192,7 +231,7 @@ while IFS= read -r -d '' src; do
     if ! "$ADB_BIN" shell am start \
             --es PERRY_UI_TEST_MODE 1 \
             --ei PERRY_UI_TEST_EXIT_AFTER_MS 500 \
-            -n "${pkg_id}/.PerryActivity" \
+            -n "${pkg_id}/com.perry.app.PerryActivity" \
             > "$OUT_DIR/$stem.run.log" 2>&1; then
         echo "  LAUNCH_FAIL"
         FAIL=$((FAIL+1)); FAILURES+=("$rel LAUNCH_FAIL")
@@ -214,6 +253,10 @@ while IFS= read -r -d '' src; do
         sleep 1
     done
 
+    # Preserve the complete device log before uninstalling the package. This
+    # makes native loader/JNI crashes diagnosable from release-sweep artifacts
+    # instead of losing the only evidence when the emulator shuts down.
+    "$ADB_BIN" logcat -d > "$OUT_DIR/$stem.logcat.log" 2>&1 || true
     "$ADB_BIN" uninstall "$pkg_id" >/dev/null 2>&1 || true
 
     if [[ "$saw_exit" -eq 1 ]]; then
