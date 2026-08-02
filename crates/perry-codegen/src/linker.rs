@@ -729,9 +729,58 @@ pub fn compile_units_to_object(units: &[String], target_triple: Option<&str>) ->
     let pid = std::process::id();
     let nonce = TEMP_NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
 
+    // Units are independent clang invocations, so compile them concurrently.
+    // Measured before this: the 13 MB Claude Code bundle spent 4,939 s wall
+    // against 4,672 s user — the split existed for memory (#5391) but the
+    // clang phase, which dominates, ran one unit at a time.
+    //
+    // Concurrency is BOUNDED rather than one-thread-per-unit: each job parses
+    // a multi-hundred-megabyte translation unit, so unbounded fan-out trades
+    // wall time for an OOM (and would undo the peak-memory win the split was
+    // introduced for). Default is a quarter of the machine's parallelism,
+    // clamped to [1, 4]; `PERRY_CODEGEN_UNIT_JOBS` overrides.
+    let jobs = std::env::var("PERRY_CODEGEN_UNIT_JOBS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|p| (p.get() / 4).clamp(1, 4))
+                .unwrap_or(1)
+        })
+        .min(units.len());
+
+    let mut compiled: Vec<Option<Result<Vec<u8>>>> = (0..units.len()).map(|_| None).collect();
+    if jobs <= 1 {
+        for (i, unit) in units.iter().enumerate() {
+            compiled[i] = Some(compile_ll_to_object(unit, target_triple));
+        }
+    } else {
+        let slots: Vec<std::sync::Mutex<Option<Result<Vec<u8>>>>> = (0..units.len())
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..jobs {
+                scope.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= units.len() {
+                        break;
+                    }
+                    let out = compile_ll_to_object(&units[i], target_triple);
+                    *slots[i].lock().expect("codegen-unit slot poisoned") = Some(out);
+                });
+            }
+        });
+        for (i, slot) in slots.into_iter().enumerate() {
+            compiled[i] = slot.into_inner().expect("codegen-unit slot poisoned");
+        }
+    }
+
     let mut obj_paths: Vec<PathBuf> = Vec::with_capacity(units.len());
-    for (i, unit) in units.iter().enumerate() {
-        let bytes = compile_ll_to_object(unit, target_triple)
+    for (i, result) in compiled.into_iter().enumerate() {
+        let bytes = result
+            .expect("every codegen unit is compiled")
             .with_context(|| format!("codegen unit {}/{} failed to compile", i + 1, units.len()))?;
         let p = tmp_dir.join(format!("perry_cgu_{}_{}_{}.o", pid, nonce, i));
         fs::write(&p, &bytes)
