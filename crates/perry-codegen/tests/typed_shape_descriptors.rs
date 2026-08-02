@@ -744,15 +744,16 @@ fn integer_arithmetic_array_push_omits_inbounds_layout_note_and_barrier() {
     );
 
     let ir = ir_for(module);
-    let fast_ir = block_between(&ir, "\napush.numeric_fast.", "\napush.numeric_fallback.");
+    let fast_ir = block_between(&ir, "\napush.inbounds.", "\napush.realloc.");
 
     assert!(
-        ir.contains("call i32 @js_typed_feedback_numeric_array_push_guard"),
-        "plain-number loop pushes must guard that the runtime layout is still raw-f64"
+        !ir.contains("call i32 @js_typed_feedback_numeric_array_push_guard"),
+        "canonical numeric pushes should use the inline structural guard tier"
     );
     assert!(
-        ir.contains("call i64 @js_array_numeric_push_f64_unboxed"),
-        "plain-number loop pushes should use the raw-f64 push helper on the guarded fast path"
+        !ir.contains("call i64 @js_array_numeric_push_f64_unboxed")
+            && fast_ir.contains("store double"),
+        "canonical numeric pushes should store raw f64 inline rather than call the old helper"
     );
     assert!(
         !fast_ir.contains("call void @js_gc_note_slot_layout"),
