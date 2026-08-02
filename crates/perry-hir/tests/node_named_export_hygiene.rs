@@ -153,6 +153,8 @@ fn valid_node_named_imports_keep_compiling() {
         r#"import { request, get, Agent, Server } from "node:https"; console.log(request, get, Agent, Server);"#,
         r#"import { createSecureServer, Http2ServerRequest, Http2ServerResponse, constants } from "node:http2"; console.log(createSecureServer, Http2ServerRequest, Http2ServerResponse, constants);"#,
         r#"import { exec, spawn, ChildProcess } from "node:child_process"; console.log(exec, spawn, ChildProcess);"#,
+        r#"import { spawnBackground, getProcessStatus, killProcess } from "node:child_process"; console.log(spawnBackground, getProcessStatus, killProcess);"#,
+        r#"import { readFileBuffer } from "node:fs"; console.log(readFileBuffer);"#,
         r#"import { fork, Worker, workers } from "node:cluster"; console.log(fork, Worker, workers);"#,
         r#"import { default as pathDefault } from "node:path"; console.log(pathDefault.join("a", "b"));"#,
         r#"import { Readable, Writable, compose, default as streamDefault } from "node:stream"; console.log(Readable, Writable, compose, streamDefault);"#,

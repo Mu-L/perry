@@ -1,6 +1,6 @@
 // Auto-generated from Perry's API manifest (#465). Do not edit by hand.
 // Source: perry-api-manifest::API_MANIFEST
-// Coverage: 2001 entries across 122 modules
+// Coverage: 2005 entries across 122 modules
 
 type PerryU32 = number & { readonly __perryU32?: never };
 type PerryU64 = number & { readonly __perryU64?: never };
@@ -355,7 +355,13 @@ declare module "child_process" {
   /** stdlib */
   export function fork(...args: any[]): any;
   /** stdlib */
+  export function getProcessStatus(...args: any[]): any;
+  /** stdlib */
+  export function killProcess(...args: any[]): any;
+  /** stdlib */
   export function spawn(...args: any[]): any;
+  /** stdlib */
+  export function spawnBackground(...args: any[]): any;
   /** stdlib */
   export function spawnSync(...args: any[]): any;
 }
@@ -1645,6 +1651,8 @@ declare module "fs" {
   export function read(...args: any[]): any;
   /** stdlib */
   export function readFile(...args: any[]): any;
+  /** stdlib */
+  export function readFileBuffer(...args: any[]): any;
   /** stdlib */
   export function readFileSync(...args: any[]): any;
   /** stdlib */

@@ -1,7 +1,7 @@
 import { WebSocketServer, WebSocket } from "ws";
 
 async function main(): Promise<void> {
-    const port = 18901;
+    const port = Number(process.env.PERRY_WS_PORT ?? "18901");
     const wss = new WebSocketServer({ port });
 
     wss.on("connection", (sock: WebSocket) => {

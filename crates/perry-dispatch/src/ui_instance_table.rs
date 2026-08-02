@@ -16,6 +16,18 @@ pub const PERRY_UI_INSTANCE_TABLE: &[MethodRow] = &[
         args: &[],
         ret: ReturnKind::Void,
     },
+    MethodRow {
+        method: "animateOpacity",
+        runtime: "perry_ui_widget_animate_opacity",
+        args: &[ArgKind::F64, ArgKind::F64],
+        ret: ReturnKind::Void,
+    },
+    MethodRow {
+        method: "animatePosition",
+        runtime: "perry_ui_widget_animate_position",
+        args: &[ArgKind::F64, ArgKind::F64, ArgKind::F64],
+        ret: ReturnKind::Void,
+    },
     // ---- Window instance methods ----
     MethodRow {
         method: "show",

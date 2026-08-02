@@ -619,7 +619,12 @@ pub(super) fn strip_duplicate_objects_from_lib(lib_path: &PathBuf) -> Result<Pat
     let ui_only_deps: Vec<&String> = staticlib_members
         .iter()
         .filter(|m| {
-            if m.ends_with(".dll") {
+            // Rust staticlibs can carry COFF import-library pseudo-members.
+            // They are not ordinary objects and become incomplete import
+            // descriptors when copied into the trimmed archive. Windows uses
+            // both `.dll` names and legacy driver-module names such as
+            // `winspool.drv`; the final link supplies their real import libs.
+            if is_coff_import_library_pseudo_member(m) {
                 return false;
             }
             if m.contains("compiler_builtins") {
@@ -752,6 +757,11 @@ pub(super) fn strip_duplicate_objects_from_lib(lib_path: &PathBuf) -> Result<Pat
     let _ = std::fs::remove_dir_all(&extract_dir);
     let _ = std::fs::remove_dir_all("_perry_ui_objects");
     Ok(trimmed_lib)
+}
+
+fn is_coff_import_library_pseudo_member(member: &str) -> bool {
+    let member = member.to_ascii_lowercase();
+    member.ends_with(".dll") || member.ends_with(".drv")
 }
 
 /// Rebuild an archive without exceeding Windows' process command-line limit.
@@ -1572,7 +1582,18 @@ pub(super) fn dedup_native_lib_for_tier3(
 
 #[cfg(test)]
 mod strip_dedup_tests {
-    use super::{force_localize_symbol, is_panic_unwind_symbol, parse_nm_archive_output};
+    use super::{
+        force_localize_symbol, is_coff_import_library_pseudo_member, is_panic_unwind_symbol,
+        parse_nm_archive_output,
+    };
+
+    #[test]
+    fn coff_import_library_pseudo_members_are_not_repacked() {
+        assert!(is_coff_import_library_pseudo_member("kernel32.dll"));
+        assert!(is_coff_import_library_pseudo_member("winspool.drv"));
+        assert!(is_coff_import_library_pseudo_member("WINHTTP.DLL"));
+        assert!(!is_coff_import_library_pseudo_member("perry_ui.cgu.0.o"));
+    }
 
     #[test]
     fn panic_unwind_classification_matches_dwref() {

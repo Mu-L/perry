@@ -644,6 +644,7 @@ pub(crate) const API_MANIFEST_PART_3: &[ApiEntry] = &[
     //     externs declared by perry-runtime/src/fs.rs). ---
     method("fs", "_toUnixTimestamp", false, None),
     method("fs", "readFileSync", false, None),
+    method("fs", "readFileBuffer", false, None),
     method("fs", "writeFileSync", false, None),
     method("fs", "appendFileSync", false, None),
     method("fs", "existsSync", false, None),
@@ -1264,6 +1265,9 @@ pub(crate) const API_MANIFEST_PART_3: &[ApiEntry] = &[
     method("child_process", "spawn", false, None),
     method("child_process", "spawnSync", false, None),
     method("child_process", "fork", false, None),
+    method("child_process", "spawnBackground", false, None),
+    method("child_process", "getProcessStatus", false, None),
+    method("child_process", "killProcess", false, None),
     property("child_process", "default"),
     // #1856: `ChildProcess` is the streaming-subprocess constructor; reading
     // it as a value yields `[Function: ChildProcess]`. `Stream` is not a real

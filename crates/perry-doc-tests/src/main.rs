@@ -808,10 +808,22 @@ fn cross_compile_one(
 }
 
 fn compile(perry_bin: &Path, src: &Path, out: &Path) -> Result<()> {
-    let out_status = Command::new(perry_bin)
-        .arg(src)
-        .arg("-o")
-        .arg(out)
+    let mut command = Command::new(perry_bin);
+    command.arg(src).arg("-o").arg(out);
+
+    // The release doc runner normally reuses fully-built host archives via
+    // PERRY_NO_AUTO_OPTIMIZE. Fastify is the exception: its external bridge
+    // is selected from the source import set and therefore requires the
+    // compiler's feature-specialized archive build.
+    if std::env::var_os("PERRY_NO_AUTO_OPTIMIZE").is_some() {
+        let source =
+            std::fs::read_to_string(src).with_context(|| format!("reading {}", src.display()))?;
+        if source.contains("\"fastify\"") || source.contains("'fastify'") {
+            command.env_remove("PERRY_NO_AUTO_OPTIMIZE");
+        }
+    }
+
+    let out_status = command
         .output()
         .with_context(|| format!("launching perry for {}", src.display()))?;
     if !out_status.status.success() {

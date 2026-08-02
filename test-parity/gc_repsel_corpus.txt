@@ -460,3 +460,12 @@ test_gap_gc_process_env_cache_rooting
 # was hiding it, and a malloc-count-driven collection stops it hiding, so it is
 # red on the SHIPPED DEFAULT at base too.
 test_gap_gc_symbol_local_rooting
+
+# --- #7252: cross-module direct-call arguments need live roots ------------
+# `extern_func.rs` evaluated arguments left-to-right but left each completed
+# heap value in a bare SSA register while later arguments could allocate and
+# trigger an evacuating minor. This witness covers both protections used by
+# the fix: reloading rooted string-literal globals and shadow-rooting locals.
+# Registered explicitly because it is a GC lowering gap, not a representation
+# file covered by the corpus manifest's automatic filename check.
+test_gap_gc_call_argument_rooting

@@ -143,6 +143,12 @@ else
     ts="$(date +%Y%m%d-%H%M%S)"
     output_dir="$REPO_ROOT/target/release-sweep/$ts"
 fi
+# Tier scripts may change their working directory before delegating to another
+# harness. Keep the shared output path stable in that case.
+case "$output_dir" in
+    /*) ;;
+    *) output_dir="$REPO_ROOT/$output_dir" ;;
+esac
 mkdir -p "$output_dir"
 
 echo "release_sweep: output → $output_dir"

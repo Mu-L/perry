@@ -140,6 +140,7 @@ def create_compiler_output(root):
             "array_slow_path_accesses_static": 0,
             "allocations_traced": 5,
             "write_barriers_static": 0,
+            "root_shading_barriers_static": 2,
             "write_barriers_traced": 8,
             "runtime_calls_static": 2,
         },
@@ -159,6 +160,7 @@ def create_compiler_output(root):
             "array_slow_path_accesses_static": 256,
             "allocations_traced": 640,
             "write_barriers_static": 6,
+            "root_shading_barriers_static": 17,
             "write_barriers_traced": 360,
             "runtime_calls_static": 12,
         },
@@ -469,7 +471,7 @@ class NativeAbiEvidenceReportTests(unittest.TestCase):
                 for row in packet["benchmark_deltas"]["material_accounting"]
             }
             self.assertEqual(accounting["runtime_calls_static"]["status"], "pass")
-            self.assertEqual(accounting["write_barriers_static"]["status"], "pass")
+            self.assertEqual(accounting["root_shading_barriers_static"]["status"], "pass")
             self.assertEqual(
                 packet["benchmark_deltas"]["benchmark_stat_quality"],
                 {"typed": "timing", "control": "timing"},
@@ -605,13 +607,13 @@ class NativeAbiEvidenceReportTests(unittest.TestCase):
                 / "manifest.json"
             )
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["runtime_counter_summary"]["write_barriers_static"] = 5
+            manifest["runtime_counter_summary"]["root_shading_barriers_static"] = 16
             write_json(manifest_path, manifest)
 
             packet = REPORT.build_packet(root, root / "metadata.json", repo_root, gate=True)
             self.assertEqual(packet["status"], "fail")
             failures = packet["benchmark_deltas"]["material_failures"]
-            self.assertTrue(any("write_barriers_static" in failure for failure in failures))
+            self.assertTrue(any("root_shading_barriers_static" in failure for failure in failures))
 
     def test_material_speedup_requires_timing_quality(self):
         temp, root, repo_root = self.make_packet()

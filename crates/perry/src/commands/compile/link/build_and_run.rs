@@ -978,17 +978,13 @@ pub(crate) fn build_and_run_link(
         }
     }
 
-    // Issue #607 — watchOS targets always link the UI lib regardless of
-    // `ctx.needs_ui`. The watchOS Swift template (`PerryWatchApp.swift`)
-    // unconditionally references four `@_silgen_name`'d Rust symbols
-    // (`perry_watchos_tree_version` / `perry_watchos_toggle_changed` /
-    // `perry_watchos_toast_seq` / `perry_watchos_toast_dismiss`) that
-    // live in `libperry_ui_watchos.a`. A console-only TS program has
-    // `needs_ui = false`, so the UI lib was previously not added to the
-    // link line — leaving those four symbols undefined and the link
-    // failing. Forcing the UI lib for watchOS adds ~MBs but unblocks
-    // `console.log("ok")`-only programs from compiling.
-    let force_ui = is_watchos;
+    // The watchOS and visionOS Swift templates unconditionally reference UI
+    // backend symbols even for console-only TS inputs. A console-only program
+    // has `needs_ui = false`, so omitting the archive leaves the Swift shell's
+    // `perry_watchos_*` or `perry_visionos_root_view` references undefined.
+    // Force the UI archive for both platforms; if it has not been prebuilt,
+    // the normal missing-library diagnostic below explains the prerequisite.
+    let force_ui = is_watchos || is_visionos;
     if ctx.needs_ui || force_ui {
         // When geisterhand is enabled, prefer the geisterhand-enabled UI lib
         // (it contains widget registration calls that the normal lib doesn't have)

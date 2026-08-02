@@ -51,7 +51,10 @@ trap 'rm -rf "$TMPDIR"' EXIT
 SRC="$REPO_ROOT/test-files/test_issue_1425_gc_unsafe_zones.ts"
 BIN="$TMPDIR/issue_1425_gc_unsafe_zones"
 
-"$PERRY" compile --no-cache "$SRC" -o "$BIN" >"$TMPDIR/compile.log" 2>&1 || {
+# Auto-optimized runtimes select the cold diagnostics serializers at compile
+# time. Request tracing for both compilation and execution so this canary's
+# JSON evidence is not compiled out by the minimal-runtime feature pass.
+PERRY_GC_TRACE=1 "$PERRY" compile --no-cache "$SRC" -o "$BIN" >"$TMPDIR/compile.log" 2>&1 || {
     echo "FAIL: compile failed"
     sed 's/^/    /' "$TMPDIR/compile.log" | tail -60
     exit 1

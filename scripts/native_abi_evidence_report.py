@@ -131,7 +131,7 @@ DELTA_FIELDS = (
     "buffer_slow_path_accesses_static",
     "array_slow_path_accesses_static",
     "allocations_traced",
-    "write_barriers_static",
+    "root_shading_barriers_static",
     "write_barriers_traced",
     "runtime_calls_static",
 )
@@ -145,7 +145,7 @@ REQUIRED_IMPROVEMENT_FIELDS = (
 
 MATERIAL_REDUCTION_THRESHOLDS = {
     "allocations_traced": 95.0,
-    "write_barriers_static": 75.0,
+    "root_shading_barriers_static": 75.0,
     "write_barriers_traced": 95.0,
     "runtime_calls_static": 25.0,
 }
@@ -208,12 +208,12 @@ MATERIAL_ACCOUNTING_CONTRACT = (
         "proves": "typed packet removes representative traced runtime allocations",
     },
     {
-        "field": "write_barriers_static",
+        "field": "root_shading_barriers_static",
         "category": "barriers",
-        "source": "optimized IR write-barrier counter",
+        "source": "optimized IR shadow-root barrier counter",
         "control_min": 1,
-        "reduction_min": MATERIAL_REDUCTION_THRESHOLDS["write_barriers_static"],
-        "proves": "typed packet removes representative static write-barrier helper sites",
+        "reduction_min": MATERIAL_REDUCTION_THRESHOLDS["root_shading_barriers_static"],
+        "proves": "typed packet reduces representative static shadow-root barrier sites",
     },
     {
         "field": "write_barriers_traced",
@@ -279,7 +279,7 @@ PACKET_WORKLOAD_CONTRACTS: dict[str, dict[str, Any]] = {
             "boxed_number_allocations_static",
             "buffer_slow_path_accesses_static",
             "array_slow_path_accesses_static",
-            "write_barriers_static",
+            "root_shading_barriers_static",
             "runtime_calls_static",
         ),
     },

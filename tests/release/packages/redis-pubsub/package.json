@@ -8,9 +8,25 @@
     "redis": "^4.7.0"
   },
   "perry": {
-    "compilePackages": ["redis"],
+    "compilePackages": [
+      "redis",
+      "@redis/client",
+      "@redis/bloom",
+      "@redis/graph",
+      "@redis/json",
+      "@redis/search",
+      "@redis/time-series"
+    ],
     "allow": {
-      "compilePackages": ["redis"]
+      "compilePackages": [
+        "redis",
+        "@redis/client",
+        "@redis/bloom",
+        "@redis/graph",
+        "@redis/json",
+        "@redis/search",
+        "@redis/time-series"
+      ]
     }
   }
 }

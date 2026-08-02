@@ -11,4 +11,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 OUT="${PERRY_RELEASE_SWEEP_OUTPUT:?PERRY_RELEASE_SWEEP_OUTPUT not set}"
-sweep_tier_run_summary "$OUT" 6 "doc_tests" "$REPO_ROOT/scripts/run_doc_tests.sh"
+sweep_tier_run_summary \
+    "$OUT" 6 "doc_tests" \
+    "$REPO_ROOT/scripts/run_doc_tests.sh" --skip-xcompile

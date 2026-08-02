@@ -21,8 +21,21 @@ cd "$REPO_ROOT"
 # `target/release/libperry_*.a` covers every doc-test's import surface,
 # letting PERRY_NO_AUTO_OPTIMIZE=1 below short-circuit the per-test
 # specialized rebuild (~30-200s saved per test).
-cargo build --release \
-    -p perry -p perry-runtime -p perry-stdlib -p perry-runtime-static -p perry-stdlib-static -p perry-doc-tests
+build_packages=(
+    -p perry
+    -p perry-runtime
+    -p perry-stdlib
+    -p perry-runtime-static
+    -p perry-stdlib-static
+    -p perry-doc-tests
+)
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    # Host UI examples link the native macOS archive. Keep this runner
+    # self-contained instead of relying on a separate CI prebuild step.
+    build_packages+=(-p perry-ui-macos)
+fi
+
+cargo build --release "${build_packages[@]}"
 
 # Disable per-test auto-optimize for HOST runs only. With this set,
 # `perry compile` short-circuits the cargo-rebuild step in

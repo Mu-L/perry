@@ -833,6 +833,7 @@ fn test_old_page_defrag_target_gate_emits_trace() {
     let _isolation = copying_nursery_isolation_lock();
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     let _barrier_guard = GeneratedWriteBarrierTestGuard::active();
+    let _defrag_guard = OldDefragTestEnable::new();
     reset_shadow_stack();
     reset_global_roots();
     reset_remembered_set();

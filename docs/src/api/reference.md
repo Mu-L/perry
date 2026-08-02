@@ -2,7 +2,7 @@
 
 This page is auto-generated from Perry's compile-time API manifest (`perry-api-manifest::API_MANIFEST`). It is the source of truth for what `perry compile` accepts; references to symbols not listed here produce `R005 UnimplementedApi` (issue #463). Stubs (#464) are flagged ⚠ — they link cleanly but no-op at runtime on the chosen target.
 
-Total: 2924 entries across 124 modules.
+Total: 2928 entries across 124 modules.
 
 ## Modules
 
@@ -413,7 +413,10 @@ Total: 2924 entries across 124 modules.
 - `execFileSync` — module
 - `execSync` — module
 - `fork` — module
+- `getProcessStatus` — module
+- `killProcess` — module
 - `spawn` — module
+- `spawnBackground` — module
 - `spawnSync` — module
 
 ### Properties
@@ -1398,6 +1401,7 @@ Total: 2924 entries across 124 modules.
 - `opendirSync` — module
 - `read` — module
 - `readFile` — module
+- `readFileBuffer` — module
 - `readFileSync` — module
 - `readSync` — module
 - `readdir` — module

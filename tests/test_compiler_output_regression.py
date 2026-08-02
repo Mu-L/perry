@@ -30,19 +30,19 @@ GOOD_IR = """
 define i32 @main() {
 entry:
   call void @llvm.assume(i1 true)
-  br label %for.body.20
-for.body.20:
+  br label %for.body.32
+for.body.32:
   %row = mul i32 %y, 255
-  br label %for.body.24
-for.body.24:
+  br label %for.body.36
+for.body.36:
   %p0 = getelementptr inbounds i8, ptr %base, i64 %i
   store i8 1, ptr %p0, align 1, !alias.scope !2, !noalias !3
   %p1 = getelementptr inbounds i8, ptr %base, i64 %i1
   store i8 2, ptr %p1, align 1, !alias.scope !2, !noalias !3
   %p2 = getelementptr inbounds i8, ptr %base, i64 %i2
   store i8 3, ptr %p2, align 1, !alias.scope !2, !noalias !3
-  br label %while.body.28
-while.body.28:
+  br label %while.body.40
+while.body.40:
   %noise0 = load i8, ptr %p0, align 1, !invariant.load !1, !alias.scope !2, !noalias !3
   %noise1 = load i8, ptr %p1, align 1, !invariant.load !1, !alias.scope !2, !noalias !3
   %noise2 = load i8, ptr %p2, align 1, !invariant.load !1, !alias.scope !2, !noalias !3
@@ -52,19 +52,19 @@ while.body.28:
   %n3 = xor i32 %n2, %seed3
   %nb = trunc i32 %n3 to i8
   store i8 %nb, ptr %p0, align 1, !alias.scope !2, !noalias !3
-  br label %for.body.38
-for.body.38:
+  br label %for.body.56
+for.body.56:
   %b0 = load i8, ptr %p0, align 1, !invariant.load !1, !alias.scope !2, !noalias !3
   %b1 = load i8, ptr %p1, align 1, !invariant.load !1, !alias.scope !2, !noalias !3
   %b2 = load i8, ptr %p2, align 1, !invariant.load !1, !alias.scope !2, !noalias !3
   store i8 %b0, ptr %p2, align 1, !alias.scope !2, !noalias !3
-  br label %for.body.42
-for.body.42:
+  br label %for.body.70
+for.body.70:
   %hbyte = load i8, ptr %p2, align 1, !invariant.load !1, !alias.scope !2, !noalias !3
   %x = zext i8 %hbyte to i32
   %h = xor i32 %prev, %x
   %m = mul i32 %h, 16777619
-  br label %for.body.42
+  br label %for.body.70
 }
 !1 = !{}
 !2 = !{}
@@ -240,7 +240,7 @@ def image_native_records():
     proven = {"proven": {"proof": "loop_guard"}}
     input_records = [
         native_record(
-            block="for.body.24",
+            block="for.body.36",
             rep="buffer_view",
             expr_kind="Uint8ArraySet.array",
             consumer="Uint8ArraySet.BufferView",
@@ -250,7 +250,7 @@ def image_native_records():
             emitted_inbounds=True,
         ),
         native_record(
-            block="for.body.24",
+            block="for.body.36",
             rep="u8",
             expr_kind="Uint8ArraySet",
             consumer="u8_store_trunc_i32",
@@ -265,7 +265,7 @@ def image_native_records():
         *input_records,
         *input_records,
         native_record(
-            block="while.body.28",
+            block="while.body.40",
             rep="u8",
             expr_kind="Uint8ArrayGet",
             consumer="u8_load_zext_i32",
@@ -275,7 +275,7 @@ def image_native_records():
             emitted_inbounds=True,
         ),
         native_record(
-            block="while.body.28",
+            block="while.body.40",
             rep="u8",
             expr_kind="Uint8ArraySet",
             consumer="u8_store_trunc_i32",
@@ -285,7 +285,7 @@ def image_native_records():
             emitted_inbounds=True,
         ),
         native_record(
-            block="for.body.38",
+            block="for.body.56",
             rep="u8",
             expr_kind="Uint8ArrayGet",
             consumer="u8_load_zext_i32",
@@ -296,7 +296,7 @@ def image_native_records():
             emitted_noalias=True,
         ),
         native_record(
-            block="for.body.38",
+            block="for.body.56",
             rep="u8",
             expr_kind="Uint8ArrayGet",
             consumer="u8_load_zext_i32",
@@ -307,7 +307,7 @@ def image_native_records():
             emitted_noalias=True,
         ),
         native_record(
-            block="for.body.38",
+            block="for.body.56",
             rep="u8",
             expr_kind="Uint8ArrayGet",
             consumer="u8_load_zext_i32",
@@ -318,7 +318,7 @@ def image_native_records():
             emitted_noalias=True,
         ),
         native_record(
-            block="for.body.38",
+            block="for.body.56",
             rep="u8",
             expr_kind="Uint8ArraySet",
             consumer="u8_store_trunc_i32",
@@ -329,7 +329,7 @@ def image_native_records():
             emitted_noalias=True,
         ),
         native_record(
-            block="for.body.42",
+            block="for.body.70",
             rep="u8",
             expr_kind="Uint8ArrayGet",
             consumer="u8_load_zext_i32",
@@ -340,7 +340,7 @@ def image_native_records():
             emitted_noalias=True,
         ),
         native_record(
-            block="for.body.42",
+            block="for.body.70",
             rep="i32",
             expr_kind="MathImul",
             consumer="lower_expr_native_i32.structural",
@@ -685,7 +685,7 @@ entry:
         self.assertEqual(report["status"], "pass", report["errors"])
 
     def test_image_convolution_requires_named_regions(self):
-        bad_ir = GOOD_IR.replace("for.body.42:", "for.body.77:").replace(
+        bad_ir = GOOD_IR.replace("for.body.70:", "for.body.77:").replace(
             "  %m = mul i32 %h, 16777619\n", ""
         )
         report = HARNESS.verify_artifacts(
@@ -2039,7 +2039,7 @@ idxset.bounded_numeric_merge.5:
                 "named_regions": [
                     {
                         "name": "input_generation",
-                        "selectors": [{"label_prefix_any": ["for.body.20"]}],
+                        "selectors": [{"label_prefix_any": ["for.body.32"]}],
                     }
                 ],
             }
@@ -2076,7 +2076,7 @@ idxset.bounded_numeric_merge.5:
                 "named_regions": [
                     {
                         "name": "input_generation",
-                        "selectors": [{"label_prefix_any": ["for.body.20"]}],
+                        "selectors": [{"label_prefix_any": ["for.body.32"]}],
                     }
                 ],
             }
@@ -2093,7 +2093,7 @@ idxset.bounded_numeric_merge.5:
                 {
                     "records": [
                         native_record(
-                            block="for.body.20",
+                            block="for.body.32",
                             rep="js_value",
                             materialization_reason="runtime_api",
                         )

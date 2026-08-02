@@ -731,6 +731,7 @@ pub extern "C" fn js_ws_server_new(opts_f64: f64) -> Handle {
                         handle_id,
                         format!("WebSocketServer bind error: {}", e),
                     ));
+                    WS_ACTIVE_SERVERS.fetch_sub(1, Ordering::Relaxed);
                     return;
                 }
             };

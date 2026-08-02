@@ -885,7 +885,7 @@ const result = main();
 console.log("default_copied_minor_churn:" + result);
 EOF
 
-    if ! $PERRY compile --no-cache "$ts" -o "$bin" >"$compile_output" 2>&1; then
+    if ! PERRY_GC_TRACE=1 $PERRY compile --no-cache "$ts" -o "$bin" >"$compile_output" 2>&1; then
         printf "  FAIL [gc-trace] %-40s compile failed\n" "default copied minor churn"
         sed 's/^/    /' "$compile_output"
         FAIL=$((FAIL + 1))
@@ -1151,7 +1151,7 @@ run_copied_minor_fallback_workload() {
     local compile_output="$TMPDIR/${name}_copied_minor_fallback_compile.$$.$RANDOM"
     LAST_GC_TRACE_FILE=""
 
-    if ! $PERRY compile --no-cache "$ts" -o "$bin" >"$compile_output" 2>&1; then
+    if ! PERRY_GC_TRACE=1 $PERRY compile --no-cache "$ts" -o "$bin" >"$compile_output" 2>&1; then
         printf "  FAIL [gc-trace] %-40s compile failed\n" "$name"
         sed 's/^/    /' "$compile_output"
         FAIL=$((FAIL + 1))
@@ -1407,7 +1407,7 @@ run_target_collector_gate_workload() {
     local compile_output="$TMPDIR/${name}_target_collector_gate_compile.$$.$RANDOM"
     LAST_GC_TRACE_FILE=""
 
-    if ! $PERRY compile --no-cache "$ts" -o "$bin" >"$compile_output" 2>&1; then
+    if ! PERRY_GC_TRACE=1 $PERRY compile --no-cache "$ts" -o "$bin" >"$compile_output" 2>&1; then
         printf "  FAIL [target-gc] %-40s compile failed\n" "$name"
         sed 's/^/    /' "$compile_output"
         FAIL=$((FAIL + 1))
@@ -1794,8 +1794,11 @@ echo ""
 echo "=== Forced-evacuation verifier canaries ==="
 run_canary "evacuation verifier surfaces" \
     cargo test -p perry-runtime --release test_evacuation_verify
+# This test disables generated-barrier coverage with its own RAII guard. Do not
+# set PERRY_WRITE_BARRIERS=0 here: that now selects full mark-sweep before the
+# copied-minor barriers-inactive decision can be observed.
 run_canary "barriers inactive force-evac gate" \
-    env PERRY_WRITE_BARRIERS=0 PERRY_GC_FORCE_EVACUATE=1 \
+    env PERRY_GC_FORCE_EVACUATE=1 \
     cargo test -p perry-runtime --release test_forced_evacuation_barriers_inactive_does_not_forward_candidate
 run_canary "old parent remembers young child" \
     env PERRY_GC_FORCE_EVACUATE=1 \
@@ -1805,7 +1808,7 @@ echo ""
 echo "=== GC acceptance telemetry (PERRY_GC_TRACE=1 JSON gates) ==="
 run_gc_trace_probe
 run_traced_canary "barriers inactive telemetry" "barriers_inactive" \
-    env PERRY_GC_TRACE=1 PERRY_WRITE_BARRIERS=0 PERRY_GC_FORCE_EVACUATE=1 \
+    env PERRY_GC_TRACE=1 PERRY_GC_FORCE_EVACUATE=1 \
     cargo test -p perry-runtime --release test_forced_evacuation_barriers_inactive_does_not_forward_candidate -- --nocapture
 run_traced_canary "productive evacuation telemetry" "evacuation_productive" \
     env PERRY_GC_TRACE=1 PERRY_GC_FORCE_EVACUATE=1 \
