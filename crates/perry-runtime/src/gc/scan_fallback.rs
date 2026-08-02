@@ -72,6 +72,12 @@ pub(crate) enum ConservativeScanSite {
     ManualCollect,
     /// `js_gc_module_minor` — explicit `perry/gc` `minor()`. Explicit.
     ManualMinor,
+    /// `PERRY_GC_SAFEPOINT_ONLY` heal (#7174 research): a precise-root
+    /// collection began outside a declared safepoint, so the contract forces
+    /// the scan for that cycle rather than consuming roots that native
+    /// stack maps only describe at mapped PCs. Automatic, and research-mode
+    /// only — it cannot fire unless the contract env is set.
+    SafepointContractHeal,
     // ★ There is deliberately no `HostPressure` variant. `js_gc_memory_pressure`
     // used to force the scan unconditionally; after #7148 it either collects
     // with precise roots (empty shadow stack) or defers to a safepoint (a
@@ -83,7 +89,7 @@ pub(crate) enum ConservativeScanSite {
 }
 
 impl ConservativeScanSite {
-    pub(crate) const COUNT: usize = 5;
+    pub(crate) const COUNT: usize = 6;
 
     const fn index(self) -> usize {
         match self {
@@ -92,6 +98,7 @@ impl ConservativeScanSite {
             Self::EmergencyReclaim => 2,
             Self::ManualCollect => 3,
             Self::ManualMinor => 4,
+            Self::SafepointContractHeal => 5,
         }
     }
 
@@ -102,6 +109,7 @@ impl ConservativeScanSite {
             Self::EmergencyReclaim => "emergency_reclaim",
             Self::ManualCollect => "manual_collect",
             Self::ManualMinor => "manual_minor",
+            Self::SafepointContractHeal => "safepoint_contract_heal",
         }
     }
 
@@ -110,9 +118,10 @@ impl ConservativeScanSite {
     /// collections a program pays for without asking for them.
     pub(crate) const fn is_automatic(self) -> bool {
         match self {
-            Self::OldReclaimAllocPoint | Self::NurseryChurnSlackValve | Self::EmergencyReclaim => {
-                true
-            }
+            Self::OldReclaimAllocPoint
+            | Self::NurseryChurnSlackValve
+            | Self::EmergencyReclaim
+            | Self::SafepointContractHeal => true,
             Self::ManualCollect | Self::ManualMinor => false,
         }
     }

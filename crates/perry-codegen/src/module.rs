@@ -737,12 +737,47 @@ impl LlModule {
         // reference survives in another object.
         let all_globals: Vec<&String> =
             shared_strings.iter().chain(shared_globals.iter()).collect();
-        let referenced_anywhere: Vec<bool> = all_globals
+        // Globals reference OTHER globals in their initializers (a string
+        // header pointing at its `.bytes` payload, a closure record naming its
+        // thunk). Function-text references alone therefore under-approximate
+        // what a unit needs — the first cut emitted `@....str.N.bytes` nowhere
+        // and clang rejected the unit with "use of undefined value". Close the
+        // reference set transitively per unit before deciding what to emit.
+        let global_index: std::collections::HashMap<&str, usize> = all_globals
+            .iter()
+            .enumerate()
+            .filter_map(|(i, def)| global_symbol_name(def).map(|nm| (nm, i)))
+            .collect();
+        let global_refs: Vec<HashSet<String>> = all_globals
             .iter()
             .map(|def| {
-                global_symbol_name(def)
-                    .is_some_and(|nm| bucket_refs.iter().any(|refs| refs.contains(nm)))
+                let mut refs = HashSet::new();
+                collect_symbol_refs(def, &mut refs);
+                refs
             })
+            .collect();
+        let bucket_needs: Vec<HashSet<usize>> = bucket_refs
+            .iter()
+            .map(|refs| {
+                let mut need: HashSet<usize> = refs
+                    .iter()
+                    .filter_map(|nm| global_index.get(nm.as_str()).copied())
+                    .collect();
+                let mut work: Vec<usize> = need.iter().copied().collect();
+                while let Some(gi) = work.pop() {
+                    for nm in &global_refs[gi] {
+                        if let Some(&next) = global_index.get(nm.as_str()) {
+                            if need.insert(next) {
+                                work.push(next);
+                            }
+                        }
+                    }
+                }
+                need
+            })
+            .collect();
+        let referenced_anywhere: Vec<bool> = (0..all_globals.len())
+            .map(|gi| bucket_needs.iter().any(|need| need.contains(&gi)))
             .collect();
 
         let mut units = Vec::with_capacity(n);
@@ -758,8 +793,7 @@ impl LlModule {
             }
 
             for (gi, def) in all_globals.iter().enumerate() {
-                let referenced =
-                    global_symbol_name(def).is_some_and(|nm| bucket_refs[bi].contains(nm));
+                let referenced = bucket_needs[bi].contains(&gi);
                 // Unreferenced globals (anchors, `llvm.*`, appending lists)
                 // keep a home in unit 0 so nothing is lost.
                 if referenced || (!referenced_anywhere[gi] && bi == 0) {

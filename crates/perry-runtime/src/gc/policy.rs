@@ -753,7 +753,9 @@ pub(super) fn contract_scan_heal_guard() -> Option<super::roots::ManualGcScanGua
              a declared safepoint"
         );
     }
-    Some(super::roots::ManualGcScanGuard::force_full_scan())
+    Some(super::roots::ManualGcScanGuard::force_full_scan(
+        super::ConservativeScanSite::SafepointContractHeal,
+    ))
 }
 
 /// RAII marker for a declared-safepoint drain. Nesting-safe: restores the
