@@ -24,9 +24,10 @@
 //! `Object.create(undefined)` / `Object.setPrototypeOf(x, undefined)` then hit
 //! the spec TypeError. Fix: recognize constructor-cased bound-native exports
 //! (leading uppercase, not flagged non-constructable) and let the
-//! synthetic-class path materialize a stable `.prototype` object — while
-//! keeping non-constructor exports (`fs.readFile`, …) at `prototype ===
-//! undefined`, matching Node's built-in non-constructor functions.
+//! synthetic-class path materialize a stable `.prototype` object. Node 26 also
+//! exposes an own prototype object on lower-case native-module callables such
+//! as `fs.readFile`, so Perry follows the registry identity rather than a
+//! capitalization heuristic.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -97,13 +98,13 @@ const prototype: any = { child() { return null; } };
 Object.setPrototypeOf(prototype, (EventEmitter as any).prototype);
 console.log("setproto:", true);
 
-// Non-constructor native exports keep prototype === undefined (no spurious
-// synthesis), matching Node's built-in non-constructor functions.
-console.log("nonctor:", (fs as any).readFile.prototype === undefined);
+// Node 26 exposes an own prototype object on lower-case native-module
+// callables such as fs.readFile.
+console.log("lowercase:", typeof (fs as any).readFile.prototype === "object");
 "#,
     );
     assert_eq!(
         stdout,
-        "rs: true\nws: true\nee: true\ncreate: true\nchain: true\nsetproto: true\nnonctor: true\n"
+        "rs: true\nws: true\nee: true\ncreate: true\nchain: true\nsetproto: true\nlowercase: true\n"
     );
 }

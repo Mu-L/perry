@@ -4,7 +4,7 @@
 // toolkit stays whole.
 #![allow(dead_code)]
 
-use perry_codegen::{compile_module, AppMetadata, CompileOptions};
+use perry_codegen::{compile_module as compile_module_unlocked, AppMetadata, CompileOptions};
 use perry_hir::types::{FunctionType, ObjectType, PropertyInfo, Type};
 use perry_hir::{
     BinaryOp, Class, ClassField, CompareOp, Expr, Function, Module, ModuleInitKind, Param, Stmt,
@@ -12,6 +12,16 @@ use perry_hir::{
 };
 
 static ARTIFACT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// Artifact tests temporarily mutate process-global PERRY_NATIVE_REPS* state.
+// Serialize every compile in this binary so ordinary IR tests cannot emit into
+// an artifact test's directory while that directory is being inspected.
+fn compile_module(module: &Module, opts: CompileOptions) -> anyhow::Result<Vec<u8>> {
+    let _guard = ARTIFACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    compile_module_unlocked(module, opts)
+}
 
 fn empty_opts() -> CompileOptions {
     CompileOptions {
@@ -147,7 +157,9 @@ fn compile_artifact_json_for_module_with_opts(
     opts: CompileOptions,
 ) -> serde_json::Value {
     let name = module.name.clone();
-    let _guard = ARTIFACT_ENV_LOCK.lock().unwrap();
+    let _guard = ARTIFACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = std::env::temp_dir().join(format!(
         "perry_native_reps_test_{}_{}",
         std::process::id(),
@@ -161,7 +173,7 @@ fn compile_artifact_json_for_module_with_opts(
     std::env::set_var("PERRY_NATIVE_REPS", "1");
     std::env::set_var("PERRY_NATIVE_REPS_DIR", &dir);
 
-    let compile_result = compile_module(&module, opts);
+    let compile_result = compile_module_unlocked(&module, opts);
 
     match old_reps {
         Some(value) => std::env::set_var("PERRY_NATIVE_REPS", value),

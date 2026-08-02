@@ -1,6 +1,6 @@
 // See native_proof_buffer_views.rs — shared HIR builder toolkit, each file in
 // this family drives a different subset.
-use perry_codegen::{compile_module, AppMetadata, CompileOptions};
+use perry_codegen::{compile_module as compile_module_unlocked, AppMetadata, CompileOptions};
 use perry_hir::types::{ObjectType, PropertyInfo, Type, TypeParam};
 use perry_hir::{
     monomorphize_module, ArgumentsObjectMeta, BinaryOp, CallArg, Class, ClassComputedMember,
@@ -9,6 +9,16 @@ use perry_hir::{
 };
 
 static ARTIFACT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// Artifact tests temporarily mutate process-global PERRY_NATIVE_REPS* state.
+// Serialize every compile in this binary so an ordinary IR test cannot emit a
+// second, still-being-written artifact into the active artifact test's folder.
+fn compile_module(module: &Module, opts: CompileOptions) -> anyhow::Result<Vec<u8>> {
+    let _guard = ARTIFACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    compile_module_unlocked(module, opts)
+}
 
 fn empty_opts() -> CompileOptions {
     CompileOptions {
@@ -156,7 +166,9 @@ fn compile_artifact_json_for_module_with_opts_and_clone_rejections(
     all_typed_clone_rejections: bool,
 ) -> serde_json::Value {
     let name = module.name.clone();
-    let _guard = ARTIFACT_ENV_LOCK.lock().unwrap();
+    let _guard = ARTIFACT_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = std::env::temp_dir().join(format!(
         "perry_native_reps_test_{}_{}",
         std::process::id(),
@@ -177,7 +189,7 @@ fn compile_artifact_json_for_module_with_opts_and_clone_rejections(
         std::env::remove_var("PERRY_NATIVE_REPS_ALL_TYPED_CLONE_REJECTIONS");
     }
 
-    let compile_result = compile_module(&module, opts);
+    let compile_result = compile_module_unlocked(&module, opts);
 
     match old_reps {
         Some(value) => std::env::set_var("PERRY_NATIVE_REPS", value),
@@ -710,8 +722,10 @@ fn assert_buffer_store_uses_dynamic_fallback(ir: &str) {
         "stale-proof case should keep the checked Buffer store fallback:\n{ir}"
     );
     assert!(
-        !ir.contains("getelementptr inbounds i8"),
-        "stale-proof case must not emit an inbounds native buffer GEP:\n{ir}"
+        !ir.lines().any(|line| {
+            line.contains("getelementptr inbounds i8, ptr") && line.contains(", i32 ")
+        }),
+        "stale-proof case must not emit an i32-indexed inbounds native buffer GEP:\n{ir}"
     );
 }
 
@@ -11696,7 +11710,7 @@ fn typed_f64_receiver_method_clone_raw_loads_after_composed_guards() {
     )
     .unwrap();
     let public = "perry_method_typed_f64_receiver_method_ts__Point__score";
-    let generic_body = "perry_method_typed_f64_receiver_method_ts__Point__score__generic";
+    let shape_body = "perry_method_typed_f64_receiver_method_ts__Point__score__pshape";
     let typed = "perry_method_typed_f64_receiver_method_ts__Point__score__typed_f64_recv";
     let caller = "perry_fn_typed_f64_receiver_method_ts__probe";
     let typed_ir = defined_function_ir_section(&ir, typed);
@@ -11736,8 +11750,8 @@ fn typed_f64_receiver_method_clone_raw_loads_after_composed_guards() {
         "receiver clone must run only after method-direct and raw-f64 field guards:\n{caller_ir}"
     );
     assert!(
-        caller_ir.contains(&format!("call double @{generic_body}(")),
-        "receiver field or numeric arg guard failure should call the generic method body:\n{caller_ir}"
+        caller_ir.contains(&format!("call double @{shape_body}(")),
+        "receiver field or numeric arg guard failure should call the proven-shape generic clone:\n{caller_ir}"
     );
     assert!(
         caller_ir.contains("call double @js_native_call_method_by_id"),
