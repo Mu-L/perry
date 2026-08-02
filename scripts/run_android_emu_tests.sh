@@ -37,6 +37,43 @@ if [[ -z "$SDK" ]]; then
     exit 2
 fi
 
+# Perry's Android auto-optimized runtime build consumes ANDROID_NDK_HOME to
+# configure cc-rs and rustc with the API-24 clang wrappers. Android Studio's
+# normal side-by-side NDK install only sets ANDROID_HOME, so discover the
+# newest installed NDK when neither of the explicit NDK variables is set.
+NDK="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}"
+if [[ -z "$NDK" && -d "$SDK/ndk" ]]; then
+    NDK="$(find "$SDK/ndk" -mindepth 1 -maxdepth 1 -type d -print \
+        | sort -V | tail -1)"
+fi
+if [[ -z "$NDK" && -d "$SDK/ndk-bundle" ]]; then
+    NDK="$SDK/ndk-bundle"
+fi
+if [[ -z "$NDK" || ! -d "$NDK" ]]; then
+    echo "android-emu: Android NDK not found (set ANDROID_NDK_HOME or install an SDK side-by-side NDK)" >&2
+    exit 2
+fi
+
+case "$(uname -s)" in
+    Darwin) NDK_HOST_TAG="darwin-x86_64" ;;
+    Linux) NDK_HOST_TAG="linux-x86_64" ;;
+    *)
+        echo "android-emu: unsupported NDK host for this runner: $(uname -s)" >&2
+        exit 2
+        ;;
+esac
+NDK_CLANG="$NDK/toolchains/llvm/prebuilt/$NDK_HOST_TAG/bin/aarch64-linux-android24-clang"
+if [[ ! -x "$NDK_CLANG" ]]; then
+    echo "android-emu: NDK API-24 clang not found at $NDK_CLANG" >&2
+    exit 2
+fi
+export ANDROID_NDK_HOME="$NDK"
+NDK_BIN="$NDK/toolchains/llvm/prebuilt/$NDK_HOST_TAG/bin"
+export CC_aarch64_linux_android="$NDK_CLANG"
+export CXX_aarch64_linux_android="$NDK_BIN/aarch64-linux-android24-clang++"
+export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_CLANG"
+
 EMULATOR_BIN="$SDK/emulator/emulator"
 [[ -x "$EMULATOR_BIN" ]] || EMULATOR_BIN="$(command -v emulator 2>/dev/null || true)"
 ADB_BIN="$SDK/platform-tools/adb"
@@ -55,6 +92,18 @@ fi
 if [[ ! -x "$PERRY_BIN" ]]; then
     echo "android-emu: perry binary not found at $PERRY_BIN" >&2
     exit 2
+fi
+
+# Android UI bundles link a target-specific backend archive in addition to
+# the auto-optimized runtime/stdlib pair. Build it once before starting the
+# emulator so every example sees a current libperry_ui_android.a and a build
+# failure does not leave an emulator idling while the fixture loop continues.
+echo "android-emu: building Android UI backend..."
+android_rustflags="${RUSTFLAGS:+$RUSTFLAGS }-Z tls-model=global-dynamic"
+if ! RUSTC_BOOTSTRAP=1 RUSTFLAGS="$android_rustflags" \
+        cargo build --release -p perry-ui-android --target aarch64-linux-android; then
+    echo "android-emu: failed to build Android UI backend" >&2
+    exit 1
 fi
 
 # Pick an AVD to boot
