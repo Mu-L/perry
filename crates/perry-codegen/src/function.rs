@@ -1084,7 +1084,18 @@ fn lower_roots_for_rs4gc(
             || trimmed.contains(" = call ")
             || trimmed.starts_with("tail call ")
             || trimmed.contains(" = tail call ");
-        if is_call && trimmed.ends_with(')') && !trimmed.contains("call void asm ") {
+        // Inline asm must be marked leaf explicitly: RS4GC otherwise rewrites
+        // it into a statepoint whose callee is the asm value, which the
+        // verifier rejects outright ("Cannot take the address of an inline
+        // asm!"). Found on the Claude Code bundle, where other codegen paths
+        // emit zero-instruction asm barriers.
+        if is_call && trimmed.ends_with(')') && trimmed.contains(" asm ") {
+            out.push_str(line.trim_end());
+            out.push_str(" "gc-leaf-function"
+");
+            continue;
+        }
+        if is_call && trimmed.ends_with(')') && !trimmed.contains(" asm ") {
             if let Some(callee) = direct_callee_name(line) {
                 let leaf = match crate::gc_call_effects::classify_direct_callee(callee) {
                     crate::gc_call_effects::GcCallEffect::CannotCollect
