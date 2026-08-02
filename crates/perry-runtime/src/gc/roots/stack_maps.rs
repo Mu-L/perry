@@ -54,7 +54,6 @@ struct StackMapIndex {
     max_pc: usize,
 }
 
-
 static STACK_MAPS: OnceLock<StackMapIndex> = OnceLock::new();
 
 const DWARF_REG_FP_AARCH64: u16 = 29;
@@ -188,8 +187,12 @@ impl StackMapIndex {
         if ip.abs_diff(candidate_pc) > MAX_SAFEPOINT_RETURN_DELTA {
             return &[];
         }
-        let first = self.records.partition_point(|record| record.pc < candidate_pc);
-        let last = self.records.partition_point(|record| record.pc <= candidate_pc);
+        let first = self
+            .records
+            .partition_point(|record| record.pc < candidate_pc);
+        let last = self
+            .records
+            .partition_point(|record| record.pc <= candidate_pc);
         &self.records[first..last]
     }
 }
@@ -246,7 +249,8 @@ fn verify_visit(
     unwind_addresses.sort_unstable();
     unwind_addresses.dedup();
     assert_eq!(
-        fast_addresses, unwind_addresses,
+        fast_addresses,
+        unwind_addresses,
         "PERRY_STACKMAP_WALKER=verify: fast walk visited {} unique slots, \
          unwinder visited {}",
         fast_addresses.len(),
@@ -777,8 +781,7 @@ mod fp_chain {
                         if caller_fp == 0 {
                             return None;
                         }
-                        stats.records_matched =
-                            stats.records_matched.saturating_add(matched.len());
+                        stats.records_matched = stats.records_matched.saturating_add(matched.len());
                         for record in matched {
                             // LLVM's AArch64 frame keeps the [x29, x30] pair
                             // at the top of the frame, so the caller's body
@@ -788,8 +791,7 @@ mod fp_chain {
                                 .checked_add(16)
                                 .and_then(|top| top.checked_sub(record.stack_size as usize));
                             for location in &record.locations {
-                                stats.locations_visited =
-                                    stats.locations_visited.saturating_add(1);
+                                stats.locations_visited = stats.locations_visited.saturating_add(1);
                                 let base = if location.dwarf_reg == DWARF_REG_FP_AARCH64 {
                                     Some(caller_fp)
                                 } else {
@@ -806,8 +808,7 @@ mod fp_chain {
                                 let Some(address) = address else {
                                     continue;
                                 };
-                                if address == 0
-                                    || address & (std::mem::align_of::<u64>() - 1) != 0
+                                if address == 0 || address & (std::mem::align_of::<u64>() - 1) != 0
                                 {
                                     continue;
                                 }

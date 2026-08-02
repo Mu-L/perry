@@ -983,15 +983,11 @@ impl PreciseRootBackend {
     }
 }
 
-
 /// RS4GC surgery (#7174): retype root allocas to `ptr addrspace(1)` and cast
 /// at every recognized load/store site. Returns `None` when any root alloca
 /// appears in an unrecognized shape (the caller falls back to the explicit
 /// statepoint backend for the whole function).
-fn lower_roots_for_rs4gc(
-    lines: &[&str],
-    root_ptrs: &[String],
-) -> Option<String> {
+fn lower_roots_for_rs4gc(lines: &[&str], root_ptrs: &[String]) -> Option<String> {
     let roots: std::collections::HashSet<&str> = root_ptrs.iter().map(String::as_str).collect();
     let mut out = String::with_capacity(lines.len() * 48 + root_ptrs.len() * 96);
     let mut cast_counter = 0usize;
@@ -1046,7 +1042,12 @@ fn lower_roots_for_rs4gc(
                     break;
                 }
             }
-            if trimmed == format!("{} = load i64, ptr {ptr}", trimmed.split(' ').next().unwrap_or("")) {
+            if trimmed
+                == format!(
+                    "{} = load i64, ptr {ptr}",
+                    trimmed.split(' ').next().unwrap_or("")
+                )
+            {
                 let result = trimmed.split(' ').next().unwrap_or("");
                 out.push_str(&format!(
                     "  {result}.rs4p = load ptr addrspace(1), ptr {ptr}\n  {result} = ptrtoint ptr addrspace(1) {result}.rs4p to i64\n"
@@ -1054,7 +1055,12 @@ fn lower_roots_for_rs4gc(
                 handled = true;
                 break;
             }
-            if trimmed == format!("{} = load double, ptr {ptr}", trimmed.split(' ').next().unwrap_or("")) {
+            if trimmed
+                == format!(
+                    "{} = load double, ptr {ptr}",
+                    trimmed.split(' ').next().unwrap_or("")
+                )
+            {
                 let result = trimmed.split(' ').next().unwrap_or("");
                 out.push_str(&format!(
                     "  {result}.rs4p = load ptr addrspace(1), ptr {ptr}\n  {result}.rs4i = ptrtoint ptr addrspace(1) {result}.rs4p to i64\n  {result} = bitcast i64 {result}.rs4i to double\n"
@@ -1457,7 +1463,6 @@ fn lower_precise_roots_to_native_stack(
                 initialized.insert(ptr.clone());
             }
         }
-
 
         // Insert before calls, not after. Rebuild the tail when the line just
         // appended is a call so the intrinsic's instruction offset is the

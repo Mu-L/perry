@@ -715,11 +715,13 @@ pub(super) enum SafepointOnlyContract {
 pub(super) fn gc_safepoint_only_contract() -> SafepointOnlyContract {
     use std::sync::OnceLock;
     static CACHED: OnceLock<SafepointOnlyContract> = OnceLock::new();
-    *CACHED.get_or_init(|| match std::env::var("PERRY_GC_SAFEPOINT_ONLY").as_deref() {
-        Ok("1") | Ok("on") | Ok("true") => SafepointOnlyContract::Heal,
-        Ok("strict") => SafepointOnlyContract::Strict,
-        _ => SafepointOnlyContract::Off,
-    })
+    *CACHED.get_or_init(
+        || match std::env::var("PERRY_GC_SAFEPOINT_ONLY").as_deref() {
+            Ok("1") | Ok("on") | Ok("true") => SafepointOnlyContract::Heal,
+            Ok("strict") => SafepointOnlyContract::Strict,
+            _ => SafepointOnlyContract::Off,
+        },
+    )
 }
 
 /// Contract enforcement chokepoint, called once at every synchronous
@@ -736,9 +738,7 @@ pub(super) fn contract_scan_heal_guard() -> Option<super::roots::ManualGcScanGua
     if gc_safepoint_only_contract() == SafepointOnlyContract::Off {
         return None;
     }
-    if !super::roots::native_stack_maps_active()
-        || GC_AT_DECLARED_SAFEPOINT.with(Cell::get)
-    {
+    if !super::roots::native_stack_maps_active() || GC_AT_DECLARED_SAFEPOINT.with(Cell::get) {
         return None;
     }
     if matches!(

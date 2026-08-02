@@ -470,10 +470,13 @@ fn maybe_rs4gc_preprocess(ll_text: &str) -> Result<Option<String>> {
         .ok()
         .filter(|p| p.exists())
         .or_else(|| {
-            ["/opt/homebrew/opt/llvm/bin/opt", "/usr/local/opt/llvm/bin/opt"]
-                .iter()
-                .map(PathBuf::from)
-                .find(|p| p.exists())
+            [
+                "/opt/homebrew/opt/llvm/bin/opt",
+                "/usr/local/opt/llvm/bin/opt",
+            ]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists())
         })
         .or_else(|| which_in_path("opt"))
         .context(
