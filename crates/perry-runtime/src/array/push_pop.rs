@@ -59,7 +59,9 @@ pub extern "C" fn js_array_push_guard(arr: *mut ArrayHeader) {
 
 #[no_mangle]
 pub extern "C" fn js_array_grow(arr: *mut ArrayHeader, min_capacity: u32) -> *mut ArrayHeader {
-    if arr.is_null() || (arr as usize) < 0x1000 {
+    // Native handles share the POINTER tag with heap objects. Reject the whole
+    // handle band before `clean_arr_ptr` or any ArrayHeader/GcHeader read.
+    if !crate::value::addr_class::is_plausible_heap_addr(arr as usize) {
         return js_array_alloc(min_capacity);
     }
     // Issue #233: resolve any existing forwarding chain before deciding

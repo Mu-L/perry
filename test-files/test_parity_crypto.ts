@@ -164,15 +164,21 @@ try {
 // algorithms instead of snapshotting unstable counts/order.
 try {
   const ciphers = crypto.getCiphers();
-  console.log("getCiphers has aes-256-gcm:", ciphers.includes("aes-256-gcm"));
+  const hasAes256Gcm = ciphers.includes("aes-256-gcm");
+  console.log("getCiphers has aes-256-gcm:", hasAes256Gcm);
+  if (!hasAes256Gcm) throw new Error("required cipher aes-256-gcm is unavailable");
 } catch (e: any) { console.log("getCiphers error:", e.message); }
 try {
   const curves = crypto.getCurves();
-  console.log("getCurves has prime256v1:", curves.includes("prime256v1"));
+  const hasPrime256v1 = curves.includes("prime256v1");
+  console.log("getCurves has prime256v1:", hasPrime256v1);
+  if (!hasPrime256v1) throw new Error("required curve prime256v1 is unavailable");
 } catch (e: any) { console.log("getCurves error:", e.message); }
 try {
   const hashes = crypto.getHashes();
-  console.log("getHashes has sha256:", hashes.includes("sha256"));
+  const hasSha256 = hashes.includes("sha256");
+  console.log("getHashes has sha256:", hasSha256);
+  if (!hasSha256) throw new Error("required hash sha256 is unavailable");
 } catch (e: any) { console.log("getHashes error:", e.message); }
 
 // HKDF

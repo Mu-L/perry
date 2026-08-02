@@ -1,4 +1,5 @@
 // Regression for #340: axios shim's response.status / response.data /
+// parity-skip: requires the optional axios package; covered by Tier 3 axios-get
 // response.statusText silently returned `undefined` because (a) the
 // async resolution path queued the AxiosResponseHandle id without
 // NaN-boxing — the awaiter saw a subnormal float instead of a

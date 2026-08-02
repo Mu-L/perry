@@ -469,6 +469,17 @@ fn test_array_grow_capacity() {
 }
 
 #[test]
+fn test_array_grow_rejects_native_handle_band_before_header_reads() {
+    // Native handles share the object NaN-box tag, but are not ArrayHeader or
+    // GcHeader allocations. Growing one must take the fresh-array fallback
+    // without dereferencing the handle id.
+    let grown = js_array_grow(0x2000usize as *mut ArrayHeader, 3);
+    assert!(!grown.is_null());
+    assert_eq!(js_array_length(grown), 0);
+    assert!(unsafe { (*grown).capacity } >= 3);
+}
+
+#[test]
 fn test_array_push_f64_no_grow_fast_path() {
     let arr = js_array_alloc(4);
     let value = 42.5;

@@ -50,13 +50,15 @@ start="$(date +%s)"
     echo
 } > "$LOG"
 
+# Keep metadata failure on the structured-result path even if this script is
+# invoked by a caller that enabled errexit before sourcing it.
+set +e
 package_list="$(
     cd "$REPO_ROOT" && cargo metadata --no-deps --format-version 1 |
         python3 -c 'import json, sys; print("\n".join(sorted(p["name"] for p in json.load(sys.stdin)["packages"])))'
 )"
 metadata_rc=$?
 
-set +e
 rc=$metadata_rc
 failed_packages=()
 if [[ "$rc" -eq 0 ]]; then
@@ -71,9 +73,11 @@ if [[ "$rc" -eq 0 ]]; then
     fi
 fi
 if [[ "$rc" -eq 0 ]]; then
+    tested_packages=0
     while IFS= read -r package; do
         [[ -z "$package" ]] && continue
         is_excluded "$package" && continue
+        tested_packages=$((tested_packages + 1))
         echo "=== cargo test --release -p $package ===" >> "$LOG"
         if [[ "$package" == "perry-runtime" ]]; then
             (cd "$REPO_ROOT" && RUST_TEST_THREADS=1 cargo test --release -p "$package") >> "$LOG" 2>&1
@@ -88,8 +92,14 @@ if [[ "$rc" -eq 0 ]]; then
         # Release test executables are large and are not inputs to later package
         # builds. Keep libraries/proc macros, prune only completed executables.
         find "$REPO_ROOT/target/release/deps" -maxdepth 1 -type f -perm -111 \
-            ! -name '*.dylib' -delete 2>/dev/null || true
+            ! -name '*.dylib' ! -name '*.so' ! -name '*.dll' \
+            -delete 2>/dev/null || true
     done <<< "$package_list"
+    if [[ "$tested_packages" -eq 0 ]]; then
+        echo "no packages were tested; package_list was empty or fully excluded" >> "$LOG"
+        rc=1
+        failed_packages+=("no-packages-tested")
+    fi
 fi
 set -e
 

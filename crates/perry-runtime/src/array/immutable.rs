@@ -91,17 +91,17 @@ pub extern "C" fn js_array_to_reversed(arr: *const ArrayHeader) -> *mut ArrayHea
 #[no_mangle]
 pub extern "C" fn js_array_to_sorted_default(arr: *const ArrayHeader) -> *mut ArrayHeader {
     let arr = clean_arr_ptr(arr);
+    if arr.is_null() {
+        return js_array_alloc(0);
+    }
     if let Some(mut bytes) = uint8array_buffer_snapshot(arr) {
         bytes.sort_unstable();
         return uint8array_buffer_from_bytes(&bytes);
     }
-    if !arr.is_null() && crate::typedarray::lookup_typed_array_kind(arr as usize).is_some() {
+    if crate::typedarray::lookup_typed_array_kind(arr as usize).is_some() {
         return crate::typedarray::js_typed_array_to_sorted_default(
             arr as *const crate::typedarray::TypedArrayHeader,
         ) as *mut ArrayHeader;
-    }
-    if arr.is_null() {
-        return js_array_alloc(0);
     }
     unsafe {
         let len = (*arr).length as usize;
@@ -140,6 +140,9 @@ pub extern "C" fn js_array_to_sorted_with_comparator(
         return js_array_to_sorted_default(arr);
     }
     let arr = clean_arr_ptr(arr);
+    if arr.is_null() {
+        return js_array_alloc(0);
+    }
     if let Some(mut bytes) = uint8array_buffer_snapshot(arr) {
         // User code in the comparator can allocate and move its closure. Keep
         // the callback in the runtime root set and refresh its address for
@@ -162,14 +165,11 @@ pub extern "C" fn js_array_to_sorted_with_comparator(
         });
         return uint8array_buffer_from_bytes(&bytes);
     }
-    if !arr.is_null() && crate::typedarray::lookup_typed_array_kind(arr as usize).is_some() {
+    if crate::typedarray::lookup_typed_array_kind(arr as usize).is_some() {
         return crate::typedarray::js_typed_array_to_sorted_with_comparator(
             arr as *const crate::typedarray::TypedArrayHeader,
             comparator,
         ) as *mut ArrayHeader;
-    }
-    if arr.is_null() {
-        return js_array_alloc(0);
     }
     unsafe {
         let len = (*arr).length as usize;

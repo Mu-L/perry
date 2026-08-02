@@ -38,7 +38,7 @@
         "node",
         "<source.ts>"
       ],
-      "resolved_executable": "~/.local/opt/node-v26.5.1-darwin-arm64/bin/node"
+      "resolved_executable": "/private/tmp/perry-public-tools/node-v22.23.1-darwin-arm64/bin/node"
     },
     "bun": {
       "available": true,
@@ -4168,7 +4168,7 @@
       },
       "commands": {
         "perry": [
-          "/private/tmp/perry-pr-audit.lhpUNK/repo/target/release/perry",
+          "target/release/perry",
           "compile",
           "bench.ts",
           "-o",
@@ -4371,7 +4371,7 @@
       },
       "commands": {
         "perry": [
-          "/private/tmp/perry-pr-audit.lhpUNK/repo/target/release/perry",
+          "target/release/perry",
           "<kernel.ts>",
           "-o",
           "<compiled-kernel>"
@@ -5505,7 +5505,7 @@
           "<compiled-workload>"
         ],
         "perry_compile": [
-          "/private/tmp/perry-pr-audit.lhpUNK/repo/target/release/perry",
+          "target/release/perry",
           "<source.ts>",
           "-o",
           "<compiled-workload>"
@@ -5524,7 +5524,7 @@
           "<compiled-kernel>"
         ],
         "perry_http_compile": [
-          "/private/tmp/perry-pr-audit.lhpUNK/repo/target/release/perry",
+          "target/release/perry",
           "<kernel.ts>",
           "-o",
           "<compiled-kernel>"

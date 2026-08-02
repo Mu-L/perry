@@ -8,9 +8,8 @@
 //! Functionally identical to `crates/perry-stdlib/src/axios.rs`.
 
 use perry_ffi::{
-    alloc_string, get_handle, json_stringify, read_string, register_handle,
-    spawn_blocking_with_reactor, with_handle, Handle, JsPromise, JsString, JsValue, Promise,
-    StringHeader,
+    alloc_string, get_handle, json_stringify, read_string, register_handle, spawn_blocking,
+    with_handle, Handle, JsPromise, JsString, JsValue, Promise, StringHeader,
 };
 
 /// #598: read the body argument as a JSON string. axios in npm-land
@@ -79,7 +78,9 @@ fn run_request<F>(
     build: F,
 ) -> *mut Promise
 where
-    F: FnOnce(reqwest::Client, String) -> reqwest::RequestBuilder + Send + 'static,
+    F: FnOnce(reqwest::blocking::Client, String) -> reqwest::blocking::RequestBuilder
+        + Send
+        + 'static,
 {
     let promise = JsPromise::new();
     let raw = promise.as_raw();
@@ -91,42 +92,39 @@ where
         }
     };
 
-    spawn_blocking_with_reactor(move || {
-        let result: Result<AxiosResponseHandle, String> = tokio::runtime::Handle::current()
-            .block_on(async move {
-                let client = reqwest::Client::new();
-                let request = build(client, url);
-                let response = request
-                    .send()
-                    .await
-                    .map_err(|e| format!("{} request failed: {}", method, e))?;
-                let status = response.status().as_u16();
-                let status_text = response
-                    .status()
-                    .canonical_reason()
-                    .unwrap_or("")
-                    .to_string();
-                // Issue #627: capture Content-Type before consuming the
-                // body. Lower-case + take the part before `;` so
-                // `application/json; charset=utf-8` reduces to
-                // `application/json` for the JSON-parse decision.
-                let content_type = response
-                    .headers()
-                    .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.split(';').next().unwrap_or(s).trim().to_ascii_lowercase())
-                    .unwrap_or_default();
-                let data = response
-                    .text()
-                    .await
-                    .map_err(|e| format!("Failed to read response body: {}", e))?;
-                Ok(AxiosResponseHandle {
-                    status,
-                    status_text,
-                    data,
-                    content_type,
-                })
-            });
+    spawn_blocking(move || {
+        let result: Result<AxiosResponseHandle, String> = (|| {
+            let client = reqwest::blocking::Client::new();
+            let request = build(client, url);
+            let response = request
+                .send()
+                .map_err(|e| format!("{} request failed: {}", method, e))?;
+            let status = response.status().as_u16();
+            let status_text = response
+                .status()
+                .canonical_reason()
+                .unwrap_or("")
+                .to_string();
+            // Issue #627: capture Content-Type before consuming the
+            // body. Lower-case + take the part before `;` so
+            // `application/json; charset=utf-8` reduces to
+            // `application/json` for the JSON-parse decision.
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.split(';').next().unwrap_or(s).trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            let data = response
+                .text()
+                .map_err(|e| format!("Failed to read response body: {}", e))?;
+            Ok(AxiosResponseHandle {
+                status,
+                status_text,
+                data,
+                content_type,
+            })
+        })();
         match result {
             Ok(resp) => {
                 let handle = register_handle(resp);

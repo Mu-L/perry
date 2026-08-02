@@ -73,7 +73,7 @@ pub extern "C" fn js_value_length_f64(value: f64) -> f64 {
         // macOS mimalloc can place arena blocks well below 2 TB just like the
         // mobile/Linux allocators; duplicating the old macOS-tight floor here
         // made legitimate low-address arrays report length 0.
-        if !crate::value::addr_class::is_valid_obj_ptr(handle as *const u8) {
+        if !crate::value::addr_class::is_plausible_heap_addr(handle) {
             return 0.0;
         }
         if let Some(value) = unsafe {
@@ -165,7 +165,7 @@ pub extern "C" fn js_value_length_f64(value: f64) -> f64 {
     // returned 0 because the value's top16 was 0, not 0x7FFD.
     // #1136: mirror the centralized platform split for raw-pointer-bitcast
     // values too, so low-address Buffer/TypedArray pointers still resolve.
-    if top16 == 0 && crate::value::addr_class::is_valid_obj_ptr(bits as usize as *const u8) {
+    if top16 == 0 && crate::value::addr_class::is_plausible_heap_addr(bits as usize) {
         let handle = bits as usize;
         if let Some(value) = unsafe {
             crate::typedarray_props::typed_array_get_property_value_by_name(handle, "length")
@@ -749,7 +749,7 @@ mod length_handle_band_tests {
             3,
         ));
         let address = array.get_raw_const_ptr::<crate::typedarray::TypedArrayHeader>() as usize;
-        assert!(addr_class::is_valid_obj_ptr(address as *const u8));
+        assert!(addr_class::is_plausible_heap_addr(address));
 
         let boxed = crate::value::js_nanbox_pointer(address as i64);
         assert_eq!(js_value_length_f64(boxed), 3.0);
@@ -757,7 +757,7 @@ mod length_handle_band_tests {
 
         let heap_array = scope.root_raw_mut_ptr(crate::array::js_array_alloc_with_length(4));
         let heap_address = heap_array.get_raw_const_ptr::<crate::array::ArrayHeader>() as usize;
-        assert!(addr_class::is_valid_obj_ptr(heap_address as *const u8));
+        assert!(addr_class::is_plausible_heap_addr(heap_address));
         assert_eq!(
             js_value_length_f64(crate::value::js_nanbox_pointer(heap_address as i64)),
             4.0

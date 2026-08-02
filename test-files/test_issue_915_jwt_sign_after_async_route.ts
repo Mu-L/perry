@@ -1,4 +1,5 @@
 // Issue #915 regression: jwt.sign after a resumed async Fastify route body
+// parity-skip: long-running optional Fastify fixture; reduced expected-output coverage lives in test_issue_915_native_module_after_async_resume
 // must not route through the generic native-module ABI.
 
 import Fastify from "fastify";

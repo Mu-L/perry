@@ -921,9 +921,6 @@ pub(crate) fn build_and_run_link(
             cmd.arg("-lssl").arg("-lcrypto");
         }
     } else if is_windows {
-        if ctx.needs_ui {
-            windows_link::add_webview2_loader(&mut cmd, runtime_lib, target);
-        }
         windows_link::add_system_libs(&mut cmd);
         windows_link::embed_app_manifest(&mut cmd, ctx.needs_ui);
     } else {
@@ -1036,6 +1033,10 @@ pub(crate) fn build_and_run_link(
                 // undefined when the lib is scanned. /WHOLEARCHIVE forces all
                 // objects from the archive to be included unconditionally.
                 cmd.arg(format!("/WHOLEARCHIVE:{}", ui_lib.display()));
+                // COFF archives are scanned left-to-right. Add WebView2's
+                // loader only after the force-included UI archive introduces
+                // its WebView2* references.
+                windows_link::add_webview2_loader(&mut cmd, runtime_lib, target);
             } else {
                 cmd.arg(&ui_lib);
             }

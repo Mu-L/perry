@@ -299,7 +299,18 @@ unsafe fn set_symbol_property(obj_f64: f64, sym_f64: f64, value_f64: f64) -> f64
             // invoker so a regular object-literal setter observes `this ===
             // receiver` (and so strict/sloppy coercion plus closure rebinding
             // stay identical across the two key kinds).
-            crate::object::invoke_accessor_setter(acc.set, obj_f64, value_f64);
+            // The setter runs arbitrary user code and may move both the
+            // receiver and assigned value. Keep them rooted and return the
+            // refreshed value rather than a stale pre-call register.
+            let scope = crate::gc::RuntimeHandleScope::new();
+            let obj_h = scope.root_nanbox_f64(obj_f64);
+            let value_h = scope.root_nanbox_f64(value_f64);
+            crate::object::invoke_accessor_setter(
+                acc.set,
+                obj_h.get_nanbox_f64(),
+                value_h.get_nanbox_f64(),
+            );
+            return value_h.get_nanbox_f64();
         }
         return value_f64;
     }

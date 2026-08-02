@@ -45,6 +45,7 @@ class PublicBaselineTests(unittest.TestCase):
 
     def test_app_pattern_contract_includes_batch_workload(self):
         self.assertIn("batch", EXPECTED_COMPONENT_BENCHMARKS["app_patterns"])
+        self.assertIn("regex_replace", EXPECTED_COMPONENT_BENCHMARKS["app_patterns"])
 
     def test_honest_component_requires_complete_correct_samples(self):
         metadata = self.honest_metadata()
@@ -157,6 +158,8 @@ class PublicBaselineTests(unittest.TestCase):
         self.assertEqual(_replace_optional_block(unmarked, "generated"), unmarked)
         with self.assertRaisesRegex(ArtifactError, "markers are missing"):
             _replace_optional_block(f"{README_START}\n", "generated")
+        with self.assertRaisesRegex(ArtifactError, "markers are missing"):
+            _replace_optional_block(f"{README_END}\n", "generated")
 
     def test_suite_validation_requires_every_workload_and_passing_correctness(self):
         records = []

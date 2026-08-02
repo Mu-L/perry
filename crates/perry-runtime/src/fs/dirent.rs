@@ -120,25 +120,7 @@ pub(crate) unsafe fn build_dirent_object(name: &str, parent_path: &str, kind: Di
 /// Returns false when the options arg is undefined / not an object /
 /// the field is absent or falsy.
 pub(crate) unsafe fn options_with_file_types(options_value: f64) -> bool {
-    let bits = options_value.to_bits();
-    let value = crate::value::JSValue::from_bits(bits);
-    let raw_ptr = if value.is_pointer() {
-        value.as_pointer::<crate::object::ObjectHeader>() as usize
-    } else if bits >> 48 == 0x0000 {
-        (bits & 0x0000_FFFF_FFFF_FFFF) as usize
-    } else {
-        return false;
-    };
-    if !crate::value::addr_class::is_plausible_heap_addr(raw_ptr) {
-        return false;
-    }
-    let obj_ptr = raw_ptr as *const crate::object::ObjectHeader;
-    if obj_ptr.is_null() {
-        return false;
-    }
-    let key = crate::string::js_string_from_bytes(b"withFileTypes".as_ptr(), 13);
-    let val = crate::object::js_object_get_field_by_name(obj_ptr, key);
-    crate::value::js_is_truthy(f64::from_bits(val.bits())) != 0
+    options_bool_field(options_value, b"withFileTypes")
 }
 
 pub(crate) unsafe fn options_bool_field(options_value: f64, field: &[u8]) -> bool {
