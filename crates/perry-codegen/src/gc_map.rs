@@ -273,11 +273,24 @@ fn decode_v3(block: &RawBlock) -> Option<Vec<FunctionMap>> {
                     let offset = read_u32(bytes, pos + 8)? as i32;
                     // Keep exactly what the collector keeps: 8-byte frame
                     // slots, with the base/derived pair collapsed to one.
-                    if matches!(kind, LOCATION_DIRECT | LOCATION_INDIRECT)
-                        && size == 8
-                        && !roots.contains(&(dwarf_reg, offset))
-                    {
-                        roots.push((dwarf_reg, offset));
+                    if matches!(kind, LOCATION_DIRECT | LOCATION_INDIRECT) && size == 8 {
+                        // The encoding stores the base as a single bit,
+                        // FP-or-SP, using this architecture's DWARF numbers.
+                        // Refuse anything else rather than silently rewriting
+                        // it to FP: on x86-64 LLVM emits RBP=6/RSP=7, which
+                        // would encode as "not SP" and decode back as
+                        // aarch64's FP=29 — a wrong base, and a wrong base is
+                        // a wrong root address. Bailing keeps LLVM's section,
+                        // which costs bytes rather than correctness. (The
+                        // native-frame-root backend is aarch64-only today; the
+                        // runtime's prologue decoder and fast walker are both
+                        // `cfg(target_arch = "aarch64")`.)
+                        if dwarf_reg != DWARF_REG_FP_AARCH64 && dwarf_reg != DWARF_REG_SP_AARCH64 {
+                            return None;
+                        }
+                        if !roots.contains(&(dwarf_reg, offset)) {
+                            roots.push((dwarf_reg, offset));
+                        }
                     }
                     pos += 12;
                 }
@@ -328,6 +341,8 @@ fn zigzag(value: i32) -> u64 {
 /// DWARF register number for the stack pointer on aarch64; every other base
 /// this backend emits is the frame pointer.
 const DWARF_REG_SP_AARCH64: u16 = 31;
+/// Frame pointer, the other base the single-bit encoding can express.
+const DWARF_REG_FP_AARCH64: u16 = 29;
 
 fn encode_stream(functions: &[FunctionMap]) -> Vec<u8> {
     let mut stream = Vec::new();
@@ -662,6 +677,22 @@ mod tests {
         assert_eq!(
             encode_stream(&functions).len(),
             encode_stream(&one_record).len() + 2
+        );
+    }
+
+    #[test]
+    fn foreign_register_bases_keep_llvm_section() {
+        // x86-64 records RBP=6 / RSP=7. The single-bit base encoding cannot
+        // express those, and guessing would decode them back as aarch64's
+        // FP=29 — a wrong base, therefore a wrong root address. Keeping
+        // LLVM's section costs bytes; guessing costs correctness.
+        let asm = sample_asm().replace(
+            "\t.byte\t3\n\t.byte\t0\n\t.short\t8\n\t.short\t29\n",
+            "\t.byte\t3\n\t.byte\t0\n\t.short\t8\n\t.short\t6\n",
+        );
+        assert!(
+            compact_stack_map_asm(&asm, true).is_none(),
+            "a non-FP/SP base must fall back rather than be re-encoded"
         );
     }
 
