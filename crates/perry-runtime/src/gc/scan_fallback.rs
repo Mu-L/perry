@@ -133,6 +133,7 @@ impl ConservativeScanSite {
         Self::EmergencyReclaim,
         Self::ManualCollect,
         Self::ManualMinor,
+        Self::SafepointContractHeal,
     ];
 }
 

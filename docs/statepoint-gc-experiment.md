@@ -419,19 +419,59 @@ stack map is a JIT-patching wire format; an AOT collector needs
 |---|---:|---:|
 | flat varint (drop constants + duplicate pairs) | 387,199 | 10.9× |
 | + roots sorted and delta-encoded | 286,258 | 14.7× |
-| + "same live set as previous record" flag | **132,418** | **31.8×** |
+| + "same live set as previous record" flag | 132,418 | 31.8× |
+| **shipped**: as above, but offsets fixed-width | **224,832** | **18.7×** |
 
-The last row is the big one and it is a fact about real programs, not a
+The third row is the big one and it is a fact about real programs, not a
 coding trick: **77% of records have exactly the live set of the record
 before them**, because consecutive safepoints in a function share their
 roots. That same fact shrinks the in-memory index — the decoder points
 repeats at one copy instead of materialising 154k entries — so it is an RSS
 win as well as a file-size one.
 
-**Projected onto the measured RS4GC arm:** 3,875,416 B of metadata becomes
-~121 KB, taking the binary from 31,957,792 to ~28.20 MB against shadow's
-28,474,576 — a **~271 KB win**, versus a 3.5 MB loss before. Statepoints
-then lead on **all three axes** (wall-clock −0.93%, RSS flat, size −271 KB).
+The fourth row is what actually ships, and the difference is a constraint
+rather than a choice: **at `-O3` LLVM emits each record's instruction offset
+as a label difference** (`.long Ltmp9-_main`) that only the assembler can
+evaluate, so those offsets cannot be delta-varint-encoded at rewrite time.
+They go in a fixed-width `u32` array instead, costing ~4 bytes per record.
+Recovering the last 92 KB would mean assembling twice — once to learn the
+numbers the assembler just computed, once to emit them — which is more
+machinery than the bytes are worth.
+
+### Measured, not projected (2026-08-03)
+
+Built with one compiler, identical flags, and a **clean object cache per
+arm** (a clean-cache rebuild reproduced the cached shadow figure to within
+8 bytes, so nothing here is a stale-artifact reading):
+
+| arm | total | `__text` | `__perry_gcmap` | vs shadow |
+|---|---:|---:|---:|---:|
+| shadow (default) | 28,737,536 | 20,646,900 | 0 | — |
+| statepoint + compact | 28,688,464 | 20,497,296 | 227,275 | **−49,072** |
+| RS4GC + compact | 28,605,912 | 20,409,232 | 224,126 | **−131,624** |
+
+The emitted map came in at 227,275 B against the 224,832 B the encoder model
+predicted — within 1%. Metadata fell from 4,214,384 B to 227,275 B (18.5×),
+and `__text` is 149,604 B smaller than shadow's on the same build.
+
+**The file-size axis is flipped.** The statepoint backend now leads on
+**all three axes** — wall-clock −0.93%, RSS flat, and size −131,624 B on the
+RS4GC arm — where it previously lost size by 3.5 MB.
+
+Both arms pass the full gate: 8/8 probes byte-match the pinned Node oracle
+normally *and* under `PERRY_GC_FORCE_EVACUATE=1 PERRY_GC_VERIFY_EVACUATION=1
+PERRY_STACKMAP_WALKER=verify`, which is the check that can actually fail if
+the new format decoded to a smaller root set — a map that lost roots would
+corrupt the heap under forced evacuation rather than merely print something
+different. The gate also asserts its subject was live: `__llvm_stackmaps`
+absent **and** `__perry_gcmap` non-empty, before any output is compared.
+Its first run correctly reported 0/8 because the rewrite had silently not
+run at all.
+
+**Compile-time cost, stated honestly:** 11.95s vs 10.43s for the whole
+application (+14.6%), covering statepoint lowering plus the assembly round
+trip. That is not one of the three axes being optimised, and it buys the
+axis that was losing.
 
 ### Why the rewrite happens on assembly
 

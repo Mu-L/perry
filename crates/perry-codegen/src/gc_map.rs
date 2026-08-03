@@ -49,11 +49,17 @@
 //! the cost; printing text is free), and assembling the result is ~0.02s.
 
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use anyhow::{anyhow, Context, Result};
 
 /// Magic at the start of every emitted blob.
 pub const GC_MAP_MAGIC: &[u8; 4] = b"PGCM";
 /// Format version. Bump on any layout change — the runtime rejects others.
-pub const GC_MAP_VERSION: u8 = 1;
+pub const GC_MAP_VERSION: u8 = 2;
 /// Section the compact map is emitted into, and the label it is given.
 const GC_MAP_LABEL: &str = "_perry_gc_map";
 const MACHO_SECTION: &str = "__PERRY_GCMAP,__perry_gcmap";
@@ -67,9 +73,14 @@ const LOCATION_DIRECT: u8 = 2;
 const LOCATION_INDIRECT: u8 = 3;
 
 /// One safepoint: where it is in its function, and which frame slots are live.
+///
+/// `instruction_offset` is the **assembly expression**, not a number: at `-O3`
+/// LLVM emits it as a label difference (`Ltmp9-_main`) that only the assembler
+/// can evaluate. That is why the emitted map stores offsets in a fixed-width
+/// `u32` array rather than folding them into the varint stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Record {
-    instruction_offset: u32,
+    instruction_offset: String,
     /// `(dwarf_reg, frame_offset)`, deduplicated and sorted by frame offset.
     roots: Vec<(u16, i32)>,
 }
@@ -105,7 +116,8 @@ struct RawBlock {
 fn parse_block(lines: &[&str]) -> Option<RawBlock> {
     let start_line = lines.iter().position(|line| {
         let t = line.trim_start();
-        t.starts_with(".section") && (t.contains("__LLVM_STACKMAPS") || t.contains(".llvm_stackmaps"))
+        t.starts_with(".section")
+            && (t.contains("__LLVM_STACKMAPS") || t.contains(".llvm_stackmaps"))
     })?;
 
     let mut bytes: Vec<u8> = Vec::new();
@@ -157,13 +169,12 @@ fn parse_block(lines: &[&str]) -> Option<RawBlock> {
         match parse_int(operand) {
             Some(value) => bytes.extend_from_slice(&value.to_le_bytes()[..width]),
             None => {
-                // A symbolic `.quad`: the function address. Remember the name
-                // and reserve the slot so later offsets stay correct.
-                if width != 8 {
-                    return None;
-                }
+                // A symbolic operand. Two kinds appear: the `.quad` function
+                // address, and — at `-O3` — the `.long` instruction offset as
+                // a label difference. Remember the expression and reserve the
+                // slot so every later structural offset stays correct.
                 symbols.insert(bytes.len(), operand.to_string());
-                bytes.extend_from_slice(&0u64.to_le_bytes());
+                bytes.extend_from_slice(&0u64.to_le_bytes()[..width]);
             }
         }
     }
@@ -182,7 +193,10 @@ fn parse_int(text: &str) -> Option<u64> {
         return u64::from_str_radix(hex, 16).ok();
     }
     if let Some(negative) = text.strip_prefix('-') {
-        return negative.parse::<u64>().ok().map(|v| (v as i64).wrapping_neg() as u64);
+        return negative
+            .parse::<u64>()
+            .ok()
+            .map(|v| (v as i64).wrapping_neg() as u64);
     }
     text.parse::<u64>().ok()
 }
@@ -243,7 +257,11 @@ fn decode_v3(block: &RawBlock) -> Option<Vec<FunctionMap>> {
             let mut records = Vec::with_capacity(count);
             for _ in 0..count {
                 let record_start = pos;
-                let instruction_offset = read_u32(bytes, pos + 8)?;
+                let instruction_offset = block
+                    .symbols
+                    .get(&(pos + 8))
+                    .cloned()
+                    .unwrap_or_else(|| read_u32(bytes, pos + 8).unwrap_or(0).to_string());
                 let location_count = read_u16(bytes, pos + 14)? as usize;
                 pos += 16;
 
@@ -314,15 +332,8 @@ const DWARF_REG_SP_AARCH64: u16 = 31;
 fn encode_stream(functions: &[FunctionMap]) -> Vec<u8> {
     let mut stream = Vec::new();
     for function in functions {
-        let mut previous_offset = 0u32;
         let mut previous_roots: Option<&Vec<(u16, i32)>> = None;
         for record in &function.records {
-            push_varint(
-                &mut stream,
-                u64::from(record.instruction_offset.wrapping_sub(previous_offset)),
-            );
-            previous_offset = record.instruction_offset;
-
             if previous_roots == Some(&record.roots) {
                 // Repeat flag: the live set is the previous record's.
                 push_varint(&mut stream, 1);
@@ -361,13 +372,22 @@ fn encode_stream(functions: &[FunctionMap]) -> Vec<u8> {
 ///   8  u32 function_count
 ///  12  u32 total_len          -- lets the runtime walk concatenated blobs
 ///  16  function_count x { u64 address, u32 stack_size, u32 record_count }
-///      varint stream (see `encode_stream`)
+///      record_count_total x u32 instruction_offset
+///      varint root stream (see `encode_stream`)
 /// ```
 ///
 /// The function table starts at 16 so every relocated address is 8-byte
-/// aligned.
+/// aligned, and the offset array that follows it is 4-byte aligned.
+///
+/// Instruction offsets are a fixed-width array rather than part of the varint
+/// stream because at `-O3` they are **label differences the assembler
+/// evaluates** (`Ltmp9-_main`), so their values do not exist at rewrite time.
+/// That costs ~4 bytes per record — 18.7x compaction instead of 31.8x — and
+/// buys not having to assemble twice just to learn numbers the assembler is
+/// about to compute anyway.
 fn emit_asm(functions: &[FunctionMap], stream: &[u8], elf: bool) -> String {
-    let total_len = 16 + functions.len() * 16 + stream.len();
+    let record_total: usize = functions.iter().map(|f| f.records.len()).sum();
+    let total_len = 16 + functions.len() * 16 + record_total * 4 + stream.len();
     let mut out = String::new();
     if elf {
         out.push_str(&format!("\t.section\t{ELF_SECTION}\n"));
@@ -386,6 +406,11 @@ fn emit_asm(functions: &[FunctionMap], stream: &[u8], elf: bool) -> String {
         out.push_str(&format!("\t.quad\t{}\n", function.symbol));
         out.push_str(&format!("\t.long\t{}\n", function.stack_size as u32));
         out.push_str(&format!("\t.long\t{}\n", function.records.len()));
+    }
+    for function in functions {
+        for record in &function.records {
+            out.push_str(&format!("\t.long\t{}\n", record.instruction_offset));
+        }
     }
     for chunk in stream.chunks(32) {
         let bytes: Vec<String> = chunk.iter().map(|b| b.to_string()).collect();
@@ -419,7 +444,10 @@ pub fn compact_stack_map_asm(asm: &str, elf: bool) -> Option<(String, GcMapStats
 
     let stats = GcMapStats {
         original_bytes: block.bytes.len(),
-        compact_bytes: 16 + functions.len() * 16 + stream.len(),
+        compact_bytes: 16
+            + functions.len() * 16
+            + functions.iter().map(|f| f.records.len()).sum::<usize>() * 4
+            + stream.len(),
         functions: functions.len(),
         records: functions.iter().map(|f| f.records.len()).sum(),
         roots: functions
@@ -454,6 +482,80 @@ pub fn compact_stack_map_asm(asm: &str, elf: bool) -> Option<(String, GcMapStats
     Some((out, stats))
 }
 
+/// Rewrite the stack map in `asm_path` into Perry's compact form, then
+/// assemble it to `obj_path`.
+///
+/// A module with no stack-map block, or one whose block does not parse, is
+/// assembled unchanged — LLVM's section is correct, merely large, so falling
+/// back costs bytes rather than roots.
+pub fn compact_and_assemble(
+    clang: &Path,
+    target: &str,
+    asm_path: &Path,
+    obj_path: &Path,
+) -> Result<()> {
+    let asm = fs::read_to_string(asm_path)
+        .with_context(|| format!("Failed to read assembly at {}", asm_path.display()))?;
+
+    let elf =
+        !target.contains("apple") && !target.contains("darwin") && !target.contains("windows");
+    if let Some((rewritten, stats)) = compact_stack_map_asm(&asm, elf) {
+        fs::write(asm_path, rewritten).with_context(|| {
+            format!(
+                "Failed to write compacted assembly at {}",
+                asm_path.display()
+            )
+        })?;
+        GC_MAP_ORIGINAL_BYTES.fetch_add(stats.original_bytes as u64, Ordering::Relaxed);
+        GC_MAP_COMPACT_BYTES.fetch_add(stats.compact_bytes as u64, Ordering::Relaxed);
+        log::debug!(
+            "perry-codegen: gc map {} -> {} bytes ({} functions, {} records, {} roots)",
+            stats.original_bytes,
+            stats.compact_bytes,
+            stats.functions,
+            stats.records,
+            stats.roots,
+        );
+    }
+
+    let output = Command::new(clang)
+        .arg("-c")
+        .arg(asm_path)
+        .arg("-o")
+        .arg(obj_path)
+        .arg("-target")
+        .arg(target)
+        .output()
+        .with_context(|| format!("Failed to invoke {}", clang.display()))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "assembling the compacted stack map failed (status={}).\n\
+             assembly left at: {}\n\
+             \n\
+             stderr:\n{}",
+            output.status,
+            asm_path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let _ = fs::remove_file(asm_path);
+    Ok(())
+}
+
+/// Totals for the whole process, so a build can report what compaction did.
+/// A run where these stay zero did not compact anything — the distinction a
+/// gate needs in order to be able to fail.
+static GC_MAP_ORIGINAL_BYTES: AtomicU64 = AtomicU64::new(0);
+static GC_MAP_COMPACT_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// `(llvm_bytes, compact_bytes)` summed across every module compiled so far.
+pub fn gc_map_compaction_totals() -> (u64, u64) {
+    (
+        GC_MAP_ORIGINAL_BYTES.load(Ordering::Relaxed),
+        GC_MAP_COMPACT_BYTES.load(Ordering::Relaxed),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,9 +581,13 @@ mod tests {
         asm.push_str("\t.short\t4\n");
         // three statepoint preamble constants, then base/derived pair
         for _ in 0..3 {
-            asm.push_str("\t.byte\t4\n\t.byte\t0\n\t.short\t8\n\t.short\t0\n\t.short\t0\n\t.long\t0\n");
+            asm.push_str(
+                "\t.byte\t4\n\t.byte\t0\n\t.short\t8\n\t.short\t0\n\t.short\t0\n\t.long\t0\n",
+            );
         }
-        asm.push_str("\t.byte\t3\n\t.byte\t0\n\t.short\t8\n\t.short\t29\n\t.short\t0\n\t.long\t4294967272\n");
+        asm.push_str(
+            "\t.byte\t3\n\t.byte\t0\n\t.short\t8\n\t.short\t29\n\t.short\t0\n\t.long\t4294967272\n",
+        );
         asm.push_str("\t.p2align\t3\n");
         asm.push_str("\t.short\t0\n\t.short\t0\n"); // live-out header
         asm.push_str("\t.p2align\t3\n");
@@ -519,15 +625,15 @@ mod tests {
             stack_size: 64,
             records: vec![
                 Record {
-                    instruction_offset: 0,
+                    instruction_offset: "0".to_string(),
                     roots: shared.clone(),
                 },
                 Record {
-                    instruction_offset: 8,
+                    instruction_offset: "8".to_string(),
                     roots: shared.clone(),
                 },
                 Record {
-                    instruction_offset: 16,
+                    instruction_offset: "16".to_string(),
                     roots: shared,
                 },
             ],
@@ -537,11 +643,12 @@ mod tests {
             stack_size: functions[0].stack_size,
             records: functions[0].records[..1].to_vec(),
         }];
-        // The two extra records cost a delta byte plus a repeat byte each,
+        // Offsets live in their own fixed-width array now, so in the varint
+        // stream the two extra records cost exactly one repeat byte each,
         // regardless of how many roots the shared live set holds.
         assert_eq!(
             encode_stream(&functions).len(),
-            encode_stream(&one_record).len() + 4
+            encode_stream(&one_record).len() + 2
         );
     }
 

@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 /// statepoint constant preamble and base/derived duplicates that this parser
 /// discarded anyway, and shipping it cost 3.9 MB on a real application.
 const GC_MAP_MAGIC: &[u8; 4] = b"PGCM";
-const GC_MAP_VERSION: u8 = 1;
+const GC_MAP_VERSION: u8 = 2;
 const MAX_SAFEPOINT_RETURN_DELTA: usize = 16;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StackMapLocation {
@@ -361,19 +361,30 @@ fn parse_gc_map(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, Vec<StackMapLocati
             return None;
         }
 
-        let mut cursor = stream_start;
+        // Instruction offsets are a fixed-width array ahead of the varint
+        // stream: at -O3 the compiler emits them as label differences the
+        // assembler evaluates, so their values cannot be varint-encoded at
+        // rewrite time.
+        let record_total: usize = (0..function_count)
+            .map(|index| read_u32(bytes, table + index * 16 + 12).unwrap_or(0) as usize)
+            .sum();
+        let offsets = stream_start;
+        let mut cursor = offsets.checked_add(record_total.checked_mul(4)?)?;
+        if cursor > blob_end {
+            return None;
+        }
+        let mut record_index = 0usize;
+
         for index in 0..function_count {
             let entry = table + index * 16;
             let function_address = read_u64(bytes, entry)? as usize;
             let stack_size = u64::from(read_u32(bytes, entry + 8)?);
             let record_count = read_u32(bytes, entry + 12)? as usize;
 
-            let mut instruction_offset = 0u32;
             let mut previous: Option<(u32, u32)> = None;
             for _ in 0..record_count {
-                let (delta, next) = read_varint(bytes, cursor, blob_end)?;
-                cursor = next;
-                instruction_offset = instruction_offset.wrapping_add(delta as u32);
+                let instruction_offset = read_u32(bytes, offsets + record_index * 4)?;
+                record_index += 1;
 
                 let (header, next) = read_varint(bytes, cursor, blob_end)?;
                 cursor = next;
@@ -932,11 +943,10 @@ mod tests {
     /// `records` is `(instruction_offset, roots)`, roots as `(dwarf_reg, offset)`;
     /// an empty root slice with `repeat` set encodes the repeat flag.
     fn one_map(function: u64, records: &[(u32, Vec<(u16, i32)>, bool)]) -> Vec<u8> {
+        let mut offsets = Vec::new();
         let mut stream = Vec::new();
-        let mut previous_offset = 0u32;
         for (instruction_offset, roots, repeat) in records {
-            push_varint(&mut stream, u64::from(instruction_offset.wrapping_sub(previous_offset)));
-            previous_offset = *instruction_offset;
+            offsets.extend_from_slice(&instruction_offset.to_le_bytes());
             if *repeat {
                 push_varint(&mut stream, 1);
                 continue;
@@ -954,7 +964,7 @@ mod tests {
             }
         }
 
-        let total_len = 16 + 16 + stream.len();
+        let total_len = 16 + 16 + offsets.len() + stream.len();
         let mut bytes = Vec::new();
         bytes.extend_from_slice(GC_MAP_MAGIC);
         bytes.push(GC_MAP_VERSION);
@@ -964,6 +974,7 @@ mod tests {
         bytes.extend_from_slice(&function.to_le_bytes());
         bytes.extend_from_slice(&32u32.to_le_bytes());
         bytes.extend_from_slice(&(records.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&offsets);
         bytes.extend_from_slice(&stream);
         while bytes.len() % 8 != 0 {
             bytes.push(0);
@@ -1031,9 +1042,18 @@ mod tests {
         assert_eq!(
             roots,
             vec![
-                StackMapLocation { dwarf_reg: 29, offset: -64 },
-                StackMapLocation { dwarf_reg: 29, offset: -8 },
-                StackMapLocation { dwarf_reg: 31, offset: 24 },
+                StackMapLocation {
+                    dwarf_reg: 29,
+                    offset: -64
+                },
+                StackMapLocation {
+                    dwarf_reg: 29,
+                    offset: -8
+                },
+                StackMapLocation {
+                    dwarf_reg: 31,
+                    offset: 24
+                },
             ]
         );
     }
@@ -1043,7 +1063,10 @@ mod tests {
         assert!(parse_gc_map(&[]).is_none() || parse_gc_map(&[]).unwrap().0.is_empty());
         let mut bytes = simple(0x1000, 0x10, -8);
         bytes[4] = GC_MAP_VERSION + 1;
-        assert!(parse_gc_map(&bytes).is_none(), "an unknown version must not be guessed at");
+        assert!(
+            parse_gc_map(&bytes).is_none(),
+            "an unknown version must not be guessed at"
+        );
         // A total_len that runs past the section must fail rather than read on.
         let mut bytes = simple(0x1000, 0x10, -8);
         let len = bytes.len();
@@ -1065,8 +1088,14 @@ mod tests {
         let walkable = index_records(
             vec![rec(0x1000), rec(0x2000)],
             vec![
-                StackMapLocation { dwarf_reg: DWARF_REG_FP_AARCH64, offset: -8 },
-                StackMapLocation { dwarf_reg: DWARF_REG_SP_AARCH64, offset: -8 },
+                StackMapLocation {
+                    dwarf_reg: DWARF_REG_FP_AARCH64,
+                    offset: -8,
+                },
+                StackMapLocation {
+                    dwarf_reg: DWARF_REG_SP_AARCH64,
+                    offset: -8,
+                },
             ],
         );
         assert!(walkable.chain_walkable);
@@ -1076,7 +1105,10 @@ mod tests {
         assert!(
             !index_records(
                 vec![rec(0x1000)],
-                vec![StackMapLocation { dwarf_reg: 1, offset: -8 }],
+                vec![StackMapLocation {
+                    dwarf_reg: 1,
+                    offset: -8
+                }],
             )
             .chain_walkable,
             "a non-FP/SP register must disable the fast walk"

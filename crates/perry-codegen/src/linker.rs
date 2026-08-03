@@ -405,10 +405,9 @@ fn build_clang_compile_plan(
     // the statepoint backends emit a stack map, so only they pay for it, and
     // the cost is small: `-S` takes the same time as `-c` (codegen is the
     // cost, printing text is free) and assembling is ~0.02s per module.
-    let compact_gc_map = crate::codegen::helpers::statepoints_enabled()
-        || crate::codegen::helpers::rs4gc_enabled();
-    let asm_path =
-        compact_gc_map.then(|| PathBuf::from(format!("{}.s", obj_path.display())));
+    let compact_gc_map =
+        crate::codegen::helpers::statepoints_enabled() || crate::codegen::helpers::rs4gc_enabled();
+    let asm_path = compact_gc_map.then(|| PathBuf::from(format!("{}.s", obj_path.display())));
 
     let mut clang_args = vec![
         if compact_gc_map { "-S" } else { "-c" }.to_string(),
@@ -441,13 +440,7 @@ fn build_clang_compile_plan(
     }
     clang_args.push(ll_path.display().to_string());
     clang_args.push("-o".to_string());
-    clang_args.push(
-        asm_path
-            .as_ref()
-            .unwrap_or(&obj_path)
-            .display()
-            .to_string(),
-    );
+    clang_args.push(asm_path.as_ref().unwrap_or(&obj_path).display().to_string());
     clang_args.push("-target".to_string());
     clang_args.push(effective_target.clone());
 
@@ -533,77 +526,6 @@ fn maybe_rs4gc_preprocess(ll_text: &str) -> Result<Option<String>> {
         ));
     }
     Ok(Some(String::from_utf8(output.stdout)?))
-}
-
-/// Rewrite the stack map in `asm_path` into Perry's compact form, then
-/// assemble it to `obj_path`.
-///
-/// A module with no stack-map block, or one whose block does not parse, is
-/// assembled unchanged — LLVM's section is correct, merely large, so falling
-/// back costs bytes rather than roots.
-fn compact_gc_map_and_assemble(
-    plan: &ClangCompilePlan,
-    asm_path: &Path,
-    obj_path: &Path,
-) -> Result<()> {
-    let asm = fs::read_to_string(asm_path)
-        .with_context(|| format!("Failed to read assembly at {}", asm_path.display()))?;
-
-    let elf = !plan.effective_target.contains("apple")
-        && !plan.effective_target.contains("darwin")
-        && !plan.effective_target.contains("windows");
-    if let Some((rewritten, stats)) = crate::gc_map::compact_stack_map_asm(&asm, elf) {
-        fs::write(asm_path, rewritten).with_context(|| {
-            format!("Failed to write compacted assembly at {}", asm_path.display())
-        })?;
-        GC_MAP_ORIGINAL_BYTES.fetch_add(stats.original_bytes as u64, Ordering::Relaxed);
-        GC_MAP_COMPACT_BYTES.fetch_add(stats.compact_bytes as u64, Ordering::Relaxed);
-        log::debug!(
-            "perry-codegen: gc map {} -> {} bytes ({} functions, {} records, {} roots)",
-            stats.original_bytes,
-            stats.compact_bytes,
-            stats.functions,
-            stats.records,
-            stats.roots,
-        );
-    }
-
-    let output = Command::new(&plan.clang)
-        .arg("-c")
-        .arg(asm_path)
-        .arg("-o")
-        .arg(obj_path)
-        .arg("-target")
-        .arg(&plan.effective_target)
-        .output()
-        .with_context(|| format!("Failed to invoke {}", plan.clang.display()))?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "assembling the compacted stack map failed (status={}).\n\
-             assembly left at: {}\n\
-             \n\
-             stderr:\n{}",
-            output.status,
-            asm_path.display(),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    let _ = fs::remove_file(asm_path);
-    Ok(())
-}
-
-/// Totals for the whole process, so a build can report what compaction did.
-/// A run where these stay zero did not compact anything — the distinction a
-/// gate needs in order to be able to fail.
-static GC_MAP_ORIGINAL_BYTES: AtomicU64 = AtomicU64::new(0);
-static GC_MAP_COMPACT_BYTES: AtomicU64 = AtomicU64::new(0);
-
-/// `(llvm_bytes, compact_bytes)` summed across every module compiled so far.
-pub fn gc_map_compaction_totals() -> (u64, u64) {
-    (
-        GC_MAP_ORIGINAL_BYTES.load(Ordering::Relaxed),
-        GC_MAP_COMPACT_BYTES.load(Ordering::Relaxed),
-    )
 }
 
 fn which_in_path(name: &str) -> Option<PathBuf> {
@@ -768,7 +690,12 @@ fn compile_ll_to_object_in(
     }
 
     if let Some(asm_path) = &plan.asm_path {
-        compact_gc_map_and_assemble(&plan, asm_path, &obj_path)?;
+        crate::gc_map::compact_and_assemble(
+            &plan.clang,
+            &plan.effective_target,
+            asm_path,
+            &obj_path,
+        )?;
     }
 
     let bytes = fs::read(&obj_path)
