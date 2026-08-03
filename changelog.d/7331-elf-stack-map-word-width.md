@@ -42,8 +42,25 @@ with Mach-O's leading underscore unconditionally under
 `extern "C"` declarations were different symbols and `perry-runtime` could not
 link at all.
 
-This does **not** yet close #7321. The defect is an ELF defect but specifically
-an AArch64-ELF one; x86 ELF spells these fields `.byte`/`.short`/`.long`/`.quad`,
+Measured on `aarch64-unknown-linux-gnu`, which could not compile a single module
+under `PERRY_STATEPOINTS=1` before this and now runs the probe matrix 8/8 against
+the pinned Node oracle under
+`PERRY_GC_FORCE_EVACUATE=1 PERRY_GC_VERIFY_EVACUATION=1`, with `.perry_gcmap`
+present and `.llvm_stackmaps` absent asserted per probe (`09_try_catch_roots` is
+excluded because the explicit bridge refuses invokes since #7330, on every
+target). Census over those eight: 478 statepoints, **0 plain stack maps, 0
+parser fallbacks**, 648 relocations, 605 non-safepoint calls skipped, max 3 live
+roots at one safepoint.
+
+This does **not** close #7321. The defect is an ELF defect but specifically an
+AArch64-ELF one; x86 ELF spells these fields `.byte`/`.short`/`.long`/`.quad`,
 which the old table already handled, and the x86-64 refusal could not be
-reproduced under Apple clang 21, Homebrew clang 19/20/22 or Ubuntu clang 18,
-across twelve `-march` settings, from either host, over all nine probes.
+reproduced under Apple clang 21, Homebrew clang 19/20/22 or Ubuntu clang 16/17/18,
+across twelve `-march` settings, from either host, over all nine probes. What the
+diagnostics above buy is that the next x86-64 run names its own cause instead of
+repeating that it failed.
+
+Filed while measuring this: #7333 — `PERRY_STACKMAP_WALKER=unwind` segfaults on
+Linux/ELF for 3 of the 8 probes, on a build whose default walker runs all 8
+clean. That matters beyond a bisection control, because on x86-64 the fp-chain
+walker is not compiled in and the unwinder *is* the walker.
