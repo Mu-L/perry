@@ -2654,9 +2654,10 @@ fn try_native_units(
     target: Option<&str>,
     module_prefix: &str,
 ) -> Option<Result<Vec<u8>>> {
-    // Invoke-EH (#7302): see try_native_construction — textual path for
-    // try/catch modules until the native reader learns invoke.
-    if llmod.has_eh_personality() {
+    // SEH funclets are the one EH shape the in-process reader cannot
+    // construct (see LlModule::needs_eh_funclets). Decline to the textual
+    // path rather than failing the compile.
+    if llmod.needs_eh_funclets() {
         return None;
     }
     match crate::native_emit::native_mode() {
@@ -2691,10 +2692,10 @@ fn try_native_construction(
     target: Option<&str>,
     module_prefix: &str,
 ) -> Option<Result<Vec<u8>>> {
-    // Invoke-EH (#7302): the native line reader does not know
-    // `invoke`/`landingpad`/`catchswitch` yet — modules with try/catch take
-    // the textual path. Follow-up tracked on #7301.
-    if llmod.has_eh_personality() {
+    // SEH funclets are the one EH shape the in-process reader cannot
+    // construct (see LlModule::needs_eh_funclets). Decline to the textual
+    // path rather than failing the compile.
+    if llmod.needs_eh_funclets() {
         return None;
     }
     match crate::native_emit::native_mode() {

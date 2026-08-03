@@ -319,13 +319,20 @@ impl LlModule {
         ));
     }
 
-    /// Invoke-EH (#7302): true when any function in this module carries a
-    /// personality (i.e. contains try/catch landing pads or SEH funclets).
-    /// The native-construction backend (exp/llvm-inprocess) bails to the
-    /// textual path for these modules until its line reader learns
-    /// `invoke`/`landingpad`/`catchswitch`.
-    pub fn has_eh_personality(&self) -> bool {
-        self.functions.iter().any(|f| f.personality.is_some())
+    /// SEH funclets (#7302): true when this module targets windows-msvc AND
+    /// contains try/catch, i.e. when its EH lowering is
+    /// `catchswitch`/`catchpad`/`catchret` rather than Itanium landing pads.
+    ///
+    /// The in-process LLVM reader can build `invoke`/`landingpad` but NOT
+    /// the funclet forms: inkwell 0.9 exposes no `build_catch_switch` /
+    /// `build_catch_pad` / `build_catch_ret` (only an opcode enum for
+    /// reading them), so constructing them needs raw `llvm-sys` FFI. Until
+    /// that lands, such modules take the textual path — declining costs
+    /// nothing but the in-process speedup, whereas letting the reader hit
+    /// the instruction is a hard compile error.
+    pub fn needs_eh_funclets(&self) -> bool {
+        self.target_triple.contains("-windows-")
+            && self.functions.iter().any(|f| f.personality.is_some())
     }
 
     /// Invoke-EH (#7302): declare the personality routine referenced by
