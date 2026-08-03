@@ -497,8 +497,17 @@ pub fn compact_and_assemble(
     let asm = fs::read_to_string(asm_path)
         .with_context(|| format!("Failed to read assembly at {}", asm_path.display()))?;
 
-    let elf =
-        !target.contains("apple") && !target.contains("darwin") && !target.contains("windows");
+    // Only the two object formats whose section syntax this module emits, and
+    // whose section the runtime knows how to find, may be rewritten. Anything
+    // else (COFF today) keeps LLVM's section: emitting a Mach-O `.section`
+    // directive into COFF assembly would fail to assemble, turning an
+    // unsupported-platform case into a broken build.
+    let macho = target.contains("apple") || target.contains("darwin");
+    let elf = !macho && !target.contains("windows") && !target.contains("msvc");
+    if !macho && !elf {
+        return assemble(clang, target, asm_path, obj_path);
+    }
+
     if let Some((rewritten, stats)) = compact_stack_map_asm(&asm, elf) {
         fs::write(asm_path, rewritten).with_context(|| {
             format!(
@@ -518,6 +527,10 @@ pub fn compact_and_assemble(
         );
     }
 
+    assemble(clang, target, asm_path, obj_path)
+}
+
+fn assemble(clang: &Path, target: &str, asm_path: &Path, obj_path: &Path) -> Result<()> {
     let output = Command::new(clang)
         .arg("-c")
         .arg(asm_path)

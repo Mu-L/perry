@@ -144,11 +144,30 @@ pub(in crate::gc) fn native_maps_active() -> bool {
 
 fn stack_maps() -> &'static StackMapIndex {
     STACK_MAPS.get_or_init(|| {
+        // No section at all is the ordinary shadow-stack build: there are no
+        // native frame roots to find, and an empty index is the right answer.
         let Some(section) = loaded_stack_map_section() else {
             return StackMapIndex::default();
         };
+        // A section that exists but does not decode is a different thing
+        // entirely, and it must never degrade to "no roots". The two failure
+        // shapes are indistinguishable downstream — both yield an empty index
+        // — but their consequences are not: with statepoints as the only root
+        // mechanism, an empty index means the collector frees live objects and
+        // corrupts the heap with no diagnostic at all. That is CLAUDE.md's
+        // fourth gate-failure mode (the gate runs, its subject never did), so
+        // fail loudly instead. In practice this can only mean a binary whose
+        // compiler and runtime disagree about the map format.
         let Some((mut records, roots)) = parse_gc_map(section) else {
-            return StackMapIndex::default();
+            panic!(
+                "perry: the GC map section (__perry_gcmap / .perry_gcmap, {} bytes) is \
+                 present but could not be decoded — expected format {:?} v{}. This binary's \
+                 compiler and runtime disagree about the map layout; continuing would run \
+                 the collector with no roots and corrupt the heap silently.",
+                section.len(),
+                std::str::from_utf8(GC_MAP_MAGIC).unwrap_or("PGCM"),
+                GC_MAP_VERSION,
+            );
         };
         records.sort_unstable_by_key(|record| record.pc);
         index_records(records, roots)
