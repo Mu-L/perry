@@ -8,7 +8,23 @@ pub(super) struct RememberedDirtySnapshot {
     pub(super) fallback_headers: Vec<usize>,
 }
 
+/// The **sole read path** for the remembered set.
+///
+/// Every collector obtains the dirty set here: the budgeted/full cycle's
+/// `RememberedSetRootMarkState::new`, the copying nursery fast path and its
+/// preflight, the cycle's pre-clear coverage snapshot, and the evacuation
+/// verifier. The barrier *writes* `DIRTY_OLD_PAGES` /
+/// `EXTERNAL_DIRTY_SLOT_PAGES` / `REMEMBERED_SET`; `remembered_set_clear`
+/// empties them; nothing else reads them for collection decisions. That is
+/// what lets #7187's lazy arming be sound by construction rather than by
+/// audit: arming the barrier here means no collector can observe an unarmed,
+/// and therefore empty, log.
+///
+/// If a future collector reads those thread-locals directly instead of coming
+/// through here, it must call
+/// [`arm_and_reconstruct_remembered_set_if_unarmed`] itself.
 pub(super) fn remembered_dirty_snapshot() -> RememberedDirtySnapshot {
+    arm_and_reconstruct_remembered_set_if_unarmed();
     let dirty_old_pages: crate::fast_hash::PtrHashSet<usize> =
         DIRTY_OLD_PAGES.with(|s| s.borrow().iter().copied().collect());
     let external_dirty_entries: Vec<(usize, usize)> = EXTERNAL_DIRTY_SLOT_PAGES.with(|s| {
@@ -895,10 +911,15 @@ pub(super) fn bump_write_barrier_trace_counter(counter: BarrierTraceCounter) {
             }
             BarrierTraceCounter::NewInserts => counters.new_inserts += 1,
             BarrierTraceCounter::DirtyPageMarkAttempts => counters.dirty_page_mark_attempts += 1,
+            BarrierTraceCounter::DirtyPageCacheHits => {
+                counters.dirty_page_mark_attempts += 1;
+                counters.dirty_page_cache_hits += 1;
+            }
             BarrierTraceCounter::NewDirtyPages => counters.new_dirty_pages += 1,
             BarrierTraceCounter::ConservativeParentSpanMarks => {
                 counters.conservative_parent_span_marks += 1;
             }
+            BarrierTraceCounter::UnarmedSkips => counters.unarmed_skips += 1,
         }
         cell.set(counters);
     });
@@ -967,6 +988,9 @@ pub(super) fn write_barrier_slot_inner(
     let Some(child_addr) = barrier_child_prologue(child) else {
         return;
     };
+    if !barrier_remembering_active() {
+        return;
+    }
     // Decode the parent — must be a NaN-boxed heap pointer.
     let parent_addr = decode_heap_addr(parent);
     if parent_addr == 0 {
@@ -992,6 +1016,33 @@ fn barrier_child_prologue(child: u64) -> Option<usize> {
     Some(child_addr)
 }
 
+/// #7187: should this barrier call do remembered-set work at all?
+///
+/// Placed **after** [`barrier_child_prologue`] and **before** the parent
+/// decode, in every entry point. Both halves of that placement are
+/// load-bearing:
+///
+///   * After the prologue, so the #6011 fast path (any number stored into any
+///     slot — the overwhelmingly common store) pays literally nothing new, and
+///     so SATB/insertion shading for an in-progress incremental cycle is never
+///     skipped. An incremental cycle implies a collection has run implies
+///     armed, so this could not bite today; writing the order down keeps a
+///     later refactor from hoisting the check above the shading.
+///   * Before the parent decode, so the unarmed window also skips
+///     `decode_heap_addr`'s raw-pointer arm — itself a
+///     `classify_heap_generation` on the bare-`u64` entry point.
+///
+/// Cost once armed: one relaxed load of a `static` (`adrp`/`ldr`) plus a
+/// perfectly-predicted, permanently-taken branch.
+#[inline]
+fn barrier_remembering_active() -> bool {
+    if barrier_remembering_armed() {
+        return true;
+    }
+    bump_write_barrier_trace_counter(BarrierTraceCounter::UnarmedSkips);
+    false
+}
+
 /// [`write_barrier_slot_inner`] for a caller that already holds the parent as
 /// a plain GC user pointer — see [`write_barrier_decoded_parent`] for why the
 /// `u64` round-trip is worth avoiding (#7187).
@@ -1004,6 +1055,9 @@ pub(super) fn write_barrier_slot_decoded(
     let Some(child_addr) = barrier_child_prologue(child) else {
         return;
     };
+    if !barrier_remembering_active() {
+        return;
+    }
     // The NaN-box round-trip this replaces was also FILTERING, not just
     // decoding, and dropping the filter is a segfault rather than a wrong
     // answer: `barrier_parent_needs_remembering` reaches
@@ -1258,17 +1312,46 @@ pub(super) fn remember_old_to_young_external_slot(parent_addr: usize, slot_addr:
     )
 }
 
+/// #7187 Phase B: record `page` in this thread's modbuf, unless it is already
+/// there. Returns whether the page was NEWLY inserted.
+///
+/// The guard is the whole of Phase B — see [`super::dirty_page_cache`] for the
+/// invariant it rests on and the measurement that picked a one-entry cache.
+/// Armed on `batch.ts` this call fires 1 774 374 times for 517 distinct pages;
+/// the guard turns 99.78% of those into a thread-local load and a compare.
+#[inline]
 pub(super) fn mark_dirty_old_page(page: usize) -> bool {
+    if super::dirty_page_cache::dirty_old_page_already_marked(page) {
+        // Bumps `dirty_page_mark_attempts` too, so that counter keeps meaning
+        // "calls", comparable across the change, and
+        // `attempts - dirty_page_cache_hits` is what still reaches the modbuf.
+        bump_write_barrier_trace_counter(BarrierTraceCounter::DirtyPageCacheHits);
+        return false;
+    }
+    mark_dirty_old_page_uncached(page)
+}
+
+/// Out of line: the hot path is the guard above, and this body's two
+/// thread-local accesses plus two hash operations are the 6.73% #7170 measured.
+#[inline(never)]
+fn mark_dirty_old_page_uncached(page: usize) -> bool {
     bump_write_barrier_trace_counter(BarrierTraceCounter::DirtyPageMarkAttempts);
     ever_dirty_note(page);
-    DIRTY_OLD_PAGES.with(|s| {
+    let inserted = DIRTY_OLD_PAGES.with(|s| {
         let inserted = s.borrow_mut().insert(page);
-        crate::arena::old_page_mark_dirty(page);
         if inserted {
             bump_write_barrier_trace_counter(BarrierTraceCounter::NewDirtyPages);
         }
         inserted
-    })
+    });
+    // Cache ONLY when the arena stamp landed as well. `old_page_mark_dirty`
+    // does nothing for a page with no metadata entry, and caching such a page
+    // would let a later `old_page_summary()` under-report `dirty_pages` if the
+    // metadata appeared afterwards. Half a recording is not a recording.
+    if crate::arena::old_page_mark_dirty(page) {
+        super::dirty_page_cache::note_dirty_old_page_marked(page);
+    }
+    inserted
 }
 
 thread_local! {
@@ -1732,6 +1815,9 @@ fn dirty_old_pages_empty() -> bool {
     DIRTY_OLD_PAGES.with(|s| s.borrow().is_empty())
 }
 
+/// The **sole** path that removes a page from `DIRTY_OLD_PAGES`. Every other
+/// touch of that set is an insert, a read, or the snapshot — which is why
+/// #7187 Phase B's cache needs exactly one invalidation point on this side.
 fn clear_one_dirty_old_page() -> bool {
     DIRTY_OLD_PAGES.with(|s| {
         let mut pages = s.borrow_mut();
@@ -1740,6 +1826,14 @@ fn clear_one_dirty_old_page() -> bool {
         };
         crate::arena::old_page_clear_dirty(page);
         pages.remove(&page);
+        // DELIBERATELY redundant with `old_page_clear_dirty`, which invalidates
+        // too (#7187 Phase B rule 2). The cache's invariant has two halves and
+        // this line owns the modbuf one: an edit that stops the arena side from
+        // invalidating — or a page whose metadata entry no longer exists, so
+        // `old_page_clear_dirty` finds nothing to clear — must not silently
+        // leave the cache asserting a page this function just removed. The cost
+        // is one thread-local store on the cold clear path.
+        super::dirty_page_cache::invalidate();
         true
     })
 }

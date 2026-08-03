@@ -423,9 +423,9 @@ pub(super) fn compile_function(
     // callee; its `-O3` growth budget still refuses cold/oversized inlines, so
     // cold utility functions never bloat the binary (that is the anti-bloat
     // property, proved by the binary-size gate). We skip `alwaysinline`
-    // functions (the hint would be redundant), async/generator forms, and rely
-    // on `to_ir`'s `has_try`-first attribute precedence to keep any function
-    // whose body later turns out to need `noinline` (try/setjmp/volatile) out.
+    // functions (the hint would be redundant) and async/generator forms.
+    // Try-containing functions are ordinary inline candidates since #7302
+    // (invoke-EH removed the setjmp-era noinline requirement).
     if !lf.force_inline
         && inline_hot_small_enabled()
         && (INLINE_HOT_SMALL_MIN..=inline_hot_small_size_cap()).contains(&f.body.len())
@@ -838,6 +838,7 @@ pub(super) fn compile_function(
         clamp_u8_functions: &cross_module.clamp_u8_functions,
         integer_returning_functions: &cross_module.returns_int_functions,
         i32_identity_functions: &cross_module.i32_identity_functions,
+        param_int_ranges: &cross_module.param_int_ranges,
         typed_f64_functions: &cross_module.typed_f64_functions,
         typed_i32_functions: &cross_module.typed_i32_functions,
         typed_string_functions: &cross_module.typed_string_functions,

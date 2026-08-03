@@ -737,10 +737,17 @@ pub(crate) struct CrossModuleCtx {
     pub returns_int_functions: std::collections::HashSet<u32>,
     /// Single-argument integer helpers that return the argument coerced to i32.
     pub i32_identity_functions: std::collections::HashSet<u32>,
+    /// #7286 lever (c): LocalId of a numeric function parameter → the
+    /// meet-over-all-call-sites integer range proven for it. Seeds
+    /// `int_range_expr`, which is what lets `a[i * size + k]` in
+    /// `16_matrix_multiply` leave the opaque runtime-key helper. Populated
+    /// only for functions whose entire call graph is visible in this module
+    /// (see `collectors/param_ranges.rs` for the proof obligations).
+    pub param_int_ranges: crate::collectors::ParamIntRanges,
     /// Representation-selection Phase 2 (`codegen/spec_abi.rs`): FuncId →
     /// specialization plan for functions with an emitted full-body specialized
     /// entry (internal linkage, named by `spec_function_name`). Mutually
-    /// exclusive with the typed_abi clone families and `i64_specialized`.
+    /// exclusive with the typed_abi clone families.
     pub spec_abi_functions: std::collections::HashMap<u32, super::spec_abi::SpecFnPlan>,
     /// Phase 2 pre-pass: LocalIds proven to permanently hold one specific
     /// non-view typed array (see `collectors/spec_abi_sites.rs`).

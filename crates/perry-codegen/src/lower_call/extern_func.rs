@@ -12,7 +12,7 @@ use perry_api_manifest::{
 use perry_hir::types::Type as HirType;
 use perry_hir::Expr;
 
-use crate::expr::{lower_expr, nanbox_pointer_inline, nanbox_string_inline, unbox_to_i64, FnCtx};
+use crate::expr::{lower_expr, nanbox_string_inline, unbox_to_i64, FnCtx};
 use crate::nanbox::{double_literal, POINTER_MASK_I64};
 use crate::native_value::{
     layout_for_manifest_pod, layout_runtime_id, llvm_type_for_native_rep, materialize_js_value,
@@ -1095,214 +1095,19 @@ pub fn try_lower_extern_func_call(
     if ctx.import_function_node_submodule.contains_key(name) {
         return Ok(None);
     }
+    // Timers (`setTimeout`/`setInterval`/`setImmediate` and their `clear*`
+    // siblings) live in `extern_timers.rs`. Split out under #7210, when the GC
+    // rooting fix for their trailing-argument staging buffers pushed this file
+    // over the 2000-line cap (`scripts/check_file_size.sh`). Dispatched HERE,
+    // immediately above the match, because they were its first arms: arm order
+    // is observable (`"setTimeout" if args.len() == 1` must still beat the
+    // generic consumer-prefix path at the bottom), and every guard they carry
+    // is on `args.len()`, so a non-matching timer name or arity falls through
+    // to exactly the arm it fell through to before.
+    if let Some(v) = super::extern_timers::try_lower_extern_timer_call(ctx, name.as_str(), args)? {
+        return Ok(Some(v));
+    }
     match name.as_str() {
-        // #1671: `setTimeout(fn)` with no explicit delay. Node treats a
-        // missing/undefined delay as 0 (fires on the next timer tick).
-        // Without this arm a 1-arg `setTimeout` falls through to the
-        // catch-all below, which emits a bare LLVM call to `@setTimeout`
-        // and the linker fails with `Undefined symbols: _setTimeout`
-        // (hit by hono/jsx's `hooks/index.js`, which schedules a re-render
-        // via `setTimeout(() => { … })`). Route it to the same runtime
-        // entry as the 2-arg form with a zero delay.
-        "setTimeout" if args.len() == 1 => {
-            let cb_box = lower_expr(ctx, &args[0])?;
-            let blk = ctx.block();
-            // #2013 — validate the callback type before unboxing the
-            // pointer. `js_timer_validate_callback` throws
-            // ERR_INVALID_ARG_TYPE for any non-callable value and
-            // returns the raw closure pointer otherwise; the second
-            // arg `0` is the type-name index for "setTimeout".
-            let zero_idx = "0";
-            let cb_handle = blk.call(
-                I64,
-                "js_timer_validate_callback",
-                &[(DOUBLE, &cb_box), (I32, zero_idx)],
-            );
-            let zero = double_literal(0.0);
-            let id = blk.call(
-                I64,
-                "js_set_timeout_callback",
-                &[(I64, &cb_handle), (DOUBLE, &zero)],
-            );
-            return Ok(Some(nanbox_pointer_inline(blk, &id)));
-        }
-        "setTimeout" if args.len() == 2 => {
-            let cb_box = lower_expr(ctx, &args[0])?;
-            let delay_box = lower_expr(ctx, &args[1])?;
-            let blk = ctx.block();
-            let zero_idx = "0";
-            let cb_handle = blk.call(
-                I64,
-                "js_timer_validate_callback",
-                &[(DOUBLE, &cb_box), (I32, zero_idx)],
-            );
-            let id = blk.call(
-                I64,
-                "js_set_timeout_callback",
-                &[(I64, &cb_handle), (DOUBLE, &delay_box)],
-            );
-            return Ok(Some(nanbox_pointer_inline(blk, &id)));
-        }
-        "setImmediate" if !args.is_empty() => {
-            let cb_box = lower_expr(ctx, &args[0])?;
-            if args.len() == 1 {
-                let blk = ctx.block();
-                let two_idx = "2";
-                let cb_handle = blk.call(
-                    I64,
-                    "js_timer_validate_callback",
-                    &[(DOUBLE, &cb_box), (I32, two_idx)],
-                );
-                let id = blk.call(I64, "js_set_immediate_callback", &[(I64, &cb_handle)]);
-                return Ok(Some(nanbox_pointer_inline(blk, &id)));
-            }
-
-            let n = args.len() - 1;
-            let buf = ctx.func.alloca_entry_array(DOUBLE, n);
-            for (i, a) in args.iter().skip(1).enumerate() {
-                let v = lower_expr(ctx, a)?;
-                let blk = ctx.block();
-                let slot = blk.gep(DOUBLE, &buf, &[(I64, &format!("{}", i))]);
-                blk.store(DOUBLE, &v, &slot);
-            }
-            let ptr_reg = ctx.block().next_reg();
-            ctx.block().emit_raw(format!(
-                "{} = getelementptr [{} x double], ptr {}, i64 0, i64 0",
-                ptr_reg, n, buf
-            ));
-            let blk = ctx.block();
-            let two_idx = "2";
-            let cb_handle = blk.call(
-                I64,
-                "js_timer_validate_callback",
-                &[(DOUBLE, &cb_box), (I32, two_idx)],
-            );
-            let id = blk.call(
-                I64,
-                "js_set_immediate_callback_args",
-                &[(I64, &cb_handle), (PTR, &ptr_reg), (I32, &n.to_string())],
-            );
-            return Ok(Some(nanbox_pointer_inline(blk, &id)));
-        }
-        // Refs #665: `setTimeout(fn, delay, ...args)` — JS spec forwards
-        // the trailing args to `fn` when the timer fires. Pack them into
-        // a stack buffer of doubles and hand off to the varargs runtime
-        // entry. Used by Promise-executor patterns like
-        // `setTimeout(resolve, delay, res)` (rate-limiter-flexible's
-        // `RateLimiterMemory.consume` is the discovering call site).
-        "setTimeout" if args.len() >= 3 => {
-            let cb_box = lower_expr(ctx, &args[0])?;
-            let delay_box = lower_expr(ctx, &args[1])?;
-            let n = args.len() - 2;
-            let buf = ctx.func.alloca_entry_array(DOUBLE, n);
-            for (i, a) in args.iter().skip(2).enumerate() {
-                let v = lower_expr(ctx, a)?;
-                let blk = ctx.block();
-                let slot = blk.gep(DOUBLE, &buf, &[(I64, &format!("{}", i))]);
-                blk.store(DOUBLE, &v, &slot);
-            }
-            let ptr_reg = ctx.block().next_reg();
-            ctx.block().emit_raw(format!(
-                "{} = getelementptr [{} x double], ptr {}, i64 0, i64 0",
-                ptr_reg, n, buf
-            ));
-            let blk = ctx.block();
-            let zero_idx = "0";
-            let cb_handle = blk.call(
-                I64,
-                "js_timer_validate_callback",
-                &[(DOUBLE, &cb_box), (I32, zero_idx)],
-            );
-            let id = blk.call(
-                I64,
-                "js_set_timeout_callback_args",
-                &[
-                    (I64, &cb_handle),
-                    (DOUBLE, &delay_box),
-                    (crate::types::PTR, &ptr_reg),
-                    (I32, &n.to_string()),
-                ],
-            );
-            return Ok(Some(nanbox_pointer_inline(blk, &id)));
-        }
-        "setInterval" if args.len() == 2 => {
-            let cb_box = lower_expr(ctx, &args[0])?;
-            let delay_box = lower_expr(ctx, &args[1])?;
-            let blk = ctx.block();
-            let one_idx = "1";
-            let cb_handle = blk.call(
-                I64,
-                "js_timer_validate_callback",
-                &[(DOUBLE, &cb_box), (I32, one_idx)],
-            );
-            let id = blk.call(
-                I64,
-                "setInterval",
-                &[(I64, &cb_handle), (DOUBLE, &delay_box)],
-            );
-            return Ok(Some(nanbox_pointer_inline(blk, &id)));
-        }
-        "setInterval" if args.len() >= 3 => {
-            let cb_box = lower_expr(ctx, &args[0])?;
-            let delay_box = lower_expr(ctx, &args[1])?;
-            let n = args.len() - 2;
-            let buf = ctx.func.alloca_entry_array(DOUBLE, n);
-            for (i, a) in args.iter().skip(2).enumerate() {
-                let v = lower_expr(ctx, a)?;
-                let blk = ctx.block();
-                let slot = blk.gep(DOUBLE, &buf, &[(I64, &format!("{}", i))]);
-                blk.store(DOUBLE, &v, &slot);
-            }
-            let ptr_reg = ctx.block().next_reg();
-            ctx.block().emit_raw(format!(
-                "{} = getelementptr [{} x double], ptr {}, i64 0, i64 0",
-                ptr_reg, n, buf
-            ));
-            let blk = ctx.block();
-            let one_idx = "1";
-            let cb_handle = blk.call(
-                I64,
-                "js_timer_validate_callback",
-                &[(DOUBLE, &cb_box), (I32, one_idx)],
-            );
-            let id = blk.call(
-                I64,
-                "js_set_interval_callback_args",
-                &[
-                    (I64, &cb_handle),
-                    (DOUBLE, &delay_box),
-                    (crate::types::PTR, &ptr_reg),
-                    (I32, &n.to_string()),
-                ],
-            );
-            return Ok(Some(nanbox_pointer_inline(blk, &id)));
-        }
-        "clearTimeout" if args.len() == 1 => {
-            // Pass the raw NaN-boxed arg so the runtime accepts both the
-            // handle and its primitive numeric id (`clearTimeout(+t)`, #1213).
-            let id_box = lower_expr(ctx, &args[0])?;
-            ctx.block()
-                .call_void("js_clear_timeout_value", &[(DOUBLE, &id_box)]);
-            return Ok(Some(double_literal(f64::from_bits(
-                crate::nanbox::TAG_UNDEFINED,
-            ))));
-        }
-        "clearInterval" if args.len() == 1 => {
-            let id_box = lower_expr(ctx, &args[0])?;
-            ctx.block()
-                .call_void("js_clear_interval_value", &[(DOUBLE, &id_box)]);
-            return Ok(Some(double_literal(f64::from_bits(
-                crate::nanbox::TAG_UNDEFINED,
-            ))));
-        }
-        "clearImmediate" if args.len() == 1 => {
-            let id_box = lower_expr(ctx, &args[0])?;
-            ctx.block()
-                .call_void("js_clear_immediate_value", &[(DOUBLE, &id_box)]);
-            return Ok(Some(double_literal(f64::from_bits(
-                crate::nanbox::TAG_UNDEFINED,
-            ))));
-        }
         "gc" => {
             ctx.block().call_void("js_gc_collect", &[]);
             return Ok(Some(double_literal(f64::from_bits(
@@ -1952,48 +1757,42 @@ pub fn try_lower_extern_func_call(
     ctx.pending_declares
         .push((fname.clone(), DOUBLE, param_types));
     let mut lowered: Vec<String> = Vec::with_capacity(target_arity);
+    let arg_guard: Option<String>;
     if has_rest {
-        // Fixed (non-rest) params: pass through.
+        // #7154: the rest twin of the arm below. Fixed params were lowered into
+        // bare registers and then held across `js_array_alloc` plus a
+        // `js_array_push_f64` per trailing arg, and the accumulator itself was
+        // a raw array pointer in a bare register holding the only reference to
+        // everything pushed so far. See `super::lower_rest_call_args_rooted`.
+        //
+        // The rest array is materialized ALWAYS — even with zero trailing args,
+        // the callee's rest binding must be `[]`. #1816: for a synthetic
+        // `arguments` param, bundle ALL args (from 0), not just the trailing
+        // ones, so `arguments.length` is correct.
         let fixed_count = declared_count.saturating_sub(1);
-        for a in args.iter().take(fixed_count) {
-            lowered.push(lower_expr(ctx, a)?);
-        }
-        // Pad fixed params if the caller passed too few.
-        let undefined_lit = double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
-        while lowered.len() < fixed_count {
-            lowered.push(undefined_lit.clone());
-        }
-        // Materialize the rest array (always — even when zero
-        // trailing args, the callee's rest binding must be `[]`).
-        // #1816: for a synthetic `arguments` param, bundle ALL args (from 0),
-        // not just the trailing ones, so `arguments.length` is correct.
         let bundle_from = if has_synthetic_args { 0 } else { fixed_count };
-        let rest_count = args.len().saturating_sub(bundle_from);
-        let cap = (rest_count as u32).to_string();
-        let mut current = ctx.block().call(I64, "js_array_alloc", &[(I32, &cap)]);
-        for a in args.iter().skip(bundle_from) {
-            let v = lower_expr(ctx, a)?;
-            let blk = ctx.block();
-            current = blk.call(I64, "js_array_push_f64", &[(I64, &current), (DOUBLE, &v)]);
-        }
-        if has_synthetic_args {
-            current = ctx
-                .block()
-                .call(I64, "js_array_mark_arguments_object", &[(I64, &current)]);
-        }
-        let rest_box = nanbox_pointer_inline(ctx.block(), &current);
-        lowered.push(rest_box);
+        let (values, guard) = super::lower_rest_call_args_rooted(
+            ctx,
+            args,
+            fixed_count,
+            &[super::RestBundle {
+                from: bundle_from,
+                mark_arguments_object: has_synthetic_args,
+            }],
+        )?;
+        arg_guard = guard;
+        lowered.extend(values);
     } else {
-        for a in args {
-            lowered.push(lower_expr(ctx, a)?);
-        }
+        // #7154: the registry's residual. See `super::lower_call_args_rooted`.
+        let (values, guard) = super::lower_call_args_rooted(ctx, args)?;
+        arg_guard = guard;
+        lowered.extend(values);
         // Pad with TAG_UNDEFINED for the missing trailing args.
         let undefined_lit = double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
         while lowered.len() < target_arity {
             lowered.push(undefined_lit.clone());
         }
     }
-    let arg_slices: Vec<(crate::types::LlvmType, &str)> =
-        lowered.iter().map(|s| (DOUBLE, s.as_str())).collect();
-    Ok(Some(ctx.block().call(DOUBLE, &fname, &arg_slices)))
+    let call = super::emit_rooted_call(ctx, &fname, &lowered, arg_guard);
+    Ok(Some(call))
 }

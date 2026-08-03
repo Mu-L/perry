@@ -108,13 +108,22 @@ LABEL_RE = re.compile(r"^([\w.$][\w.$]*):\s*(?:;.*)?$")
 # strict form above declines it, that is a parser gap and must be loud.
 LABEL_SHAPED_RE = re.compile(r"^[^\s=]+:\s*(?:;.*)?$")
 ASSIGN_RE = re.compile(r"^\s*%([\w.$]+)\s*=\s*(.*)$")
-CALL_RE = re.compile(r"\bcall\s+[^@]*@([\w.$]+)\(")
+# `invoke` (#7302) is a call with an unwind edge — it must be seen as a call
+# here or every collecting call inside a `try` body would be invisible to the
+# dominance analysis (a silent false-green for exactly the functions where
+# rooting is hardest).
+CALL_RE = re.compile(r"\b(?:call|invoke)\s+[^@]*@([\w.$]+)\(")
 BIND_RE = re.compile(r"call void @js_shadow_slot_bind\(i32 (\d+), ptr %([\w.$]+)\)")
 CLEAR_RE = re.compile(r"call void @js_shadow_slot_set\(i32 (\d+), i64 0\)")
 STORE_RE = re.compile(r"^\s*store\s+([\w\[\]x* ]+?)\s+([^,]+),\s*ptr %([\w.$]+)")
 BR_UNCOND_RE = re.compile(r"^\s*br label %([\w.$]+)")
 BR_COND_RE = re.compile(r"^\s*br i1 [^,]+, label %([\w.$]+), label %([\w.$]+)")
 SWITCH_LABEL_RE = re.compile(r"label %([\w.$]+)")
+# Invoke edges (#7302): normal destination + unwind destination. The invoke
+# terminates its block; the continuation label follows immediately in the
+# emitted text and both successors must appear in the CFG or the landing pad
+# (and everything reached through it) would be dropped as unreachable.
+INVOKE_EDGE_RE = re.compile(r"\binvoke\b.*\bto label %([\w.$]+) unwind label %([\w.$]+)")
 
 
 class Insn:
@@ -219,6 +228,11 @@ def build_cfg(f):
             if t.strip().startswith("switch"):
                 for lbl in SWITCH_LABEL_RE.findall(t):
                     f.succs[b].add(lbl)
+                continue
+            m = INVOKE_EDGE_RE.search(t)
+            if m:
+                f.succs[b].add(m.group(1))
+                f.succs[b].add(m.group(2))
     for b, ss in list(f.succs.items()):
         for s in ss:
             f.preds[s].add(b)
@@ -483,6 +497,59 @@ def audit_alloc_re(roots=SYMBOL_ROOTS):
     print("=== every alternative matches at least one exported symbol")
     return 0
 
+
+def dead_poll_capable(symbols):
+    """`POLL_CAPABLE_RUNTIME` entries that name no exported symbol, sorted.
+
+    No exceptions, deliberately — `MOVING_POLL` itself is a real export
+    (`gc/policy.rs:1766`), so carving one out would be an unearned hole in the
+    very audit that exists because unearned holes are the recurring bug here.
+    """
+    return sorted(n for n in POLL_CAPABLE_RUNTIME if n not in symbols)
+
+
+def audit_poll_capable(roots=SYMBOL_ROOTS):
+    """Exit status for `--audit-poll-capable`. 0 clean, 2 on a phantom entry.
+
+    Same hazard as `--audit-alloc-re`, in the other direction. `ALLOC_RE`
+    decides whether a register HAS a heap-value source; `POLL_CAPABLE_RUNTIME`
+    decides whether the window around it is MOVING, which is what
+    `gc-root-dominance.yml`'s `--moving-only` arms gate on. An entry that names
+    nothing reads as coverage and suppresses nothing, and unlike a dead
+    ALLOC_RE alternative it is invisible even to a careful reader, because the
+    misspelling is usually a *plausible* name for a real operation.
+
+    Measured when this auditor was written: TEN of twenty-eight entries were
+    phantoms, including four separate spellings of "call a JS closure", none of
+    which existed. See the block comment on `POLL_CAPABLE_RUNTIME`.
+    """
+    syms = runtime_symbols(roots)
+    # Non-vacuity first, for the same reason `audit_alloc_re` does it: an empty
+    # or tiny symbol table would report every entry dead and the verdict would
+    # be about the scan.
+    if len(syms) < 500:
+        print(f"error: found only {len(syms)} `extern \"C\" fn js_*` symbols "
+              f"under {', '.join(roots)}. The audit is measuring its own scan, "
+              "not POLL_CAPABLE_RUNTIME. Run it from the repository root.",
+              file=sys.stderr)
+        return 2
+    dead = dead_poll_capable(syms)
+    print(f"=== POLL_CAPABLE_RUNTIME: {len(POLL_CAPABLE_RUNTIME)} entries vs "
+          f"{len(syms)} exported js_* symbols")
+    if dead:
+        print("error: POLL_CAPABLE_RUNTIME entries that name no runtime symbol:",
+              file=sys.stderr)
+        for n in dead:
+            print(f"  {n}", file=sys.stderr)
+        print("An entry that matches nothing cannot classify any window as "
+              "MOVING, so it reads as coverage of an operation the "
+              "`--moving-only` gate is in fact blind to. Replace it with the "
+              "symbol codegen actually emits -- do not just delete it, or the "
+              "audit goes green and the hole stays.", file=sys.stderr)
+        return 2
+    print("=== every entry names an exported runtime symbol")
+    return 0
+
 # Bit-level / identity producers a heap address flows through unchanged.
 TRANSPARENT_OPS = ("or i64", "and i64", "bitcast", "inttoptr", "ptrtoint",
                    "select", "phi", "add i64", "sub i64")
@@ -568,13 +635,118 @@ def is_collecting(callee):
 # This matters more than the raw-count modes suggest, because `--moving-only`
 # is the mode the `gc-root-dominance.yml` gate runs. A source the gate cannot
 # classify as reaching a moving minor is a source the gate cannot fail on.
+#
+# ## The property-GET hole (#7154 follow-up)
+#
+# Membership here is by EXACT emitted symbol, and that is the trap. The set
+# carried `js_object_get_field_by_name` and `js_object_set_field_by_name` as a
+# matched pair, which reads like symmetric coverage of property access. It is
+# not. Codegen emits `js_object_set_field_by_name` verbatim (27 call sites in
+# perry-codegen, 205 in the gate's own corpus) but never emits
+# `js_object_get_field_by_name` at all — the GET side lowers to
+# `js_object_get_field_by_name_f64`, `js_object_get_field_ic_miss` and
+# `js_typed_feedback_object_get_field_by_name_f64` (1324 / 532 / 556 calls in
+# the same corpus), and not one of those three was in this set. So every
+# property SET classified `MOVING: YES` and every property GET classified
+# `MOVING: no`, which is the asymmetry that put "as of this writing all five
+# violations the gate reports are `MOVING: YES via js_object_set_field_by_name`"
+# in docs/src/internals/gc-rooting-invariant.md and left the GET half unread.
+#
+# Measured on the gate corpus at the commit that added these six names: 55
+# `--stale-registers` uses have an emitted property-GET helper in their window
+# and 31 of them classified `MOVING: no`, so `--moving-only` dropped all 31 —
+# including the shape that faults deterministically under
+# `PERRY_GC_PROTECT_FROMSPACE=1 PERRY_GC_PROTECT_FROMSPACE_DEPTH=800` at zod's
+# `clone`. The protector and the checker disagreed and the checker was wrong.
+#
+# The premise for each addition is the SAME premise the set already grants
+# `js_object_get_field_by_name`: it runs a user getter through a transmuted
+# function pointer (`get_field_by_name.rs:1064-1067`) and routes a registered
+# Proxy to `js_proxy_get` (`get_field_by_name.rs:84`) — arbitrary JS, with its
+# own back-edge polls. Each name below is an entry point that reaches it:
+#
+#   js_object_get_field_by_name_f64             ic_miss.rs:29  -> _by_name
+#   js_object_get_field_by_name_boxed           ic_miss.rs:81,86 -> _f64
+#   js_object_get_field_by_property_id_f64      ic_miss.rs:123 -> _f64
+#   js_object_get_field_ic_miss                 ic_miss.rs:228,275 -> _by_name
+#                                               ic_miss.rs:252 -> js_proxy_get
+#   js_object_get_field_ic                      ic_miss.rs:526,561 -> _f64,
+#                                               ic_miss.rs:544 -> _ic_miss
+#   js_typed_feedback_object_get_field_by_name_f64
+#                                               typed_feedback.rs:992 -> _f64
+#
+# `js_object_get_field_by_name` STAYS. It is a real exported symbol
+# (`--audit-poll-capable` checks that), the runtime calls it internally, and a
+# future lowering may emit it directly; removing it would be a narrowing bought
+# for nothing. The bug was never that it was listed — it was that listing it
+# read as covering the GET side when nothing in the corpus matched it.
+#
+# ## The ten names that were not symbols at all
+#
+# Auditing the set the way `--audit-alloc-re` audits ALLOC_RE found that TEN of
+# its twenty-eight entries matched no `extern "C" fn js_*` anywhere in
+# perry-runtime or perry-stdlib: `js_apply_function`, `js_array_for_each`,
+# `js_array_sort`, `js_call_closure`, `js_call_value`, `js_function_call`,
+# `js_invoke_closure`, `js_object_get_property`, `js_object_set_property`,
+# `js_string_replace`. Extrapolated spellings, exactly like `regexp_alloc\w*`
+# and the eight other dead ALLOC_RE alternatives, and with the same effect: the
+# set LOOKED like it covered "call a JS closure" behind four separate entries
+# and covered it zero times. The real closure-call entry points
+# (`js_closure_callN`, 186 call sites in the gate corpus) were never in it, so
+# a value held live across a plain JS function call classified `MOVING: no` —
+# the most obviously poll-capable operation there is. `RECEIVER_SINKS` in this
+# same file already spelled it `closure_call\w*`, so the correct name was three
+# hundred lines away the whole time.
+#
+# Each phantom is replaced by the emitted symbol that carries the premise the
+# phantom asserted, never deleted outright — dropping the fake name without the
+# real one would keep the audit green and leave the hole:
+#
+#   js_call_closure / js_invoke_closure / js_function_call / js_apply_function
+#       -> js_closure_call0..16, js_closure_call_array,
+#          js_closure_call_apply_with_spread   (closure/dispatch/calln.rs:33 —
+#          invokes a JS closure; nothing is more poll-capable than this)
+#   js_call_value  -> js_native_call_value     (closure/dispatch/value_call.rs:17
+#          — calls a value as a function, incl. the Proxy `apply` trap)
+#   js_array_sort  -> js_array_sort_default, js_array_sort_with_comparator
+#          (array/sort.rs:542,635 — the comparator is user JS)
+#   js_array_for_each -> js_typed_array_for_each  (typedarray/iterate.rs:137)
+#   js_object_get_property / js_object_set_property
+#       -> js_object_get_property_key, js_object_set_property_key,
+#          js_object_set_property_key_method  (object/property_key.rs:154,210,257
+#          — ToPropertyKey coercion, then `js_object_get_field_by_name`)
+#   js_string_replace -> the four `_fn` variants, which take a user replacer
+#          callback (regex/replace_expand.rs:277 and siblings). The `_dyn` and
+#          plain variants are a separate coverage decision with their own hit
+#          count and are deliberately NOT folded in here — same reasoning as
+#          ALLOC_RE's deleted `bigint_\w+_op`.
 POLL_CAPABLE_RUNTIME = {
-    "js_call_function", "js_call_closure", "js_invoke_closure",
-    "js_call_value", "js_apply_function", "js_function_call",
-    "js_object_get_property", "js_object_set_property",
+    "js_call_function",
+    # Calling a JS closure. The four names this replaces
+    # (`js_call_closure`, `js_invoke_closure`, `js_function_call`,
+    # `js_apply_function`) were not symbols; these are.
+    "js_closure_call0", "js_closure_call1", "js_closure_call2",
+    "js_closure_call3", "js_closure_call4", "js_closure_call5",
+    "js_closure_call6", "js_closure_call7", "js_closure_call8",
+    "js_closure_call9", "js_closure_call10", "js_closure_call11",
+    "js_closure_call12", "js_closure_call13", "js_closure_call14",
+    "js_closure_call15", "js_closure_call16",
+    "js_closure_call_array", "js_closure_call_apply_with_spread",
+    "js_native_call_value",
+    "js_object_get_property_key", "js_object_set_property_key",
+    "js_object_set_property_key_method",
     "js_object_get_field_by_name", "js_object_set_field_by_name",
-    "js_array_sort", "js_array_map", "js_array_filter", "js_array_for_each",
-    "js_array_reduce", "js_json_stringify", "js_string_replace",
+    # The property-GET dispatch codegen ACTUALLY emits. See the block comment
+    # above for the reach proof behind each one.
+    "js_object_get_field_by_name_f64", "js_object_get_field_by_name_boxed",
+    "js_object_get_field_by_property_id_f64",
+    "js_object_get_field_ic", "js_object_get_field_ic_miss",
+    "js_typed_feedback_object_get_field_by_name_f64",
+    "js_array_sort_default", "js_array_sort_with_comparator",
+    "js_array_map", "js_array_filter", "js_typed_array_for_each",
+    "js_array_reduce", "js_json_stringify",
+    "js_string_replace_regex_fn", "js_string_replace_string_fn",
+    "js_string_replace_all_regex_fn", "js_string_replace_all_string_fn",
     "js_promise_run_microtasks", "js_gc_loop_safepoint",
     # ToPrimitive / ToString / ToNumber: every one of these dispatches a user
     # `[Symbol.toPrimitive]` / `toString` / `valueOf` on an object operand.
@@ -1375,6 +1547,56 @@ define double @perry_fn_selftest__nolabel(double %a) {
 # `@perry_global_*` and are registered roots that evacuation rewrites.
 GLOBAL_ROOT_RE = re.compile(r"@perry_global_[\w.$]+")
 
+# Loads whose source is a location the collector REWRITES. A register holding
+# one of these is stale below a collection point even though the value survives
+# — property (2) without property (3), the module-header distinction.
+#
+# ## Why this lives here rather than only next to `--unrooted-allocas`
+#
+# It was defined twice, in effect: `--unrooted-allocas` had this pattern and
+# used it, while `--stale-registers` had `GLOBAL_ROOT_RE` and knew about
+# `@perry_global_*` alone. **The two modes disagreed about what a
+# collector-rewritten load is, and the narrower one was wrong.**
+#
+# The cost of that disagreement is #7240: a string literal lowers to
+# `load double, ptr @…_.str.N.handle`, and the handle global IS a registered
+# root — `js_gc_register_global_root`, `codegen/string_pool.rs` — so the string
+# is never swept, but an evacuating cycle REWRITES the global while a register
+# loaded from it beforehand keeps the pre-move address. Measured at #7240's
+# fault: the handle global held the post-move address, the register held the
+# retired from-space one. `heap_source_kind` classified that load as nothing at
+# all, so the register had no recognised source and no stale use could be
+# attributed to it. Over #7240's own gap test the checker reported 24
+# `--moving-only` stale uses at the offending call and named NEITHER of the two
+# literals that actually faulted; the registry's `alerts.ts` call passes
+# literals in both unprotected positions, so it reported nothing whatsoever.
+#
+# Unlike `js_implicit_this_set` (#7226) and `js_regexp_new` (#7227), this one
+# could NOT be closed by adding a name to `ALLOC_RE` — the source is a `load`,
+# not a `call`. It needs the source SET widened, which is why it waited for its
+# own before/after rather than riding along with a fix.
+#
+# One definition, both modes, so the next reader cannot re-derive half of it.
+REWRITTEN_LOAD_RE = re.compile(
+    r"load\s+\S+,\s*ptr\s+@(?:"
+    r"(?P<strhandle>[\w.$]*_\.str\.\d+\.handle)"   # string-literal handles
+    r"|(?P<global>perry_global_[\w.$]+)"           # module-level variables
+    r"|(?P<classkeys>perry_class_keys_[\w.$]+)"    # class keys (old-gen, C4b movable)
+    r")"
+)
+
+
+def rewritten_load_kind(text):
+    """Which collector-rewritten global does this load read, if any?
+
+    Returns the source kind (`strhandle` / `global` / `classkeys`) so the
+    `--stale-registers` breakdown can be triaged one population at a time —
+    they have genuinely different verdicts, and lumping them under one label
+    would hide that.
+    """
+    m = REWRITTEN_LOAD_RE.search(text)
+    return None if m is None else m.lastgroup
+
 # Calls that READ a collector-rewritten location into a register.
 ROOT_READ_CALLS = {
     "js_closure_get_capture_bits",   # closure/alloc.rs:463 capture cell read
@@ -1431,8 +1653,20 @@ def heap_source_kind(ins, slot_of_alloca):
             return "capture" if "capture" in ins.callee else "rootread"
         return None
     if "= load " in ins.text:
+        # `GLOBAL_ROOT_RE` first, and deliberately: it is the looser of the two
+        # (it matches the name anywhere in the line, so it still catches a load
+        # through a `getelementptr` on the global) and it keeps the `global`
+        # population reporting under exactly the label it reported under
+        # before. This widening is then strictly ADDITIVE — no previously
+        # reported source changes kind, only sources that were invisible start
+        # appearing — which is the property the gate's baselined counts need.
         if GLOBAL_ROOT_RE.search(ins.text):
             return "global"
+        # #7240's third follow-up: a load of a string-literal handle global is
+        # a heap-value source. See `REWRITTEN_LOAD_RE`.
+        kind = rewritten_load_kind(ins.text)
+        if kind is not None:
+            return kind
         m = re.search(r"load\s+(?:i64|double)\s*,\s*ptr %([\w.$]+)", ins.text)
         if m and m.group(1) in slot_of_alloca:
             return "slotload"
@@ -1633,7 +1867,10 @@ def run_stale(parsed, poll_reaching, verbose, moving_only, fatal_only,
 #   1. it is never an operand of `js_shadow_slot_bind` anywhere in the function
 #      (a bind makes the collector rewrite it, which is the fix);
 #   2. some store into it carries a value whose provenance is a heap-value
-#      SOURCE — an allocation, or a load of a collector-rewritten location;
+#      source that can MOVE or be RECLAIMED — an allocation, or a load of a
+#      collector-rewritten location, minus the exemptions enumerated in
+#      `IMMOVABLE_SOURCES` (#7210: being a location the collector rewrites is
+#      not the same as naming an object that can move);
 #   3. a collecting call sits on some CFG path between that store and a LOAD of
 #      the alloca.
 #
@@ -1642,16 +1879,11 @@ def run_stale(parsed, poll_reaching, verbose, moving_only, fatal_only,
 # positive and never a missed bug. It is reported separately from the
 # bind-anchored count because its two populations are disjoint by construction.
 
-# Loads whose source is a location the collector REWRITES. A register holding
-# one of these is stale below a collection point even though the value survives
-# — property (2) without property (3), the module-header distinction.
-REWRITTEN_LOAD_RE = re.compile(
-    r"load\s+\S+,\s*ptr\s+@(?:"
-    r"\w*_\.str\.\d+\.handle"          # string-literal handle globals
-    r"|perry_global_\w+"               # module-level variables
-    r"|perry_class_keys_\w+"           # class keys arrays (old-gen, C4b movable)
-    r")"
-)
+# `REWRITTEN_LOAD_RE` — the loads whose source the collector rewrites — is
+# defined once, up with `GLOBAL_ROOT_RE` and the rest of the heap-value source
+# vocabulary, because `--stale-registers` needs the same answer this mode does.
+# It used to live only here, and the two modes disagreeing about it is exactly
+# what made #7240's string-literal argument invisible; see the comment there.
 
 # Calls that MATERIALIZE a heap value (a superset of ALLOC_RE: anything that
 # hands back an object the collector can move).
@@ -1660,6 +1892,311 @@ HEAP_SOURCE_CALLS = frozenset({
     "js_box_get_bits", "js_implicit_this_get", "js_new_target_get",
     "js_static_this_resolve", "js_get_exception",
 })
+
+
+# ------------------------------------------------- movability vs rewritability
+#
+# #7210 measured this predicate and found ALL 66 of its `--moving-only` hits to
+# be false positives, for one reason: it answered
+#
+#     "does the collector REWRITE this location?"
+#
+# when the question the report is about is
+#
+#     "can the OBJECT this register names go bad while it sits in unrooted
+#      memory across a collection?"
+#
+# Those are different questions, and `@perry_class_keys_*` is exactly where
+# they come apart. The GLOBAL is registered with `js_gc_register_global_root`
+# (`perry-codegen/src/codegen/string_pool.rs:477`) — so yes, the collector
+# rewrites it. But the ARRAY it names is allocated by
+# `js_build_class_keys_array` through `js_array_alloc_with_length_longlived`
+# (`perry-runtime/src/object/alloc.rs:320,337`), i.e. in the OLD arena, which
+# the nursery copying minor never relocates. 64 of the 66 were that, and 2 were
+# `js_box_alloc_bits`, which is `std::alloc::alloc` — not in the GC heap at all.
+#
+# A register naming an object can go bad in exactly two independent ways, and
+# the exemptions below have to close BOTH or they are unsound:
+#
+#   MOVABLE      some shipped/tested collector configuration relocates the
+#                object, so the held address becomes stale. Only this one is
+#                what `--moving-only` is about.
+#   RECLAIMABLE  the object is freed if nothing else keeps it reachable, so
+#                holding it in storage the precise root walk never visits is a
+#                premature sweep (#7230's staging-buffer defect). This is what
+#                the default (non-`--moving-only`) mode additionally covers.
+#
+# An exemption asserts BOTH are false and says why. It is one-sided in the
+# UNSAFE direction — a source not listed here keeps the old, conservative
+# classification — so the cost of forgetting one is a false positive, never a
+# missed bug.
+#
+# ★ Every premise below is machine-checked by `--audit-immovable-sources`
+# (wired into the gc-root-dominance workflow), and every exemption has a CLI
+# knob that turns it back OFF so the counterfactual is one flag away rather
+# than tribal knowledge. Both are deliberate: an exemption justified only by a
+# comment is the shape that rots, and #7210's two conditions were written down
+# precisely so somebody could re-check them.
+
+class ImmovableSource:
+    """A heap-value source whose object can neither move nor be reclaimed.
+
+    `probes` are (path, regex, must_match) triples over the repository. They
+    are the PREMISES of the exemption, not decoration: if one stops holding,
+    `--audit-immovable-sources` goes red and the exemption must be re-argued
+    rather than silently continuing to suppress real hazards.
+    """
+
+    def __init__(self, key, label, knob, callees=frozenset(), load_re=None,
+                 not_movable_because="", not_reclaimable_because="",
+                 becomes_real_when="", probes=()):
+        self.key = key
+        self.label = label
+        self.knob = knob
+        self.callees = frozenset(callees)
+        self.load_re = load_re
+        self.not_movable_because = not_movable_because
+        self.not_reclaimable_because = not_reclaimable_because
+        self.becomes_real_when = becomes_real_when
+        self.probes = tuple(probes)
+
+    def matches(self, ins):
+        if ins.callee is not None:
+            return ins.callee in self.callees
+        return bool(self.load_re and self.load_re.search(ins.text))
+
+
+# `js_build_class_keys_array`'s body, which the first probe reads. rustfmt puts
+# a top-level fn's closing brace at column 0, so "from the signature to the
+# next line that is exactly `}`" is the body and nothing else.
+def rust_fn_body(path, fn_name):
+    """Source text of a top-level Rust fn, or None if it is not there."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    start = None
+    for i, line in enumerate(lines):
+        if re.search(r"\bfn\s+" + re.escape(fn_name) + r"\b", line):
+            start = i
+            break
+    if start is None:
+        return None
+    for j in range(start + 1, len(lines)):
+        if lines[j] == "}":
+            return "\n".join(lines[start:j + 1])
+    return None
+
+
+def _probe_class_keys_longlived():
+    """Every array allocation in `js_build_class_keys_array` is `_longlived`."""
+    body = rust_fn_body("crates/perry-runtime/src/object/alloc.rs",
+                        "js_build_class_keys_array")
+    if body is None:
+        return (False, "js_build_class_keys_array not found in "
+                       "crates/perry-runtime/src/object/alloc.rs")
+    allocs = re.findall(r"js_array_alloc\w*", body)
+    if not allocs:
+        return (False, "js_build_class_keys_array no longer allocates its "
+                       "array with a js_array_alloc* call; the arena it uses "
+                       "must be re-established by hand")
+    bad = [a for a in allocs if "longlived" not in a]
+    if bad:
+        return (False, "js_build_class_keys_array now calls %s — a NURSERY "
+                       "allocator. The class-keys exemption is void; the 64 "
+                       "#7210 reports are real." % ", ".join(sorted(set(bad))))
+    return (True, "%d longlived allocation(s)" % len(allocs))
+
+
+def _probe_old_defrag_off_by_default():
+    """Old-page defrag still returns an empty selection unless opted in."""
+    try:
+        with open("crates/perry-runtime/src/gc/oldgen.rs",
+                  encoding="utf-8", errors="replace") as fh:
+            src = fh.read()
+    except OSError:
+        return (False, "crates/perry-runtime/src/gc/oldgen.rs not readable")
+    if "PERRY_GC_OLD_DEFRAG" not in src:
+        return (False, "gc/oldgen.rs no longer mentions PERRY_GC_OLD_DEFRAG; "
+                       "old-page defrag may now be unconditional")
+    body = rust_fn_body("crates/perry-runtime/src/gc/oldgen.rs",
+                        "select_old_page_defrag_pages")
+    if body is None:
+        return (False, "select_old_page_defrag_pages not found in gc/oldgen.rs")
+    if not re.search(r"if\s+!old_page_defrag_enabled\(\)\s*\{\s*\n\s*return\s+"
+                     r"OldPageDefragSelection::default\(\);", body):
+        return (False, "select_old_page_defrag_pages no longer short-circuits "
+                       "to an empty selection when defrag is disabled — "
+                       "old-arena objects may relocate on a default build")
+    return (True, "gated on PERRY_GC_OLD_DEFRAG, empty selection when off")
+
+
+def _probe_class_keys_global_is_a_root():
+    """The keys global is registered, so the array is never unreachable."""
+    try:
+        with open("crates/perry-codegen/src/codegen/string_pool.rs",
+                  encoding="utf-8", errors="replace") as fh:
+            src = fh.read()
+    except OSError:
+        return (False, "perry-codegen/src/codegen/string_pool.rs not readable")
+    if "js_build_class_keys_array" not in src:
+        return (False, "string_pool.rs no longer emits js_build_class_keys_array")
+    if "js_gc_register_global_root" not in src:
+        return (False, "string_pool.rs no longer registers the class-keys "
+                       "global as a GC root — the array can now be swept")
+    return (True, "@perry_class_keys_* registered via js_gc_register_global_root")
+
+
+def _probe_boxes_outside_the_gc_heap():
+    """Boxes are `std::alloc::alloc`, never freed, never arena-allocated."""
+    try:
+        with open("crates/perry-runtime/src/box.rs",
+                  encoding="utf-8", errors="replace") as fh:
+            src = fh.read()
+    except OSError:
+        return (False, "crates/perry-runtime/src/box.rs not readable")
+    body = rust_fn_body("crates/perry-runtime/src/box.rs", "js_box_alloc_bits")
+    if body is None:
+        return (False, "js_box_alloc_bits not found in box.rs")
+    if "alloc(layout)" not in body:
+        return (False, "js_box_alloc_bits no longer allocates via "
+                       "std::alloc::alloc; if it now uses arena_alloc_gc the "
+                       "box IS a GC object and the exemption is void")
+    if re.search(r"arena_alloc\w*\s*\(", src):
+        return (False, "box.rs now calls an arena allocator — boxes may be GC "
+                       "heap objects, which makes them movable AND sweepable")
+    if re.search(r"\bdealloc\s*\(", src):
+        return (False, "box.rs now frees boxes; the never-reclaimed premise of "
+                       "the exemption no longer holds")
+    return (True, "std::alloc::alloc, no arena allocation, no dealloc")
+
+
+IMMOVABLE_SOURCES = (
+    ImmovableSource(
+        key="class-keys",
+        label="@perry_class_keys_* / js_build_class_keys_array (old arena)",
+        knob="assume_old_defrag",
+        callees={"js_build_class_keys_array"},
+        load_re=re.compile(r"load\s+\S+,\s*ptr\s+@perry_class_keys_\w+"),
+        not_movable_because=(
+            "js_build_class_keys_array allocates through "
+            "js_array_alloc_with_length_longlived — the OLD arena. The nursery "
+            "copying minor relocates nursery objects only, and the one thing "
+            "that relocates an old-arena object is old-page defrag, which "
+            "select_old_page_defrag_pages short-circuits off (#6206). No "
+            "shipped configuration and no gc_repsel_matrix arm sets "
+            "PERRY_GC_OLD_DEFRAG=1."),
+        not_reclaimable_because=(
+            "the @perry_class_keys_* global is registered with "
+            "js_gc_register_global_root at module init, so the array is "
+            "reachable from a root for the life of the process and no sweep "
+            "can free it. (#5042 registered the global for the DEFRAG rewrite; "
+            "the reachability is the side effect that closes this half.)"),
+        becomes_real_when=(
+            "PERRY_GC_OLD_DEFRAG ships on by default, or "
+            "js_build_class_keys_array stops using a _longlived allocator. "
+            "Re-check with --assume-old-defrag; the fix is to bind "
+            "entry_init_load_global's cache slot (expr::root_entry_alloca "
+            "accepts a bare i64 heap word)."),
+        probes=(
+            ("class-keys array is old-arena", _probe_class_keys_longlived),
+            ("old-page defrag is off by default", _probe_old_defrag_off_by_default),
+            ("the keys global is a registered root",
+             _probe_class_keys_global_is_a_root),
+        ),
+    ),
+    ImmovableSource(
+        key="box",
+        label="js_box_alloc* (outside the GC heap)",
+        knob="assume_boxes_in_gc_heap",
+        callees={"js_box_alloc", "js_box_alloc_bits", "js_i32_box_alloc",
+                 "js_bool_box_alloc"},
+        not_movable_because=(
+            "js_box_alloc_bits uses std::alloc::alloc, so the Box is not an "
+            "arena object and no collector phase relocates it. What the "
+            "collector does touch is the JSValue INSIDE the box, which "
+            "scan_box_roots_mut rewrites in place — the box's own address "
+            "never changes."),
+        not_reclaimable_because=(
+            "boxes are never freed: box.rs has no dealloc, and BOX_REGISTRY is "
+            "monotonic per thread (box.rs:429 states this as an invariant that "
+            "js_box_is_box's membership test depends on)."),
+        becomes_real_when=(
+            "boxes become GC-heap allocations (arena_alloc_gc) or box.rs grows "
+            "a free path. Re-check with --assume-boxes-in-gc-heap."),
+        probes=(("boxes are outside the GC heap and never freed",
+                 _probe_boxes_outside_the_gc_heap),),
+    ),
+)
+
+
+def audit_immovable_sources():
+    """Exit status for `--audit-immovable-sources`. 0 clean, 2 on a stale premise.
+
+    Every `IMMOVABLE_SOURCES` entry SUPPRESSES reports. An exemption whose
+    premise has quietly stopped holding is strictly worse than no exemption:
+    it reads as a triaged false positive and is a live hazard. So the premises
+    are a gate rather than a paragraph.
+    """
+    if not os.path.isdir("crates/perry-runtime/src"):
+        print("error: run --audit-immovable-sources from the repository root "
+              "(crates/perry-runtime/src not found).", file=sys.stderr)
+        return 2
+    if not IMMOVABLE_SOURCES:
+        print("error: IMMOVABLE_SOURCES is empty, so this audit checks "
+              "nothing. Delete the audit with the last exemption.",
+              file=sys.stderr)
+        return 2
+    bad = 0
+    n_probes = 0
+    for src in IMMOVABLE_SOURCES:
+        print(f"=== {src.key}: {src.label}")
+        if not src.probes:
+            print("  error: exemption has no probes — its premise is "
+                  "unverifiable", file=sys.stderr)
+            bad += 1
+            continue
+        for name, fn in src.probes:
+            n_probes += 1
+            ok, detail = fn()
+            print(f"  [{'ok ' if ok else 'FAIL'}] {name}: {detail}")
+            if not ok:
+                bad += 1
+    print(f"=== immovable-source premises: {n_probes} probe(s), {bad} failing")
+    if bad:
+        print("error: an exemption's premise no longer holds. The reports it "
+              "was suppressing are real again — re-run with the exemption's "
+              "knob (see --help) to see them.", file=sys.stderr)
+        return 2
+    return 0
+
+
+def classify_heap_source(ins, exempt=True, assume_old_defrag=False,
+                         assume_boxes_in_gc_heap=False):
+    """`(is_heap_source, is_hazardous, exemption_or_None)` for one instruction.
+
+    `is_hazardous` is the reportable property: the object can move, or can be
+    reclaimed, while held in storage the precise root walk never visits. A
+    source that is neither is a heap value the checker recognises and
+    deliberately does not report.
+    """
+    if ins.callee is not None:
+        is_source = bool(ALLOC_RE.match(ins.callee)) or ins.callee in HEAP_SOURCE_CALLS
+    else:
+        is_source = bool(REWRITTEN_LOAD_RE.search(ins.text))
+    if not is_source:
+        return (False, False, None)
+    if not exempt:
+        return (True, True, None)
+    assumed = {"assume_old_defrag": assume_old_defrag,
+               "assume_boxes_in_gc_heap": assume_boxes_in_gc_heap}
+    for src in IMMOVABLE_SOURCES:
+        if src.matches(ins):
+            if assumed.get(src.knob):
+                return (True, True, None)
+            return (True, False, src)
+    return (True, True, None)
 
 ALLOCA_RE = re.compile(r"^\s*%([\w.$]+)\s*=\s*alloca\s+(.+)$")
 LOAD_FROM_RE = re.compile(r"=\s*load\s+[^,]+,\s*ptr\s+%([\w.$]+)")
@@ -1690,15 +2227,21 @@ class UnrootedAlloca:
         return bool(self.movers)
 
 
-def _is_heap_source(ins):
-    """Does `ins` materialize a value the collector can move?"""
-    if ins.callee is not None:
-        return bool(ALLOC_RE.match(ins.callee)) or ins.callee in HEAP_SOURCE_CALLS
-    return bool(REWRITTEN_LOAD_RE.search(ins.text))
+def _is_heap_source(ins, **kw):
+    """Does `ins` materialize a value that can go bad in unrooted storage?
+
+    Not "is this a heap value" and not "does the collector rewrite this
+    location" — see the EXEMPTIONS block above for why conflating those cost
+    #7210 sixty-six false positives.
+    """
+    _src, hazardous, _why = classify_heap_source(ins, **kw)
+    return hazardous
 
 
 def check_func_unrooted_allocas(module, f, want_moving_only=False,
-                                poll_reaching=frozenset()):
+                                poll_reaching=frozenset(), source_opts=None,
+                                exempt_counts=None):
+    source_opts = source_opts or {}
     if not f.blocks:
         return []
 
@@ -1763,14 +2306,31 @@ def check_func_unrooted_allocas(module, f, want_moving_only=False,
         if not stores[reg] or not loads[reg]:
             continue
         reported = False
+        # Exemptions are TALLIED, never reported, and they must never
+        # short-circuit the store loop: one alloca can be written from an
+        # exempt source AND from a real one, and stopping at the exempt store
+        # would turn the accounting into a missed hazard.
+        exempt_seen = set()
         for st in stores[reg]:
             sm = STORE_RE.match(st.text)
             val = sm.group(2).strip()
             if not val.startswith("%"):
                 continue        # a constant seed (`undefined`) names no heap
             origins = provenance(def_of, val[1:])
-            if not any(_is_heap_source(o) for o in origins):
-                continue
+            hazardous = any(_is_heap_source(o, **source_opts) for o in origins)
+            exemptions = []
+            if not hazardous:
+                # This site would have been reported before #7210's predicate
+                # split. Record WHICH exemption dropped it, so a run that
+                # reports zero can be told apart from a run that exempted the
+                # whole corpus -- CLAUDE.md hazard 4, applied to the
+                # suppression rather than to the check.
+                for o in origins:
+                    _s, _h, why = classify_heap_source(o, **source_opts)
+                    if why is not None:
+                        exemptions.append(why.key)
+                if not exemptions:
+                    continue
             for ld in loads[reg]:
                 if not dominates(idom, st.block, ld.block):
                     continue
@@ -1783,11 +2343,17 @@ def check_func_unrooted_allocas(module, f, want_moving_only=False,
                                    poll_reaching)
                 if want_moving_only and not v.moving:
                     continue
-                out.append(v)
-                reported = True
+                if hazardous:
+                    out.append(v)
+                    reported = True
+                else:
+                    exempt_seen.update(exemptions)
                 break
             if reported:
                 break
+        if exempt_counts is not None:
+            for k in sorted(exempt_seen):
+                exempt_counts[k] += 1
     return out
 
 
@@ -1824,7 +2390,190 @@ entry.0:
 """
 
 
-def _scan_unrooted(paths):
+# The two #7210 exemption shapes, verbatim in the emitted-IR form the triage
+# classified. `@class_keys` is `codegen/function.rs`'s `entry_init_load_global`
+# cache; `@boxed` is a `js_box_alloc_bits` result parked in a local slot. Both
+# are held across a collection point with no bind — i.e. structurally identical
+# to `@unrooted` above — and both are NOT hazards, for reasons about the
+# allocator rather than about the code shape. They are fixtures so that the
+# exemption is proven to fire, and proven to be exactly reversible.
+_SELFTEST_EXEMPT_CLASS_KEYS = """\
+define double @perry_fn_selftest__class_keys(double %a) {
+entry.0:
+  %slot = alloca i64
+  %keys = load i64, ptr @perry_class_keys_Foo_0
+  store i64 %keys, ptr %slot
+  %ret = call double @js_gc_loop_safepoint(double %a)
+  %k = load i64, ptr %slot
+  %obj = call i64 @js_object_alloc_class_inline_keys(i32 1, i32 0, i32 3, i64 %k)
+  %box = bitcast i64 %obj to double
+  ret double %box
+}
+"""
+
+_SELFTEST_EXEMPT_BOX = """\
+define double @perry_fn_selftest__box(double %a) {
+entry.0:
+  %slot = alloca i64
+  %b = call i64 @js_box_alloc_bits(i64 0)
+  store i64 %b, ptr %slot
+  %ret = call double @js_gc_loop_safepoint(double %a)
+  %p = load i64, ptr %slot
+  %v = call i64 @js_box_get_bits(i64 %p)
+  %box = bitcast i64 %v to double
+  ret double %box
+}
+"""
+
+# ★ The planted GENUINE hazard that keeps the exemptions honest. Same function
+# shape as `@class_keys` — an `i64` slot holding a raw array pointer, loaded
+# below a user call and fed to `js_object_alloc_class_inline_keys` as `keys` —
+# but the pointer comes from `js_array_alloc_with_length`, a NURSERY allocator.
+# If a future widening of the exemptions ever suppresses this, the exemption has
+# stopped being about the allocator and started being about the code shape,
+# which is the failure this whole split exists to prevent.
+_SELFTEST_NURSERY_HAZARD = """\
+define double @perry_fn_selftest__nursery(double %a) {
+entry.0:
+  %slot = alloca i64
+  %keys = call i64 @js_array_alloc_with_length(i32 3)
+  store i64 %keys, ptr %slot
+  %ret = call double @js_gc_loop_safepoint(double %a)
+  %k = load i64, ptr %slot
+  %obj = call i64 @js_object_alloc_class_inline_keys(i32 1, i32 0, i32 3, i64 %k)
+  %box = bitcast i64 %obj to double
+  ret double %box
+}
+"""
+
+# One slot, written from an EXEMPT source and then from a real one. The
+# exemption must tally and get out of the way; if tallying it also ends the
+# per-alloca search, the nursery store below it is never examined and the
+# accounting has become a missed hazard. That is a bug this file has already
+# had once, in the change that introduced the tally.
+_SELFTEST_EXEMPT_THEN_HAZARD = """\
+define double @perry_fn_selftest__mixed(double %a, i1 %c) {
+entry.0:
+  %slot = alloca i64
+  %keys = load i64, ptr @perry_class_keys_Foo_0
+  store i64 %keys, ptr %slot
+  %p1 = call double @js_gc_loop_safepoint(double %a)
+  %k1 = load i64, ptr %slot
+  %fresh = call i64 @js_array_alloc_with_length(i32 3)
+  store i64 %fresh, ptr %slot
+  %p2 = call double @js_gc_loop_safepoint(double %a)
+  %k2 = load i64, ptr %slot
+  %obj = call i64 @js_object_alloc_class_inline_keys(i32 1, i32 0, i32 3, i64 %k2)
+  %box = bitcast i64 %obj to double
+  ret double %box
+}
+"""
+
+
+# #7240's blind spot, both directions. `%lit` is a load of a string-literal
+# handle global — a registered root, so the string is never SWEPT, but an
+# evacuating cycle rewrites the global and leaves this register naming
+# from-space. It is then passed as a call argument below `js_call_function`,
+# which is exactly the registry's `defineApiCall(url, method, …)` shape.
+#
+# Before the widening `heap_source_kind` returned `None` for that load, so the
+# register had no source and the mode reported ZERO over this fixture.
+_SELFTEST_STR_HANDLE = """\
+define double @perry_fn_selftest__strhandle(double %a) {
+entry.0:
+  %lit = load double, ptr @perry_mod_.str.3.handle
+  %ret = call double @js_call_function(double %a)
+  %r = call double @perry_fn_other__callee(double %lit, double %ret)
+  ret double %r
+}
+"""
+
+# The fix's shape: the load is re-emitted BELOW the collection point, so it
+# observes the address evacuation wrote back. No runtime call, no temp root —
+# `OperandProtection::Reload`.
+_SELFTEST_STR_HANDLE_RELOADED = """\
+define double @perry_fn_selftest__reload(double %a) {
+entry.0:
+  %ret = call double @js_call_function(double %a)
+  %lit = load double, ptr @perry_mod_.str.3.handle
+  %r = call double @perry_fn_other__callee(double %lit, double %ret)
+  ret double %r
+}
+"""
+
+
+# The property-GET window, both directions.
+#
+# This is the shape at which `--stale-registers` and
+# `PERRY_GC_PROTECT_FROMSPACE=1 PERRY_GC_PROTECT_FROMSPACE_DEPTH=800`
+# disagreed at zod's `clone(schema, def, params)`: the protector faulted
+# deterministically, the checker classified the window `MOVING: no`, and
+# `--moving-only` — the arm `gc-root-dominance.yml` gates on — dropped it. The
+# checker was the wrong one. `POLL_CAPABLE_RUNTIME` held
+# `js_object_get_field_by_name`, which codegen never emits, and none of the
+# three GET entry points it DOES emit.
+#
+# Reduced from the real emitted IR (perry-codegen `property_get/
+# generic_dispatch.rs`'s `pget.recv_ok` block, and the full-outline
+# `js_object_get_field_ic` in `object/field_get_set/ic_miss.rs:544`):
+# parameter #1 is spilled and bound, loaded into a bare register, and then a
+# property read on the RECEIVER runs the generic GET dispatch — which resolves
+# a user getter through a transmuted function pointer and can therefore run an
+# evacuating minor — before that register is dereferenced.
+#
+# The bind is what makes this a `slotload` source rather than an invisible one:
+# the slot IS rewritten by evacuation, so re-reading it is the fix and holding
+# the pre-call register is the bug. Nothing in the fixture is an allocation, so
+# the whole verdict rests on the window classification.
+#
+# The receiver and the key arrive as bare function PARAMETERS on purpose. That
+# keeps the fixture to exactly one recognised source — `%def` — so the arms
+# below assert one number about one register rather than a total that moves for
+# any reason. It also records a second, separate gap honestly: `heap_source_kind`
+# has no "incoming pointer parameter" kind, so `%a1` and `%a3` are invisible
+# here and would be invisible in a real callee too. That gap is REAL but it is
+# not what the zod adjudication turned on — measured over the gate corpus, only
+# 4 unspilled parameters are used below a collecting call and all 4 are
+# `double`/`i64` arithmetic in typed-f64 specialisations, none a pointer. It
+# needs its own change with its own measured hit count.
+_SELFTEST_PROPERTY_GET_WINDOW = """\
+define double @perry_fn_selftest__clone(double %a1, double %a2, i64 %a3) {
+entry.0:
+  %d = alloca double
+  store double %a2, ptr %d
+  call void @js_shadow_slot_bind(i32 1, ptr %d)
+  %def = load double, ptr %d
+  %rb = bitcast double %a1 to i64
+  %rh = and i64 %rb, 281474976710655
+  call void @js_typed_feedback_observe_property_get(i64 4242, i64 %rh, i64 %a3)
+  %inner = call double @js_object_get_field_ic_miss(i64 %rh, i64 %a3, ptr @perry_ic_1)
+  %out = call double @perry_fn_other__callee(double %def, double %inner)
+  ret double %out
+}
+"""
+
+# The fix's shape: `%def` is re-read from its shadow slot BELOW the GET
+# dispatch, so it observes the address evacuation wrote back. Identical in
+# every other respect — if the control reports anything, the check is firing on
+# the code shape rather than on the staleness.
+_SELFTEST_PROPERTY_GET_RELOADED = """\
+define double @perry_fn_selftest__clone_reloaded(double %a1, double %a2, i64 %a3) {
+entry.0:
+  %d = alloca double
+  store double %a2, ptr %d
+  call void @js_shadow_slot_bind(i32 1, ptr %d)
+  %rb = bitcast double %a1 to i64
+  %rh = and i64 %rb, 281474976710655
+  call void @js_typed_feedback_observe_property_get(i64 4242, i64 %rh, i64 %a3)
+  %inner = call double @js_object_get_field_ic_miss(i64 %rh, i64 %a3, ptr @perry_ic_1)
+  %def = load double, ptr %d
+  %out = call double @perry_fn_other__callee(double %def, double %inner)
+  ret double %out
+}
+"""
+
+
+def _scan_unrooted(paths, moving_only=False, **source_opts):
     """(violations, n_gc_capable_allocas) over `paths`."""
     parsed = [(os.path.basename(p), parse_file(p)) for p in sorted(paths)]
     poll_reaching, _known = compute_poll_reaching(
@@ -1842,7 +2591,8 @@ def _scan_unrooted(paths):
         (mod, v)
         for mod, fs in parsed
         for f in fs
-        for v in check_func_unrooted_allocas(mod, f, False, poll_reaching)
+        for v in check_func_unrooted_allocas(mod, f, moving_only, poll_reaching,
+                                             source_opts)
     ]
     return found, n
 
@@ -1881,6 +2631,22 @@ def _stale_probe(path, max_stale):
         rc = run_stale(parsed, poll_reaching, False, False, False, max_stale)
     m = re.search(r"stale-register uses: (\d+)", buf.getvalue())
     return (int(m.group(1)) if m else -1), rc
+
+
+def _stale_kinds_probe(path, moving_only=False):
+    """{source kind: count} from --stale-registers over one file.
+
+    The breakdown, not just the total: this widening's whole claim is that a
+    specific SOURCE became visible, and a total can move for any reason.
+    """
+    parsed = [(os.path.basename(path), parse_file(path))]
+    poll_reaching, _known = compute_poll_reaching(
+        [f for _m, fs in parsed for f in fs])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        run_stale(parsed, poll_reaching, False, moving_only, False, None)
+    return {k: int(n)
+            for n, k in re.findall(r"(\d+)\s+source=(\w+)", buf.getvalue())}
 
 
 def _main_probe(argv):
@@ -2057,6 +2823,47 @@ def self_test():
                   f"the alternatives themselves: {residue}. That is a bug in "
                   "the auditor, not in ALLOC_RE.", file=sys.stderr)
             ok = False
+        # --- the POLL_CAPABLE_RUNTIME audit, both directions -----------------
+        #
+        # Same treatment as the ALLOC_RE auditor above, and for a sharper
+        # reason: this set decides the MOVING classification, so a phantom
+        # entry is a hole in the arm the CI gate actually runs. Ten of
+        # twenty-eight entries were phantoms when the auditor was written, and
+        # four of those ten were four different misspellings of "call a JS
+        # closure". Driven off synthetic symbol tables so the arm does not pass
+        # merely because today's runtime happens to export the right names.
+        if dead_poll_capable({"js_gc_loop_safepoint"}) == []:
+            print("self-test FAIL: audited against a one-symbol table, almost "
+                  "every POLL_CAPABLE_RUNTIME entry must be reported dead. An "
+                  "empty result means the auditor cannot detect a phantom "
+                  "entry at all.", file=sys.stderr)
+            ok = False
+        if dead_poll_capable(set(POLL_CAPABLE_RUNTIME)) != []:
+            print("self-test FAIL: the auditor reported entries dead against a "
+                  "symbol table that is POLL_CAPABLE_RUNTIME itself. That is a "
+                  "bug in the auditor, not in the set.", file=sys.stderr)
+            ok = False
+        if dead_poll_capable(set(POLL_CAPABLE_RUNTIME) |
+                             {"js_extra"}) != []:
+            print("self-test FAIL: a symbol table that is a strict SUPERSET of "
+                  "the set must also come back clean; the auditor is asking "
+                  "the wrong containment question.", file=sys.stderr)
+            ok = False
+        # And the property-GET family specifically: the entries this whole
+        # change is about must be in the set, or the fixture arms below are
+        # asserting something the classification no longer does.
+        _pget_family = {"js_object_get_field_by_name_f64",
+                        "js_object_get_field_ic_miss",
+                        "js_typed_feedback_object_get_field_by_name_f64"}
+        if not _pget_family <= POLL_CAPABLE_RUNTIME:
+            print("self-test FAIL: the emitted property-GET dispatch "
+                  f"{sorted(_pget_family - POLL_CAPABLE_RUNTIME)} must stay in "
+                  "POLL_CAPABLE_RUNTIME. Codegen emits these and never emits "
+                  "js_object_get_field_by_name, so dropping them puts the GET "
+                  "half of property access back outside --moving-only.",
+                  file=sys.stderr)
+            ok = False
+
         # A knob that is silently ignored is a disarmed knob -- the same rule
         # `--max-stale` and `--fatal-sinks` already carry, read the other way.
         if _main_probe(["--stale-registers", "--any-def", planted]) != 2:
@@ -2069,6 +2876,90 @@ def self_test():
             print("self-test FAIL: --any-def WITHOUT --stale-registers must "
                   "still run the bind-anchored check and report the planted "
                   "violations", file=sys.stderr)
+            ok = False
+
+        # --- the string-literal handle source, both directions --------------
+        #
+        # #7240 shipped a codegen fix its own checker could not see. The load
+        # of a `__perry_init_strings_*` handle global is a heap-value SOURCE —
+        # the global is a registered root that evacuation REWRITES, so a
+        # register loaded from it beforehand names from-space. Asserted as a
+        # named source rather than as a total, because a total moves for any
+        # reason and the claim here is about one specific population.
+        strh = os.path.join(td, "strhandle.ll")
+        strh_fixed = os.path.join(td, "strhandle_reloaded.ll")
+        for p, text in ((strh, _SELFTEST_STR_HANDLE),
+                        (strh_fixed, _SELFTEST_STR_HANDLE_RELOADED)):
+            with open(p, "w") as fh:
+                fh.write(text)
+
+        kinds = _stale_kinds_probe(strh)
+        if kinds.get("strhandle", 0) != 1:
+            print("self-test FAIL: --stale-registers must report the load of a "
+                  "string-literal handle global as source=strhandle. Got "
+                  f"{kinds!r}. That load is a registered root the collector "
+                  "REWRITES; a register holding it is stale below a collection "
+                  "point, and missing it is what made #7240 invisible.",
+                  file=sys.stderr)
+            ok = False
+        # `--moving-only` is the mode `gc-root-dominance.yml` gates on. A source
+        # the gate cannot classify as reaching a moving minor is a source the
+        # gate cannot fail on, so the raw count alone proves nothing.
+        moving_kinds = _stale_kinds_probe(strh, moving_only=True)
+        if moving_kinds.get("strhandle", 0) != 1:
+            print("self-test FAIL: the planted strhandle use reaches a moving "
+                  "minor via js_call_function and must survive --moving-only. "
+                  f"Got {moving_kinds!r}", file=sys.stderr)
+            ok = False
+        if _stale_kinds_probe(strh_fixed).get("strhandle", 0) != 0:
+            print("self-test FAIL: re-loading the handle global BELOW the "
+                  "collection point is the fix (OperandProtection::Reload), so "
+                  "the control fixture must report no strhandle use. The check "
+                  "reports every literal load and cannot tell fixed from "
+                  "broken.", file=sys.stderr)
+            ok = False
+
+        # --- the property-GET window, both directions -----------------------
+        #
+        # The zod `clone` adjudication. `--stale-registers` said `MOVING: no`
+        # and the from-space protector faulted deterministically on the same
+        # site; the checker was wrong, because `POLL_CAPABLE_RUNTIME` named the
+        # one GET symbol codegen never emits and none of the three it does.
+        #
+        # The RAW arm is not the interesting one and never was — the window
+        # already reported, it just reported as non-moving, and `--moving-only`
+        # is the arm `gc-root-dominance.yml` gates on. So both are asserted,
+        # and the second is the one that was red.
+        pget = os.path.join(td, "property_get_window.ll")
+        pget_fixed = os.path.join(td, "property_get_reloaded.ll")
+        for p, text in ((pget, _SELFTEST_PROPERTY_GET_WINDOW),
+                        (pget_fixed, _SELFTEST_PROPERTY_GET_RELOADED)):
+            with open(p, "w") as fh:
+                fh.write(text)
+
+        if _stale_kinds_probe(pget).get("slotload", 0) != 1:
+            print("self-test FAIL: --stale-registers must report the shadow-slot "
+                  "load held across the generic property-GET dispatch as "
+                  f"source=slotload. Got {_stale_kinds_probe(pget)!r}.",
+                  file=sys.stderr)
+            ok = False
+        pget_moving = _stale_kinds_probe(pget, moving_only=True)
+        if pget_moving.get("slotload", 0) != 1:
+            print("self-test FAIL: the generic property-GET dispatch resolves a "
+                  "user getter (object/field_get_set/get_field_by_name.rs:1064) "
+                  "and routes a Proxy to js_proxy_get (:84), so a register held "
+                  "across it MUST classify MOVING and survive --moving-only. "
+                  f"Got {pget_moving!r}. This is the shape that faults under "
+                  "PERRY_GC_PROTECT_FROMSPACE_DEPTH=800 at zod's `clone` while "
+                  "the checker called the window non-moving; a gate that cannot "
+                  "see a live bug is the failure mode this whole file exists "
+                  "to avoid.", file=sys.stderr)
+            ok = False
+        if _stale_kinds_probe(pget_fixed).get("slotload", 0) != 0:
+            print("self-test FAIL: re-reading the shadow slot BELOW the GET "
+                  "dispatch is the fix, so the control fixture must report no "
+                  "slotload use. A non-zero count means the check fires on the "
+                  "code shape rather than on the staleness.", file=sys.stderr)
             ok = False
 
         try:
@@ -2119,6 +3010,123 @@ def self_test():
                   f"bind for every alloca, so the unrooted check must report 0, "
                   f"got {len(found)}", file=sys.stderr)
             ok = False
+
+        # --- movability vs rewritability (#7210), all four directions -------
+        #
+        # An exemption is a suppression, so it gets the strictest treatment in
+        # the file: it must FIRE (or the 66 false positives come back), it must
+        # be exactly REVERSIBLE by its knob (or the counterfactual in #7210 is
+        # unrecheckable), it must not suppress a genuine nursery hazard of the
+        # SAME SHAPE (or it has become a code-shape rule instead of an
+        # allocator rule), and its premises must still hold in the tree.
+        ck = os.path.join(td, "exempt_class_keys.ll")
+        bx = os.path.join(td, "exempt_box.ll")
+        nz = os.path.join(td, "nursery_hazard.ll")
+        for p, text in ((ck, _SELFTEST_EXEMPT_CLASS_KEYS),
+                        (bx, _SELFTEST_EXEMPT_BOX),
+                        (nz, _SELFTEST_NURSERY_HAZARD)):
+            with open(p, "w") as fh:
+                fh.write(text)
+
+        for path, knob, label in ((ck, "assume_old_defrag", "class-keys"),
+                                  (bx, "assume_boxes_in_gc_heap", "box")):
+            found, n_allocas = _scan_unrooted([path], moving_only=True)
+            if found:
+                print(f"self-test FAIL: the {label} exemption fixture must "
+                      f"report 0 under --moving-only, got {len(found)}. That "
+                      "is the arm #7198's promote-to-required clock depends on.",
+                      file=sys.stderr)
+                ok = False
+            found, n_allocas = _scan_unrooted([path])
+            if found:
+                print(f"self-test FAIL: the {label} exemption fixture must "
+                      f"report 0, got {len(found)}. _is_heap_source has gone "
+                      "back to conflating 'the collector rewrites this "
+                      "location' with 'this object can move' (#7210).",
+                      file=sys.stderr)
+                ok = False
+            if n_allocas != 1:
+                print(f"self-test FAIL: {label} fixture -> {n_allocas} "
+                      "gc-capable allocas, expected 1. A fixture that stopped "
+                      "parsing would clear for the wrong reason.",
+                      file=sys.stderr)
+                ok = False
+            found, _ = _scan_unrooted([path], **{knob: True})
+            if len(found) != 1:
+                print(f"self-test FAIL: --{knob.replace('_', '-')} must make "
+                      f"the {label} fixture report again (got {len(found)}). "
+                      "#7210 recorded the exact condition under which these "
+                      "become real hazards; a knob that cannot restore them is "
+                      "a condition nobody can re-check.", file=sys.stderr)
+                ok = False
+
+        # ★ The planted genuine hazard. Structurally identical to the
+        # class-keys fixture — same slot type, same load below the same call,
+        # same consumer — differing only in the ALLOCATOR.
+        found, n_allocas = _scan_unrooted([nz])
+        if len(found) != 1:
+            print(f"self-test FAIL: a NURSERY-allocated keys array in an "
+                  f"unrooted alloca across a collection point must still be "
+                  f"reported, got {len(found)}. The exemptions have started "
+                  "suppressing by code shape rather than by allocator.",
+                  file=sys.stderr)
+            ok = False
+        if ok and found and not found[0][1].moving:
+            print("self-test FAIL: the planted nursery hazard must classify "
+                  "as MOVING, or --moving-only would drop it and the "
+                  "acceptance proof would be vacuous", file=sys.stderr)
+            ok = False
+        found, _ = _scan_unrooted([nz], assume_old_defrag=True,
+                                  assume_boxes_in_gc_heap=True)
+        if len(found) != 1:
+            print("self-test FAIL: the planted nursery hazard must be reported "
+                  "under BOTH knobs too — the knobs only ever widen",
+                  file=sys.stderr)
+            ok = False
+        found, _ = _scan_unrooted([nz], moving_only=True)
+        if len(found) != 1:
+            print("self-test FAIL: the planted nursery hazard must survive "
+                  "--moving-only. If it does not, '--unrooted-allocas "
+                  "--moving-only reaches 0' would be a statement about the "
+                  "filter rather than about the corpus.", file=sys.stderr)
+            ok = False
+
+        # One slot, exempt store first, real store second. The tally must not
+        # end the search for the alloca.
+        mixed = os.path.join(td, "exempt_then_hazard.ll")
+        with open(mixed, "w") as fh:
+            fh.write(_SELFTEST_EXEMPT_THEN_HAZARD)
+        found, _ = _scan_unrooted([mixed], moving_only=True)
+        if len(found) != 1:
+            print("self-test FAIL: an alloca written from an exempt source AND "
+                  f"from a nursery allocator must still be reported (got "
+                  f"{len(found)}). Tallying the exemption must not consume the "
+                  "alloca's report.", file=sys.stderr)
+            ok = False
+
+        # Every exemption must be reachable through its knob, or it is a dead
+        # switch. Asserted structurally rather than per-entry so a new
+        # exemption cannot be added without one.
+        knobs = {"assume_old_defrag", "assume_boxes_in_gc_heap"}
+        for src in IMMOVABLE_SOURCES:
+            if src.knob not in knobs:
+                print(f"self-test FAIL: exemption {src.key!r} declares knob "
+                      f"{src.knob!r}, which classify_heap_source does not "
+                      "read. An exemption with no off-switch cannot be "
+                      "re-checked.", file=sys.stderr)
+                ok = False
+            if not src.probes:
+                print(f"self-test FAIL: exemption {src.key!r} has no premise "
+                      "probes, so --audit-immovable-sources cannot tell "
+                      "whether it is still true", file=sys.stderr)
+                ok = False
+            if not (src.not_movable_because and src.not_reclaimable_because
+                    and src.becomes_real_when):
+                print(f"self-test FAIL: exemption {src.key!r} must state why "
+                      "the object cannot MOVE, why it cannot be RECLAIMED, "
+                      "and when that stops being true. Suppressing one of the "
+                      "two hazards is not an exemption.", file=sys.stderr)
+                ok = False
         # ---- the allowlist must not be able to absorb a new violation ------
         #
         # These arms exist because the allowlist is the only component whose
@@ -2299,12 +3307,43 @@ def main():
                          "that matches nothing. A dead alternative reads as "
                          "coverage and is not -- nine of them have shipped in "
                          "this pattern across two rounds. Takes no corpus.")
+    ap.add_argument("--audit-poll-capable", action="store_true",
+                    help="check every POLL_CAPABLE_RUNTIME entry against the "
+                         "runtime's real `extern \"C\" fn js_*` symbols and "
+                         "fail on any that names nothing. This set decides the "
+                         "MOVING classification the --moving-only gate runs on, "
+                         "so a phantom entry is a hole the gate cannot fail "
+                         "through -- ten of twenty-eight were phantoms when "
+                         "this was added. Takes no corpus.")
+    ap.add_argument("--audit-immovable-sources", action="store_true",
+                    help="re-check the PREMISES of every --unrooted-allocas "
+                         "exemption against the runtime source (#7210): the "
+                         "class-keys array is still old-arena, old-page defrag "
+                         "is still off by default, the keys global is still a "
+                         "registered root, and boxes are still outside the GC "
+                         "heap and never freed. An exemption whose premise has "
+                         "quietly lapsed reads as a triaged false positive and "
+                         "is a live hazard. Takes no corpus.")
+    ap.add_argument("--assume-old-defrag", action="store_true",
+                    help="treat old-arena objects (the @perry_class_keys_* "
+                         "cache) as MOVABLE, i.e. answer #7210's first "
+                         "counterfactual: what --unrooted-allocas reports if "
+                         "PERRY_GC_OLD_DEFRAG=1 ever ships on. Widens only.")
+    ap.add_argument("--assume-boxes-in-gc-heap", action="store_true",
+                    help="treat js_box_alloc* results as GC-heap objects, i.e. "
+                         "#7210's second counterfactual: what "
+                         "--unrooted-allocas reports if boxes ever stop being "
+                         "std::alloc::alloc allocations. Widens only.")
     ns = ap.parse_args()
 
-    # Standalone static audit: it reads the crates, not an IR corpus, so it is
-    # checked before the corpus arguments are.
+    # Standalone static audits: they read the crates, not an IR corpus, so they
+    # are checked before the corpus arguments are.
     if ns.audit_alloc_re:
         return audit_alloc_re()
+    if ns.audit_poll_capable:
+        return audit_poll_capable()
+    if ns.audit_immovable_sources:
+        return audit_immovable_sources()
 
     # A knob that is silently ignored is a disarmed knob: `--max-stale 0`
     # without `--stale-registers` would run the bind-anchored check and look
@@ -2329,6 +3368,14 @@ def main():
     if ns.stale_registers and ns.unrooted_allocas:
         ap.error("--stale-registers and --unrooted-allocas are separate "
                  "passes; run them one at a time")
+    # Same disarmed-knob rule. The exemptions live in the unrooted-alloca pass
+    # only, so `--assume-old-defrag` on any other pass would read like a
+    # widening and do nothing at all.
+    for flag, val in (("--assume-old-defrag", ns.assume_old_defrag),
+                      ("--assume-boxes-in-gc-heap", ns.assume_boxes_in_gc_heap)):
+        if val and not ns.unrooted_allocas:
+            ap.error(f"{flag} requires --unrooted-allocas (it only affects "
+                     "that pass's exemptions)")
 
     if ns.self_test:
         return self_test()
@@ -2433,6 +3480,9 @@ def main():
         per_fn = defaultdict(int)
         out = []
         n_allocas = 0
+        source_opts = {"assume_old_defrag": ns.assume_old_defrag,
+                       "assume_boxes_in_gc_heap": ns.assume_boxes_in_gc_heap}
+        exempt_counts = defaultdict(int)
         for mod, fs in parsed:
             for f in fs:
                 for b in f.blocks:
@@ -2442,7 +3492,9 @@ def main():
                                       for t in GC_CAPABLE_ALLOCA_TYPES):
                             n_allocas += 1
                 for v in check_func_unrooted_allocas(mod, f, moving_only,
-                                                     poll_reaching):
+                                                     poll_reaching,
+                                                     source_opts,
+                                                     exempt_counts):
                     total += 1
                     per_fn[v.func] += 1
                     if v.moving:
@@ -2464,6 +3516,20 @@ def main():
               f"   (moving-minor reachable: {moving_total})")
         for k, n in sorted(per_fn.items(), key=lambda kv: -kv[1])[:20]:
             print(f"  {n:6d}  {k}")
+        # A zero verdict is only meaningful next to what was EXEMPTED. Without
+        # this line, "the corpus is clean" and "the corpus is entirely
+        # exempted" print identically -- and the exemptions are the newest and
+        # least-weathered part of the check.
+        if exempt_counts:
+            print("=== suppressed by an IMMOVABLE_SOURCES exemption "
+                  "(#7210: rewritten location, immovable object):")
+            by_key = {s.key: s for s in IMMOVABLE_SOURCES}
+            for k, n in sorted(exempt_counts.items(), key=lambda kv: -kv[1]):
+                src = by_key.get(k)
+                knob = f"  (--{src.knob.replace('_', '-')} re-reports these)" if src else ""
+                print(f"  {n:6d}  {k}{knob}")
+        else:
+            print("=== suppressed by an IMMOVABLE_SOURCES exemption: none")
         # Liveness floor: the subject here is the alloca population, not the
         # bind population, so `--min-binds` would certify the wrong thing.
         if n_allocas < ns.min_binds:

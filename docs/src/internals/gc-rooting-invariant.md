@@ -50,7 +50,7 @@ wrong:
 Four instances shipped in a single day. The detection lag, not the fix, was the
 cost every time.
 
-## The four ways it has actually broken
+## The five ways it has actually broken
 
 ### 1. Slot index past the frame (#7184)
 
@@ -95,42 +95,55 @@ collection point** instead of caching the load.
 
 *Tell:* two operands where one is evaluated first and used last.
 
-### And the one that is still open (#7211)
+### 5. Runtime-cache class (#7226, #7239)
 
-`Expr::ClassExprFresh` roots its class object only when it believes the static
-*initializers* can collect:
+A thread-local or static cell holding a GC pointer that no registered scanner
+rewrites. Unlike the register-class bugs above (which go bad intermittently when a
+collection lands in a narrow window), a runtime cache goes bad at collection #0
+and stays bad.
 
-```rust
-let protect_handle = !captured_args.is_empty()
-    || !symbol_statics.is_empty()
-    || !block_fns.is_empty()
-    || any_may_trigger_gc(ctx, named_statics.iter().map(|(_, v)| v));
-```
+Real instances: `js_value_typeof` interned its eight result strings in
+thread-local `Cell<*mut StringHeader>`s with no registered scanner (#7226);
+`json/raw_json.rs`'s cached `"rawJSON"` key (#7226); and the ten runtime caches
+in #7239 — `CACHED_ENV`, `CACHED_PERMISSION`, `CACHED_REPORT`, `ERROR_CONSTRUCTOR_PTR`,
+`INPUT_HANDLER`, `RESIZE_CALLBACK`, `FRAME_CALLBACKS`, `CURRENT_NEW_TARGET`,
+`ACCESSOR_RECEIVER_OVERRIDE`, and `PENDING_FETCH_SIGNAL`.
 
-Every disjunct asks about code the *author* supplied. None asks whether the
-lowering's **own emitted calls** collect — and the loop below unconditionally
-emits one `js_object_set_field_by_name` per static, which does. So
-`class C { static tag = tag }`, whose only initializer is an inert `LocalGet`,
-takes `protect_handle == false` and goes stale.
+*Tell:* a thread-local or static cell holding a GC pointer. A test that fails 10/10,
+not intermittently, suggests this class rather than a stale register.
 
-This one is worth internalising, because it is the sophisticated version of the
-mistake: the author *did* think about rooting, wrote a predicate for it, and the
-predicate asked the wrong question.
-
-> **`js_object_mark_class` does not save it.** That helper puts the object in
-> `CLASS_OBJECT_VALUES`, which is a registered root and *is* forwarded. The
-> object stays alive and the side table's copy stays correct — and the register
-> is still stale, because the collector rewrote a different copy.
->
-> **Reachability is not the invariant.** The invariant is that the register you
-> are still going to use was rewritten. A side table roots *its* pointer, not
-> yours.
+**`scripts/gc_root_dominance_check.py` is structurally blind to this class** — it
+reads emitted LLVM IR and cannot see a runtime table. The instruments that catch it
+are `PERRY_GC_ZEAL=1 PERRY_GC_PROTECT_FROMSPACE=1 PERRY_GC_PROTECT_FROMSPACE_DEPTH=800`
+on a real workload. When adding a cache of a heap pointer, register it in
+`gc_register_mutable_root_scanner` in `gc/mod.rs` in the same commit.
 
 ## How to check your work
 
 ### 1. The static checker — run this one
 
-It is the only instrument that sees this class before it crashes.
+**Scope: emitted-LLVM rooting hazards only** — a stale register or an unrooted
+alloca in generated code. Within that scope it is the only instrument that sees
+a defect before it crashes, which is why it runs first.
+
+**It is blind to three classes, all found the hard way. A clean report is not
+evidence for any of them:**
+
+- **Runtime tables and interning caches** (#7231) — it reads emitted IR and
+  cannot see a runtime cell. Tell: fails 10/10 rather than intermittently.
+- **Unrooted locals in runtime Rust** (#7249) — same reason. It read
+  `0 violations` on both sides of a real bug whose fix was a one-line
+  `GcSuppressScope` in the `globalThis` bootstrap.
+- **Anything its symbol sets do not name** (#7284) — `POLL_CAPABLE_RUNTIME` is
+  an *exact emitted-symbol* set. It carried `js_object_get_field_by_name`, which
+  codegen never emits, next to `js_object_set_field_by_name`, which it emits
+  verbatim. Property sets classified `MOVING: YES`, property gets `MOVING: no`,
+  and 31 stale uses were dropped by `--moving-only`. **Audit these sets against
+  what codegen actually emits, the way #7227 audits `ALLOC_RE`.**
+
+For the classes above, the instruments that catch them are the zeal/quarantine
+arms below and a *dependency-scale* workload — #7280 records 25 curated corpus
+files passing while 20 lines of stock zod fail.
 
 ```bash
 cargo build --release -p perry -p perry-runtime-static -p perry-stdlib-static
@@ -168,15 +181,56 @@ otherwise inert loop body cannot appear in the corpus without it.
 It is **not** what makes the `MOVING` classification work, and it is not the
 only collection point that can run inside a loop — a `POLL_CAPABLE_RUNTIME`
 helper called from a loop body is in-loop too. `movers`
-(`gc_root_dominance_check.py:576-579`) counts `js_gc_loop_safepoint`, anything
-in `poll_reaching`, **and** anything in `POLL_CAPABLE_RUNTIME` — the runtime
+(`gc_root_dominance_check.py`, the `movers` property on `Violation`, `StaleUse`
+and `UnrootedAlloca`) counts `js_gc_loop_safepoint`, anything in
+`poll_reaching`, **and** anything in `POLL_CAPABLE_RUNTIME` — the runtime
 helpers that can re-enter JS, such as `js_object_set_field_by_name`,
-`js_object_get_property` and `js_call_function`. Those are moving with no poll
-anywhere near them. As of this writing all five violations the gate reports are
-`MOVING: YES via js_object_set_field_by_name`; not one of them needs a poll.
+`js_object_get_field_ic_miss` and `js_closure_call1`. Those are moving with no
+poll anywhere near them.
 
 So: turn the knob on, because it widens what the corpus can express, but do not
 read a poll-free function as safe.
+
+### `POLL_CAPABLE_RUNTIME` is by EXACT emitted symbol, and that has bitten twice
+
+`movers` is a set-membership test on the callee name, so an entry that names a
+symbol codegen does not emit classifies nothing, forever, and looks exactly
+like coverage while doing it. Two rounds of this have now been measured:
+
+1. **A real symbol codegen never emits.** The set carried
+   `js_object_get_field_by_name` next to `js_object_set_field_by_name`, which
+   reads as symmetric coverage of property access. It is not: codegen emits the
+   SET verbatim but lowers every GET to `js_object_get_field_by_name_f64`,
+   `js_object_get_field_ic_miss` or
+   `js_typed_feedback_object_get_field_by_name_f64`, none of which were in the
+   set. Property sets classified `MOVING: YES`, property gets classified
+   `MOVING: no`, and 31 `--stale-registers` hits on the gate corpus were dropped
+   by `--moving-only` as a result — including the shape that faults
+   deterministically under `PERRY_GC_PROTECT_FROMSPACE=1
+   PERRY_GC_PROTECT_FROMSPACE_DEPTH=800` at zod's `clone`. The protector and the
+   checker disagreed; the checker was wrong.
+2. **Ten names that were not symbols at all.** `js_apply_function`,
+   `js_array_for_each`, `js_array_sort`, `js_call_closure`, `js_call_value`,
+   `js_function_call`, `js_invoke_closure`, `js_object_get_property`,
+   `js_object_set_property`, `js_string_replace` — extrapolated spellings, none
+   of them an `extern "C" fn` anywhere in the runtime. Four of the ten were four
+   different ways of saying "call a JS closure", so the single most obviously
+   poll-capable operation in the language was covered zero times; the real
+   entry points are `js_closure_callN`, which `RECEIVER_SINKS` in the same file
+   already spelled correctly.
+
+`--audit-poll-capable` is the gate for this, and `gc-root-dominance.yml` runs it
+alongside `--audit-alloc-re` before the build. It fails on any entry that names
+no exported `extern "C" fn js_*`. When it goes red, **replace** the phantom with
+the symbol codegen actually emits rather than deleting it — deleting turns the
+audit green and leaves the hole.
+
+Checking a *plausible* name is not enough. Confirm against emitted IR:
+
+```bash
+grep -ho 'call [^@]*@js_[A-Za-z0-9_.$]*(' ir-corpus/*.ll \
+  | sed -E 's/.*@([A-Za-z0-9_.$]+)\($/\1/' | sort | uniq -c | sort -rn
+```
 
 `PERRY_INLINE_SHADOW_SLOT=0` makes every root store the `js_shadow_slot_bind`
 call form the checker anchors on.
@@ -192,9 +246,13 @@ bind-anchored check is structurally blind to: the value lives in a plain
 `alloca_entry` for its whole lifetime, so there is no `js_shadow_slot_bind` to
 anchor on and a scan that starts from binds calls the function clean. It found
 `lower_call/new.rs`'s inline-ctor `this_slot` independently of any runtime
-probe. **The gate does not run this mode yet** — its remaining hits are the
-caches, staging arrays and inlined-callee params tracked as #7210, and they are
-deliberately not in the allowlist, which covers the bind-anchored shape only.
+probe.
+
+**The gate runs this mode as of #7236, and the corpus reads 0.** It could not
+before: #7210 measured 66 hits and triaged every one as a false positive, #7235
+split the heap-source predicate by movability (98 → 2 on a grown corpus), and
+the 2 residuals were one bug — `collectors/pointer_locals.rs` classified
+`Type::Symbol` as an immediate, so a `Symbol` local got no shadow slot at all.
 Run it by hand when you touch an `alloca_entry` site:
 
 ```bash
@@ -215,6 +273,23 @@ From #7196:
 > FALSE GREENS.** Four levels of retained from-space is not enough to still be
 > holding the block your stale pointer is in by the time it is dereferenced.
 > **Use 800.** A clean run at the default depth means nothing.
+
+Depth is a **detection-window** knob, not a sensitivity knob, and the
+difference matters when the two instruments disagree. A page-set enters the
+quarantine only because an evacuating minor actually retired it as from-space
+(`arena/quarantine.rs`, and the knob gates only
+`copying_reset_from_spaces_and_flip`), so *any* fault on a quarantined address
+is a genuine stale read no matter how deep the ring is. Raising the depth
+removes false NEGATIVES — evicting a set hands its blocks back to Eden, where
+the same read silently succeeds — and cannot manufacture a false positive. So
+"the protector faulted, but only at DEPTH=800" is never grounds to doubt the
+protector; when it disagrees with the static checker, look at the checker first.
+That is how the zod `clone` disagreement was settled.
+
+And when a fault does fire, **walk UP the stack**. The reporter names the frame
+that DEREFERENCED the stale value, which is usually not the frame that owns the
+register — the value commonly arrives as an argument from a caller that let it
+go stale.
 
 And remember the ceiling on all of these: if the collection happens while the
 only copy is in a register, there is nothing at that moment for any runtime
@@ -239,7 +314,13 @@ It is built to be able to fail, against all four hazards in CLAUDE.md:
 - `--self-test` proves it still fires on planted fixtures, and
   `--seeded-violations 40` splices collection points into the **real** corpus IR
   and requires all 40 to be reported — that is the arm that catches the checker
-  silently losing the ability to read perry's output.
+  silently losing the ability to read perry's output;
+- `--audit-alloc-re` and `--audit-poll-capable` refuse a name that matches no
+  exported runtime symbol, in the two tables that decide *whether a register has
+  a heap-value source* and *whether the window around it is moving*. Both run
+  before the build, because both are static and instant and both have shipped
+  dead entries: nine in `ALLOC_RE` across two rounds, ten in
+  `POLL_CAPABLE_RUNTIME`.
 
 ### The allowlist, and why it is not a number
 
@@ -266,18 +347,38 @@ the exact thing this file exists to prevent.
 ### Promoting this gate
 
 **As of this writing the job is NOT in branch protection's required contexts**,
-which means it cannot turn a merge red — hazard 2, and the reason the #7211 hits
-sat unread on `main` from #7198 onward while the job was visibly failing.
+which means it cannot turn a merge red — hazard 2.
 
-With the allowlist the job is green on `main`, so the remaining step is for a
-repo admin to add `gc-root-dominance` to the required contexts. A workflow
-cannot do this to itself. Until it is done, this is documentation.
+Both of the conditions #7198 named are now met:
+
+- the bind-anchored dominance check is green on `main` with an **empty**
+  allowlist (the #7211 entries were deleted when that predicate was fixed in
+  #7226);
+- `--unrooted-allocas --moving-only` reads **0** and is a step in the job
+  (#7236). That was the outstanding one: it was 98 before #7235, 2 after, and 0
+  once `Type::Symbol` stopped being classified as an immediate.
+
+So the remaining step is for a **repo admin** to add `gc-root-dominance` to
+branch protection's required contexts:
+
+```
+Settings → Branches → main → Require status checks to pass
+  → add:  gc-root-dominance
+```
+
+A workflow cannot do this to itself, and neither can a PR. Until it is done,
+this is documentation. Per CLAUDE.md's corollary, promote it **after** the job's
+first green run on `main` with the `--unrooted-allocas` step included — a gate
+that has never been green in its current shape blocks every open PR the day it
+becomes required.
 
 ## Rules of thumb
 
 - **Root before you call, not after.** If a value must survive a call, its root
   store belongs above the call, unconditionally. Do not predicate it on a
-  cleverness about which callees collect — that is bug #5.
+  cleverness about which callees collect — #7211's `ClassExprFresh` tried that and
+  only asked about author-supplied initializers, never about the lowering's own
+  emitted `js_object_set_field_by_name` calls.
 - **Re-read the root after every collection point.** Never cache a load out of a
   root slot across a call. `rooted_handle_get` exists for this.
 - **Evaluate-then-allocate is the hazard.** Any lowering with two or more

@@ -1,13 +1,27 @@
 # Corpus for the GC x representation-selection stress matrix
 # (scripts/gc_repsel_matrix.sh).
 #
-# ***IF YOU ARE ADDING A REPRESENTATION, ADD ITS GAP FILE HERE.***
-# The matrix script FAILS if a `test_gap_repsel_*` / `test_gap_specabi_*` file
-# exists in test-files/ that is not registered below. That is the enforcement
-# point behind docs/representation-selection-rfc.md 5.6: a new representation
-# must be exercised against every GC arm, not just verified once by hand in its
-# own PR. Files outside those two prefixes (typed-array param reads, int-valued
-# typed-array locals) are not auto-detected, so register them explicitly.
+# ***A NEW TEST FILE MUST BE REGISTERED HERE OR IT WILL NOT RUN.***
+# `test-files/test_gap_{gc,repsel,specabi}_*.ts` is compiled and executed by
+# NOTHING unless its basename appears below. An unregistered witness is not a
+# failing test, it is no test at all: the PR that adds it goes green having run
+# it zero times. That happened four times -- #7192, #7216, #7252 and
+# #7270/#7271 -- before it was gated.
+#
+# Enforcement, cheapest first:
+#   * scripts/check_test_registration.py -- pure text, ~0.2s, runs in `lint`
+#     (a REQUIRED context) on every PR. This is the one that will stop you.
+#   * scripts/gc_repsel_matrix.sh -- auto-detects unregistered
+#     `test_gap_repsel_*` / `test_gap_specabi_*`, but only behind a full
+#     compiler build.
+#   * gc-moving-witnesses.yml -- same, for `test_gap_gc_*`, same cost.
+# Deleting a file without deleting its line here also FAILS (a rotted entry).
+#
+# That is the enforcement point behind docs/representation-selection-rfc.md
+# 5.6: a new representation must be exercised against every GC arm, not just
+# verified once by hand in its own PR. Files outside those three prefixes
+# (typed-array param reads, int-valued typed-array locals) are not
+# auto-detected at all, so register them explicitly.
 #
 # One basename per line, without the .ts extension. `#` starts a comment.
 
@@ -47,6 +61,16 @@ test_gap_repsel_ptr_shape_barriers
 # — the caller's bound slot is the only rewritable root for that object, which
 # is exactly the claim this phase's GC contract makes.
 test_gap_repsel_return_shape
+
+# --- Phase 3b / #7170 R1: the same mechanism inside Perry's own CJS IIFE -----
+# `cjs_wrap` puts every CommonJS module body in `(function () { ... })()`, which
+# turns every module-level `function` declaration into a closure -- so #7107's
+# producer walk (`hir.functions`) and its caller-side seed (`Expr::FuncRef`)
+# both missed it, and 91.6% of dependency-JS allocation sites were unreachable
+# (#7170 §6). The GC claim is the same one and needs its own cells: the
+# call-seeded local now lives in a CLOSURE region, whose shadow-slot binding is
+# emitted by `codegen/closure.rs`, not `codegen/function.rs`.
+test_gap_repsel_cjs_iife_return_shape
 
 # --- Phase 3b / #7034 §3: array-element shape facts -------------------------
 # `rows.push(row)` no longer disqualifies `row`, and `const r = rows[i]` under
@@ -187,6 +211,19 @@ test_gap_repsel_gc_stress
 #   inline_ctor_this_rooting    green — see its own header; it is a STATIC
 #                               gate, pinned by the codegen test and by
 #                               `gc_root_dominance_check.py --unrooted-allocas`
+#
+# #7217 UPDATE: `spread_accessor_rooting` and `static_block_this_rooting` are now
+# ALSO green on the ALLOCATION-POINT route, which they were not when #7207
+# landed. That route's failure was never in the code #7207 fixed: it was minor #0
+# landing inside the lazy `globalThis` bootstrap, which threads raw
+# `*mut ObjectHeader` installer locals across its own ~1.15 MB of allocations.
+# The bootstrap now runs in a no-move window. Measured on `origin/main`
+# (8b024958f) vs this branch, same profile, same host, idle, 10 runs each, at
+# `PERRY_GC_HEAP_LIMIT=8 PERRY_GC_INCREMENTAL=0 PERRY_CONSERVATIVE_STACK_SCAN=off`
+# with NO compile-time GC env:
+#   spread_accessor_rooting     exit=139 10/10  ->  `plain 0 hot 0 tail 0` 10/10
+#   static_block_this_rooting   `bad 1`  10/10  ->  `bad 0`               10/10
+#   inline_ctor_this_rooting    green    10/10  ->  green                 10/10
 test_gap_gc_spread_accessor_rooting
 test_gap_gc_static_block_this_rooting
 test_gap_gc_inline_ctor_this_rooting
@@ -263,6 +300,26 @@ test_gap_gc_closure_call_callee_rooting
 test_gap_gc_closure_call_this_rooting
 test_gap_gc_closure_call_argument_rooting
 
+# --- A THIRD witness that was registered nowhere (#7252) --------------------
+# `test_gap_gc_call_argument_rooting` shipped with #7252 (cross-module direct
+# call argument rooting, authored by @jdalton, restacked at merge). Same defect
+# as #7192 and #7216 above: the PR added the witness and did not add the line.
+# It was dark from merge until the `test_gap_gc_*` enforcement added for those
+# two caught it on the first `GC Moving Witnesses` run on main -- which is the
+# enforcement working exactly as designed, on the third occurrence of the same
+# mistake. Registering the file is the whole fix.
+test_gap_gc_call_argument_rooting
+
+# --- #7270's two witnesses, registered here rather than dark -----------------
+# `rest_argument_rooting` and `same_module_call_argument_rooting` shipped with
+# #7270. Registering them at merge rather than after: they are the FOURTH
+# instance of the add-a-witness-forget-the-line defect (#7192, #7216, #7252
+# above), and #7252's was caught only by the `test_gap_gc_*` enforcement firing
+# on the first main-line `GC Moving Witnesses` run after #7253 gave that matrix
+# a trigger at all. Four occurrences is a process problem, not four mistakes.
+test_gap_gc_rest_argument_rooting
+test_gap_gc_same_module_call_argument_rooting
+
 # --- Two witnesses that were registered nowhere (#7192, #7216) ---------------
 # Both files exist in test-files/, both say in their own headers that they are
 # LIVE BY CONSTRUCTION and bite only on the moving arms, and neither was in this
@@ -282,6 +339,13 @@ test_gap_gc_closure_call_argument_rooting
 # Measured on this commit (7d1dc9ca2), `--arms loop_polls --filter test_gap_gc_`:
 # both PASS with copy-minor > 0, i.e. they relocate and they are byte-exact.
 # Also measured on the `gc-stress` PR arm set: PASS/UNVER only, no new red.
+#
+# #7217 UPDATE for `assign_string_source_rooting`: partly improved by #7217's
+# no-move bootstrap window (`bad char 3 count 3` -> `bad char 1 count 1`, 10/10
+# each) but NOT green. The residual iteration is a stale `js_eq` left operand in
+# the test's own `got !== ALPHA[i % 26]` assertion, not anything in
+# `js_object_assign_one` — tracked as #7248 with the emitted IR; the triage
+# entries are retargeted there.
 test_gap_gc_new_instance_rooting
 test_gap_gc_assign_string_source_rooting
 
@@ -337,5 +401,163 @@ test_gap_gc_closure_call_prev_this_rooting
 # PASS on `loop_polls` 8/8 (`bad 0`, matching the oracle), and exit=139 on all
 # TEN allocation-point arms, also deterministic. See gc_repsel_triage.txt: the
 # fix in this PR is verified on the safepoint route and is NOT claimed on the
-# allocation-point route, which is #7217's open defect class at a second site.
+# allocation-point route.
+#
+# #7217 UPDATE: that class turned out to be TWO unrelated sites, not one. #7217
+# itself (the lazy `globalThis` bootstrap) is fixed and this file is UNCHANGED by
+# it — exit=139 10/10 both before and after. Its own site is `js_regexp_new`
+# holding `&str` borrows into a movable `StringHeader` across its whole body,
+# tracked as #7247; the triage entries are retargeted there.
 test_gap_gc_regexp_receiver_rooting
+# --- #7210: argument staging buffers filled interleaved with lowering -------
+# `setTimeout(cb, 0, {…}, churn())` kept the CALLBACK closure in a bare SSA
+# register across every argument's lowering, and each trailing argument in a
+# bare `alloca_entry_array` the precise root walk never visits, while the next
+# one was lowered. Measured at base (`7d1dc9ca2`), compiled and run under
+# `PERRY_GC_MOVING_LOOP_POLLS=1 PERRY_GC_HEAP_LIMIT=8`: 5/5
+# `TypeError: The "callback" argument must be of type function. Received an
+# instance of Object` — deterministic, and identical on the `evac_minor` arm.
+# Clean 5/5 on the shipped default (no polls, no pressure) both before and
+# after, so this is a `requires=move`-only witness like the #7207 trio.
+test_gap_gc_staging_args_rooting
+
+# --- #7210 runtime half: setInterval trailing args were in no root ----------
+# `scan_timer_roots_mut` walked `args` for CALLBACK_TIMERS and for both
+# MOCK_TIMERS lists, and NOT for INTERVAL_TIMERS; the incremental twin
+# `scan_interval_timers_step` had the same hole, and cycle-based collections run
+# only the step scanner. A partially-correct scanner is worse than an absent one
+# — it reads as covered. Measured at base: `BAD interval.a` from tick 2 onward.
+test_gap_gc_interval_args_rooting
+
+# --- #7231: unrooted runtime-side caches (nothing static can find these) ----
+# `js_process_env_impl` builds `process.env` once with `js_object_alloc` (the
+# NURSERY) and stores it in a thread-local `Cell<f64>` that no scanner visited.
+# That cell is the whole reference graph — `process.env` is a getter CALL, not
+# a field of `process` — so the first minor swept or evacuated the object and
+# every later `process.env.X = v` wrote through a dangling pointer.
+#
+# The observable is ENUMERATION (`Object.keys(process.env)`, spread, `for…in`),
+# because a direct `process.env.KEY` read lowers to `js_getenv` and asks the OS.
+#
+# Measured at base (`c9cd73ba5`), compiled and run under
+# `PERRY_GC_MOVING_LOOP_POLLS=1` with `PERRY_GC_INCREMENTAL=0
+# PERRY_CONSERVATIVE_STACK_SCAN=off PERRY_GC_HEAP_LIMIT=8`: **SIGBUS 10/10**,
+# `[gc-fromspace-protect] obj_type=2 size=416 … RETIRED FROM-SPACE`. Clean 5/5
+# on the shipped default both before and after, so this is a `requires=move`
+# witness. 10/10 green after, byte-exact vs node 26.5.1.
+#
+# The determinism is the diagnostic signature (#7226): an unrooted CACHE goes
+# bad at collection #0 and stays bad, where an unrooted REGISTER needs a
+# collection to land in a narrow window.
+test_gap_gc_process_env_cache_rooting
+
+# --- #7236: a Symbol-typed local had no shadow slot at all ------------------
+# Not a representation file, so registered explicitly per the header rule.
+# `collectors/pointer_locals.rs` classified `Type::Symbol` as a NON-pointer, so
+# `const s = Symbol()` got no shadow-stack slot and lived in a plain `alloca` —
+# the last violation `gc_root_dominance_check.py --unrooted-allocas
+# --moving-only` reported on the #7235 corpus, and the one thing standing
+# between `gc-root-dominance` and promotion to a required context (#7198).
+#
+# ★ THE FAILURE IS A PREMATURE FREE, NOT A STALE ADDRESS, and that dictates the
+# shape of the file. `alloc_symbol` is `gc_malloc(_, GC_TYPE_STRING)` and
+# `gc_malloc` is the SYSTEM allocator with a GcHeader in front, not an arena
+# allocation — so the copying minor cannot relocate a symbol, it can only
+# `dealloc` it. Under #7235's taxonomy the local is RECLAIMABLE and not
+# MOVABLE. `SYMBOL_POINTERS` does not save it:
+# `scan_symbol_pointer_metadata_roots_mut` uses `visit_metadata_usize_slot`,
+# which rewrites without marking, exactly as `alloc_symbol`'s own comment says
+# ("kept alive ... or NOT AT ALL").
+#
+# So the pressure is SYMBOLS, not objects. `copied_minor_malloc_sweep_due`
+# gates the malloc sweep on a `MallocCount` trigger or the malloc-object
+# threshold; object churn reaches the ARENA trigger instead, and with it the
+# defect reproduces intermittently — measured at 1 failure in 80 probes on one
+# object-churn shape, and 0 on four of five repeats of another. Symbol churn
+# makes the malloc-count trigger the one that fires AND makes the freed block
+# the exact size class the next `Symbol()` reuses.
+#
+# ★ THE PROBE SYMBOL DELIBERATELY HAS NO DESCRIPTION, so this file gates ONE
+# defect. `GC_TYPE_STRING` is `pointer_free: true` / `Leaf`, so a symbol's
+# `description` StringHeader is never traced or rewritten and can be reaped out
+# from under a perfectly rooted symbol — a SEPARATE runtime-side defect (#7246)
+# that #7236 does not touch. With `Symbol("k")` this file stayed red 2/20 on the
+# `PERRY_GC_INCREMENTAL=0 PERRY_CONSERVATIVE_STACK_SCAN=off` arms AFTER the
+# fix; with `Symbol()` there is no such pointer and what remains is exactly the
+# lifetime of the symbol object. If those two arms ever go red here again,
+# suspect the description defect before suspecting the classification.
+#
+# Measured with `--arms all --pressure 8`, oracle node 26.5.1 (`B 0`):
+#   f8f1e7188 (base)  21/21 cells FAIL, 0/21 byte-exact (5 of them exit=1)
+#   with the fix      0 FAIL, 21/21 byte-exact, PASS=17 UNVER=4
+# It does NOT need a `requires=move` arm: the conservative stack scan is what
+# was hiding it, and a malloc-count-driven collection stops it hiding, so it is
+# red on the SHIPPED DEFAULT at base too.
+test_gap_gc_symbol_local_rooting
+
+# --- #7280: RUNTIME-DISPATCHED `new` — the instance in a Rust frame ----------
+# The sibling of `test_gap_gc_new_instance_rooting` one layer down. That file
+# covers the CODEGEN route: `new C(n)` with a statically-known `C`, where the
+# caller holds the instance itself. This one covers the four routes where
+# codegen cannot resolve the callee and hands the whole construction to
+# perry-runtime's `js_new_function_construct` family:
+#
+#   1. `new obj.ctor(n)`, `ctor` a declared class     -> construct_registered_class_ref
+#   2. `new obj.ctor(n)`, `ctor` a plain function     -> the closure tail
+#   3. `new obj.ctor(n)`, `ctor` a class EXPRESSION   -> the class-object arm
+#   4. `Reflect.construct(fn, [n], otherFn)`          -> ..._with_new_target
+#
+# Each allocated the instance, called back into user JS to run the constructor
+# body, and returned the pointer it had captured BEFORE that call. A runtime
+# frame is not visited by the precise root walk and the conservative stack scan
+# resolves to SkipDisabled in shipped builds, so the instance moved and the
+# helper returned the pre-move address — a stale receiver produced OUTSIDE the
+# emitted IR, which is why `scripts/gc_root_dominance_check.py` is structurally
+# blind to it (it reads LLVM IR; none of this is in LLVM IR).
+#
+# Measured on this branch, release, `PERRY_GC_MOVING_LOOP_POLLS=1` at compile:
+#   before the fix, POLLS=1 + ZEAL=1     200/200 iterations wrong on EVERY route
+#   after  the fix, POLLS=1 + ZEAL=1     10/10 runs byte-exact with the oracle
+#   control, + PERRY_GEN_GC=0            clean on both sides
+# and under the loop_polls arm env
+# (`HEAP_LIMIT=8 INCREMENTAL=0 CONSERVATIVE_STACK_SCAN=off POLLS=1 FORCE_EVACUATE=1`)
+# red before / clean after, which is the arm `gc-moving-witnesses` runs.
+#
+# ONE FILE, FOUR ROUTES, FOUR SEPARATE console.log LINES. The matrix byte-diffs
+# stdout, so a regression on any single route names itself instead of collapsing
+# into one `bad N`.
+test_gap_gc_dynamic_construct_receiver_rooting
+
+# --- #7280: OPTIONAL PARAMETERS — the residual that held #7161's stopgap -----
+# THE file for #7154's surviving residual. zod `util.ts`'s
+# `clone(inst, def?, params?: { parent: boolean })` gave `params` no shadow slot
+# even though HIR types it `Object(...)` and `type_is_pointer_bearing` says
+# true, so it crossed `new inst._zod.constr(...)` in callee-saved `d8` and
+# `params?.parent` dereferenced retired from-space.
+#
+# The cause is the OPTIONAL MARKER, not the object type. The pointer-locals
+# refinement fixpoint proves a local non-pointer from its WRITES, and a
+# PARAMETER's write list is a strict SUBSET of its definitions — the incoming
+# argument is not a write. The optional-parameter desugaring then donates the
+# one write that completes the false proof, for free, on every optional
+# parameter in the program:
+#
+#     if (p === undefined) { p = undefined; }
+#
+# Two functions because the fixpoint draws TWO conclusions from that subset and
+# both are unsound for a parameter:
+#   `annotated` — the declared-Object shape (zod's). Needs the `all_non_pointer`
+#                 exclusion.
+#   `inferred`  — `p?: any` plus a local aliased from it. Needs the
+#                 `precise_inference` exclusion as well: measured RED 200/200
+#                 with only the first exclusion applied.
+#
+# Measured on this branch, release, `PERRY_GC_MOVING_LOOP_POLLS=1` at compile:
+#   before, POLLS=1 + ZEAL=1            200/200 iterations wrong, both shapes
+#   after,  POLLS=1 + ZEAL=1            byte-exact with the oracle
+#   after,  loop_polls arm env          byte-exact
+#   control, + PERRY_GEN_GC=0           clean on both sides
+# and on the real workload, `sfw-registry --help` under
+# `PROTECT_FROMSPACE=1 DEPTH=800 POLLS=1` (no zeal): 10/10 FAULT before,
+# 40/40 clean after.
+test_gap_gc_optional_param_receiver_rooting

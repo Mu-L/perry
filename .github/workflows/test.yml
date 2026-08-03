@@ -124,14 +124,17 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check formatting
+        if: ${{ !cancelled() }}
         run: cargo fmt --all -- --check
 
       - name: Audit workspace architecture
+        if: ${{ !cancelled() }}
         run: |
           python3 scripts/workspace_architecture.py --self-test
           python3 scripts/workspace_architecture.py --check --print-summary
 
       - name: Public benchmark evidence freshness
+        if: ${{ !cancelled() }}
         run: |
           PYTHONPATH=. python3 tests/test_public_baseline.py
           # README embedded table is optional since #6736 (marketing landing
@@ -145,6 +148,7 @@ jobs:
       # cargo-check incrementality, and hide regressions in code review.
       # Allowlist + exclusions live in the script.
       - name: File size limit
+        if: ${{ !cancelled() }}
         run: ./scripts/check_file_size.sh
 
       # Well-known binding provenance pins: every third-party binding in
@@ -154,6 +158,7 @@ jobs:
       # (no network); the weekly update runs `--check --refresh` to surface
       # newly-soaked upstream releases as advisories.
       - name: Binding upstream pins (lock-step)
+        if: ${{ !cancelled() }}
         run: node scripts/binding_pins.mjs --check
 
       # GC write-barrier store-site inventory: every raw heap-slot store in
@@ -162,6 +167,7 @@ jobs:
       # in scripts/gc_store_site_allowlist.txt). Catches new unbarriered
       # old->young store paths before they become nondeterministic segfaults.
       - name: GC store-site inventory
+        if: ${{ !cancelled() }}
         run: |
           python3 scripts/gc_store_site_inventory.py --self-test
           python3 scripts/gc_store_site_inventory.py
@@ -174,6 +180,7 @@ jobs:
       # they become Linux-only segfaults (#1843, #4004, #4665, #4800 class).
       # Allowlist: scripts/addr_class_allowlist.txt.
       - name: Address-classification audit
+        if: ${{ !cancelled() }}
         run: |
           python3 scripts/addr_class_inventory.py --self-test
           python3 scripts/addr_class_inventory.py
@@ -182,10 +189,84 @@ jobs:
       # its own logic is unit-checked on the cheap job rather than only being
       # exercised 8 shards deep.
       - name: Gap snapshot checker self-test
+        if: ${{ !cancelled() }}
         run: python3 scripts/gap_snapshot.py --self-test
 
       - name: Platform-aware parity allowlist self-test
+        if: ${{ !cancelled() }}
         run: python3 scripts/parity_known_failures.py --self-test
+
+      # Moving-GC gate wiring. The GC gates are the ones this repo has most
+      # often found unable to fail (CLAUDE.md's four hazards), and every miss so
+      # far was caught by a human re-deriving it mid-incident. This asserts the
+      # mechanical half from `lint`, which IS a required context: each gate job
+      # must actually execute on main-line code (a push to `main`, or the
+      # nightly `schedule` — a tag-only run adjudicates nothing, it fires after
+      # every merge it was supposed to judge), must not carry job-level
+      # `continue-on-error`, must not swallow its gating step's exit status, and
+      # must not let a new merge cancel the previous main run.
+      #
+      # It cannot check branch protection's required-context list — that is
+      # server-side state, not a file in the tree — and says so; `--list` prints
+      # what is and is not covered.
+      - name: Moving-GC gate wiring
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/gc_gate_wiring_check.py --self-test
+          python3 scripts/gc_gate_wiring_check.py
+
+      # The other half of the same hazard (#7255). `gc_gate_wiring_check.py`
+      # asserts the matrix JOB can run; this asserts the matrix ARMS can fail.
+      # Four of the six PR-gating arms sat at copy-minor 0/50 for five weeks
+      # while the script's header advertised 12/22, because an all-UNVER table
+      # exits 0. Both checks are build-free, so they belong in `lint`:
+      # `--self-test` covers the red/green rule itself, `--check-registry`
+      # covers the known-inert list (names resolve to real arms, every entry
+      # cites an issue, and the matrix still calls the checker at all — a gate
+      # nobody invokes is the same hazard one level up).
+      - name: GC matrix liveness gate
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/gc_matrix_liveness_check.py --self-test
+          python3 scripts/gc_matrix_liveness_check.py --check-registry
+
+      # Dark-test gate. Four of this repo's suites are driven by an explicit
+      # registry rather than a glob, and a test file added without its registry
+      # line runs NOWHERE while its PR stays green — #7192, #7216, #7252 and
+      # #7270/#7271 all shipped that way against test-parity/gc_repsel_corpus.txt.
+      #
+      # Registration checks already existed for two of those prefixes, but both
+      # live behind a 90-minute compiler build, behind a changed-paths relevance
+      # filter, and in workflows that are NOT in branch protection — so the check
+      # could not run on the pull request that needed it. This is the pure
+      # filesystem-and-text half (~0.2s, no compiler, no Node), placed in `lint`
+      # BECAUSE `lint` is already a required context: hazard 2 is the step people
+      # forget, so this gate is put where that step does not exist.
+      #
+      # The self-test plants an unregistered file into each mechanism and asserts
+      # the gate names it, then removes it and asserts green — over the real
+      # registries, through an in-memory overlay, so the checkout is never
+      # mutated. Each mechanism also floors its candidate set, so a stale glob
+      # fails loudly instead of making every future run vacuously green.
+      #
+      # `!cancelled()` is hazard 4 in a costume nobody has named yet: `lint` is a
+      # SEQUENCE of independent gates, and a step that fails takes every later
+      # step in the job to `skipped`. That is not hypothetical here — `Public
+      # benchmark evidence freshness` has failed on `main` on every run from
+      # 2026-07-29 onward, so `File size limit`, `GC store-site inventory`,
+      # `Address-classification audit`, `Gap snapshot checker self-test` and
+      # `Platform-aware parity allowlist self-test` have all been skipped for
+      # days while the job dutifully reported red for an unrelated reason. A gate
+      # that never executes cannot fail on its own subject. This step costs 0.2s
+      # and shares no state with anything above it, so it always speaks.
+      # (`!cancelled()` rather than `always()`: a cancelled run should stay
+      # cancelled.) The five steps above deserve the same treatment; that is a
+      # separate change from this one.
+      - name: Test registration (dark tests)
+        if: ${{ !cancelled() }}
+        run: |
+          python3 scripts/check_test_registration.py --self-test
+          python3 scripts/check_test_registration.py
 
   # ---------------------------------------------------------------------------
   # Clippy — enforces the deny-level lints in [workspace.lints] (root
@@ -910,14 +991,38 @@ jobs:
   #
   # Cost split: a PR runs the 4-arm subset, whose arms all share one
   # compile-time environment, so the corpus is compiled ONCE and run four
-  # times. push / workflow_dispatch run the full arm list (19 arms, 9 compile
-  # groups) as the deeper net. NOTE: this job is not yet in branch protection's
-  # required contexts — adding it there is what makes the gate blocking.
+  # times. push / schedule / workflow_dispatch run the full arm list as the
+  # deeper net. NOTE: this job is not yet in branch protection's required
+  # contexts — adding it there is what makes the gate blocking.
+  #
+  # ***`schedule` IS LOAD-BEARING IN THE `if:` BELOW (#7194).*** Without it this
+  # job had NO main-line execution at all, and the hole is invisible from either
+  # end on its own:
+  #
+  #   * this workflow's `push:` trigger is TAGS ONLY — "Direct pushes to main do
+  #     NOT trigger tests", stated at the top of this file — so `push` in the
+  #     `if:` only ever means a release tag;
+  #   * the nightly cron, which the concurrency comment above calls "the only
+  #     backstop for integration-suite regressions a scoped PR run can't see",
+  #     fires as `schedule`, which the `if:` did not list. Measured: twelve
+  #     consecutive nightly `main` runs, `gc-stress` reported `skipped` in every
+  #     one.
+  #
+  # So between release tags, nothing in CI ran scripts/gc_repsel_matrix.sh on
+  # `main` — and the matrix is the only place the `requires=move`
+  # allocation-point arms execute over the representation corpus. That is how
+  # test_gap_repsel_p4a3_ptr_numarray stayed red on ten arms for over a week
+  # with no CI event to say so, forcing three separate PRs (#7193, #7233, #7196)
+  # to hand-exonerate the same seventy cells. This is CLAUDE.md hazard 4 in its
+  # purest form: the job existed, was correctly written, and its subject never
+  # ran. scripts/gc_gate_wiring_check.py asserts this from `lint` so it cannot
+  # silently come back.
   # ---------------------------------------------------------------------------
   gc-stress:
     if: >-
       github.event_name == 'push' ||
       github.event_name == 'pull_request' ||
+      github.event_name == 'schedule' ||
       github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 90
