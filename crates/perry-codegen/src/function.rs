@@ -16,23 +16,6 @@ pub struct LlFunction {
     /// Optional LLVM linkage string, e.g. `"internal"` or `"private"`. Empty
     /// string means external (default) linkage.
     pub linkage: String,
-    /// When true, the function body contains a `try` statement (setjmp/longjmp),
-    /// so the definition gets `#1` (`noinline`) and `to_ir` runs the volatile
-    /// promotion pass.
-    ///
-    /// The setjmp hazard: `longjmp` restores the callee-saved registers and
-    /// stack pointer that `setjmp` snapshotted, so any local LLVM parked in a
-    /// register across the setjmp call reverts to its setjmp-time value when
-    /// the exception fires — the try body's mutations vanish in the catch.
-    /// `returns_twice` on the setjmp call is not sufficient at -O2 on aarch64.
-    ///
-    /// This used to be handled by stamping `optnone` on the whole function,
-    /// which is correct (at -O0 every value is frame-resident) but cost ~5x on
-    /// the surrounding code even when nothing ever throws (#6385). We now apply
-    /// C's `volatile` rule precisely instead: only the allocas the try body
-    /// actually stores into get volatile accesses, and everything else in the
-    /// function stays optimizable. See [`crate::volatile_setjmp`].
-    pub has_try: bool,
     /// When true, emit `alwaysinline` attribute. Forces LLVM to inline this
     /// function at every call site, exposing integer operations to the
     /// caller's optimizer context (critical for vectorization of clamp patterns).
@@ -45,9 +28,14 @@ pub struct LlFunction {
     /// gets inlined into its loop without the binary-size blowup an
     /// unconditional `alwaysinline` threshold bump causes. See the
     /// inline-hot-small heuristic in `codegen/function.rs`. `alwaysinline`
-    /// already implies the hint, so the two are never emitted together, and
-    /// `has_try` (noinline) still wins over both in `to_ir`.
+    /// already implies the hint, so the two are never emitted together.
     pub inline_hint: bool,
+    /// Invoke-EH (#7302): this function contains landing pads (Itanium) or
+    /// funclet pads (SEH), so its `define` line must carry
+    /// `personality ptr @<name>` — `perry_eh_personality` on Mach-O/ELF,
+    /// `__C_specific_handler` on windows-msvc. Set by the try/async-boundary
+    /// dispatch (which knows the target triple).
+    pub personality: Option<&'static str>,
     blocks: Vec<LlBlock>,
     block_counter: u32,
     reg_counter: Rc<RegCounter>,
@@ -211,9 +199,9 @@ impl LlFunction {
             return_type,
             params,
             linkage: String::new(),
-            has_try: false,
             force_inline: false,
             inline_hint: false,
+            personality: None,
             blocks: Vec::new(),
             block_counter: 0,
             reg_counter: Rc::new(RegCounter::new()),
@@ -394,22 +382,15 @@ impl LlFunction {
         self.pre_return_void_calls.push(func_name.into());
     }
 
-    /// Open a setjmp-protected region (#6385). Every `store` emitted into any
-    /// block of this function until the matching [`exit_try_region`] is
-    /// recorded as "modified between the setjmp and a possible longjmp", and
-    /// the alloca behind it is given volatile accesses by `to_ir`.
-    ///
-    /// Call this around the lowering of a `try` body and of a `catch` body
-    /// that a `finally` re-protects — i.e. exactly the code that a `longjmp`
-    /// can cut short. Regions nest; the depth counter handles that.
-    ///
-    /// [`exit_try_region`]: LlFunction::exit_try_region
-    pub fn enter_try_region(&self) {
-        self.reg_counter.enter_try_region();
+    /// Invoke-EH (#7302): enter/leave a handler scope. While a scope is
+    /// active, every potentially-throwing call any block of this function
+    /// emits carries an unwind edge to the scope's landing-pad label.
+    pub fn push_eh_scope(&self, lpad_label: String) {
+        self.reg_counter.push_eh_scope(lpad_label);
     }
 
-    pub fn exit_try_region(&self) {
-        self.reg_counter.exit_try_region();
+    pub fn pop_eh_scope(&self) {
+        self.reg_counter.pop_eh_scope();
     }
 
     /// Allocate a fresh stack slot in the function entry block. Returns
@@ -600,21 +581,23 @@ impl LlFunction {
             format!("{} ", self.linkage)
         };
 
-        let attrs = if self.has_try {
-            // noinline (setjmp/volatile/async-rejecting boundary) always wins,
-            // even if an inline attribute was optimistically set before body
-            // lowering discovered the try.
-            " #1"
-        } else if self.force_inline {
+        let attrs = if self.force_inline {
             " alwaysinline"
         } else if self.inline_hint {
             " inlinehint"
         } else {
             ""
         };
+        // Invoke-EH (#7302): functions containing landing/funclet pads name
+        // their personality on the define line (LLVM: `define ... [fn attrs]
+        // [personality] { ... }`).
+        let personality = match self.personality {
+            Some(p) => format!(" personality ptr @{}", p),
+            None => String::new(),
+        };
         let mut ir = format!(
-            "define {}{} @{}({}){} {{\n",
-            linkage, self.return_type, self.name, param_str, attrs
+            "define {}{} @{}({}){}{} {{\n",
+            linkage, self.return_type, self.name, param_str, attrs, personality
         );
         self.for_each_final_line::<std::convert::Infallible>(&mut |line| {
             ir.push_str(line);
@@ -624,19 +607,11 @@ impl LlFunction {
         .unwrap_or_else(|e| match e {});
         ir.push_str("}\n");
 
-        // setjmp volatile promotion (#6385).
-        //
-        // Runs LAST so it sees every instruction, including the return-site
-        // rewrites the visitor just streamed in. Any alloca this function
-        // stores into between a `setjmp` and its `longjmp` (recorded by
-        // `LlBlock::emit` while a try region was open) gets `volatile` loads
-        // and stores, which is what stops mem2reg/SROA from promoting it into
-        // a register that `longjmp` would revert.
-        if self.has_try {
-            let try_stores = self.reg_counter.try_region_stores();
-            if !try_stores.is_empty() {
-                return crate::volatile_setjmp::apply_setjmp_volatile(&ir, &try_stores);
-            }
+        // Invoke-EH (#7302): inline invoke splits move a block's true CFG
+        // tail behind `eh.contN:` labels; phi incoming-edge labels captured
+        // at emit time must follow. Runs last so it sees the streamed text.
+        if self.personality.is_some() && ir.contains("eh.cont") {
+            return crate::eh_mode::rewrite_phi_predecessors(&ir);
         }
 
         ir
@@ -646,9 +621,10 @@ impl LlFunction {
     /// entry-alloca and post-init splices, instructions, return-site
     /// rewrites; blank separator lines between blocks) in exactly the order
     /// [`to_ir`] renders them — `to_ir` IS this visitor plus the define
-    /// header, closing brace, and the setjmp volatile pass (which needs
-    /// whole-function analysis and therefore text; native construction
-    /// falls back to `to_ir` for `has_try` functions).
+    /// header, closing brace, and the invoke-EH phi-predecessor rewrite
+    /// (which needs whole-function analysis and therefore text; native
+    /// construction bails on personality-carrying functions and takes the
+    /// textual path — see codegen/mod.rs).
     ///
     /// This is the seam the native backend consumes: per finalized line,
     /// no per-function text materialization.

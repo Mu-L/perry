@@ -97,7 +97,7 @@ fn promote_global_for_units(line: &str) -> String {
 /// * Anything that can allocate or trigger GC gets NO group — the moving
 ///   GC's shadow-stack reload discipline depends on those calls staying
 ///   maximally clobbering.
-/// * Anything that can reach `js_throw` (setjmp/longjmp) gets NO group —
+/// * Anything that can reach `js_throw` (raises through the unwinder) gets NO group —
 ///   `willreturn` would let DCE delete a throwing call whose result is
 ///   unused, silently dropping the exception.
 ///
@@ -109,7 +109,7 @@ fn promote_global_for_units(line: &str) -> String {
 /// string/object paths read+parse and reach ToPrimitive),
 /// `js_value_length_f64` (Buffer/TypedArray registry lookups take locks —
 /// a lock acquisition writes memory).
-fn helper_decl_attrs(name: &str) -> &'static str {
+pub(crate) fn helper_decl_attrs(name: &str) -> &'static str {
     match name {
         // PURE — each verified: pure bit tests/masking on the f64/i64 args,
         // total over arbitrary bits, no memory access anywhere in the body.
@@ -166,12 +166,7 @@ pub(crate) fn declare_line_for(f: &LlFunction) -> String {
         .map(|(t, _)| t.to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    let attrs = if f.name == "setjmp" || f.name == "_setjmp" {
-        " #0"
-    } else {
-        ""
-    };
-    format!("declare {} @{}({}){}", f.return_type, f.name, params, attrs)
+    format!("declare {} @{}({})", f.return_type, f.name, params)
 }
 
 /// Render a function with external linkage forced, promoting an `internal` /
@@ -256,24 +251,73 @@ impl LlModule {
         }
         self.declared_names.insert(name.to_string());
         let param_str = param_types.join(", ");
-        // setjmp needs the `returns_twice` attribute to prevent
-        // LLVM from promoting alloca slots to SSA registers across
-        // the setjmp boundary. Without it, local variables modified
-        // between setjmp and longjmp are clobbered when the second
-        // return (via longjmp) happens.
-        //
         // Verified-pure runtime helpers get the #2/#3 optimization groups
         // (#6082) — see `helper_decl_attrs` for the audit invariants. The
         // lookup is name-keyed here in the single declaration funnel so
         // every declaration path agrees on the attributes.
-        let attrs = if name == "setjmp" || name == "_setjmp" {
-            " #0"
-        } else {
-            helper_decl_attrs(name)
-        };
+        let attrs = helper_decl_attrs(name);
         self.declarations.push((
             name.to_string(),
             format!("declare {} @{}({}){}", return_type, name, param_str, attrs),
+        ));
+    }
+
+    /// Invoke-EH (#7302): true when any function in this module carries a
+    /// personality (i.e. contains try/catch landing pads or SEH funclets).
+    /// The native-construction backend (exp/llvm-inprocess) bails to the
+    /// textual path for these modules until its line reader learns
+    /// `invoke`/`landingpad`/`catchswitch`.
+    pub fn has_eh_personality(&self) -> bool {
+        self.functions.iter().any(|f| f.personality.is_some())
+    }
+
+    /// Invoke-EH (#7302): declare the personality routine referenced by
+    /// every `define ... personality ptr @perry_eh_personality`. Declared
+    /// varargs — the symbol is only ever *named* on define lines and in the
+    /// unwind tables; generated code never calls it.
+    pub fn declare_personality(&mut self) {
+        if self.declared_names.contains("perry_eh_personality") {
+            return;
+        }
+        self.declared_names
+            .insert("perry_eh_personality".to_string());
+        self.declarations.push((
+            "perry_eh_personality".to_string(),
+            "declare i32 @perry_eh_personality(...)".to_string(),
+        ));
+    }
+
+    /// Invoke-EH on windows-msvc (#7302): the SEH personality plus the
+    /// module-local `__except` filter every catchpad names. The filter
+    /// accepts exactly Perry's `RaiseException` code 0xE0504A53 ("PJS" |
+    /// 0xE0000000, `perry-runtime/src/eh.rs`), so foreign SEH exceptions
+    /// (access violations etc.) keep unwinding past JS handlers — the
+    /// setjmp path never caught those either. Rendered among the
+    /// declarations; LLVM accepts interleaved declares/defines.
+    pub fn declare_seh_machinery(&mut self) {
+        if self.declared_names.contains("__C_specific_handler") {
+            return;
+        }
+        self.declared_names
+            .insert("__C_specific_handler".to_string());
+        self.declarations.push((
+            "__C_specific_handler".to_string(),
+            "declare i32 @__C_specific_handler(...)".to_string(),
+        ));
+        self.declared_names.insert("perry_seh_filter".to_string());
+        self.declarations.push((
+            "perry_seh_filter".to_string(),
+            concat!(
+                "define internal i32 @perry_seh_filter(ptr %eptrs, ptr %frame) {\n",
+                "entry:\n",
+                "  %rec = load ptr, ptr %eptrs\n",
+                "  %code = load i32, ptr %rec\n",
+                "  %ok = icmp eq i32 %code, -531609005\n",
+                "  %r = zext i1 %ok to i32\n",
+                "  ret i32 %r\n",
+                "}"
+            )
+            .to_string(),
         ));
     }
 
@@ -533,33 +577,6 @@ impl LlModule {
     /// same attributes and metadata (so `#0`/`#1` and `!N` references resolve in
     /// every unit). Over-emitting an unused attribute group is harmless.
     fn push_attrs_and_metadata(&self, ir: &mut String) {
-        // Attribute group for setjmp's `returns_twice` marker. Only emit if
-        // setjmp (any variant) was declared. Apple declares `_setjmp`, Windows
-        // `_setjmp` (2-arg ABI), Linux `setjmp` — all need `returns_twice`.
-        if self.declared_names.contains("setjmp") || self.declared_names.contains("_setjmp") {
-            ir.push_str("\nattributes #0 = { returns_twice }\n");
-            // Functions containing a `try` are marked `#1`.
-            //
-            // This group used to carry `optnone` as well, to stop mem2reg/SROA
-            // from promoting allocas across the setjmp call (a promoted local
-            // lives in a callee-saved register, which `longjmp` restores to its
-            // setjmp-time value — so try-body mutations were invisible to the
-            // catch). That worked, but it deoptimized the ENTIRE function: just
-            // having a `try` cost ~5x on the surrounding loop even when nothing
-            // ever threw (#6385).
-            //
-            // The promotion is now blocked surgically instead, by emitting
-            // `volatile` loads/stores for exactly the allocas the try body
-            // writes (see `crate::volatile_setjmp`) — LLVM refuses to promote
-            // an alloca with any volatile access. Everything else optimizes.
-            //
-            // `noinline` stays. LLVM's `isInlineViable` already refuses to
-            // inline a function that contains a `returns_twice` call, so this
-            // is belt-and-braces rather than load-bearing — but it keeps the
-            // setjmp frame's identity from depending on an internal inliner
-            // policy, at zero cost.
-            ir.push_str("attributes #1 = { noinline }\n");
-        }
         // Verified runtime-helper groups (#6082) — emitted only when a
         // declaration actually references them (mirrors the setjmp gating
         // above). See `helper_decl_attrs` for the audit invariants.

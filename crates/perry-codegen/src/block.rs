@@ -9,8 +9,8 @@
 //! sorts out the registers. Explicit `phi` nodes are still emitted for
 //! control-flow merges (if/else value context, short-circuit logical ops).
 
-use std::cell::{Cell, Ref, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::codegen::FpContractMode;
@@ -62,76 +62,44 @@ impl Default for FpFlags {
 #[derive(Default)]
 pub struct RegCounter {
     value: Cell<u32>,
-    /// Nesting depth of the setjmp-protected regions codegen is currently
-    /// inside (a `try` body, or a `catch` body that a `finally` re-protects).
-    /// Tracked by *emission* depth rather than by block index so it covers
-    /// nested blocks, loops, nested `try`s and duplicated `finally` bodies
-    /// automatically — whatever is lowered while the region is open belongs
-    /// to it, no matter which basic block the instruction lands in.
-    try_region_depth: Cell<u32>,
-    /// Destination pointer of every `store` emitted while
-    /// `try_region_depth > 0`. These are the memory locations this function
-    /// can modify between a `setjmp` and its `longjmp`; the allocas among
-    /// them get `volatile` accesses at IR-render time so LLVM cannot promote
-    /// them into registers that `longjmp` would revert. See
-    /// `crate::volatile_setjmp` for the full argument (#6385).
-    try_region_stores: RefCell<HashSet<String>>,
+    /// Invoke-EH (#7302): stack of landing-pad labels for the active
+    /// handler scopes, innermost last. While non-empty, every emitted call
+    /// that can reach `js_throw` becomes an `invoke` unwinding to the top
+    /// label (followed by an inline continuation label, so the emitting
+    /// code keeps appending transparently). Lexical scoping matches the
+    /// dynamic handler stack: `lower_try` pushes around the try body only —
+    /// catch/finally bodies see the *enclosing* scope, which is exactly
+    /// where a throw escaping them lands at runtime.
+    eh_unwind_labels: RefCell<Vec<String>>,
 }
 
 impl RegCounter {
     pub fn new() -> Self {
         Self {
             value: Cell::new(0),
-            try_region_depth: Cell::new(0),
-            try_region_stores: RefCell::new(HashSet::new()),
+            eh_unwind_labels: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Enter an invoke-EH handler scope: calls emitted from here until the
+    /// matching pop unwind to `lpad_label`.
+    pub fn push_eh_scope(&self, lpad_label: String) {
+        self.eh_unwind_labels.borrow_mut().push(lpad_label);
+    }
+
+    pub fn pop_eh_scope(&self) {
+        self.eh_unwind_labels.borrow_mut().pop();
+    }
+
+    /// Landing pad of the innermost active handler scope, if any.
+    pub fn current_eh_unwind_label(&self) -> Option<String> {
+        self.eh_unwind_labels.borrow().last().cloned()
     }
 
     pub fn next(&self) -> u32 {
         let v = self.value.get() + 1;
         self.value.set(v);
         v
-    }
-
-    /// Open a setjmp-protected region: every `store` emitted from here until
-    /// the matching `exit_try_region` is recorded as "modified between the
-    /// setjmp and a possible longjmp".
-    pub fn enter_try_region(&self) {
-        self.try_region_depth.set(self.try_region_depth.get() + 1);
-    }
-
-    pub fn exit_try_region(&self) {
-        self.try_region_depth
-            .set(self.try_region_depth.get().saturating_sub(1));
-    }
-
-    pub fn try_region_stores(&self) -> Ref<'_, HashSet<String>> {
-        self.try_region_stores.borrow()
-    }
-
-    /// Typed twin of [`note_emitted`] for `LlInst::Store` pushes: record the
-    /// store destination if we are inside a setjmp-protected region.
-    pub(crate) fn note_store_ptr(&self, ptr: &str) {
-        if self.try_region_depth.get() == 0 {
-            return;
-        }
-        if ptr.starts_with('%') {
-            self.try_region_stores.borrow_mut().insert(ptr.to_string());
-        }
-    }
-
-    /// Record `line`'s store destination if we are inside a try region.
-    /// Called from [`LlBlock::emit`], the single choke point every emitter
-    /// (including `emit_raw`) funnels through.
-    fn note_emitted(&self, line: &str) {
-        if self.try_region_depth.get() == 0 {
-            return;
-        }
-        if let Some(ptr) = crate::volatile_setjmp::store_dest_ptr(line) {
-            if ptr.starts_with('%') {
-                self.try_region_stores.borrow_mut().insert(ptr.to_string());
-            }
-        }
     }
 }
 
@@ -181,6 +149,14 @@ impl LlBlock {
         self.terminated
     }
 
+    /// Mark the block terminated after emitting a terminator through
+    /// `emit_raw` (e.g. `catchswitch`/`catchret` in the SEH dispatch, which
+    /// have no dedicated builder methods). Without this the block would
+    /// silently accept further instructions after its terminator.
+    pub fn mark_terminated(&mut self) {
+        self.terminated = true;
+    }
+
     /// #5093: true if this block contains a `call` to anything other than an
     /// `@llvm.*` intrinsic or an inline-asm marker. The class-field versioned
     /// loop uses this to verify AT COMPILE TIME that its fast clone came out
@@ -202,14 +178,11 @@ impl LlBlock {
         self.reg()
     }
 
-    /// Typed twin of [`emit`]: same terminator discipline, same try-region
-    /// store tracking, no line formatting.
+    /// Typed twin of [`emit`]: same terminator discipline, no line
+    /// formatting.
     fn push_inst(&mut self, inst: crate::inst::LlInst) {
         if self.terminated {
             return;
-        }
-        if let crate::inst::LlInst::Store { ptr, .. } = &inst {
-            self.counter.note_store_ptr(ptr);
         }
         self.instructions.push(inst);
     }
@@ -224,9 +197,6 @@ impl LlBlock {
             return;
         }
         let line = line.into();
-        // #6385: note stores emitted inside a setjmp-protected region so
-        // `LlFunction::to_ir` can make the backing allocas volatile.
-        self.counter.note_emitted(&line);
         self.instructions
             .push(crate::inst::LlInst::Raw(format!("  {}", line)));
     }
@@ -241,6 +211,19 @@ impl LlBlock {
 
     pub fn emit_raw(&mut self, line: impl Into<String>) {
         self.emit(line);
+    }
+
+    /// Invoke-EH (#7302): emit the continuation label that follows an
+    /// `invoke` inline in this block's instruction stream. Flush-left (no
+    /// two-space instruction indent) so IR-consuming tools that anchor
+    /// labels at column 0 (`scripts/gc_root_dominance_check.py`'s LABEL_RE)
+    /// keep parsing the block structure correctly.
+    fn emit_inline_label(&mut self, label: &str) {
+        if self.terminated {
+            return;
+        }
+        self.instructions
+            .push(crate::inst::LlInst::Raw(format!("{}:", label)));
     }
 
     /// Number of instructions currently in this block. Used by
@@ -1104,30 +1087,70 @@ impl LlBlock {
 
     // -------- Function calls --------
 
+    /// Invoke-EH (#7302): if a handler scope is active and this callee can
+    /// reach `js_throw`, the call must carry the scope's unwind edge —
+    /// otherwise a throw beneath it sails PAST this function's handlers (the
+    /// IP would sit outside every LSDA call-site range). Returns the
+    /// `to`/`unwind` suffix and emits nothing; `None` means "emit a plain
+    /// call". The continuation label is emitted by the caller right after
+    /// the invoke line — LLVM accepts labels mid-"block" textually, and the
+    /// LlBlock keeps appending into the continuation transparently.
+    fn eh_invoke_suffix(&mut self, func_name: &str) -> Option<(String, String)> {
+        let lpad = self.counter.current_eh_unwind_label()?;
+        if crate::eh_mode::callee_is_nothrow(func_name) {
+            return None;
+        }
+        let cont = format!("eh.cont{}", self.counter.next());
+        Some((cont, lpad))
+    }
+
     pub fn call(&mut self, ret_ty: LlvmType, func_name: &str, args: &[(LlvmType, &str)]) -> String {
         // #835 + #846: record this emission against the FFI provenance
         // registry. The driver consults the registry after all per-module
         // codegen finishes to auto-link the providing crate.
         crate::ext_registry::record_ffi_call(func_name);
         let r = self.reg();
-        self.push_inst(crate::inst::LlInst::Call {
-            dst: Some(r.clone()),
-            ret: ret_ty,
-            callee: func_name.to_string(),
-            args: args.iter().map(|(t, v)| (*t, v.to_string())).collect(),
-        });
+        // Invoke-EH (#7302): inside a handler scope, throw-capable calls
+        // carry the unwind edge. The invoke + inline continuation label ride
+        // the Raw escape hatch; the native-construction backend bails on
+        // personality-carrying modules (see codegen/mod.rs) until its line
+        // reader learns invoke.
+        if let Some((cont, lpad)) = self.eh_invoke_suffix(func_name) {
+            let arg_str = format_args(args);
+            self.emit(format!(
+                "{} = invoke {} @{}({}) to label %{} unwind label %{}",
+                r, ret_ty, func_name, arg_str, cont, lpad
+            ));
+            self.emit_inline_label(&cont);
+        } else {
+            self.push_inst(crate::inst::LlInst::Call {
+                dst: Some(r.clone()),
+                ret: ret_ty,
+                callee: func_name.to_string(),
+                args: args.iter().map(|(t, v)| (*t, v.to_string())).collect(),
+            });
+        }
         r
     }
 
     pub fn call_void(&mut self, func_name: &str, args: &[(LlvmType, &str)]) {
         // #835 + #846: same registry hook as `call` — see comment there.
         crate::ext_registry::record_ffi_call(func_name);
-        self.push_inst(crate::inst::LlInst::Call {
-            dst: None,
-            ret: "void",
-            callee: func_name.to_string(),
-            args: args.iter().map(|(t, v)| (*t, v.to_string())).collect(),
-        });
+        if let Some((cont, lpad)) = self.eh_invoke_suffix(func_name) {
+            let arg_str = format_args(args);
+            self.emit(format!(
+                "invoke void @{}({}) to label %{} unwind label %{}",
+                func_name, arg_str, cont, lpad
+            ));
+            self.emit_inline_label(&cont);
+        } else {
+            self.push_inst(crate::inst::LlInst::Call {
+                dst: None,
+                ret: "void",
+                callee: func_name.to_string(),
+                args: args.iter().map(|(t, v)| (*t, v.to_string())).collect(),
+            });
+        }
     }
 
     /// Empty inline-asm barrier (`call void asm sideeffect "", ""()`).
@@ -1149,12 +1172,30 @@ impl LlBlock {
         args: &[(LlvmType, &str)],
     ) -> String {
         let r = self.reg();
-        self.push_inst(crate::inst::LlInst::CallIndirect {
-            dst: r.clone(),
-            ret: ret_ty,
-            fptr: fn_ptr.to_string(),
-            args: args.iter().map(|(t, v)| (*t, v.to_string())).collect(),
-        });
+        // Indirect targets (closures, method pointers) can always throw.
+        if let Some(lpad) = self.counter.current_eh_unwind_label() {
+            let arg_str = format_args(args);
+            let param_types: Vec<&str> = args.iter().map(|(t, _)| *t).collect();
+            let cont = format!("eh.cont{}", self.counter.next());
+            self.emit(format!(
+                "{} = invoke {} ({})* {}({}) to label %{} unwind label %{}",
+                r,
+                ret_ty,
+                param_types.join(", "),
+                fn_ptr,
+                arg_str,
+                cont,
+                lpad
+            ));
+            self.emit_inline_label(&cont);
+        } else {
+            self.push_inst(crate::inst::LlInst::CallIndirect {
+                dst: r.clone(),
+                ret: ret_ty,
+                fptr: fn_ptr.to_string(),
+                args: args.iter().map(|(t, v)| (*t, v.to_string())).collect(),
+            });
+        }
         r
     }
 

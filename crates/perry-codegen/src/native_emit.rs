@@ -100,9 +100,12 @@ fn stream_functions<'ctx>(
         let header = synth_define_header(f, force_external);
         let mut stream = crate::dialect::FnStream::begin(context, module, &header)
             .map_err(|e| anyhow!("native IR construction failed in @{}: {:#}", f.name, e))?;
-        if f.has_try {
-            // The setjmp volatile pass needs whole-function analysis; keep
-            // the materialized-text path for try-containing functions.
+        if f.personality.is_some() {
+            // The invoke-EH phi-predecessor rewrite needs whole-function
+            // analysis, and the line reader does not know
+            // invoke/landingpad; keep the materialized-text path for
+            // try-containing functions (#7302 — module-level dispatch bails
+            // even earlier, this is belt-and-braces for direct callers).
             let fn_text = f.to_ir();
             for line in fn_text.lines().skip(1) {
                 stream.line(line).map_err(|e| {
@@ -358,17 +361,19 @@ fn synth_define_header(f: &crate::function::LlFunction, force_external: bool) ->
     } else {
         format!("{} ", f.linkage)
     };
-    let attrs = if f.has_try {
-        " #1"
-    } else if f.force_inline {
+    let attrs = if f.force_inline {
         " alwaysinline"
     } else if f.inline_hint {
         " inlinehint"
     } else {
         ""
     };
+    let personality = match f.personality {
+        Some(p) => format!(" personality ptr @{}", p),
+        None => String::new(),
+    };
     format!(
-        "define {}{} @{}({}){} {{",
-        linkage, f.return_type, f.name, params, attrs
+        "define {}{} @{}({}){}{} {{",
+        linkage, f.return_type, f.name, params, attrs, personality
     )
 }
