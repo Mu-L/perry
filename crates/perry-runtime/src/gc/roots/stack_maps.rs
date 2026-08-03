@@ -64,6 +64,9 @@ struct StackMapIndex {
     /// Every root slot, referenced by `StackMapRecord`'s range. Shared between
     /// records whose live sets are identical.
     roots: Vec<StackMapLocation>,
+    /// Sorted, deduplicated start address of every function that has records.
+    /// Used to confirm a matched record belongs to the function `ip` is in.
+    function_starts: Vec<usize>,
     chain_walkable: bool,
     min_pc: usize,
     max_pc: usize,
@@ -193,9 +196,16 @@ fn index_records(records: Vec<StackMapRecord>, roots: Vec<StackMapLocation>) -> 
     });
     let min_pc = records.first().map_or(usize::MAX, |record| record.pc);
     let max_pc = records.last().map_or(0, |record| record.pc);
+    let mut function_starts: Vec<usize> = records
+        .iter()
+        .map(|record| record.function_address)
+        .collect();
+    function_starts.sort_unstable();
+    function_starts.dedup();
     StackMapIndex {
         records,
         roots,
+        function_starts,
         chain_walkable,
         min_pc,
         max_pc,
@@ -275,13 +285,40 @@ impl StackMapIndex {
         if ip.abs_diff(candidate_pc) > MAX_SAFEPOINT_RETURN_DELTA {
             return &[];
         }
+        // The ±16 window is a distance, not a containment check: nothing in it
+        // says the matched record belongs to the function `ip` is executing.
+        // Functions are adjacent in .text, so an `ip` early in B can sit within
+        // the window of a safepoint at the end of A — and the walker would then
+        // use A's frame offsets against B's frame and rewrite unrelated words.
+        //
+        // Require the record's function to be the one containing `ip`: the
+        // greatest mapped function start <= ip. Measured across the probe
+        // suite, every near-match is already same-function (deltas 8..64, all
+        // `same=true`), so this rejects only the cross-function case — and
+        // notably NOT the legitimate delta=8 match, which requiring an exact
+        // pc would have discarded along with its roots.
+        //
+        // Residual gap, stated rather than papered over: a function with no
+        // safepoints is absent from `function_starts`, so an `ip` inside one
+        // resolves to the previous mapped function. Closing that needs a
+        // per-function code extent, which Mach-O does not expose cheaply
+        // (`Lfunc_end` covers only EH-carrying functions; there is no `.size`).
+        let owning = self
+            .function_starts
+            .partition_point(|start| *start <= ip)
+            .checked_sub(1)
+            .map(|index| self.function_starts[index]);
         let first = self
             .records
             .partition_point(|record| record.pc < candidate_pc);
         let last = self
             .records
             .partition_point(|record| record.pc <= candidate_pc);
-        &self.records[first..last]
+        let matched = &self.records[first..last];
+        match (matched.first(), owning) {
+            (Some(record), Some(owning)) if record.function_address == owning => matched,
+            _ => &[],
+        }
     }
 }
 
@@ -1263,6 +1300,43 @@ mod tests {
             .chain_walkable,
             "a non-FP/SP register must disable the fast walk"
         );
+    }
+
+    #[test]
+    fn rejects_a_record_from_an_adjacent_function() {
+        // A safepoint at the end of A must not be matched for an `ip` early in
+        // B just because it falls inside the +-16 window: the walker would use
+        // A's frame offsets against B's frame.
+        let index = index_records(
+            vec![
+                StackMapRecord {
+                    pc: 0x1ffc,
+                    function_address: 0x1000,
+                    stack_size: 32,
+                    roots_start: 0,
+                    roots_len: 1,
+                },
+                StackMapRecord {
+                    pc: 0x2040,
+                    function_address: 0x2000,
+                    stack_size: 32,
+                    roots_start: 0,
+                    roots_len: 1,
+                },
+            ],
+            vec![StackMapLocation {
+                dwarf_reg: 29,
+                offset: -8,
+            }],
+        );
+        // 0x2004 is 8 bytes past A's last safepoint but lives in B.
+        assert!(
+            index.match_records(0x2004).is_empty(),
+            "a record from the previous function must not match"
+        );
+        // A same-function near-match is still accepted — requiring an exact pc
+        // would drop it, and the measured suite has one.
+        assert_eq!(index.match_records(0x2038).len(), 1);
     }
 
     #[test]
