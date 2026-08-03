@@ -379,15 +379,91 @@ imbalance that no audited elision closes.** The contract's real-app effect
 is −4.8% metadata (probe-scale was −8.8%; dependency code has
 proportionally fewer audited-helper sites).
 
-**Standing verdict, now measured on every axis:** the shadow stack is the
-three-axis optimum shipping today — wall-clock tied within timer
-quantization, RSS tied, file-size won by 3.5 MB on a real application.
-The statepoint backend is correctness-superior (the forgot-to-root class
-is structurally impossible), speed-competitive, and 59% leaner in metadata
-than its own first prototype — and its remaining 25× size gap is proven
-(not projected) to close only through repsel promotion shrinking the
-maybe-pointer root set, or RS4GC managed-pointer SSA. Both are tracked;
-neither is this branch's to deliver.
+**Verdict as of 2026-08-01 (superseded below):** the shadow stack was the
+three-axis optimum — wall-clock tied within timer quantization, RSS tied,
+file-size won by 3.5 MB on a real application. The statepoint backend was
+correctness-superior (the forgot-to-root class is structurally impossible),
+speed-competitive, and 59% leaner in metadata than its own first prototype,
+but carried a 25× metadata imbalance that no audited elision closed.
+
+That conclusion assumed the metadata's *content* was the cost. It was not.
+
+## The file-size axis was the wire format, not the roots (2026-08-03)
+
+Re-examined with `scripts/stackmap_anatomy.py`, which breaks the section
+down by structural component and asserts it parsed 100% of the bytes.
+
+**First correction: generated code is already smaller under statepoints.**
+On `test-drizzle-pg` the RS4GC arm's `__text` is 20,128,708 against shadow's
+20,376,748 — **248 KB better**. The entire loss is `__llvm_stackmaps`.
+
+**Second correction: most of that section is provably dead weight.**
+
+| component | share of section |
+|---|---:|
+| `Constant` location slots (3 per record: CC / Flags / NumDeopt) | 40.6% |
+| duplicate base/derived location slots | 13.3% |
+| record headers (incl. an 8-byte patchpoint ID never patched) | 18.0% |
+| inter-record padding | 11.3% |
+
+`stack_maps.rs` **already discarded the constants and collapsed the
+base/derived pair at parse time**. Over half the section was shipped in the
+binary and thrown away at startup — redundancy, not a tradeoff. LLVM's
+stack map is a JIT-patching wire format; an AOT collector needs
+`{dwarf_reg, offset}` per distinct root and nothing else.
+
+**Compaction measured on drizzle** (4,214,384 B, 124 concatenated maps,
+1,717 functions, 33,406 records, 154,020 distinct roots):
+
+| encoding | bytes | ratio |
+|---|---:|---:|
+| flat varint (drop constants + duplicate pairs) | 387,199 | 10.9× |
+| + roots sorted and delta-encoded | 286,258 | 14.7× |
+| + "same live set as previous record" flag | **132,418** | **31.8×** |
+
+The last row is the big one and it is a fact about real programs, not a
+coding trick: **77% of records have exactly the live set of the record
+before them**, because consecutive safepoints in a function share their
+roots. That same fact shrinks the in-memory index — the decoder points
+repeats at one copy instead of materialising 154k entries — so it is an RSS
+win as well as a file-size one.
+
+**Projected onto the measured RS4GC arm:** 3,875,416 B of metadata becomes
+~121 KB, taking the binary from 31,957,792 to ~28.20 MB against shadow's
+28,474,576 — a **~271 KB win**, versus a 3.5 MB loss before. Statepoints
+then lead on **all three axes** (wall-clock −0.93%, RSS flat, size −271 KB).
+
+### Why the rewrite happens on assembly
+
+`clang -S` prints the stack map as ordinary directives with the function
+addresses as **symbol names in plain text** (`.quad _main`), so one text
+parser replaces Mach-O *and* ELF relocation parsing, `llvm-objcopy`, and a
+second link pass. Two facts settled this empirically rather than by taste:
+
+- the stack map's function-address fields are **external symbol
+  relocations** (`otool -r`: `extern 1` at offsets 16 and 40), so a
+  separately assembled table can reference them by name and the linker
+  resolves it — no relink needed;
+- `-S` costs nothing: it takes the **same 0.04s as `-c`** (codegen is the
+  cost, printing text is free), and `llvm-mc` assembles in 0.02s. Use
+  `llvm-mc`, not `clang -c file.s` — the latter is 0.13s of driver overhead.
+
+### Two traps that cost time here
+
+- **On-disk stack-map addresses look like garbage** (`0x00300000000008b0`)
+  because they are **dyld chained-fixup entries**, not addresses: bits 0-35
+  are the target, bits 51-62 the chain delta to the next fixup. dyld
+  resolves them at load. Do not conclude records are mismatching from an
+  on-disk read.
+- **The section is a concatenation of one map per object file**, not a
+  single map. A parser that reads only the first header silently
+  under-counts, and nothing downstream notices. Assert that parse coverage
+  equals the section size.
+- **`.no_dead_strip` names the block's label from outside the block.**
+  Removing the label without retargeting that directive leaves an undefined
+  symbol — and the directive is also the only thing keeping a section
+  nothing references from being stripped, which would leave the collector
+  with no roots at all.
 
 ### The transfer question, also measured: can the audit shrink the SHADOW stack?
 

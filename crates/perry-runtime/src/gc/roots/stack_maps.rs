@@ -7,7 +7,7 @@
 //! in the emitted stack-map section.
 //!
 //! This first implementation deliberately targets macOS, where the experiment
-//! is being measured. It discovers the concatenated `__LLVM_STACKMAPS` section
+//! is being measured. It discovers the concatenated `__PERRY_GCMAP` section
 //! in the main Mach-O image and uses the platform unwinder to recover the
 //! frame-register value for each active generated frame. Unsupported targets
 //! return no roots; neither native-stack experiment may be used for correctness
@@ -18,9 +18,13 @@ use crate::gc::telemetry::RootSourcesTraceStats;
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
-const STACK_MAP_VERSION: u8 = 3;
-const LOCATION_DIRECT: u8 = 2;
-const LOCATION_INDIRECT: u8 = 3;
+/// Magic and version of the compact map the compiler emits
+/// (`perry-codegen/src/gc_map.rs`). LLVM's own stack-map section is rewritten
+/// at assembly time and never reaches the binary: >50% of it was the
+/// statepoint constant preamble and base/derived duplicates that this parser
+/// discarded anyway, and shipping it cost 3.9 MB on a real application.
+const GC_MAP_MAGIC: &[u8; 4] = b"PGCM";
+const GC_MAP_VERSION: u8 = 1;
 const MAX_SAFEPOINT_RETURN_DELTA: usize = 16;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StackMapLocation {
@@ -31,13 +35,20 @@ struct StackMapLocation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StackMapRecord {
     pc: usize,
-    /// Start address of the containing function, from the stack-map header.
-    /// Used to decode that function's prologue when an SP-relative location
-    /// needs the FP-to-SP offset (see `fp_to_sp_offset`).
+    /// Start address of the containing function, from the map's function
+    /// table. Used to decode that function's prologue when an SP-relative
+    /// location needs the FP-to-SP offset (see `fp_to_sp_offset`).
     function_address: usize,
-    /// The containing function's total frame size from the stack-map header.
+    /// The containing function's total frame size from the function table.
     stack_size: u64,
-    locations: Vec<StackMapLocation>,
+    /// Half-open range into `StackMapIndex::roots`.
+    ///
+    /// A range rather than an owned `Vec` because **77% of records have the
+    /// identical live set as the record before them** — consecutive safepoints
+    /// in a function usually share their roots — so the decoder points the
+    /// repeats at one copy instead of duplicating 154k entries.
+    roots_start: u32,
+    roots_len: u32,
 }
 
 /// Parsed section plus the facts the fast walker's preconditions need.
@@ -50,9 +61,20 @@ struct StackMapRecord {
 #[derive(Debug, Default)]
 struct StackMapIndex {
     records: Vec<StackMapRecord>,
+    /// Every root slot, referenced by `StackMapRecord`'s range. Shared between
+    /// records whose live sets are identical.
+    roots: Vec<StackMapLocation>,
     chain_walkable: bool,
     min_pc: usize,
     max_pc: usize,
+}
+
+impl StackMapIndex {
+    fn locations(&self, record: &StackMapRecord) -> &[StackMapLocation] {
+        let start = record.roots_start as usize;
+        let end = start + record.roots_len as usize;
+        self.roots.get(start..end).unwrap_or(&[])
+    }
 }
 
 static STACK_MAPS: OnceLock<StackMapIndex> = OnceLock::new();
@@ -125,31 +147,36 @@ fn stack_maps() -> &'static StackMapIndex {
         let Some(section) = loaded_stack_map_section() else {
             return StackMapIndex::default();
         };
-        let mut records = parse_concatenated_stack_maps(section).unwrap_or_default();
+        let Some((mut records, roots)) = parse_gc_map(section) else {
+            return StackMapIndex::default();
+        };
         records.sort_unstable_by_key(|record| record.pc);
-        index_records(records)
+        index_records(records, roots)
     })
 }
 
-fn index_records(records: Vec<StackMapRecord>) -> StackMapIndex {
+fn index_records(records: Vec<StackMapRecord>, roots: Vec<StackMapLocation>) -> StackMapIndex {
     // SP-relative locations are admitted here and resolved per FRAME in the
     // walker, which decodes the owning function's `add x29, sp, #imm`
     // prologue to get the body SP (#7173). Deciding it here would mean
     // dereferencing every function address at startup — unsafe for records
     // whose addresses are not live code, and unnecessary because the walker
     // already fails closed to the platform unwinder on any anomaly.
-    let chain_walkable = records.iter().all(|record| {
-        record.locations.iter().all(|location| {
-            matches!(
-                location.dwarf_reg,
-                DWARF_REG_FP_AARCH64 | DWARF_REG_SP_AARCH64
-            )
-        })
+    // The decoder only ever produces these two bases, but keep the check: it
+    // is what decides the fast walker is usable at all, and a format change
+    // that introduced a third base must disable the chain walk, not be
+    // trusted by it.
+    let chain_walkable = roots.iter().all(|location| {
+        matches!(
+            location.dwarf_reg,
+            DWARF_REG_FP_AARCH64 | DWARF_REG_SP_AARCH64
+        )
     });
     let min_pc = records.first().map_or(usize::MAX, |record| record.pc);
     let max_pc = records.last().map_or(0, |record| record.pc);
     StackMapIndex {
         records,
+        roots,
         chain_walkable,
         min_pc,
         max_pc,
@@ -302,104 +329,118 @@ fn verify_visit(
     stats
 }
 
-fn parse_concatenated_stack_maps(bytes: &[u8]) -> Option<Vec<StackMapRecord>> {
-    let mut all = Vec::new();
+/// Decode every concatenated compact map in the section.
+///
+/// The linker concatenates one blob per object file, so this walks blob by
+/// blob using each header's `total_len` rather than assuming a single map —
+/// a decoder that reads only the first header silently drops every other
+/// object's roots, which is invisible until a collection frees a live object.
+fn parse_gc_map(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, Vec<StackMapLocation>)> {
+    let mut records = Vec::new();
+    let mut roots: Vec<StackMapLocation> = Vec::new();
     let mut base = 0usize;
-    while base < bytes.len() {
-        // Linkers preserve the input section's 8-byte alignment. Ignore a
-        // zero-filled tail, but do not search through malformed non-zero data.
-        if bytes[base..].iter().all(|byte| *byte == 0) {
-            break;
+
+    while base + 16 <= bytes.len() {
+        if bytes.get(base..base + 4)? != GC_MAP_MAGIC {
+            // Linkers pad between input sections; a zero tail is the end.
+            if bytes[base..].iter().all(|byte| *byte == 0) {
+                break;
+            }
+            base += 1;
+            continue;
         }
-        let (mut records, consumed) = parse_one_stack_map(&bytes[base..])?;
-        if consumed == 0 {
+        if read_u8(bytes, base + 4)? != GC_MAP_VERSION {
             return None;
         }
-        all.append(&mut records);
-        base = base.checked_add(consumed)?;
+        let function_count = read_u32(bytes, base + 8)? as usize;
+        let total_len = read_u32(bytes, base + 12)? as usize;
+        let table = base.checked_add(16)?;
+        let stream_start = table.checked_add(function_count.checked_mul(16)?)?;
+        let blob_end = base.checked_add(total_len)?;
+        if blob_end > bytes.len() || stream_start > blob_end {
+            return None;
+        }
+
+        let mut cursor = stream_start;
+        for index in 0..function_count {
+            let entry = table + index * 16;
+            let function_address = read_u64(bytes, entry)? as usize;
+            let stack_size = u64::from(read_u32(bytes, entry + 8)?);
+            let record_count = read_u32(bytes, entry + 12)? as usize;
+
+            let mut instruction_offset = 0u32;
+            let mut previous: Option<(u32, u32)> = None;
+            for _ in 0..record_count {
+                let (delta, next) = read_varint(bytes, cursor, blob_end)?;
+                cursor = next;
+                instruction_offset = instruction_offset.wrapping_add(delta as u32);
+
+                let (header, next) = read_varint(bytes, cursor, blob_end)?;
+                cursor = next;
+                let range = if header & 1 == 1 {
+                    // Repeat: this safepoint's live set is the previous one's.
+                    previous?
+                } else {
+                    let count = (header >> 1) as usize;
+                    let start = u32::try_from(roots.len()).ok()?;
+                    let mut last: Option<i32> = None;
+                    for _ in 0..count {
+                        let (value, next) = read_varint(bytes, cursor, blob_end)?;
+                        cursor = next;
+                        let dwarf_reg = if value & 1 == 1 {
+                            DWARF_REG_SP_AARCH64
+                        } else {
+                            DWARF_REG_FP_AARCH64
+                        };
+                        let delta = unzigzag((value >> 1) as u32);
+                        let offset = match last {
+                            None => delta,
+                            Some(previous_offset) => previous_offset.wrapping_add(delta),
+                        };
+                        last = Some(offset);
+                        roots.push(StackMapLocation { dwarf_reg, offset });
+                    }
+                    (start, u32::try_from(count).ok()?)
+                };
+                previous = Some(range);
+
+                records.push(StackMapRecord {
+                    pc: function_address.checked_add(instruction_offset as usize)?,
+                    function_address,
+                    stack_size,
+                    roots_start: range.0,
+                    roots_len: range.1,
+                });
+            }
+        }
+
+        base = align_up(blob_end, 8)?;
     }
-    Some(all)
+
+    Some((records, roots))
 }
 
-fn parse_one_stack_map(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, usize)> {
-    if read_u8(bytes, 0)? != STACK_MAP_VERSION {
-        return None;
-    }
-    let function_count = read_u32(bytes, 4)? as usize;
-    let constant_count = read_u32(bytes, 8)? as usize;
-    let record_count = read_u32(bytes, 12)? as usize;
-    let mut offset = 16usize;
-
-    let mut functions = Vec::with_capacity(function_count);
-    let mut expected_records = 0usize;
-    for _ in 0..function_count {
-        let address = read_u64(bytes, offset)? as usize;
-        let stack_size = read_u64(bytes, offset + 8)?;
-        let records = read_u64(bytes, offset + 16)? as usize;
-        functions.push((address, stack_size, records));
-        expected_records = expected_records.checked_add(records)?;
-        offset = offset.checked_add(24)?;
-    }
-    if expected_records != record_count {
-        return None;
-    }
-    offset = offset.checked_add(constant_count.checked_mul(8)?)?;
-    if offset > bytes.len() {
-        return None;
-    }
-
-    let mut out = Vec::with_capacity(record_count);
-    for (function_address, function_stack_size, function_record_count) in functions {
-        for _ in 0..function_record_count {
-            let instruction_offset = read_u32(bytes, offset + 8)? as usize;
-            let location_count = read_u16(bytes, offset + 14)? as usize;
-            offset = offset.checked_add(16)?;
-
-            let mut locations = Vec::new();
-            for _ in 0..location_count {
-                let kind = read_u8(bytes, offset)?;
-                let size = read_u16(bytes, offset + 2)?;
-                let dwarf_reg = read_u16(bytes, offset + 4)?;
-                let location_offset = read_i32(bytes, offset + 8)?;
-                if matches!(kind, LOCATION_DIRECT | LOCATION_INDIRECT) && size == 8 {
-                    let location = StackMapLocation {
-                        dwarf_reg,
-                        offset: location_offset,
-                    };
-                    // A statepoint records a base/derived pair for every
-                    // relocation. Perry currently uses the same value for
-                    // both, so LLVM commonly emits the exact same spill slot
-                    // twice. Visit that physical word once.
-                    if !locations.contains(&location) {
-                        locations.push(location);
-                    }
-                }
-                offset = offset.checked_add(12)?;
-            }
-
-            // LLVM aligns the live-out header independently from the whole
-            // record. This first padding is observable whenever the location
-            // count is odd (one Direct root is a common case).
-            offset = align_up(offset, 8)?;
-            // Two reserved bytes followed by the live-out count.
-            let live_out_count = read_u16(bytes, offset + 2)? as usize;
-            offset = offset
-                .checked_add(4)?
-                .checked_add(live_out_count.checked_mul(4)?)?;
-            offset = align_up(offset, 8)?;
-            if offset > bytes.len() {
-                return None;
-            }
-
-            out.push(StackMapRecord {
-                pc: function_address.checked_add(instruction_offset)?,
-                function_address,
-                stack_size: function_stack_size,
-                locations,
-            });
+/// LEB128 read bounded by the blob it belongs to, so a corrupt length cannot
+/// walk into the next blob or off the section.
+fn read_varint(bytes: &[u8], mut at: usize, end: usize) -> Option<(u64, usize)> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    loop {
+        if at >= end || shift > 63 {
+            return None;
         }
+        let byte = *bytes.get(at)?;
+        at += 1;
+        value |= u64::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            return Some((value, at));
+        }
+        shift += 7;
     }
-    Some((out, offset))
+}
+
+fn unzigzag(value: u32) -> i32 {
+    ((value >> 1) as i32) ^ -((value & 1) as i32)
 }
 
 fn align_up(value: usize, alignment: usize) -> Option<usize> {
@@ -412,20 +453,8 @@ fn read_u8(bytes: &[u8], offset: usize) -> Option<u8> {
     bytes.get(offset).copied()
 }
 
-fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(
-        bytes.get(offset..offset + 2)?.try_into().ok()?,
-    ))
-}
-
 fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_le_bytes(
-        bytes.get(offset..offset + 4)?.try_into().ok()?,
-    ))
-}
-
-fn read_i32(bytes: &[u8], offset: usize) -> Option<i32> {
-    Some(i32::from_le_bytes(
         bytes.get(offset..offset + 4)?.try_into().ok()?,
     ))
 }
@@ -520,8 +549,8 @@ fn loaded_stack_map_section() -> Option<&'static [u8]> {
                 let mut section_ptr = command_ptr.add(std::mem::size_of::<SegmentCommand64>());
                 for _ in 0..segment.section_count {
                     let section = std::ptr::read_unaligned(section_ptr.cast::<Section64>());
-                    if fixed_name_matches(&section.segment_name, b"__LLVM_STACKMAPS")
-                        && fixed_name_matches(&section.section_name, b"__llvm_stackmaps")
+                    if fixed_name_matches(&section.segment_name, b"__PERRY_GCMAP")
+                        && fixed_name_matches(&section.section_name, b"__perry_gcmap")
                     {
                         let address = (section.address as isize).checked_add(slide)? as usize;
                         let size = usize::try_from(section.size).ok()?;
@@ -539,11 +568,11 @@ fn loaded_stack_map_section() -> Option<&'static [u8]> {
     None
 }
 
-/// ELF (#7173): the `.llvm_stackmaps` section of the main executable.
+/// ELF (#7173): the `.perry_gcmap` section of the main executable.
 ///
 /// Linker-provided `__start_`/`__stop_` symbols would need weak linkage
 /// (unstable in Rust) or `-rdynamic` (not guaranteed), so instead: read
-/// `/proc/self/exe`'s section headers for `.llvm_stackmaps` (sh_addr,
+/// `/proc/self/exe`'s section headers for `.perry_gcmap` (sh_addr,
 /// sh_size) and add the main object's load bias from the first
 /// `dl_iterate_phdr` callback. Runtime-verified gates for this path are
 /// pending a Linux host — tracked in #7173; the parser, index, matching,
@@ -551,7 +580,7 @@ fn loaded_stack_map_section() -> Option<&'static [u8]> {
 #[cfg(target_os = "linux")]
 fn loaded_stack_map_section() -> Option<&'static [u8]> {
     let bytes = std::fs::read("/proc/self/exe").ok()?;
-    let (addr, size) = elf_section_vaddr(&bytes, b".llvm_stackmaps")?;
+    let (addr, size) = elf_section_vaddr(&bytes, b".perry_gcmap")?;
     let bias = main_object_load_bias()?;
     let start = bias.checked_add(addr)?;
     if start == 0 || size == 0 {
@@ -680,7 +709,7 @@ mod unwind {
         }
         state.stats.records_matched = state.stats.records_matched.saturating_add(matched.len());
         for record in matched {
-            for location in &record.locations {
+            for location in state.index.locations(record) {
                 state.stats.locations_visited = state.stats.locations_visited.saturating_add(1);
                 let base = _Unwind_GetGR(context, i32::from(location.dwarf_reg));
                 let address = if location.offset < 0 {
@@ -831,7 +860,7 @@ mod fp_chain {
                             // SP-relative record in the image (#7173).
                             let sp = fp_to_sp_offset(record.function_address)
                                 .and_then(|off| caller_fp.checked_sub(off));
-                            for location in &record.locations {
+                            for location in index.locations(record) {
                                 stats.locations_visited = stats.locations_visited.saturating_add(1);
                                 let base = if location.dwarf_reg == DWARF_REG_FP_AARCH64 {
                                     Some(caller_fp)
@@ -887,154 +916,183 @@ mod fp_chain {
 mod tests {
     use super::*;
 
-    fn one_map_with_locations(
-        function: u64,
-        id: u64,
-        offset: u32,
-        locations: &[(u8, i32)],
-    ) -> Vec<u8> {
+    fn push_varint(out: &mut Vec<u8>, mut value: u64) {
+        while value >= 0x80 {
+            out.push((value as u8 & 0x7F) | 0x80);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+
+    fn zigzag(value: i32) -> u64 {
+        ((value << 1) ^ (value >> 31)) as u32 as u64
+    }
+
+    /// Build one compact blob, mirroring `perry-codegen/src/gc_map.rs`.
+    /// `records` is `(instruction_offset, roots)`, roots as `(dwarf_reg, offset)`;
+    /// an empty root slice with `repeat` set encodes the repeat flag.
+    fn one_map(function: u64, records: &[(u32, Vec<(u16, i32)>, bool)]) -> Vec<u8> {
+        let mut stream = Vec::new();
+        let mut previous_offset = 0u32;
+        for (instruction_offset, roots, repeat) in records {
+            push_varint(&mut stream, u64::from(instruction_offset.wrapping_sub(previous_offset)));
+            previous_offset = *instruction_offset;
+            if *repeat {
+                push_varint(&mut stream, 1);
+                continue;
+            }
+            push_varint(&mut stream, (roots.len() as u64) << 1);
+            let mut last: Option<i32> = None;
+            for (reg, offset) in roots {
+                let bit = u64::from(*reg == DWARF_REG_SP_AARCH64);
+                let delta = match last {
+                    None => *offset,
+                    Some(previous) => offset.wrapping_sub(previous),
+                };
+                push_varint(&mut stream, (zigzag(delta) << 1) | bit);
+                last = Some(*offset);
+            }
+        }
+
+        let total_len = 16 + 16 + stream.len();
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&[STACK_MAP_VERSION, 0, 0, 0]);
+        bytes.extend_from_slice(GC_MAP_MAGIC);
+        bytes.push(GC_MAP_VERSION);
+        bytes.extend_from_slice(&[0, 0, 0]);
         bytes.extend_from_slice(&1u32.to_le_bytes());
-        bytes.extend_from_slice(&0u32.to_le_bytes());
-        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&(total_len as u32).to_le_bytes());
         bytes.extend_from_slice(&function.to_le_bytes());
-        bytes.extend_from_slice(&32u64.to_le_bytes());
-        bytes.extend_from_slice(&1u64.to_le_bytes());
-        bytes.extend_from_slice(&id.to_le_bytes());
-        bytes.extend_from_slice(&offset.to_le_bytes());
-        bytes.extend_from_slice(&0u16.to_le_bytes());
-        bytes.extend_from_slice(&(locations.len() as u16).to_le_bytes());
-        for (kind, frame_offset) in locations {
-            bytes.push(*kind);
-            bytes.push(0);
-            bytes.extend_from_slice(&8u16.to_le_bytes());
-            bytes.extend_from_slice(&29u16.to_le_bytes());
-            bytes.extend_from_slice(&0u16.to_le_bytes());
-            bytes.extend_from_slice(&frame_offset.to_le_bytes());
-        }
-        while bytes.len() % 8 != 0 {
-            bytes.push(0);
-        }
-        bytes.extend_from_slice(&0u16.to_le_bytes());
-        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&32u32.to_le_bytes());
+        bytes.extend_from_slice(&(records.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&stream);
         while bytes.len() % 8 != 0 {
             bytes.push(0);
         }
         bytes
     }
 
-    fn one_map(function: u64, id: u64, offset: u32, frame_offset: i32) -> Vec<u8> {
-        one_map_with_locations(function, id, offset, &[(LOCATION_DIRECT, frame_offset)])
+    fn simple(function: u64, offset: u32, frame_offset: i32) -> Vec<u8> {
+        one_map(function, &[(offset, vec![(29, frame_offset)], false)])
     }
 
     #[test]
-    fn parses_direct_mutable_frame_location() {
-        let bytes = one_map(0x1000, 42, 0x10, -8);
-        let (records, consumed) = parse_one_stack_map(&bytes).expect("valid stack map");
-        assert_eq!(consumed, bytes.len());
+    fn decodes_frame_location() {
+        let bytes = simple(0x1000, 0x10, -8);
+        let (records, roots) = parse_gc_map(&bytes).expect("valid map");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].pc, 0x1010);
+        assert_eq!(records[0].function_address, 0x1000);
+        assert_eq!(records[0].stack_size, 32);
         assert_eq!(
-            records,
-            vec![StackMapRecord {
-                pc: 0x1010,
-                function_address: 0x1000,
-                stack_size: 32,
-                locations: vec![StackMapLocation {
-                    dwarf_reg: 29,
-                    offset: -8,
-                }],
+            roots,
+            vec![StackMapLocation {
+                dwarf_reg: 29,
+                offset: -8,
             }]
         );
     }
 
     #[test]
-    fn parses_linker_concatenated_input_sections() {
-        let mut bytes = one_map(0x1000, 42, 0x10, -8);
-        bytes.extend_from_slice(&one_map(0x2000, 43, 0x20, -16));
-        let records = parse_concatenated_stack_maps(&bytes).expect("concatenated maps");
+    fn decodes_linker_concatenated_input_sections() {
+        let mut bytes = simple(0x1000, 0x10, -8);
+        bytes.extend_from_slice(&simple(0x2000, 0x20, -16));
+        let (records, _) = parse_gc_map(&bytes).expect("concatenated maps");
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].pc, 0x1010);
         assert_eq!(records[1].pc, 0x2020);
     }
 
     #[test]
-    fn parses_and_deduplicates_statepoint_spill_locations() {
-        let bytes = one_map_with_locations(
+    fn repeated_live_sets_share_one_copy() {
+        // Three safepoints, the last two repeating the first's live set: the
+        // whole point of the format, and the reason the in-memory index does
+        // not hold 154k duplicated entries on a real application.
+        let bytes = one_map(
             0x1000,
-            7,
-            0x20,
-            &[(LOCATION_INDIRECT, -16), (LOCATION_INDIRECT, -16)],
+            &[
+                (0x10, vec![(29, -8), (29, -16)], false),
+                (0x20, vec![], true),
+                (0x30, vec![], true),
+            ],
         );
-        let (records, consumed) = parse_one_stack_map(&bytes).expect("valid statepoint map");
-        assert_eq!(consumed, bytes.len());
+        let (records, roots) = parse_gc_map(&bytes).expect("valid map");
+        assert_eq!(records.len(), 3);
+        assert_eq!(roots.len(), 2, "the repeats must not append new roots");
+        for record in &records {
+            assert_eq!(record.roots_start, 0);
+            assert_eq!(record.roots_len, 2);
+        }
+    }
+
+    #[test]
+    fn decodes_negative_and_ascending_root_offsets() {
+        let bytes = one_map(0x1000, &[(0, vec![(29, -64), (29, -8), (31, 24)], false)]);
+        let (_, roots) = parse_gc_map(&bytes).expect("valid map");
         assert_eq!(
-            records,
-            vec![StackMapRecord {
-                pc: 0x1020,
-                function_address: 0x1000,
-                stack_size: 32,
-                locations: vec![StackMapLocation {
-                    dwarf_reg: 29,
-                    offset: -16,
-                }],
-            }]
+            roots,
+            vec![
+                StackMapLocation { dwarf_reg: 29, offset: -64 },
+                StackMapLocation { dwarf_reg: 29, offset: -8 },
+                StackMapLocation { dwarf_reg: 31, offset: 24 },
+            ]
         );
     }
 
     #[test]
     fn rejects_truncated_or_wrong_version_sections() {
-        assert!(parse_one_stack_map(&[]).is_none());
-        let mut bytes = one_map(0x1000, 42, 0x10, -8);
-        bytes[0] = 2;
-        assert!(parse_one_stack_map(&bytes).is_none());
-        bytes[0] = STACK_MAP_VERSION;
-        bytes.truncate(bytes.len() - 1);
-        assert!(parse_one_stack_map(&bytes).is_none());
+        assert!(parse_gc_map(&[]).is_none() || parse_gc_map(&[]).unwrap().0.is_empty());
+        let mut bytes = simple(0x1000, 0x10, -8);
+        bytes[4] = GC_MAP_VERSION + 1;
+        assert!(parse_gc_map(&bytes).is_none(), "an unknown version must not be guessed at");
+        // A total_len that runs past the section must fail rather than read on.
+        let mut bytes = simple(0x1000, 0x10, -8);
+        let len = bytes.len();
+        bytes[12..16].copy_from_slice(&((len as u32) + 64).to_le_bytes());
+        assert!(parse_gc_map(&bytes).is_none());
     }
 
     #[test]
     fn chain_walkable_index_accepts_fp_and_sp_locations_only() {
-        let rec = |pc: usize, reg: u16| StackMapRecord {
+        let rec = |pc: usize| StackMapRecord {
             pc,
             function_address: pc,
             stack_size: 160,
-            locations: vec![StackMapLocation {
-                dwarf_reg: reg,
-                offset: -8,
-            }],
+            roots_start: 0,
+            roots_len: 1,
         };
         // FP and SP are both walkable: SP resolves per frame by decoding the
         // owning function's prologue (#7173).
-        let walkable = index_records(vec![
-            rec(0x1000, DWARF_REG_FP_AARCH64),
-            rec(0x2000, DWARF_REG_SP_AARCH64),
-        ]);
+        let walkable = index_records(
+            vec![rec(0x1000), rec(0x2000)],
+            vec![
+                StackMapLocation { dwarf_reg: DWARF_REG_FP_AARCH64, offset: -8 },
+                StackMapLocation { dwarf_reg: DWARF_REG_SP_AARCH64, offset: -8 },
+            ],
+        );
         assert!(walkable.chain_walkable);
         assert_eq!(walkable.min_pc, 0x1000);
         assert_eq!(walkable.max_pc, 0x2000);
         // Any other register disqualifies the whole image.
         assert!(
-            !index_records(vec![rec(0x1000, DWARF_REG_FP_AARCH64), rec(0x3000, 1)]).chain_walkable,
+            !index_records(
+                vec![rec(0x1000)],
+                vec![StackMapLocation { dwarf_reg: 1, offset: -8 }],
+            )
+            .chain_walkable,
             "a non-FP/SP register must disable the fast walk"
         );
     }
 
     #[test]
     fn matches_plain_maps_before_and_statepoints_after_unwinder_ips() {
-        let maps = vec![
-            StackMapRecord {
-                pc: 0x1000,
-                function_address: 0x1000,
-                stack_size: 32,
-                locations: Vec::new(),
-            },
-            StackMapRecord {
-                pc: 0x1020,
-                function_address: 0x1020,
-                stack_size: 32,
-                locations: Vec::new(),
-            },
-        ];
+        let rec = |pc: usize| StackMapRecord {
+            pc,
+            function_address: pc,
+            stack_size: 32,
+            roots_start: 0,
+            roots_len: 0,
+        };
+        let maps = vec![rec(0x1000), rec(0x1020)];
         assert_eq!(closest_record_pc(&maps, 0x1004), Some(0x1000));
         assert_eq!(closest_record_pc(&maps, 0x101c), Some(0x1020));
         assert_eq!(closest_record_pc(&maps, 0x1020), Some(0x1020));

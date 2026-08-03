@@ -12,6 +12,7 @@ pub mod expr;
 pub mod ext_registry;
 pub mod function;
 pub(crate) mod gc_call_effects;
+pub mod gc_map;
 pub mod linker;
 pub(crate) mod loop_purity;
 pub(crate) mod lower_array_method;
