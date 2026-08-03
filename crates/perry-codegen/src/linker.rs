@@ -223,6 +223,10 @@ struct ClangCompilePlan {
     ll_path: PathBuf,
     obj_path: PathBuf,
     stderr_remarks_path: PathBuf,
+    /// Set when the stack map is being compacted: clang emits assembly here
+    /// instead of an object, the stack-map block is rewritten (see
+    /// `crate::gc_map`), and the result is assembled to `obj_path`.
+    asm_path: Option<PathBuf>,
 }
 
 fn native_tuning_arg_for_host() -> &'static str {
@@ -395,7 +399,20 @@ fn build_clang_compile_plan(
         "-O3"
     };
 
-    let mut clang_args = vec!["-c".to_string(), opt_flag.to_string()];
+    // Compacting the stack map means going through assembly, because that is
+    // where LLVM prints the map's function addresses as symbol *names* — the
+    // one form that needs neither relocation parsing nor a second link. Only
+    // the statepoint backends emit a stack map, so only they pay for it, and
+    // the cost is small: `-S` takes the same time as `-c` (codegen is the
+    // cost, printing text is free) and assembling is ~0.02s per module.
+    let compact_gc_map =
+        crate::codegen::helpers::statepoints_enabled() || crate::codegen::helpers::rs4gc_enabled();
+    let asm_path = compact_gc_map.then(|| PathBuf::from(format!("{}.s", obj_path.display())));
+
+    let mut clang_args = vec![
+        if compact_gc_map { "-S" } else { "-c" }.to_string(),
+        opt_flag.to_string(),
+    ];
     // A parameter rather than an env probe so a test can pin what `-g` does
     // and does not reach — measured in #7144: on a Perry `.ll` it produces a
     // byte-identical object with no `.debug_*` sections, because Perry's
@@ -423,7 +440,7 @@ fn build_clang_compile_plan(
     }
     clang_args.push(ll_path.display().to_string());
     clang_args.push("-o".to_string());
-    clang_args.push(obj_path.display().to_string());
+    clang_args.push(asm_path.as_ref().unwrap_or(&obj_path).display().to_string());
     clang_args.push("-target".to_string());
     clang_args.push(effective_target.clone());
 
@@ -443,6 +460,7 @@ fn build_clang_compile_plan(
         ll_path,
         obj_path,
         stderr_remarks_path,
+        asm_path,
     }
 }
 
@@ -453,7 +471,74 @@ fn build_clang_compile_plan(
 /// more reliably from disk than from stdin), invoke `clang -c`, read the
 /// resulting `.o`, and clean up both on success. On failure the temp files
 /// are left behind for debugging — the caller can `grep /tmp/perry_llvm_*`.
+/// #7174 research pipe: run `opt -passes='function(mem2reg),
+/// rewrite-statepoints-for-gc'` over the module before clang when
+/// `PERRY_RS4GC=1`. mem2reg promotes the retyped `ptr addrspace(1)` root
+/// allocas into SSA (their only uses are the surgery's loads/stores, so
+/// promotion always succeeds), and RS4GC then owns every statepoint,
+/// relocation, and downstream-use rewrite. Fails the compile loudly when no
+/// `opt` is available or the pass pipeline errors — a silent skip would be a
+/// vacuous mode.
+fn maybe_rs4gc_preprocess(ll_text: &str) -> Result<Option<String>> {
+    if !crate::codegen::helpers::rs4gc_enabled() {
+        return Ok(None);
+    }
+    let opt = std::env::var("PERRY_LLVM_OPT")
+        .map(PathBuf::from)
+        .ok()
+        .filter(|p| p.exists())
+        .or_else(|| {
+            [
+                "/opt/homebrew/opt/llvm/bin/opt",
+                "/usr/local/opt/llvm/bin/opt",
+            ]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.exists())
+        })
+        .or_else(|| which_in_path("opt"))
+        .context(
+            "PERRY_RS4GC=1 requires an LLVM `opt` binary: set PERRY_LLVM_OPT, \
+             install Homebrew LLVM, or put `opt` on PATH",
+        )?;
+    let mut child = Command::new(&opt)
+        .args([
+            "-passes=function(mem2reg),rewrite-statepoints-for-gc",
+            "-S",
+            "-",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn {}", opt.display()))?;
+    use std::io::Write as _;
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(ll_text.as_bytes())?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "PERRY_RS4GC: opt pipeline failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(Some(String::from_utf8(output.stdout)?))
+}
+
+fn which_in_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(name))
+            .find(|p| p.exists())
+    })
+}
+
 pub fn compile_ll_to_object(ll_text: &str, target_triple: Option<&str>) -> Result<Vec<u8>> {
+    let rs4gc_ll = maybe_rs4gc_preprocess(ll_text)?;
+    let ll_text: &str = rs4gc_ll.as_deref().unwrap_or(ll_text);
     compile_ll_to_object_in(
         &env::temp_dir(),
         ll_text,
@@ -726,6 +811,15 @@ fn compile_ll_to_object_in(
         ));
     }
 
+    if let Some(asm_path) = &plan.asm_path {
+        crate::gc_map::compact_and_assemble(
+            &plan.clang,
+            &plan.effective_target,
+            asm_path,
+            &obj_path,
+        )?;
+    }
+
     let bytes = fs::read(&obj_path)
         .with_context(|| format!("Failed to read clang output at {}", obj_path.display()))?;
 
@@ -780,11 +874,63 @@ pub fn compile_units_to_object(units: &[String], target_triple: Option<&str>) ->
         _ => {}
     }
 
+    // Units are independent clang invocations, so compile them concurrently.
+    // Measured before this: the 13 MB Claude Code bundle spent 4,939 s wall
+    // against 4,672 s user — the split existed for memory (#5391) but the
+    // clang phase, which dominates, ran one unit at a time.
+    //
+    // Concurrency is BOUNDED rather than one-thread-per-unit: each job parses
+    // a multi-hundred-megabyte translation unit, so unbounded fan-out trades
+    // wall time for an OOM (and would undo the peak-memory win the split was
+    // introduced for). Default is a quarter of the machine's parallelism,
+    // clamped to [1, 4]; `PERRY_CODEGEN_UNIT_JOBS` overrides.
+    let jobs = std::env::var("PERRY_CODEGEN_UNIT_JOBS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|p| (p.get() / 4).clamp(1, 4))
+                .unwrap_or(1)
+        })
+        .min(units.len());
+
+    let mut compiled: Vec<Option<Result<Vec<u8>>>> = (0..units.len()).map(|_| None).collect();
+    if jobs <= 1 {
+        for (i, unit) in units.iter().enumerate() {
+            compiled[i] = Some(compile_ll_to_object(unit, target_triple));
+        }
+    } else {
+        let slots: Vec<std::sync::Mutex<Option<Result<Vec<u8>>>>> = (0..units.len())
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..jobs {
+                scope.spawn(|| loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= units.len() {
+                        break;
+                    }
+                    let out = compile_ll_to_object(&units[i], target_triple);
+                    *slots[i].lock().expect("codegen-unit slot poisoned") = Some(out);
+                });
+            }
+        });
+        for (i, slot) in slots.into_iter().enumerate() {
+            compiled[i] = slot.into_inner().expect("codegen-unit slot poisoned");
+        }
+    }
+
     let mut objs: Vec<Vec<u8>> = Vec::with_capacity(units.len());
-    for (i, unit) in units.iter().enumerate() {
-        objs.push(compile_ll_to_object(unit, target_triple).with_context(|| {
-            format!("codegen unit {}/{} failed to compile", i + 1, units.len())
-        })?);
+    for (i, result) in compiled.into_iter().enumerate() {
+        objs.push(
+            result
+                .expect("every codegen unit is compiled")
+                .with_context(|| {
+                    format!("codegen unit {}/{} failed to compile", i + 1, units.len())
+                })?,
+        );
     }
     merge_unit_objects(&objs)
 }

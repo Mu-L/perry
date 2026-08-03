@@ -143,13 +143,12 @@ pub(super) fn decode_root_word(bits: u64) -> Option<RootWord> {
     })
 }
 
-/// Mark the object referenced by a mutable-root slot word — shadow-stack
-/// slots (`MutableRootSlotKind::ShadowStack`) and registered module-global
-/// roots (`MutableRootSlotKind::GlobalRoot`) alike.
+/// Mark the object referenced by a mutable-root slot word — shadow-stack,
+/// native stack-map, and registered module-global slots alike.
 ///
-/// Both slot kinds are rewritten by `rewrite_mutable_root_slots` through
-/// `try_rewrite_value`, so both must be marked through the same decoder
-/// (#6910). Marking is address-identical for the two forms once decoded —
+/// All slot kinds are rewritten by `rewrite_mutable_root_slots` through
+/// `try_rewrite_value`, so all must be marked through the same decoder
+/// (#6910). Marking is address-identical for the forms once decoded —
 /// `try_mark_raw_root_addr` performs the same validation and mark that
 /// `try_mark_value` does after unwrapping a NaN box — so a single call
 /// covers them.

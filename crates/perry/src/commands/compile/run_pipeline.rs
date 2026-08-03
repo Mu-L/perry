@@ -223,6 +223,31 @@ pub fn run_with_parse_cache(
         std::env::set_var("PERRY_NO_CACHE", "1");
     }
 
+    // Native-stack GC root-pressure report. Like `--opt-report`, this is
+    // observational and must be enabled before rayon starts module codegen.
+    // Cache reuse is disabled because cached objects bypass the lowering that
+    // records each function.
+    let statepoint_report_format = args.statepoint_report.or_else(|| {
+        match std::env::var("PERRY_STATEPOINT_REPORT").as_deref() {
+            Ok("json") => Some(StatepointReportFormat::Json),
+            Ok("1") | Ok("text") => Some(StatepointReportFormat::Text),
+            _ => None,
+        }
+    });
+    if let Some(fmt) = statepoint_report_format {
+        std::env::set_var(
+            "PERRY_STATEPOINT_REPORT",
+            match fmt {
+                StatepointReportFormat::Json => "json",
+                StatepointReportFormat::Text => "text",
+            },
+        );
+        std::env::set_var("PERRY_NO_CACHE", "1");
+        // `perry dev` reuses the process; discard records from its previous
+        // build before starting this one.
+        let _ = perry_codegen::statepoint_report::take_records();
+    }
+
     // Canonicalize the input path first so its `.parent()` is an absolute directory.
     // Without this, a bare filename like `perry demo.ts` produced `Path::new("").parent()`
     // → fallback `"."`, and the walk-up loops below (package.json + perry.toml discovery)
@@ -4700,6 +4725,15 @@ pub fn run_with_parse_cache(
         let rendered = match fmt {
             OptReportFormat::Json => perry_codegen::opt_report::render_json(&entries),
             OptReportFormat::Text => perry_codegen::opt_report::render_text(&entries),
+        };
+        eprintln!("{rendered}");
+    }
+
+    if let Some(fmt) = statepoint_report_format {
+        let records = perry_codegen::statepoint_report::take_records();
+        let rendered = match fmt {
+            StatepointReportFormat::Json => perry_codegen::statepoint_report::render_json(&records),
+            StatepointReportFormat::Text => perry_codegen::statepoint_report::render_text(&records),
         };
         eprintln!("{rendered}");
     }

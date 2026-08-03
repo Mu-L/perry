@@ -14,6 +14,8 @@ pub(crate) mod eh_mode;
 pub mod expr;
 pub mod ext_registry;
 pub mod function;
+pub(crate) mod gc_call_effects;
+pub mod gc_map;
 #[cfg(feature = "llvm-inprocess")]
 pub mod inprocess;
 pub mod inst;
@@ -32,6 +34,7 @@ pub(crate) mod nm_install;
 pub mod opt_report;
 pub(crate) mod root_reload;
 pub mod runtime_decls;
+pub mod statepoint_report;
 pub(crate) mod stmt;
 pub mod strings;
 pub mod stubs;

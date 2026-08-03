@@ -243,6 +243,19 @@ fn root_heavy_workload_reports_root_sources_and_budgeted_progression() {
             >= u64::from(roots),
         "shadow-root telemetry should classify the roots as pointers"
     );
+    assert!(
+        event["root_sources"]["compiled_native"].is_object(),
+        "native stack-map roots need their own source bucket"
+    );
+    assert!(
+        event["root_sources"]["native_stack_maps"]["frames_visited"].is_number(),
+        "native stack-map telemetry should expose unwinder work"
+    );
+    assert!(
+        event["root_sources"]["native_stack_maps"]["fp_walks"].is_number()
+            && event["root_sources"]["native_stack_maps"]["fallback_walks"].is_number(),
+        "native stack-map telemetry should expose which walker ran"
+    );
 
     let live_after = (js_shadow_slot_get(0) & POINTER_MASK) as *const crate::StringHeader;
     unsafe {

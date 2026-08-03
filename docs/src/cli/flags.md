@@ -103,6 +103,7 @@ accept either the `$perryfs/<path>` virtual path or the embed-relative key.
 | `--no-codegen` | Skip the `package.json` `perry.codegen` build-time steps (also `PERRY_SKIP_CODEGEN=1`). See [Project Configuration](../getting-started/project-config.md) |
 | `--keep-intermediates` | Keep `.o` and `.asm` intermediate files |
 | `--opt-report[=json]` | Report which values Perry could **not** statically type, why, and whether you can fix it. Text by default; `--opt-report=json` emits a stable schema for tooling. Also settable via `PERRY_OPT_REPORT=1` |
+| `--statepoint-report[=json]` | Report native-stack GC root pressure: calls with live roots, audited non-collecting calls omitted, relocations, plain-map fallbacks, and live-root widths. Research-only; requires `PERRY_STATEPOINTS=1` or `PERRY_RS4GC=1` (the plain stack-map mode it also named is gone) |
 
 The `--trace`/`--focus` pair localizes "compiled to the wrong thing" bugs:
 `perry compile foo.ts --trace hir,llvm --focus parseRow` dumps just the
@@ -228,6 +229,7 @@ shrink less, proportionally.
 | `CI=true` | Auto-skip update checks (set by most CI systems) |
 | `RUST_LOG` | Debug logging level (`debug`, `info`, `trace`) |
 | `PERRY_OPT_REPORT` | `1`/`text` or `json` — same as `--opt-report[=json]`, for driving the report from an environment where adding a flag is awkward |
+| `PERRY_STATEPOINT_REPORT` | `1`/`text` or `json` — same as `--statepoint-report[=json]`; observational root-pressure reporting for the native-stack GC experiments |
 
 ## Configuration Files
 

@@ -113,6 +113,10 @@ pub fn gc_collect_minor() -> u64 {
 }
 
 pub(super) fn gc_collect_minor_with_trigger(trigger: GcTriggerSnapshot) -> GcCollectOutcome {
+    // PERRY_GC_SAFEPOINT_ONLY: held for the whole collection so every
+    // consumer of the scan decision (root scan, copying eligibility,
+    // evacuation pinning, verifier) sees the same healed answer.
+    let _contract_heal = policy::contract_scan_heal_guard();
     gc_drain_active_budgeted_cycle();
     // Barriers-off ⇒ the remembered set is not being maintained, and a
     // minor's black-leafed old parents would hide live children. Route
@@ -325,6 +329,10 @@ fn gc_collect_inner_with_trigger(trigger: GcTriggerSnapshot) -> GcCollectOutcome
 }
 
 fn gc_collect_full_mark_sweep_with_trigger(trigger: GcTriggerSnapshot) -> GcCollectOutcome {
+    // PERRY_GC_SAFEPOINT_ONLY: see gc_collect_minor_with_trigger. Manual
+    // gc() engages its own force_full_scan first, which this detects as
+    // already-Scan and no-ops.
+    let _contract_heal = policy::contract_scan_heal_guard();
     gc_drain_active_budgeted_cycle();
     GC_TRIGGER_BUMPED.with(|c| c.set(false));
     GcCycleState::new_full(trigger).run_to_completion()
@@ -709,6 +717,10 @@ pub fn gc_init() {
 
 #[no_mangle]
 pub extern "C" fn js_gc_init() {
+    // Parse LLVM stack-map metadata before the first collection. The parser
+    // allocates its immutable index once; root scans themselves must remain
+    // allocation-free while the collector owns the heap.
+    initialize_stack_maps();
     // Windows: opt console stdout/stderr into VT/ANSI escape processing
     // once at program start so runtime-emitted escapes (console.clear, tty
     // cursor ops, color output keyed off isTTY) render instead of printing

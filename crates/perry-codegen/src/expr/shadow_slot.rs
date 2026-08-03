@@ -206,6 +206,19 @@ pub(crate) fn emit_shadow_slot_bind_for_local(ctx: &mut FnCtx<'_>, local_id: u32
         return;
     };
     ctx.shadow_slots_bound.insert(slot_idx);
+    if crate::codegen::helpers::native_stack_roots_enabled() {
+        // Kept temporarily as a textual marker: LlFunction's final stack-map
+        // lowering records `slot_idx -> local_slot` and removes this call.
+        // The incremental root barrier remains real because the native slot
+        // can be updated after an in-flight cycle scanned this frame.
+        ctx.block().call_void(
+            "js_shadow_slot_bind",
+            &[(I32, &slot_idx.to_string()), (PTR, &local_slot)],
+        );
+        let value_bits = ctx.block().load(I64, &local_slot);
+        emit_persistent_shadow_root_barrier(ctx, &value_bits);
+        return;
+    }
     // #7088: the hot per-store root write. Emitted inline against this
     // activation's cached `ShadowStackState` pointer when it has one; falls
     // through to the call otherwise.
