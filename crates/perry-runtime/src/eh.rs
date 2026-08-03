@@ -64,6 +64,7 @@ extern "C" {
     fn _Unwind_GetRegionStart(ctx: *mut UnwindContext) -> usize;
     fn _Unwind_SetGR(ctx: *mut UnwindContext, reg_index: c_int, value: usize);
     fn _Unwind_SetIP(ctx: *mut UnwindContext, value: usize);
+    fn _Unwind_GetCFA(ctx: *mut UnwindContext) -> usize;
     fn _Unwind_Backtrace(
         trace: extern "C" fn(*mut UnwindContext, *mut core::ffi::c_void) -> UnwindReasonCode,
         arg: *mut core::ffi::c_void,
@@ -156,6 +157,13 @@ thread_local! {
         };
 }
 
+/// Address of this thread's `_Unwind_Exception` object — what a landing
+/// pad receives in x0. The owned fast transport passes it explicitly
+/// because it installs the context itself (#7302 follow-up).
+pub(crate) fn exception_object_addr() -> u64 {
+    EXC_OBJECT.with(|c| c.get()) as u64
+}
+
 /// Raise the per-thread Perry exception. Returns ONLY if the unwinder found
 /// no handler (the caller reports the uncaught exception and exits) — with a
 /// handler-stack entry present this indicates lost unwind tables between the
@@ -213,6 +221,11 @@ pub unsafe extern "C" fn perry_eh_personality(
     } else {
         match lpad {
             Some(lpad) => {
+                // W1 diff mode (#7302 follow-up): the owned walker predicted
+                // where this throw lands before the raise; the system
+                // unwinder is the oracle. Any mismatch is a walker bug —
+                // fail loudly here, where both answers are in hand.
+                crate::eh_walker::verify_prediction(lpad as u64, _Unwind_GetCFA(context) as u64);
                 _Unwind_SetGR(context, UNWIND_DATA_REG.0, exception_object as usize);
                 _Unwind_SetGR(context, UNWIND_DATA_REG.1, 0);
                 _Unwind_SetIP(context, lpad);
@@ -247,7 +260,7 @@ unsafe fn find_landing_pad(context: *mut UnwindContext) -> Result<Option<usize>,
 /// call-site table sorted by start offset. Perry generates only catch-all
 /// handlers, so the action/type tables need no interpretation: any non-zero
 /// landing-pad offset is a handler.
-unsafe fn find_landing_pad_in_lsda(
+pub(crate) unsafe fn find_landing_pad_in_lsda(
     lsda: *const u8,
     ip: usize,
     func_start: usize,
