@@ -1,10 +1,12 @@
 ### Native-frame GC roots via LLVM statepoints, opt-in (#7173, #7174)
 
-Adds a second precise-root mechanism alongside the shadow stack, selected with
-`PERRY_STATEPOINTS=1` (explicit bridge) or `PERRY_STATEPOINTS=1 PERRY_RS4GC=1`
-(LLVM's `RewriteStatepointsForGC` owns statepoint and relocation insertion).
-**The default path is unchanged**: without those flags nothing here runs, and
-the shadow stack remains the shipping root mechanism.
+Adds a second precise-root mechanism alongside the shadow stack, selected by
+`PERRY_STATEPOINTS=1` (explicit bridge) or `PERRY_RS4GC=1` (LLVM's
+`RewriteStatepointsForGC` owns statepoint and relocation insertion). Either
+one activates native roots on its own — `native_stack_roots_enabled()` is
+`statepoints || rs4gc` — so `PERRY_RS4GC=1` does not require
+`PERRY_STATEPOINTS=1`. **The default path is unchanged**: with neither set
+nothing here runs, and the shadow stack remains the shipping root mechanism.
 
 The point of the mechanism is that the forgot-to-root bug class becomes
 structurally impossible — LLVM, not Perry, is responsible for knowing which
@@ -37,7 +39,8 @@ runtime already discarded at startup: three `Constant` slots per record
 rewrites that block at assembly time — where LLVM prints the function addresses
 as symbol names, so one text parser replaces Mach-O *and* ELF relocation
 parsing plus a second link pass — into a compact map: 4,214,384 B → 224,832 B
-(18.7×). The largest single lever is that **77% of records have the identical
+(19.0× measured same-build; 18.5× once the conservative `js_throw`
+classification below is accounted for). The largest single lever is that **77% of records have the identical
 live set as the record before them**, so a repeat flag replaces the payload;
 that also lets the runtime share one copy per distinct set instead of
 materialising 154k entries.

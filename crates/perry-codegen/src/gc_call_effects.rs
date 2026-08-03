@@ -112,7 +112,21 @@ pub(crate) fn classify_direct_callee(name: &str) -> GcCallEffect {
         | "js_array_indexOf_jsvalue"
         | "js_validate_array_comparator"
         | "js_validate_array_map_callback" => GcCallEffect::AllocNoReentry,
-        name if name.starts_with("js_throw") => GcCallEffect::NeverReturns,
+        // NO `js_throw*` prefix arm. It used to classify the whole family
+        // `NeverReturns`, which suppresses the safepoint in every mode — the
+        // strongest classification in this table, and the only one applied by
+        // prefix rather than exact name.
+        //
+        // Two things make that unsafe. The audit it rested on is already
+        // false: `js_throw_reference_error_tdz`, `js_throw_not_a_constructor`
+        // and others are declared `-> f64`, not `-> !`. And since #7302 a
+        // throw UNWINDS rather than longjmps, so the call site is an `invoke`
+        // whose unwind edge needs relocations — while these helpers allocate
+        // the Error they raise and can therefore collect. Suppressing the
+        // safepoint would leave the catch handler's roots stale after a move.
+        //
+        // Falling through to `Unknown` costs a few statepoints and is
+        // conservative in the only direction that is safe.
         _ => GcCallEffect::Unknown,
     }
 }

@@ -132,6 +132,15 @@ def analyze(buf):
 
 
 def varint_len(value):
+    """Bytes a LEB128 encoding of `value` occupies.
+
+    Rejects negatives rather than returning 1 for them: Python ints are
+    unbounded, so a negative slips straight past `>= 0x80` and every negative
+    frame offset would be counted as a single byte, understating the very
+    encoding this script claims to measure exactly.
+    """
+    if value < 0:
+        raise ValueError(f"varint_len expects a non-negative value, got {value}")
     n = 1
     while value >= 0x80:
         value >>= 7
@@ -169,7 +178,7 @@ def compact_size(buf):
             rec_start = pos
             _pid, instr_off, _res, nloc = struct.unpack_from("<QIHH", buf, pos)
             pos += 16
-            size += varint_len(instr_off - prev_off)
+            size += varint_len((instr_off - prev_off) & 0xFFFFFFFF)
             prev_off = instr_off
             seen = []
             for _ in range(nloc):
@@ -181,7 +190,7 @@ def compact_size(buf):
                         seen.append(key)
             size += varint_len(len(seen))
             for reg, offv in seen:
-                zig = (offv << 1) ^ (offv >> 31)
+                zig = ((offv << 1) ^ (offv >> 31)) & 0xFFFFFFFF
                 size += varint_len((zig << 1) | (1 if reg == 31 else 0))
             roots_kept += len(seen)
             if (pos - rec_start) % 8:

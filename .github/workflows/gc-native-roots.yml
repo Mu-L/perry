@@ -43,7 +43,10 @@ jobs:
           export PERRY_RUNTIME_DIR="$PWD/target/perry-dev"
           export PERRY_NO_AUTO_OPTIMIZE=1
           pass=0
+          total=0
+          errs=""
           for probe in benchmarks/gc_ratchet/probes/*.ts; do
+            total=$((total+1))
             name=$(basename "$probe" .ts)
             node --expose-gc --experimental-strip-types "$probe" > "/tmp/$name.oracle"
             PERRY_STATEPOINTS=1 ./target/perry-dev/perry "$probe" -o "/tmp/$name"
@@ -59,11 +62,19 @@ jobs:
               "/tmp/$name" > "/tmp/$name.out" 2> "/tmp/$name.err"
             diff "/tmp/$name.oracle" "/tmp/$name.out" \
               || { echo "::error::$name output diverged from the pinned oracle"; exit 1; }
+            errs="$errs /tmp/$name.err"
             pass=$((pass+1))
           done
-          echo "statepoint forced-evacuation matrix: $pass/8"
-          [ "$pass" -eq 8 ]
-          # Liveness assert 2: at least one probe actually collected
-          # (gcmetric lines are emitted on stderr by every probe).
-          grep -l "#gcmetric" /tmp/0*.err >/dev/null \
+          # Derived from the glob, not hardcoded: a literal goes stale the
+          # moment a probe is added (it did — 09_try_catch_roots), and if it is
+          # ever lowered to match it silently stops asserting full coverage.
+          echo "statepoint forced-evacuation matrix: $pass/$total"
+          [ "$total" -gt 0 ] \
+            || { echo "::error::no probes matched — the matrix ran on nothing"; exit 1; }
+          [ "$pass" -eq "$total" ]
+          # Liveness assert 2: at least one probe actually collected (gcmetric
+          # lines go to stderr). Collected during the loop rather than globbed
+          # as /tmp/0*.err, which silently depends on every probe name starting
+          # with a zero.
+          grep -l "#gcmetric" $errs >/dev/null \
             || { echo "::error::no probe emitted gc metrics — the collector never ran"; exit 1; }

@@ -58,7 +58,7 @@ use anyhow::{anyhow, Context, Result};
 /// Magic at the start of every emitted blob.
 const GC_MAP_MAGIC: &[u8; 4] = b"PGCM";
 /// Format version. Bump on any layout change — the runtime rejects others.
-const GC_MAP_VERSION: u8 = 2;
+const GC_MAP_VERSION: u8 = 3;
 /// Section the compact map is emitted into, and the label it is given.
 const GC_MAP_LABEL: &str = "_perry_gc_map";
 const MACHO_SECTION: &str = "__PERRY_GCMAP,__perry_gcmap";
@@ -279,20 +279,6 @@ fn decode_v3(block: &RawBlock) -> Option<Vec<FunctionMap>> {
                     // Keep exactly what the collector keeps: 8-byte frame
                     // slots, with the base/derived pair collapsed to one.
                     if matches!(kind, LOCATION_DIRECT | LOCATION_INDIRECT) && size == 8 {
-                        // The encoding stores the base as a single bit,
-                        // FP-or-SP, using this architecture's DWARF numbers.
-                        // Refuse anything else rather than silently rewriting
-                        // it to FP: on x86-64 LLVM emits RBP=6/RSP=7, which
-                        // would encode as "not SP" and decode back as
-                        // aarch64's FP=29 — a wrong base, and a wrong base is
-                        // a wrong root address. Bailing keeps LLVM's section,
-                        // which costs bytes rather than correctness. (The
-                        // native-frame-root backend is aarch64-only today; the
-                        // runtime's prologue decoder and fast walker are both
-                        // `cfg(target_arch = "aarch64")`.)
-                        if dwarf_reg != DWARF_REG_FP_AARCH64 && dwarf_reg != DWARF_REG_SP_AARCH64 {
-                            return None;
-                        }
                         if !roots.contains(&(dwarf_reg, offset)) {
                             roots.push((dwarf_reg, offset));
                         }
@@ -366,14 +352,28 @@ fn encode_stream(functions: &[FunctionMap]) -> Vec<u8> {
             // delta sign-extends into a 10-byte varint and silently bloats the
             // map — the format must not depend on an ordering invariant held
             // somewhere else.
+            // Base is a 2-bit tag, not a single FP/SP bit: LLVM also uses a
+            // callee-saved register (x19 on aarch64) as a frame base pointer
+            // in functions with dynamic stack allocation — measured 66 root
+            // slots in one real module. A bit cannot express that, and the
+            // format must not be the reason a root is unrepresentable.
+            //   0 = frame pointer, 1 = stack pointer, 2 = explicit DWARF
+            //   register number as a following varint.
             let mut previous: Option<i32> = None;
             for (reg, offset) in &record.roots {
-                let base_bit = u64::from(*reg == DWARF_REG_SP_AARCH64);
+                let tag = match *reg {
+                    DWARF_REG_FP_AARCH64 => 0u64,
+                    DWARF_REG_SP_AARCH64 => 1,
+                    _ => 2,
+                };
                 let delta = match previous {
                     None => *offset,
                     Some(prev) => offset.wrapping_sub(prev),
                 };
-                push_varint(&mut stream, (zigzag(delta) << 1) | base_bit);
+                push_varint(&mut stream, (zigzag(delta) << 2) | tag);
+                if tag == 2 {
+                    push_varint(&mut stream, u64::from(*reg));
+                }
                 previous = Some(*offset);
             }
             previous_roots = Some(&record.roots);
@@ -456,9 +456,12 @@ struct GcMapStats {
 /// Rewrite the LLVM stack-map block in `asm` into the compact map.
 ///
 /// Returns `None` when there is no stack-map block to rewrite (the common case
-/// for a module without safepoints) or when the block does not parse — a
-/// module whose metadata we do not fully understand keeps LLVM's section
-/// rather than shipping a map that might be missing roots.
+/// for a module without safepoints) or when the block does not parse.
+///
+/// Those two are NOT the same to the caller: no block is fine, while a block
+/// that fails to parse is a hard error in `compact_and_assemble`. Keeping
+/// LLVM's section in that case would look conservative and would in fact lose
+/// the module's roots, because the runtime reads only the compact section.
 fn compact_stack_map_asm(asm: &str, elf: bool) -> Option<(String, GcMapStats)> {
     let lines: Vec<&str> = asm.lines().collect();
     let block = parse_block(&lines)?;
@@ -528,14 +531,23 @@ pub fn compact_and_assemble(
         .with_context(|| format!("Failed to read assembly at {}", asm_path.display()))?;
 
     // Only the two object formats whose section syntax this module emits, and
-    // whose section the runtime knows how to find, may be rewritten. Anything
-    // else (COFF today) keeps LLVM's section: emitting a Mach-O `.section`
-    // directive into COFF assembly would fail to assemble, turning an
-    // unsupported-platform case into a broken build.
+    // whose section the runtime knows how to find, can be rewritten.
+    //
+    // Assembling unchanged on anything else looks like a graceful degradation
+    // and is the opposite: the object would carry LLVM's `__llvm_stackmaps`
+    // and no `__perry_gcmap`, the runtime reads only the compact section, and
+    // the collector finds no native roots at all — the exact outcome the hard
+    // error below exists to prevent, reached with no diagnostic. The mode is
+    // opt-in, so refusing loudly costs nothing.
     let macho = target.contains("apple") || target.contains("darwin");
     let elf = !macho && !target.contains("windows") && !target.contains("msvc");
     if !macho && !elf {
-        return assemble(clang, target, asm_path, obj_path);
+        return Err(anyhow!(
+            "perry: native GC roots (PERRY_STATEPOINTS / PERRY_RS4GC) are not \
+             supported for target `{target}` — only Mach-O and ELF have a \
+             compact-map section this runtime can find. Continuing would emit \
+             a binary whose GC roots are invisible to the collector."
+        ));
     }
 
     let has_block = asm.lines().any(|l| {
@@ -696,19 +708,19 @@ mod tests {
     }
 
     #[test]
-    fn foreign_register_bases_keep_llvm_section() {
-        // x86-64 records RBP=6 / RSP=7. The single-bit base encoding cannot
-        // express those, and guessing would decode them back as aarch64's
-        // FP=29 — a wrong base, therefore a wrong root address. Keeping
-        // LLVM's section costs bytes; guessing costs correctness.
+    fn encodes_a_foreign_register_base() {
+        // A base that is neither FP nor SP is real: LLVM uses x19 as a frame
+        // base pointer in functions with dynamic stack allocation. The 2-bit
+        // tag carries the DWARF number explicitly rather than refusing — the
+        // format must never be the reason a root is unrepresentable.
         let asm = sample_asm().replace(
             "\t.byte\t3\n\t.byte\t0\n\t.short\t8\n\t.short\t29\n",
-            "\t.byte\t3\n\t.byte\t0\n\t.short\t8\n\t.short\t6\n",
+            "\t.byte\t3\n\t.byte\t0\n\t.short\t8\n\t.short\t19\n",
         );
-        assert!(
-            compact_stack_map_asm(&asm, true).is_none(),
-            "a non-FP/SP base must fall back rather than be re-encoded"
-        );
+        let (out, stats) =
+            compact_stack_map_asm(&asm, true).expect("a foreign base must still encode");
+        assert_eq!(stats.roots, 1);
+        assert!(out.contains("_perry_gc_map:"));
     }
 
     #[test]

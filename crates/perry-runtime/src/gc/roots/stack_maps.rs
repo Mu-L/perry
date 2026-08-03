@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 /// statepoint constant preamble and base/derived duplicates that this parser
 /// discarded anyway, and shipping it cost 3.9 MB on a real application.
 const GC_MAP_MAGIC: &[u8; 4] = b"PGCM";
-const GC_MAP_VERSION: u8 = 2;
+const GC_MAP_VERSION: u8 = 3;
 const MAX_SAFEPOINT_RETURN_DELTA: usize = 16;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StackMapLocation {
@@ -373,6 +373,15 @@ fn parse_gc_map(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, Vec<StackMapLocati
         }
         let function_count = read_u32(bytes, base + 8)? as usize;
         let total_len = read_u32(bytes, base + 12)? as usize;
+        // A blob must at least cover its header and function table. Without
+        // this, a `total_len` of 0 leaves `base` unchanged — and because the
+        // magic still matches at that offset the resynchronisation path below
+        // is never reached, so the loop spins forever. This runs inside
+        // `OnceLock::get_or_init`, so that is a process hang at the first
+        // collection rather than the fail-closed panic in `stack_maps`.
+        if total_len < 16 + function_count.checked_mul(16)? {
+            return None;
+        }
         let table = base.checked_add(16)?;
         let stream_start = table.checked_add(function_count.checked_mul(16)?)?;
         let blob_end = base.checked_add(total_len)?;
@@ -384,9 +393,15 @@ fn parse_gc_map(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, Vec<StackMapLocati
         // stream: at -O3 the compiler emits them as label differences the
         // assembler evaluates, so their values cannot be varint-encoded at
         // rewrite time.
-        let record_total: usize = (0..function_count)
-            .map(|index| read_u32(bytes, table + index * 16 + 12).unwrap_or(0) as usize)
-            .sum();
+        // Not `unwrap_or(0)`: a failed read here means the function table is
+        // truncated, and treating that function as having zero records starts
+        // `cursor` at the wrong offset so every later varint decodes from
+        // misaligned bytes. A wrong live set is worse than no map.
+        let mut record_total: usize = 0;
+        for index in 0..function_count {
+            record_total =
+                record_total.checked_add(read_u32(bytes, table + index * 16 + 12)? as usize)?;
+        }
         let offsets = stream_start;
         let mut cursor = offsets.checked_add(record_total.checked_mul(4)?)?;
         if cursor > blob_end {
@@ -417,12 +432,20 @@ fn parse_gc_map(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, Vec<StackMapLocati
                     for _ in 0..count {
                         let (value, next) = read_varint(bytes, cursor, blob_end)?;
                         cursor = next;
-                        let dwarf_reg = if value & 1 == 1 {
-                            DWARF_REG_SP_AARCH64
-                        } else {
-                            DWARF_REG_FP_AARCH64
+                        // 2-bit base tag: 0 = FP, 1 = SP, 2 = explicit DWARF
+                        // register in a following varint (LLVM uses x19 as a
+                        // frame base in functions with dynamic allocation).
+                        let dwarf_reg = match value & 3 {
+                            0 => DWARF_REG_FP_AARCH64,
+                            1 => DWARF_REG_SP_AARCH64,
+                            2 => {
+                                let (reg, next) = read_varint(bytes, cursor, blob_end)?;
+                                cursor = next;
+                                u16::try_from(reg).ok()?
+                            }
+                            _ => return None,
                         };
-                        let delta = unzigzag((value >> 1) as u32);
+                        let delta = unzigzag((value >> 2) as u32);
                         let offset = match last {
                             None => delta,
                             Some(previous_offset) => previous_offset.wrapping_add(delta),
@@ -444,7 +467,11 @@ fn parse_gc_map(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, Vec<StackMapLocati
             }
         }
 
-        base = align_up(blob_end, 8)?;
+        let next = align_up(blob_end, 8)?;
+        if next <= base {
+            return None;
+        }
+        base = next;
     }
 
     Some((records, roots))
@@ -891,7 +918,21 @@ mod fp_chain {
                         // The record describes the caller's frame; its
                         // locations are relative to the caller's own x29,
                         // which is exactly the saved word we just read.
-                        if caller_fp == 0 {
+                        //
+                        // It gets the SAME validation `fp` gets at the top of
+                        // the loop, and it gets it BEFORE the root loop rather
+                        // than after. Every FP-relative root is based on this
+                        // word, and `fp_to_sp_offset` subtracts from it for the
+                        // SP-relative ones; downstream the only filters are
+                        // non-zero and 8-byte alignment, so an unvalidated
+                        // `caller_fp` lets a corrupt frame produce addresses
+                        // outside the stack that the collector then reads and
+                        // rewrites. Fail closed to the platform unwinder.
+                        if caller_fp == 0
+                            || caller_fp & 0xF != 0
+                            || caller_fp <= fp
+                            || caller_fp.checked_add(16)? > top
+                        {
                             return None;
                         }
                         stats.records_matched = stats.records_matched.saturating_add(matched.len());
@@ -984,12 +1025,19 @@ mod tests {
             push_varint(&mut stream, (roots.len() as u64) << 1);
             let mut last: Option<i32> = None;
             for (reg, offset) in roots {
-                let bit = u64::from(*reg == DWARF_REG_SP_AARCH64);
+                let tag = match *reg {
+                    DWARF_REG_FP_AARCH64 => 0u64,
+                    DWARF_REG_SP_AARCH64 => 1,
+                    _ => 2,
+                };
                 let delta = match last {
                     None => *offset,
                     Some(previous) => offset.wrapping_sub(previous),
                 };
-                push_varint(&mut stream, (zigzag(delta) << 1) | bit);
+                push_varint(&mut stream, (zigzag(delta) << 2) | tag);
+                if tag == 2 {
+                    push_varint(&mut stream, u64::from(*reg));
+                }
                 last = Some(*offset);
             }
         }
@@ -1086,6 +1134,78 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn decodes_an_explicit_base_register() {
+        // LLVM uses x19 as a frame base pointer in functions with dynamic
+        // stack allocation — 66 root slots in one real module. A single FP/SP
+        // bit cannot express that, which is what forced the 2-bit base tag.
+        let bytes = one_map(0x1000, &[(0x10, vec![(19, -40), (29, -8)], false)]);
+        let (_, roots) = parse_gc_map(&bytes).expect("valid map");
+        assert_eq!(
+            roots,
+            vec![
+                StackMapLocation {
+                    dwarf_reg: 19,
+                    offset: -40
+                },
+                StackMapLocation {
+                    dwarf_reg: 29,
+                    offset: -8
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_explicit_base_register_disables_the_fast_walk() {
+        // The x29-chain walker can only recover FP and SP; anything else must
+        // fall back to the platform unwinder, which can.
+        let index = index_records(
+            vec![StackMapRecord {
+                pc: 0x1000,
+                function_address: 0x1000,
+                stack_size: 64,
+                roots_start: 0,
+                roots_len: 1,
+            }],
+            vec![StackMapLocation {
+                dwarf_reg: 19,
+                offset: -40,
+            }],
+        );
+        assert!(!index.chain_walkable);
+    }
+
+    #[test]
+    fn rejects_a_blob_whose_length_cannot_advance_the_cursor() {
+        // `total_len` comes straight from the header. A zero (or too-small)
+        // value leaves `base` where it was, and because the magic still
+        // matches there the resync path never runs — the loop spins forever
+        // inside `OnceLock::get_or_init`, hanging the process at the first
+        // collection instead of failing closed.
+        let mut bytes = simple(0x1000, 0x10, -8);
+        bytes[12..16].copy_from_slice(&0u32.to_le_bytes());
+        assert!(
+            parse_gc_map(&bytes).is_none(),
+            "a blob that cannot advance the cursor must be rejected, not looped on"
+        );
+
+        // Long enough to look plausible, still short of header + function table.
+        let mut bytes = simple(0x1000, 0x10, -8);
+        bytes[12..16].copy_from_slice(&20u32.to_le_bytes());
+        assert!(parse_gc_map(&bytes).is_none());
+    }
+
+    #[test]
+    fn rejects_a_truncated_function_table() {
+        // The record counts size the fixed-width offset array; a short read
+        // there must not be rounded down to zero, or every later varint is
+        // decoded from the wrong offset.
+        let bytes = simple(0x1000, 0x10, -8);
+        let truncated = &bytes[..20];
+        assert!(parse_gc_map(truncated).is_none());
     }
 
     #[test]
