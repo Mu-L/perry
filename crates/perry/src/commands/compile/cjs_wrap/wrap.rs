@@ -263,7 +263,11 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
     // instead keep the synthetic binding and rename it `_lazyreq_N` so the
     // target stays `Deferred` and inits only when the shim's
     // `return _lazyreq_N` runs (i.e. when the function actually calls require).
-    let lazy_specs = function_local_specs(source);
+    let mut lazy_specs = function_local_specs(source);
+    let cyclic_specs = cyclic_require_specs(source, source_path);
+    let parent_sensitive_specs = parent_sensitive_require_specs(source, source_path);
+    lazy_specs.extend(cyclic_specs.iter().cloned());
+    lazy_specs.extend(parent_sensitive_specs.iter().cloned());
 
     let mut import_local_names: Vec<String> = require_specs
         .iter()
@@ -343,6 +347,9 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let imports = format!(
+        "import {{ createRequire as __perry_cjs_create_require }} from 'node:module';\n{imports}"
+    );
 
     // An UNRESOLVABLE adopted specifier (`require('@opentelemetry/api')`
     // with only Next's vendored copy on disk) leaves its hoisted import
@@ -362,14 +369,64 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
         .iter()
         .zip(import_local_names.iter())
         .map(|(spec, local)| {
+            let resolved_target =
+                super::super::resolve::resolve_relative_import_path(spec, source_path);
+            let link_child = resolved_target
+                .as_ref()
+                .map(|target| {
+                    format!(
+                        "const child = require.cache[{path:?}]; if (child) {{ if (child.parent === undefined) child.parent = module; if (module.children.indexOf(child) === -1) module.children.push(child); }} ",
+                        path = target.to_string_lossy(),
+                    )
+                })
+                .unwrap_or_default();
+            let needs_runtime_record =
+                cyclic_specs.contains(spec) || parent_sensitive_specs.contains(spec);
+            let runtime_require = if needs_runtime_record {
+                resolved_target
+                    .as_ref()
+                    .map(|target| {
+                        let warnings = if cyclic_specs.contains(spec) {
+                            cyclic_missing_property_names(source, source_path, spec, target)
+                                .into_iter()
+                                .map(|property| {
+                                    format!(
+                                        "if (childBefore && childBefore.loaded === false) process.emitWarning(\"Accessing non-existent property '{property}' of module exports inside circular dependency\"); "
+                                    )
+                                })
+                                .collect::<String>()
+                        } else {
+                            String::new()
+                        };
+                        format!(
+                            "const childBefore = require.cache[{path:?}]; {warnings}globalThis.__perry_cjs_pending_parent = module; const required = __perry_require_path_module({path:?}); globalThis.__perry_cjs_pending_parent = undefined; {link_child}return required;",
+                            path = target.to_string_lossy(),
+                        )
+                    })
+            } else {
+                None
+            };
+            let required_value = if needs_runtime_record {
+                runtime_require.clone().unwrap_or_else(|| format!("return {local};"))
+            } else {
+                format!("{link_child}return {local};")
+            };
             if require_site_in_try(source, spec) {
                 format!(
                     "        if (specifier === '{spec}') {{ if (typeof {local} === 'boolean') \
                      throw __perry_cjs_require_error('error', 'MODULE_NOT_FOUND', \
-                     \"Cannot find module '{spec}'\"); return {local}; }}"
+                     \"Cannot find module '{spec}'\"); {required_value} }}"
                 )
             } else {
-                format!("        if (specifier === '{}') return {};", spec, local)
+                if needs_runtime_record {
+                    format!("        if (specifier === '{spec}') {{ {required_value} }}")
+                } else if link_child.is_empty() {
+                    format!("        if (specifier === '{spec}') return {local};")
+                } else {
+                    format!(
+                        "        if (specifier === '{spec}') {{ {required_value} }}"
+                    )
+                }
             }
         })
         .collect::<Vec<_>>()
@@ -745,6 +802,12 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default()
     );
+    let module_filename_literal = format!("{:?}", source_path.to_string_lossy());
+    let cjs_factory_value = if flat_default_class.is_some() {
+        "undefined"
+    } else {
+        "__perry_cjs_factory"
+    };
     let cjs_preamble = format!(
         r#"    // #3527: `module`/`exports` are reassignable `var`s (mirroring Node, where
     // they are wrapper-function parameters), so CJS bodies that do
@@ -756,8 +819,21 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
     // real module ref the same way), so named/default-export resolution stays
     // correct regardless of what the body does to its `module` local.
     const __cjs_module = {{ exports: {{}} }};
+    __cjs_module.__perry_cjs_record = true;
+    __cjs_module.__perry_cjs_factory = {cjs_factory_value};
+    __cjs_module.id = {module_filename_literal};
+    __cjs_module.path = {module_dir_literal};
+    __cjs_module.filename = {module_filename_literal};
+    __cjs_module.loaded = false;
+    __cjs_module.children = [];
+    __cjs_module.parent = globalThis.__perry_cjs_pending_parent;
+    globalThis.__perry_cjs_pending_parent = undefined;
+    __cjs_module.paths = [{module_dir_literal} + '/node_modules'];
+    __cjs_module.require = undefined;
     var module = __cjs_module;
     var exports = __cjs_module.exports;
+    const __perry_cjs_base_require = __perry_cjs_create_require({module_filename_literal});
+    __perry_cjs_base_require.cache[{module_filename_literal}] = __cjs_module;
     function __perry_cjs_require_error(kind, code, message) {{
         const err = kind === 'type' ? new TypeError(message) : new Error(message);
         err.code = code;
@@ -862,7 +938,12 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
         '.json': function(module, filename) {{}},
         '.node': function(module, filename) {{}},
     }};
+    require.cache = __perry_cjs_base_require.cache;
+    require.extensions = __perry_cjs_base_require.extensions;
     require.main = module;"#
+    );
+    let cjs_preamble = format!(
+        "{cjs_preamble}\n    module.require = function moduleRequire(specifier) {{ return require(specifier); }};"
     );
 
     // Wall 54: self-register this compiled module's exports under its absolute
@@ -870,7 +951,11 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
     // page+chunk loading) resolves to it. `{:?}` debug-quotes to a valid JS
     // string literal.
     let path_register = format!(
-        "__perry_register_path_module({:?}, __cjs_module.exports);",
+        "__cjs_module.loaded = true; __perry_register_path_module({:?}, __cjs_module);",
+        source_path.to_string_lossy()
+    );
+    let path_register_early = format!(
+        "__perry_register_path_module({:?}, __cjs_module);",
         source_path.to_string_lossy()
     );
     let wrapped = if let Some(flat_class) = &flat_default_class {
@@ -887,6 +972,7 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
 {import_aliases}
 {hoisted_class_block}
 {cjs_preamble}
+{path_register_early}
 
 {body_for_iife}
 
@@ -906,12 +992,16 @@ export {{ {flat_class} }};
 {import_aliases}
 {hoisted_class_block}
 const _cjs = (function() {{
+function __perry_cjs_factory() {{
 {cjs_preamble}
+    {path_register_early}
 
     {body_for_iife}
 
     {path_register}
     return __cjs_module.exports;
+}}
+return __perry_cjs_factory();
 }})();
 
 {default_export_decl}
@@ -987,6 +1077,124 @@ fn target_node_platform(target: Option<&str>) -> Option<&'static str> {
             }
         }
     }
+}
+
+fn cyclic_require_specs(source: &str, source_path: &Path) -> std::collections::HashSet<String> {
+    let source_key = source_path
+        .canonicalize()
+        .unwrap_or_else(|_| source_path.to_path_buf());
+    extract_require_specifiers(source)
+        .into_iter()
+        .filter(|specifier| {
+            let Some(target) =
+                super::super::resolve::resolve_relative_import_path(specifier, source_path)
+            else {
+                return false;
+            };
+            require_graph_reaches(&target, &source_key, &mut std::collections::HashSet::new())
+        })
+        .collect()
+}
+
+fn parent_sensitive_require_specs(
+    source: &str,
+    source_path: &Path,
+) -> std::collections::HashSet<String> {
+    extract_require_specifiers(source)
+        .into_iter()
+        .filter(|specifier| {
+            super::super::resolve::resolve_relative_import_path(specifier, source_path)
+                .and_then(|target| std::fs::read_to_string(target).ok())
+                .is_some_and(|dependency| dependency.contains("module.parent"))
+        })
+        .collect()
+}
+
+fn cyclic_missing_property_names(
+    source: &str,
+    source_path: &Path,
+    specifier: &str,
+    target_path: &Path,
+) -> Vec<String> {
+    let aliases: Vec<String> = extract_require_aliases_with_ranges(source)
+        .into_iter()
+        .filter(|(_, required, _)| required == specifier)
+        .map(|(alias, _, _)| alias)
+        .collect();
+    if aliases.is_empty() {
+        return Vec::new();
+    }
+    let Ok(target_source) = std::fs::read_to_string(target_path) else {
+        return Vec::new();
+    };
+    let cycle_at = extract_require_specifiers(&target_source)
+        .into_iter()
+        .filter(|required| {
+            super::super::resolve::resolve_relative_import_path(required, target_path).is_some_and(
+                |resolved| {
+                    resolved.canonicalize().unwrap_or(resolved)
+                        == source_path
+                            .canonicalize()
+                            .unwrap_or_else(|_| source_path.to_path_buf())
+                },
+            )
+        })
+        .filter_map(|required| {
+            let single = format!("require('{required}')");
+            let double = format!("require(\"{required}\")");
+            target_source
+                .find(&single)
+                .or_else(|| target_source.find(&double))
+        })
+        .min()
+        .unwrap_or(target_source.len());
+    let assigned_before = regex::Regex::new(
+        r#"(?:^|[^A-Za-z0-9_$])(?:exports|module\.exports)\.([A-Za-z_$][A-Za-z0-9_$]*)\s*="#,
+    )
+    .expect("CJS export assignment regex")
+    .captures_iter(&target_source[..cycle_at])
+    .filter_map(|capture| capture.get(1).map(|name| name.as_str().to_string()))
+    .collect::<std::collections::HashSet<_>>();
+    let masked_source = super::detect::strip_comments_and_strings(source);
+    let mut missing = std::collections::BTreeSet::new();
+    for alias in aliases {
+        let access = regex::Regex::new(&format!(
+            r#"(?:^|[^A-Za-z0-9_$]){}\.([A-Za-z_$][A-Za-z0-9_$]*)"#,
+            regex::escape(&alias)
+        ))
+        .expect("CJS cyclic alias access regex");
+        for capture in access.captures_iter(&masked_source) {
+            if let Some(property) = capture.get(1).map(|name| name.as_str()) {
+                if !assigned_before.contains(property) {
+                    missing.insert(property.to_string());
+                }
+            }
+        }
+    }
+    missing.into_iter().collect()
+}
+
+fn require_graph_reaches(
+    path: &Path,
+    target: &Path,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) -> bool {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if path == target {
+        return true;
+    }
+    if !visited.insert(path.clone()) {
+        return false;
+    }
+    let Ok(source) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    extract_require_specifiers(&source)
+        .into_iter()
+        .filter_map(|specifier| {
+            super::super::resolve::resolve_relative_import_path(&specifier, &path)
+        })
+        .any(|dependency| require_graph_reaches(&dependency, target, visited))
 }
 
 fn inactive_platform_guarded_requires(

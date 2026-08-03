@@ -250,6 +250,11 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
         DOUBLE,
         &[PTR, I64, PTR, I64],
     );
+    module.declare_function(
+        "js_native_module_esm_export_value",
+        DOUBLE,
+        &[DOUBLE, DOUBLE],
+    );
     // Issue #894: materialize a NATIVE_MODULE_CLASS_ID-tagged namespace
     // object for `Expr::NativeModuleRef` when it reaches the value-form
     // fallback path (the require-call-result-then-member-access shape

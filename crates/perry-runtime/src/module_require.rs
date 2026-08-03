@@ -4,8 +4,11 @@
 //! public function shape. Full CommonJS file/package resolution remains in the
 //! compiler-side CJS wrapper and future `Module._*` work.
 
-use crate::closure::{js_closure_alloc, js_register_closure_arity, ClosureHeader};
-use crate::object::{js_object_alloc, js_object_set_field_by_name};
+use crate::closure::{
+    js_closure_alloc, js_closure_get_capture_f64, js_closure_set_capture_f64,
+    js_register_closure_arity, ClosureHeader,
+};
+use crate::object::{js_object_alloc, js_object_get_field_by_name, js_object_set_field_by_name};
 use crate::string::js_string_from_bytes;
 use crate::value::{js_nanbox_pointer, JSValue, TAG_NULL, TAG_UNDEFINED};
 
@@ -27,12 +30,26 @@ fn object_value(obj: *mut crate::object::ObjectHeader) -> f64 {
 }
 
 fn set_field(obj: *mut crate::object::ObjectHeader, name: &str, value: f64) {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let obj_handle = scope.root_raw_mut_ptr(obj);
+    let value_handle = scope.root_nanbox_f64(value);
     let key = js_string_from_bytes(name.as_ptr(), name.len() as u32);
-    js_object_set_field_by_name(obj, key, value);
+    js_object_set_field_by_name(
+        obj_handle.get_raw_mut_ptr::<crate::object::ObjectHeader>(),
+        key,
+        value_handle.get_nanbox_f64(),
+    );
 }
 
 fn set_closure_prop(closure: *mut ClosureHeader, name: &str, value: f64) {
-    crate::closure::closure_set_dynamic_prop(closure as usize, name, value);
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let closure_handle = scope.root_raw_mut_ptr(closure);
+    let value_handle = scope.root_nanbox_f64(value);
+    crate::closure::closure_set_dynamic_prop(
+        closure_handle.get_raw_mut_ptr::<ClosureHeader>() as usize,
+        name,
+        value_handle.get_nanbox_f64(),
+    );
 }
 
 fn named_closure(
@@ -43,9 +60,18 @@ fn named_closure(
 ) -> (*mut ClosureHeader, f64) {
     js_register_closure_arity(func, arity);
     crate::closure::js_register_closure_length(func, length);
-    let closure = js_closure_alloc(func, 0);
-    crate::object::set_bound_native_closure_name(closure, name);
-    crate::object::set_builtin_closure_length(closure as usize, length);
+    let closure = js_closure_alloc(func, 1);
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let closure_handle = scope.root_raw_mut_ptr(closure);
+    crate::object::set_bound_native_closure_name(
+        closure_handle.get_raw_mut_ptr::<ClosureHeader>(),
+        name,
+    );
+    crate::object::set_builtin_closure_length(
+        closure_handle.get_raw_mut_ptr::<ClosureHeader>() as usize,
+        length,
+    );
+    let closure = closure_handle.get_raw_mut_ptr::<ClosureHeader>();
     (closure, js_nanbox_pointer(closure as i64))
 }
 
@@ -120,96 +146,560 @@ fn throw_module_not_found(specifier: &str) -> ! {
     crate::fs::validate::throw_error_with_code(&message, "MODULE_NOT_FOUND")
 }
 
-fn throw_unsupported_package_require(specifier: &str) -> ! {
-    let message = format!(
-        "Perry createRequire() currently supports built-in modules only; package/file require('{}') is not supported under perry compile. Use ESM import syntax and perry.compilePackages instead.",
-        specifier
+fn throw_require_module_not_found(specifier: &str, base: &std::path::Path) -> ! {
+    let message = format!("Cannot find module '{specifier}'");
+    let msg = js_string_from_bytes(message.as_ptr(), message.len() as u32);
+    crate::node_submodules::register_error_code_pub(msg, "MODULE_NOT_FOUND");
+    let error = crate::error::js_error_new_with_message(msg);
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let error_handle = scope.root_raw_mut_ptr(error);
+    let stack = crate::array::js_array_alloc_with_length(1);
+    let stack_handle = scope.root_raw_mut_ptr(stack);
+    let base_value = string_value(&base.to_string_lossy());
+    crate::array::js_array_set_f64(
+        stack_handle.get_raw_mut_ptr::<crate::array::ArrayHeader>(),
+        0,
+        base_value,
     );
-    crate::fs::validate::throw_error_with_code(&message, "ERR_PERRY_UNSUPPORTED_CREATE_REQUIRE")
+    let error = error_handle.get_raw_mut_ptr::<crate::object::ObjectHeader>();
+    let error_value = js_nanbox_pointer(error as i64);
+    unsafe {
+        crate::object::exotic_expando::exotic_set_property(
+            error as usize,
+            crate::object::exotic_expando::ExoticKind::Error,
+            "requireStack",
+            f64::from_bits(
+                JSValue::array_ptr(stack_handle.get_raw_mut_ptr::<crate::array::ArrayHeader>())
+                    .bits(),
+            ),
+            error_value,
+        );
+    }
+    crate::exception::js_throw(error_value)
 }
 
-extern "C" fn require_thunk(_closure: *const ClosureHeader, id: f64) -> f64 {
+fn throw_package_path_not_exported(specifier: &str) -> ! {
+    let message = format!("Package subpath '{specifier}' is not defined by \"exports\"");
+    crate::fs::validate::throw_error_with_code(&message, "ERR_PACKAGE_PATH_NOT_EXPORTED")
+}
+
+#[derive(Clone, Copy)]
+enum ResolveError {
+    NotFound,
+    NotExported,
+}
+
+fn require_base_dir(closure: *const ClosureHeader) -> std::path::PathBuf {
+    let base = value_to_string(js_closure_get_capture_f64(closure, 0), "filename");
+    let path = std::path::PathBuf::from(base);
+    path.parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf()
+}
+
+fn require_base_filename(closure: *const ClosureHeader) -> String {
+    if closure.is_null() {
+        return std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join("__perry_ambient.cjs")
+            .to_string_lossy()
+            .into_owned();
+    }
+    value_to_string(js_closure_get_capture_f64(closure, 0), "filename")
+}
+
+fn resolve_file(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    if path.is_file() {
+        return Some(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+    }
+    for ext in ["js", "json", "node"] {
+        let candidate = path.with_extension(ext);
+        if candidate.is_file() {
+            return Some(std::fs::canonicalize(&candidate).unwrap_or(candidate));
+        }
+    }
+    if path.is_dir() {
+        if let Ok(text) = std::fs::read_to_string(path.join("package.json")) {
+            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(main) = manifest.get("main").and_then(|v| v.as_str()) {
+                    if let Some(found) = resolve_file(&path.join(main)) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        for ext in ["js", "json", "node", "cjs"] {
+            let candidate = path.join(format!("index.{ext}"));
+            if candidate.is_file() {
+                return Some(std::fs::canonicalize(&candidate).unwrap_or(candidate));
+            }
+        }
+    }
+    None
+}
+
+fn package_parts(specifier: &str) -> (&str, Option<&str>) {
+    if specifier.starts_with('@') {
+        let mut parts = specifier.splitn(3, '/');
+        let scope = parts.next().unwrap_or(specifier);
+        let name = parts.next().unwrap_or("");
+        let package_len = scope.len() + 1 + name.len();
+        (&specifier[..package_len.min(specifier.len())], parts.next())
+    } else {
+        specifier
+            .split_once('/')
+            .map_or((specifier, None), |(p, s)| (p, Some(s)))
+    }
+}
+
+fn resolve_exports(value: &serde_json::Value, key: &str) -> Option<String> {
+    match value {
+        serde_json::Value::String(target) => Some(target.clone()),
+        serde_json::Value::Array(items) => items.iter().find_map(|v| resolve_exports(v, key)),
+        serde_json::Value::Object(map) => {
+            if let Some(target) = map.get(key) {
+                return resolve_exports(target, key);
+            }
+            for (condition, target) in map {
+                if matches!(condition.as_str(), "node" | "require" | "default") {
+                    if let Some(found) = resolve_exports(target, key) {
+                        return Some(found);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn resolve_request(
+    base: &std::path::Path,
+    specifier: &str,
+) -> Result<std::path::PathBuf, ResolveError> {
+    if specifier.starts_with('/') {
+        return resolve_file(std::path::Path::new(specifier)).ok_or(ResolveError::NotFound);
+    }
+    if specifier.starts_with("./") || specifier.starts_with("../") {
+        return resolve_file(&base.join(specifier)).ok_or(ResolveError::NotFound);
+    }
+    let (package, subpath) = package_parts(specifier);
+    for ancestor in base.ancestors() {
+        let package_dir = ancestor.join("node_modules").join(package);
+        if !package_dir.is_dir() {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(package_dir.join("package.json")) {
+            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(exports) = manifest.get("exports") {
+                    let key = subpath
+                        .map(|s| format!("./{s}"))
+                        .unwrap_or_else(|| ".".into());
+                    let target = resolve_exports(exports, &key).ok_or(ResolveError::NotExported)?;
+                    return resolve_file(&package_dir.join(target)).ok_or(ResolveError::NotFound);
+                }
+                if let Some(subpath) = subpath {
+                    return resolve_file(&package_dir.join(subpath)).ok_or(ResolveError::NotFound);
+                }
+                if let Some(main) = manifest.get("main").and_then(|v| v.as_str()) {
+                    if let Some(found) = resolve_file(&package_dir.join(main)) {
+                        return Ok(found);
+                    }
+                }
+            }
+        }
+        return resolve_file(&package_dir).ok_or(ResolveError::NotFound);
+    }
+    Err(ResolveError::NotFound)
+}
+
+fn object_ptr(value: f64) -> *mut crate::object::ObjectHeader {
+    crate::value::js_nanbox_get_pointer(value) as *mut crate::object::ObjectHeader
+}
+
+fn cached_record(cache: f64, filename: &str) -> Option<(f64, f64)> {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let cache_handle = scope.root_nanbox_f64(cache);
+    let key = js_string_from_bytes(filename.as_ptr(), filename.len() as u32);
+    let record = js_object_get_field_by_name(object_ptr(cache_handle.get_nanbox_f64()), key);
+    if record.is_undefined() {
+        return None;
+    }
+    let record_handle = scope.root_nanbox_f64(f64::from_bits(record.bits()));
+    let exports_key = js_string_from_bytes(b"exports".as_ptr(), 7);
+    let exports = f64::from_bits(
+        js_object_get_field_by_name(object_ptr(record_handle.get_nanbox_f64()), exports_key).bits(),
+    );
+    Some((record_handle.get_nanbox_f64(), exports))
+}
+
+fn cache_exports(cache: f64, filename: &str, exports: f64) -> f64 {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let cache_handle = scope.root_nanbox_f64(cache);
+    let exports_handle = scope.root_nanbox_f64(exports);
+    let record = js_object_alloc(0, 5);
+    let record_handle = scope.root_raw_mut_ptr(record);
+    let id = string_value(filename);
+    set_field(record_handle.get_raw_mut_ptr(), "id", id);
+    let filename_value = string_value(filename);
+    set_field(record_handle.get_raw_mut_ptr(), "filename", filename_value);
+    set_field(
+        record_handle.get_raw_mut_ptr(),
+        "exports",
+        exports_handle.get_nanbox_f64(),
+    );
+    set_field(
+        record_handle.get_raw_mut_ptr(),
+        "loaded",
+        f64::from_bits(crate::value::TAG_TRUE),
+    );
+    let children = crate::array::js_array_alloc_with_length(0);
+    let children_handle = scope.root_raw_mut_ptr(children);
+    set_field(
+        record_handle.get_raw_mut_ptr(),
+        "children",
+        f64::from_bits(JSValue::array_ptr(children_handle.get_raw_mut_ptr()).bits()),
+    );
+    let key = js_string_from_bytes(filename.as_ptr(), filename.len() as u32);
+    let record_value = object_value(record_handle.get_raw_mut_ptr());
+    js_object_set_field_by_name(object_ptr(cache_handle.get_nanbox_f64()), key, record_value);
+    record_value
+}
+
+fn cjs_record_exports(value: f64) -> Option<f64> {
+    let jv = JSValue::from_bits(value.to_bits());
+    if !jv.is_pointer() {
+        return None;
+    }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let record_handle = scope.root_nanbox_f64(value);
+    let marker_key = js_string_from_bytes(b"__perry_cjs_record".as_ptr(), 18);
+    let record = object_ptr(record_handle.get_nanbox_f64());
+    let marker = js_object_get_field_by_name(record, marker_key);
+    if !marker.is_bool() || !marker.as_bool() {
+        return None;
+    }
+    let exports_key = js_string_from_bytes(b"exports".as_ptr(), 7);
+    let exports = f64::from_bits(
+        js_object_get_field_by_name(object_ptr(record_handle.get_nanbox_f64()), exports_key).bits(),
+    );
+    Some(exports)
+}
+
+fn cjs_record_field(value: f64, name: &str) -> Option<f64> {
+    if cjs_record_exports(value).is_none() {
+        return None;
+    }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let record_handle = scope.root_nanbox_f64(value);
+    let key = js_string_from_bytes(name.as_ptr(), name.len() as u32);
+    Some(f64::from_bits(
+        js_object_get_field_by_name(object_ptr(record_handle.get_nanbox_f64()), key).bits(),
+    ))
+}
+
+fn registered_path_module_value(path: &str) -> Option<f64> {
+    let key = canonicalize_module_path(path);
+    let guard = MODULE_PATH_REGISTRY.read().unwrap();
+    guard
+        .as_ref()
+        .and_then(|modules| modules.get(&key).copied())
+        .map(f64::from_bits)
+}
+
+fn link_parent(cache: f64, record: f64, parent_filename: &str) {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let cache_handle = scope.root_nanbox_f64(cache);
+    let record_handle = scope.root_nanbox_f64(record);
+    let parent_key = js_string_from_bytes(b"parent".as_ptr(), 6);
+    let existing =
+        js_object_get_field_by_name(object_ptr(record_handle.get_nanbox_f64()), parent_key);
+    if !existing.is_undefined() {
+        return;
+    }
+    let cache_key = js_string_from_bytes(parent_filename.as_ptr(), parent_filename.len() as u32);
+    let cached_parent =
+        js_object_get_field_by_name(object_ptr(cache_handle.get_nanbox_f64()), cache_key);
+    let parent = if cached_parent.is_undefined() {
+        let parent = js_object_alloc(0, 1);
+        let parent_handle = scope.root_raw_mut_ptr(parent);
+        let id = string_value(parent_filename);
+        set_field(parent_handle.get_raw_mut_ptr(), "id", id);
+        object_value(parent_handle.get_raw_mut_ptr())
+    } else {
+        f64::from_bits(cached_parent.bits())
+    };
+    set_field(object_ptr(record_handle.get_nanbox_f64()), "parent", parent);
+}
+
+fn require_path(cache: f64, path: &std::path::Path, parent_filename: &str) -> f64 {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let cache_handle = scope.root_nanbox_f64(cache);
+    let filename = path.to_string_lossy();
+    if let Some((record, exports)) = cached_record(cache_handle.get_nanbox_f64(), &filename) {
+        link_parent(cache_handle.get_nanbox_f64(), record, parent_filename);
+        return exports;
+    }
+    let mut registered = registered_path_module_value(&filename).unwrap_or_else(|| {
+        PENDING_REQUIRE_PARENT.with(|pending| {
+            *pending.borrow_mut() = Some(parent_filename.to_string());
+        });
+        let result = js_require_path_module(string_value(&filename));
+        PENDING_REQUIRE_PARENT.with(|pending| pending.borrow_mut().take());
+        registered_path_module_value(&filename).unwrap_or(result)
+    });
+    if let Some((record, exports)) = cached_record(cache_handle.get_nanbox_f64(), &filename) {
+        link_parent(cache_handle.get_nanbox_f64(), record, parent_filename);
+        run_custom_extension(path, record, &filename);
+        return exports;
+    }
+    if cjs_record_field(registered, "loaded").is_some_and(|loaded| {
+        JSValue::from_bits(loaded.to_bits()).is_bool()
+            && JSValue::from_bits(loaded.to_bits()).as_bool()
+    }) {
+        if let Some(factory) = cjs_record_field(registered, "__perry_cjs_factory") {
+            let factory_value = JSValue::from_bits(factory.to_bits());
+            if factory_value.is_pointer()
+                && crate::closure::is_closure_ptr(
+                    crate::value::js_nanbox_get_pointer(factory) as usize
+                )
+            {
+                let factory_handle = scope.root_nanbox_f64(factory);
+                let exports = crate::closure::js_closure_call0(
+                    crate::value::js_nanbox_get_pointer(factory_handle.get_nanbox_f64())
+                        as *const ClosureHeader,
+                );
+                if let Some((record, cached)) =
+                    cached_record(cache_handle.get_nanbox_f64(), &filename)
+                {
+                    link_parent(cache_handle.get_nanbox_f64(), record, parent_filename);
+                    run_custom_extension(path, record, &filename);
+                    return cached;
+                }
+                let exports_handle = scope.root_nanbox_f64(exports);
+                let (record, value) =
+                    if let Some(value) = cjs_record_exports(exports_handle.get_nanbox_f64()) {
+                        let key = js_string_from_bytes(filename.as_ptr(), filename.len() as u32);
+                        js_object_set_field_by_name(
+                            object_ptr(cache_handle.get_nanbox_f64()),
+                            key,
+                            exports_handle.get_nanbox_f64(),
+                        );
+                        (exports_handle.get_nanbox_f64(), value)
+                    } else {
+                        (
+                            cache_exports(
+                                cache_handle.get_nanbox_f64(),
+                                &filename,
+                                exports_handle.get_nanbox_f64(),
+                            ),
+                            exports_handle.get_nanbox_f64(),
+                        )
+                    };
+                let record_handle = scope.root_nanbox_f64(record);
+                link_parent(
+                    cache_handle.get_nanbox_f64(),
+                    record_handle.get_nanbox_f64(),
+                    parent_filename,
+                );
+                run_custom_extension(path, record_handle.get_nanbox_f64(), &filename);
+                return value;
+            }
+        }
+        registered = registered_path_module_value(&filename).unwrap_or(registered);
+    }
+    let registered_handle = scope.root_nanbox_f64(registered);
+    let exports = if let Some(exports) = cjs_record_exports(registered_handle.get_nanbox_f64()) {
+        exports
+    } else if !JSValue::from_bits(registered_handle.get_nanbox_f64().to_bits()).is_undefined() {
+        registered_handle.get_nanbox_f64()
+    } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
+        js_require_json_disk(string_value(&filename))
+    } else {
+        if JSValue::from_bits(registered_handle.get_nanbox_f64().to_bits()).is_undefined() {
+            throw_module_not_found(&filename);
+        }
+        registered_handle.get_nanbox_f64()
+    };
+    let exports_handle = scope.root_nanbox_f64(exports);
+    let record = if cjs_record_exports(registered_handle.get_nanbox_f64()).is_some() {
+        let key = js_string_from_bytes(filename.as_ptr(), filename.len() as u32);
+        js_object_set_field_by_name(
+            object_ptr(cache_handle.get_nanbox_f64()),
+            key,
+            registered_handle.get_nanbox_f64(),
+        );
+        registered_handle.get_nanbox_f64()
+    } else {
+        cache_exports(
+            cache_handle.get_nanbox_f64(),
+            &filename,
+            exports_handle.get_nanbox_f64(),
+        )
+    };
+    let record_handle = scope.root_nanbox_f64(record);
+    if cjs_record_exports(record_handle.get_nanbox_f64()).is_some() {
+        set_field(
+            object_ptr(record_handle.get_nanbox_f64()),
+            "loaded",
+            f64::from_bits(crate::value::TAG_TRUE),
+        );
+    }
+    link_parent(
+        cache_handle.get_nanbox_f64(),
+        record_handle.get_nanbox_f64(),
+        parent_filename,
+    );
+    run_custom_extension(path, record_handle.get_nanbox_f64(), &filename);
+    exports_handle.get_nanbox_f64()
+}
+
+fn run_custom_extension(path: &std::path::Path, record: f64, filename: &str) {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let record_handle = scope.root_nanbox_f64(record);
+    if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
+        let extension = format!(".{extension}");
+        if !matches!(extension.as_str(), ".js" | ".json" | ".node" | ".cjs") {
+            let extensions_handle =
+                scope.root_nanbox_f64(crate::object::module_cjs_extensions_value());
+            let key = js_string_from_bytes(extension.as_ptr(), extension.len() as u32);
+            let handler =
+                js_object_get_field_by_name(object_ptr(extensions_handle.get_nanbox_f64()), key);
+            if !handler.is_undefined() {
+                let handler_handle = scope.root_nanbox_f64(f64::from_bits(handler.bits()));
+                let filename_value = string_value(&filename);
+                crate::closure::js_closure_call2(
+                    object_ptr(handler_handle.get_nanbox_f64()) as *mut ClosureHeader,
+                    record_handle.get_nanbox_f64(),
+                    filename_value,
+                );
+            }
+        }
+    }
+}
+
+extern "C" fn require_thunk(closure: *const ClosureHeader, id: f64) -> f64 {
     let specifier = value_to_string(id, "id");
     if specifier.is_empty() {
         let message = "The argument 'id' must be a non-empty string";
         crate::fs::validate::throw_type_error_with_code(message, "ERR_INVALID_ARG_VALUE");
     }
-    let Some(module_name) = supported_require_builtin(&specifier) else {
-        throw_unsupported_package_require(&specifier);
-    };
-    require_builtin_value(module_name)
+    if let Some(module_name) = supported_require_builtin(&specifier) {
+        return require_builtin_value(module_name);
+    }
+    let base = require_base_dir(closure);
+    let parent_filename = require_base_filename(closure);
+    match resolve_request(&base, &specifier) {
+        Ok(path) => require_path(
+            crate::object::module_cjs_cache_value(),
+            &path,
+            &parent_filename,
+        ),
+        Err(ResolveError::NotExported) => throw_package_path_not_exported(&specifier),
+        Err(ResolveError::NotFound) => throw_require_module_not_found(&specifier, &base),
+    }
 }
 
-extern "C" fn resolve_thunk(_closure: *const ClosureHeader, request: f64, _options: f64) -> f64 {
+extern "C" fn resolve_thunk(closure: *const ClosureHeader, request: f64, _options: f64) -> f64 {
     let specifier = value_to_string(request, "request");
     if let Some(resolved) = resolve_builtin(&specifier) {
         return string_value(resolved);
     }
-    throw_module_not_found(&specifier)
+    let base = require_base_dir(closure);
+    match resolve_request(&base, &specifier) {
+        Ok(path) => string_value(&path.to_string_lossy()),
+        Err(ResolveError::NotExported) => throw_package_path_not_exported(&specifier),
+        Err(ResolveError::NotFound) => throw_require_module_not_found(&specifier, &base),
+    }
 }
 
-extern "C" fn resolve_paths_thunk(_closure: *const ClosureHeader, request: f64) -> f64 {
+extern "C" fn resolve_paths_thunk(closure: *const ClosureHeader, request: f64) -> f64 {
     let specifier = value_to_string(request, "request");
     if supported_require_builtin(&specifier).is_some() {
         return null();
     }
-    null()
-}
-
-extern "C" fn extension_noop_thunk(
-    _closure: *const ClosureHeader,
-    _module: f64,
-    _filename: f64,
-) -> f64 {
-    undefined()
-}
-
-fn extensions_object() -> f64 {
+    let base = require_base_dir(closure);
+    let paths: Vec<_> = if specifier.starts_with("./") || specifier.starts_with("../") {
+        vec![base.to_string_lossy().into_owned()]
+    } else {
+        base.ancestors()
+            .map(|dir| dir.join("node_modules").to_string_lossy().into_owned())
+            .collect()
+    };
     let scope = crate::gc::RuntimeHandleScope::new();
-    let obj = js_object_alloc(0, 3);
-    let obj_handle = scope.root_raw_mut_ptr(obj);
-    for name in [".js", ".json", ".node"] {
-        let (_, value) = named_closure(extension_noop_thunk as *const u8, 2, 2, name);
-        let value_handle = scope.root_nanbox_f64(value);
-        set_field(
-            obj_handle.get_raw_mut_ptr::<crate::object::ObjectHeader>(),
-            name,
-            value_handle.get_nanbox_f64(),
-        );
+    let arr = crate::array::js_array_alloc_with_length(paths.len() as u32);
+    let arr_handle = scope.root_raw_mut_ptr(arr);
+    for (index, path) in paths.iter().enumerate() {
+        let path_value = string_value(path);
+        crate::array::js_array_set_f64(arr_handle.get_raw_mut_ptr(), index as u32, path_value);
     }
-    object_value(obj_handle.get_raw_mut_ptr::<crate::object::ObjectHeader>())
+    f64::from_bits(JSValue::array_ptr(arr_handle.get_raw_mut_ptr()).bits())
 }
 
-fn make_require(main_value: f64) -> f64 {
+fn make_require(base: f64, main_value: f64) -> f64 {
     let scope = crate::gc::RuntimeHandleScope::new();
+    let base_handle = scope.root_nanbox_f64(base);
+    let main_handle = scope.root_nanbox_f64(main_value);
     let (_, paths_value) = named_closure(resolve_paths_thunk as *const u8, 1, 1, "paths");
     let paths_handle = scope.root_nanbox_f64(paths_value);
-    let (resolve_closure, resolve_value) =
-        named_closure(resolve_thunk as *const u8, 2, 2, "resolve");
+    js_closure_set_capture_f64(
+        object_ptr(paths_handle.get_nanbox_f64()) as *mut ClosureHeader,
+        0,
+        base_handle.get_nanbox_f64(),
+    );
+    let (_, resolve_value) = named_closure(resolve_thunk as *const u8, 2, 2, "resolve");
     let resolve_handle = scope.root_nanbox_f64(resolve_value);
-    set_closure_prop(resolve_closure, "paths", paths_handle.get_nanbox_f64());
-
-    let cache_handle = scope.root_nanbox_f64(object_value(js_object_alloc(0, 0)));
-    let extensions_handle = scope.root_nanbox_f64(extensions_object());
-
-    let (require_closure, require_value) =
-        named_closure(require_thunk as *const u8, 1, 1, "require");
-    let require_handle = scope.root_nanbox_f64(require_value);
-    set_closure_prop(require_closure, "resolve", resolve_handle.get_nanbox_f64());
-    set_closure_prop(require_closure, "cache", cache_handle.get_nanbox_f64());
+    js_closure_set_capture_f64(
+        object_ptr(resolve_handle.get_nanbox_f64()) as *mut ClosureHeader,
+        0,
+        base_handle.get_nanbox_f64(),
+    );
     set_closure_prop(
-        require_closure,
+        object_ptr(resolve_handle.get_nanbox_f64()) as *mut ClosureHeader,
+        "paths",
+        paths_handle.get_nanbox_f64(),
+    );
+    let resolve_prototype = scope.root_nanbox_f64(object_value(js_object_alloc(0, 0)));
+    set_closure_prop(
+        object_ptr(resolve_handle.get_nanbox_f64()) as *mut ClosureHeader,
+        "prototype",
+        resolve_prototype.get_nanbox_f64(),
+    );
+
+    let cache_handle = scope.root_nanbox_f64(crate::object::module_cjs_cache_value());
+    let extensions_handle = scope.root_nanbox_f64(crate::object::module_cjs_extensions_value());
+
+    let (_, require_value) = named_closure(require_thunk as *const u8, 1, 1, "require");
+    let require_handle = scope.root_nanbox_f64(require_value);
+    js_closure_set_capture_f64(
+        object_ptr(require_handle.get_nanbox_f64()) as *mut ClosureHeader,
+        0,
+        base_handle.get_nanbox_f64(),
+    );
+    let require_ptr = || object_ptr(require_handle.get_nanbox_f64()) as *mut ClosureHeader;
+    set_closure_prop(require_ptr(), "resolve", resolve_handle.get_nanbox_f64());
+    set_closure_prop(require_ptr(), "cache", cache_handle.get_nanbox_f64());
+    set_closure_prop(
+        require_ptr(),
         "extensions",
         extensions_handle.get_nanbox_f64(),
     );
-    set_closure_prop(require_closure, "main", main_value);
+    set_closure_prop(require_ptr(), "main", main_handle.get_nanbox_f64());
+    let require_prototype = scope.root_nanbox_f64(object_value(js_object_alloc(0, 0)));
+    set_closure_prop(
+        require_ptr(),
+        "prototype",
+        require_prototype.get_nanbox_f64(),
+    );
     require_handle.get_nanbox_f64()
 }
 
 #[no_mangle]
 pub extern "C" fn js_module_create_require(filename_or_url: f64) -> f64 {
     validate_create_require_base(filename_or_url);
-    make_require(undefined())
+    let base = crate::url::node_compat::module_base_to_path(filename_or_url)
+        .unwrap_or_else(|| value_to_string(filename_or_url, "filename"));
+    make_require(string_value(&base), undefined())
 }
 
 /// Devirt codegen entry for `module.createRequire(...)` (#6644). The require
@@ -239,6 +729,10 @@ pub extern "C" fn js_module_create_require_devirt(filename_or_url: f64) -> f64 {
 /// compiled module self-registers at the end of its CJS wrapper init.
 static MODULE_PATH_REGISTRY: std::sync::RwLock<Option<std::collections::HashMap<String, u64>>> =
     std::sync::RwLock::new(None);
+
+thread_local! {
+    static PENDING_REQUIRE_PARENT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
 
 /// Next.js wall 54 (part 2): registry mapping an AOT-compiled module's absolute
 /// source path to the ADDRESS of its `<prefix>__init` function, so a runtime
@@ -286,12 +780,29 @@ pub unsafe extern "C" fn js_register_path_init(path_ptr: *const u8, path_len: i6
 /// [`MODULE_PATH_REGISTRY`].
 #[no_mangle]
 pub extern "C" fn js_register_path_module(path_value: f64, exports: f64) {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let exports = scope.root_nanbox_f64(exports);
     let path = value_to_string(path_value, "path");
     let key = canonicalize_module_path(&path);
+    if let Some(parent_filename) =
+        PENDING_REQUIRE_PARENT.with(|pending| pending.borrow_mut().take())
+    {
+        if cjs_record_exports(exports.get_nanbox_f64()).is_some() {
+            let record = scope.root_nanbox_f64(exports.get_nanbox_f64());
+            let parent = scope.root_nanbox_f64(object_value(js_object_alloc(0, 1)));
+            let id = string_value(&parent_filename);
+            set_field(object_ptr(parent.get_nanbox_f64()), "id", id);
+            set_field(
+                object_ptr(record.get_nanbox_f64()),
+                "parent",
+                parent.get_nanbox_f64(),
+            );
+        }
+    }
     let mut guard = MODULE_PATH_REGISTRY.write().unwrap();
     guard
         .get_or_insert_with(std::collections::HashMap::new)
-        .insert(key, exports.to_bits());
+        .insert(key, exports.get_nanbox_f64().to_bits());
 }
 
 /// Codegen FFI: resolve a runtime `require(absolutePath.js)` to a registered
@@ -309,7 +820,8 @@ pub extern "C" fn js_require_path_module(path_value: f64) -> f64 {
         let guard = MODULE_PATH_REGISTRY.read().unwrap();
         if let Some(map) = guard.as_ref() {
             if let Some(bits) = map.get(&key) {
-                return f64::from_bits(*bits);
+                let value = f64::from_bits(*bits);
+                return cjs_record_exports(value).unwrap_or(value);
             }
         }
     }
@@ -332,7 +844,8 @@ pub extern "C" fn js_require_path_module(path_value: f64) -> f64 {
         let guard = MODULE_PATH_REGISTRY.read().unwrap();
         if let Some(map) = guard.as_ref() {
             if let Some(bits) = map.get(&key) {
-                return f64::from_bits(*bits);
+                let value = f64::from_bits(*bits);
+                return cjs_record_exports(value).unwrap_or(value);
             }
         }
     }
@@ -362,7 +875,8 @@ pub extern "C" fn js_require_path_module(path_value: f64) -> f64 {
                 guard.as_ref().and_then(|m| m.get(&cand_key).copied())
             };
             if let Some(bits) = resolved {
-                return f64::from_bits(bits);
+                let value = f64::from_bits(bits);
+                return cjs_record_exports(value).unwrap_or(value);
             }
             // Deferred module: trigger its init, then re-check.
             let cand_init = {
@@ -375,7 +889,8 @@ pub extern "C" fn js_require_path_module(path_value: f64) -> f64 {
                 init_fn();
                 let guard = MODULE_PATH_REGISTRY.read().unwrap();
                 if let Some(bits) = guard.as_ref().and_then(|m| m.get(&cand_key).copied()) {
-                    return f64::from_bits(bits);
+                    let value = f64::from_bits(bits);
+                    return cjs_record_exports(value).unwrap_or(value);
                 }
             }
         }
@@ -487,7 +1002,12 @@ pub extern "C" fn js_require_json_disk(specifier: f64) -> f64 {
 /// resolution.
 #[no_mangle]
 pub extern "C" fn js_module_ambient_require() -> f64 {
-    make_require(undefined())
+    let base = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("__perry_ambient.cjs")
+        .to_string_lossy()
+        .into_owned();
+    make_require(string_value(&base), undefined())
 }
 
 /// Keepalive anchor for the auto-optimize whole-program build (generated-code-only

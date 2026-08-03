@@ -56,13 +56,56 @@ pub(super) fn transform_static_literal_requires(
 
     let mut imported_specs = HashMap::new();
     let mut imports = Vec::new();
+    let mut discovered_side_effects = HashSet::new();
     let mut replacements = Vec::new();
     let mut next_id = 0usize;
     for alias in require_aliases {
+        for cap in literal_require_resolve_call_re(&alias).captures_iter(source) {
+            let Some(full) = cap.name("call") else {
+                continue;
+            };
+            if masked_source[full.start()..full.end()]
+                .bytes()
+                .all(|b| b.is_ascii_whitespace())
+            {
+                continue;
+            }
+            let specifier = cap.name("spec").map(|m| m.as_str()).unwrap_or_default();
+            if let Some(target) = resolve_static_require(module_dir, specifier) {
+                if discovered_side_effects.insert(target.clone()) {
+                    let binding = unique_lazy_require_name(source, &mut next_id);
+                    imports.push(format!(
+                        "import {binding} from {:?};",
+                        target.to_string_lossy()
+                    ));
+                }
+            }
+        }
         let call_re = literal_require_call_re(&alias);
         for cap in call_re.captures_iter(source) {
             let specifier = cap.name("spec").map(|m| m.as_str()).unwrap_or_default();
+            let require_target = resolve_static_require(module_dir, specifier);
             if should_leave_runtime_require(specifier, compile_packages) {
+                if let Some(target) = require_target.as_ref() {
+                    if discovered_side_effects.insert(target.clone()) {
+                        let binding = unique_lazy_require_name(source, &mut next_id);
+                        imports.push(format!(
+                            "import {binding} from {:?};",
+                            target.to_string_lossy()
+                        ));
+                    }
+                }
+                continue;
+            }
+            // A missing file or an exports-blocked package subpath is a runtime
+            // createRequire error, never a hard AOT import. This also covers
+            // callbacks declared outside the `try` that eventually invokes
+            // them; lexical try detection alone cannot see that control flow.
+            if alias != "require"
+                && require_target.is_none()
+                && (is_relative_or_absolute_specifier(specifier)
+                    || package_subpath_is_blocked(module_dir, specifier))
+            {
                 continue;
             }
             // #6873: hoisting `try { x = require("./gen") } catch {}` to a
@@ -75,9 +118,7 @@ pub(super) fn transform_static_literal_requires(
             //
             // Resolvable optional requires keep being hoisted, so a module
             // that IS present still gets compiled in and loads.
-            if optional_specs.get(specifier).copied().unwrap_or(false)
-                && !relative_specifier_resolves(module_dir, specifier)
-            {
+            if optional_specs.get(specifier).copied().unwrap_or(false) && require_target.is_none() {
                 continue;
             }
             let Some(full) = cap.name("call") else {
@@ -88,6 +129,25 @@ pub(super) fn transform_static_literal_requires(
                 .all(|b| b == b' ' || b == b'\t' || b == b'\r' || b == b'\n')
             {
                 continue;
+            }
+            // CJS, JSON, native addons, and custom extensions need the runtime
+            // `require` path: it owns Node's cache/record/extension-hook
+            // semantics. The side-effect import only makes the statically-known
+            // module part of the AOT graph.
+            if let Some(target) = require_target.as_ref() {
+                if !matches!(
+                    target.extension().and_then(|e| e.to_str()),
+                    Some("ts" | "tsx" | "mts" | "cts" | "js" | "mjs")
+                ) {
+                    if discovered_side_effects.insert(target.clone()) {
+                        let binding = unique_lazy_require_name(source, &mut next_id);
+                        imports.push(format!(
+                            "import {binding} from {:?};",
+                            target.to_string_lossy()
+                        ));
+                    }
+                    continue;
+                }
             }
             let temp = imported_specs
                 .entry(specifier.to_string())
@@ -110,6 +170,128 @@ pub(super) fn transform_static_literal_requires(
         transformed.replace_range(start..end, &replacement);
     }
     prepend_imports_preserving_shebang(&transformed, &imports)
+}
+
+fn resolve_static_require(module_dir: &Path, specifier: &str) -> Option<std::path::PathBuf> {
+    if is_relative_or_absolute_specifier(specifier) {
+        let base = if std::path::Path::new(specifier).is_absolute() {
+            std::path::PathBuf::from(specifier)
+        } else {
+            module_dir.join(specifier)
+        };
+        return resolve_require_path(&base);
+    }
+
+    let (package, subpath) = super::parse_package_specifier(specifier);
+    for node_modules in crate::commands::compile::resolve::ancestor_node_modules_dirs(module_dir) {
+        let package_dir = node_modules.join(&package);
+        if !package_dir.is_dir() {
+            continue;
+        }
+        let package_json = std::fs::read_to_string(package_dir.join("package.json")).ok();
+        if let Some(text) = package_json {
+            let manifest: serde_json::Value = serde_json::from_str(&text).ok()?;
+            if let Some(exports) = manifest.get("exports") {
+                let key = subpath
+                    .as_deref()
+                    .map(|s| format!("./{s}"))
+                    .unwrap_or_else(|| ".".to_string());
+                let target = resolve_require_exports(exports, &key)?;
+                return resolve_require_path(&package_dir.join(target));
+            }
+            if let Some(subpath) = subpath.as_deref() {
+                return resolve_require_path(&package_dir.join(subpath));
+            }
+            if let Some(main) = manifest.get("main").and_then(|v| v.as_str()) {
+                if let Some(path) = resolve_require_path(&package_dir.join(main)) {
+                    return Some(path);
+                }
+            }
+        }
+        return resolve_require_path(&package_dir);
+    }
+    None
+}
+
+fn package_subpath_is_blocked(module_dir: &Path, specifier: &str) -> bool {
+    if is_relative_or_absolute_specifier(specifier) {
+        return false;
+    }
+    let (package, subpath) = super::parse_package_specifier(specifier);
+    for node_modules in crate::commands::compile::resolve::ancestor_node_modules_dirs(module_dir) {
+        let package_dir = node_modules.join(&package);
+        if !package_dir.is_dir() {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(package_dir.join("package.json")) else {
+            return false;
+        };
+        let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return false;
+        };
+        let Some(exports) = manifest.get("exports") else {
+            return false;
+        };
+        let key = subpath
+            .as_deref()
+            .map(|path| format!("./{path}"))
+            .unwrap_or_else(|| ".".to_string());
+        return resolve_require_exports(exports, &key).is_none();
+    }
+    false
+}
+
+fn resolve_require_path(path: &Path) -> Option<std::path::PathBuf> {
+    if path.is_file() {
+        return path.canonicalize().ok();
+    }
+    for ext in ["ts", "tsx", "mts", "cts", "js", "json", "node", "cjs"] {
+        let candidate = path.with_extension(ext);
+        if candidate.is_file() {
+            return candidate.canonicalize().ok();
+        }
+    }
+    if path.is_dir() {
+        if let Ok(text) = std::fs::read_to_string(path.join("package.json")) {
+            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(main) = manifest.get("main").and_then(|v| v.as_str()) {
+                    if let Some(found) = resolve_require_path(&path.join(main)) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        for ext in ["ts", "tsx", "mts", "cts", "js", "json", "node", "cjs"] {
+            let candidate = path.join(format!("index.{ext}"));
+            if candidate.is_file() {
+                return candidate.canonicalize().ok();
+            }
+        }
+    }
+    None
+}
+
+fn resolve_require_exports(exports: &serde_json::Value, key: &str) -> Option<String> {
+    match exports {
+        serde_json::Value::String(target) => Some(target.clone()),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find_map(|item| resolve_require_exports(item, key)),
+        serde_json::Value::Object(map) => {
+            if let Some(target) = map.get(key) {
+                return resolve_require_exports(target, key);
+            }
+            for (condition, target) in map {
+                if matches!(condition.as_str(), "node" | "require" | "default") {
+                    if let Some(resolved) = resolve_require_exports(target, key) {
+                        return Some(resolved);
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 fn prepend_imports_preserving_shebang(source: &str, imports: &[String]) -> String {
@@ -192,6 +374,14 @@ fn literal_require_call_re(require_alias: &str) -> Regex {
     .expect("static require literal call regex")
 }
 
+fn literal_require_resolve_call_re(require_alias: &str) -> Regex {
+    Regex::new(&format!(
+        r#"(?m)(?:^|[^A-Za-z0-9_$\.])(?P<call>{}\.resolve\s*\(\s*['\"](?P<spec>[^'\"]+)['\"]\s*\))"#,
+        regex::escape(require_alias)
+    ))
+    .expect("static require.resolve literal call regex")
+}
+
 fn should_leave_runtime_require(specifier: &str, compile_packages: &HashSet<String>) -> bool {
     if perry_hir::is_native_module(specifier) {
         return true;
@@ -236,29 +426,19 @@ fn unique_temp_name(source: &str, next_id: &mut usize) -> String {
     }
 }
 
+fn unique_lazy_require_name(source: &str, next_id: &mut usize) -> String {
+    loop {
+        let name = format!("_lazyreq_static_{}", *next_id);
+        *next_id += 1;
+        if !source.contains(&name) {
+            return name;
+        }
+    }
+}
+
 /// Does a relative/absolute `specifier` name a file that exists next to the
 /// module being compiled? Mirrors the extension set the module resolver tries.
 /// Non-relative specifiers return `true` so they keep today's hoisting.
-fn relative_specifier_resolves(module_dir: &Path, specifier: &str) -> bool {
-    if !is_relative_or_absolute_specifier(specifier) {
-        return true;
-    }
-    const EXTENSIONS: [&str; 8] = ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
-    let base = module_dir.join(specifier);
-    if base.is_file() {
-        return true;
-    }
-    for ext in EXTENSIONS {
-        if base.with_extension(ext).is_file() {
-            return true;
-        }
-        if base.join(format!("index.{ext}")).is_file() {
-            return true;
-        }
-    }
-    false
-}
-
 /// Is byte offset `at` lexically inside the block of a `try { ... }`?
 ///
 /// `masked` is the comment/string-blanked copy of the source (identical byte

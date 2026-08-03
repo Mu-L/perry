@@ -72,14 +72,15 @@ pub(crate) use report::scan_report_cache_roots_mut;
 pub use node_module::{
     js_module_builtin_modules, js_module_constants, js_module_dynamic_import_apply_hooks,
     js_module_enable_compile_cache, js_module_find_package_json, js_module_find_path,
-    js_module_flush_compile_cache, js_module_get_compile_cache_dir,
-    js_module_get_source_maps_support, js_module_init_paths, js_module_is_builtin, js_module_load,
-    js_module_module_new, js_module_node_module_paths, js_module_preload_modules,
-    js_module_register, js_module_register_hooks, js_module_resolve_filename,
-    js_module_resolve_lookup_paths, js_module_set_source_maps_support, js_module_source_map_new,
-    js_module_strip_typescript_types, js_process_get_builtin_module,
+    js_module_find_source_map, js_module_flush_compile_cache, js_module_get_compile_cache_dir,
+    js_module_get_source_maps_support, js_module_init_paths, js_module_instance_load,
+    js_module_is_builtin, js_module_load, js_module_module_new, js_module_node_module_paths,
+    js_module_preload_modules, js_module_register, js_module_register_hooks,
+    js_module_resolve_filename, js_module_resolve_lookup_paths, js_module_set_source_maps_support,
+    js_module_source_map_new, js_module_strip_typescript_types, js_process_get_builtin_module,
     js_process_get_builtin_module_devirt, js_process_set_source_maps_enabled,
-    js_process_source_maps_enabled, scan_process_module_loader_roots_mut,
+    js_process_source_maps_enabled, module_source_map_attach_constructor,
+    scan_process_module_loader_roots_mut,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -184,6 +185,8 @@ pub(crate) fn builtin_module_value(module_name: &str) -> f64 {
     crate::object::native_module_get_builtin_module_value(module_name)
 }
 
+pub(crate) const MODULE_CJS_CLASS_ID: u32 = 0xC0_00_4D;
+
 pub(crate) const MODULE_BUILTIN_MODULES: &[&str] = &[
     "_http_agent",
     "_http_client",
@@ -191,12 +194,6 @@ pub(crate) const MODULE_BUILTIN_MODULES: &[&str] = &[
     "_http_incoming",
     "_http_outgoing",
     "_http_server",
-    "_stream_duplex",
-    "_stream_passthrough",
-    "_stream_readable",
-    "_stream_transform",
-    "_stream_wrap",
-    "_stream_writable",
     "_tls_common",
     "_tls_wrap",
     "assert",
@@ -223,10 +220,6 @@ pub(crate) const MODULE_BUILTIN_MODULES: &[&str] = &[
     "inspector/promises",
     "module",
     "net",
-    "node:sea",
-    "node:sqlite",
-    "node:test",
-    "node:test/reporters",
     "os",
     "path",
     "path/posix",
@@ -257,6 +250,10 @@ pub(crate) const MODULE_BUILTIN_MODULES: &[&str] = &[
     "wasi",
     "worker_threads",
     "zlib",
+    "node:sea",
+    "node:sqlite",
+    "node:test",
+    "node:test/reporters",
 ];
 
 pub(crate) fn module_string_value(value: &str) -> f64 {
@@ -269,8 +266,11 @@ pub(crate) fn module_object_value(obj: *mut crate::object::ObjectHeader) -> f64 
 }
 
 pub(crate) fn module_set_field(obj: *mut crate::object::ObjectHeader, name: &str, value: f64) {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let obj = scope.root_raw_mut_ptr(obj);
+    let value = scope.root_nanbox_f64(value);
     let key = js_string_from_bytes(name.as_ptr(), name.len() as u32);
-    crate::object::js_object_set_field_by_name(obj, key, value);
+    crate::object::js_object_set_field_by_name(obj.get_raw_mut_ptr(), key, value.get_nanbox_f64());
 }
 
 pub(crate) type ModuleFunction1 = extern "C" fn(*const crate::closure::ClosureHeader, f64) -> f64;
@@ -330,9 +330,16 @@ pub(crate) fn module_function1(name: &str, thunk: ModuleFunction1, length: u32) 
     crate::closure::js_register_closure_arity(func_ptr, 1);
     crate::closure::js_register_closure_length(func_ptr, length);
     let closure = crate::closure::js_closure_alloc(func_ptr, 0);
-    crate::object::set_bound_native_closure_name(closure, name);
-    crate::object::set_builtin_closure_length(closure as usize, length);
-    crate::value::js_nanbox_pointer(closure as i64)
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let closure = scope.root_raw_mut_ptr(closure);
+    crate::object::set_bound_native_closure_name(closure.get_raw_mut_ptr(), name);
+    crate::object::set_builtin_closure_length(
+        closure.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as usize,
+        length,
+    );
+    crate::value::js_nanbox_pointer(
+        closure.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as i64
+    )
 }
 
 pub(crate) fn module_function2(name: &str, thunk: ModuleFunction2, length: u32) -> f64 {
