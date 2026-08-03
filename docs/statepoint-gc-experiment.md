@@ -1012,3 +1012,38 @@ This matters for the size ranking: **RS4GC is the leanest arm measured
 actually complete today is the explicit bridge at −49,072 B.** Both still beat
 the shadow stack on size; the RS4GC/EH interaction is the remaining work, and
 it is an LLVM-convention problem rather than anything the compact map touches.
+
+### Correction: the size win does not survive the merge with main (2026-08-03)
+
+Re-measured on `test-drizzle-pg` after merging main, one compiler, clean
+object cache per arm:
+
+| arm | total | `__text` | gcmap | unwind | eh_frame | vs shadow |
+|---|---:|---:|---:|---:|---:|---:|
+| shadow | 26,950,504 | 19,801,644 | 0 | 195,104 | 1,479,652 | — |
+| bridge | 26,951,000 | 19,650,408 | 189,454 | 187,056 | 1,375,028 | **+496** |
+| RS4GC | 27,000,568 | 19,562,088 | 220,936 | 187,064 | 1,374,892 | **+50,064** |
+
+Pre-merge the same measurement gave −49,072 (bridge) and −131,624 (RS4GC).
+Main's own changes shrank every arm by ~1.7–1.8 MB, but shrank **shadow about
+50 KB more than the statepoint arms**, which is the entire swing.
+
+What did not change is the reason to keep the compact map: statepoints still
+generate less code (`__text` −151 KB for the bridge, −240 KB for RS4GC, plus
+~105 KB less `__eh_frame`). Those savings are simply now cancelled by the
+189–221 KB of remaining metadata. Without compaction that metadata is 4.2 MB
+and the arm loses by ~4 MB, so the 18–19× is doing real work — it converted a
+3.5 MB loss into a tie, not into a win.
+
+**Honest standing on the three axes**, post-merge:
+
+* **performance** — statepoints ahead (−0.93% RS4GC, measured earlier);
+* **RSS** — tied;
+* **file size** — the explicit bridge is *tied* with shadow (+496 B, 0.002%);
+  RS4GC is 50 KB behind despite the smallest `__text`, because its live-set is
+  larger and so is its map.
+
+Closing the last axis therefore needs the root set to shrink, not the encoding:
+221 KB of map for 154k roots is already near this format's floor. That is the
+repsel-promotion lever the earlier projection named, and it is still the
+outstanding work.
