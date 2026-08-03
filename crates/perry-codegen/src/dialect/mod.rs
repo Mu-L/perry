@@ -26,6 +26,10 @@ use inkwell::values::{
 };
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate};
 
+mod eh;
+#[cfg(test)]
+mod tests;
+
 /// Create (only) the function declaration for `fn_text`'s define header, so
 /// later-defined functions are callable while earlier bodies are read. The
 /// native path pre-declares every define before reading any body — calls to
@@ -156,6 +160,9 @@ struct ParsedHeader {
     /// (type token, `%name`) per parameter.
     params: Vec<(String, String)>,
     attr_str: String,
+    /// `personality ptr @NAME` clause, if the define carries one (#7302:
+    /// every function containing try/catch does).
+    personality: Option<String>,
 }
 
 fn parse_header(header: &str) -> Result<ParsedHeader> {
@@ -201,7 +208,25 @@ fn parse_header(header: &str) -> Result<ParsedHeader> {
     let name = unquote(&after[..paren]);
     let close = rmatch_paren(after, paren)?;
     let params_str = &after[paren + 1..close];
-    let attr_str = after[close + 1..].trim().to_string();
+    let mut attr_str = after[close + 1..].trim().to_string();
+    // `personality ptr @NAME` sits with the fn attributes on the define
+    // line; lift it out so the attribute loop only sees real attributes.
+    let mut personality = None;
+    if let Some(pos) = attr_str.find("personality ") {
+        let tail = attr_str[pos..].to_string();
+        attr_str = attr_str[..pos].trim_end().to_string();
+        let pname = tail
+            .trim_start_matches("personality ")
+            .trim()
+            .trim_start_matches("ptr ")
+            .trim()
+            .trim_start_matches('@')
+            .trim();
+        if pname.is_empty() {
+            bail!("malformed personality clause: {tail}");
+        }
+        personality = Some(unquote(pname));
+    }
 
     let mut params = Vec::new();
     for p in split_top_level(params_str) {
@@ -220,6 +245,7 @@ fn parse_header(header: &str) -> Result<ParsedHeader> {
         name,
         params,
         attr_str,
+        personality,
     })
 }
 
@@ -257,6 +283,12 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
             bail!("duplicate define of @{}", h.name);
         }
         let param_names: Vec<String> = h.params.iter().map(|(_, n)| n.clone()).collect();
+        if let Some(pname) = &h.personality {
+            let pf = module
+                .get_function(pname)
+                .ok_or_else(|| anyhow!("personality @{pname} not declared"))?;
+            func.set_personality_function(pf);
+        }
         let attr_str = h.attr_str;
         for a in attr_str.split_whitespace() {
             match a {
@@ -425,6 +457,8 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
             "call" | "tail call" => self
                 .call(Some(dst), rest)?
                 .ok_or_else(|| anyhow!("call with result had void type"))?,
+            "invoke" => return self.invoke(Some(dst), rest).map(|_| ()),
+            "landingpad" => return self.landingpad(dst, rest),
             "getelementptr" => self.gep(dst, rest)?,
             "select" => {
                 // `select i1 C, T A, T B`
@@ -506,6 +540,7 @@ impl<'ctx, 'm> FnReader<'ctx, 'm> {
                 Ok(())
             }
             "call" | "tail call" => self.call(None, rest).map(|_| ()),
+            "invoke" => self.invoke(None, rest).map(|_| ()),
             "switch" => self.switch(rest),
             "unreachable" => {
                 self.builder.build_unreachable().map_err(be)?;
@@ -1907,82 +1942,5 @@ fn apply_flags(inst: Option<InstructionValue<'_>>, flags: &[&str]) {
     }
     if fmf != 0 {
         unsafe { llvm_sys::core::LLVMSetFastMathFlags(inst.as_value_ref(), fmf) };
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn split_corpus(text: &str) -> (String, Vec<String>) {
-        let mut skeleton = String::new();
-        let mut fns = Vec::new();
-        let mut cur: Option<String> = None;
-        for line in text.lines() {
-            if line.starts_with("define ") {
-                cur = Some(String::new());
-            }
-            match cur.as_mut() {
-                Some(f) => {
-                    f.push_str(line);
-                    f.push('\n');
-                    if line == "}" {
-                        fns.push(cur.take().unwrap());
-                    }
-                }
-                None => {
-                    skeleton.push_str(line);
-                    skeleton.push('\n');
-                }
-            }
-        }
-        (skeleton, fns)
-    }
-
-    /// Every function in a real perry-emitted corpus file must construct
-    /// natively and pass the LLVM verifier. This is the reader's primary
-    /// gate: a form it cannot express fails here, not in a user build.
-    fn corpus_roundtrip(path: &str) {
-        // The corpora are tracked in-tree alongside this reader, so a missing
-        // file is a broken checkout, not a branch without artifacts. Skipping
-        // would make the reader's primary gate pass vacuously — precisely the
-        // failure mode the Linux bring-up had to rule out by hand.
-        let text = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("corpus file {path} is not readable: {e}"));
-        let (skeleton, fns) = split_corpus(&text);
-        let ctx = Context::create();
-        let module = crate::inprocess::parse_ir_text(&ctx, &skeleton, "corpus_skel")
-            .expect("skeleton parses");
-        for f in &fns {
-            predeclare_function_from_text(&ctx, &module, f)
-                .unwrap_or_else(|e| panic!("predeclare: {e:#}"));
-        }
-        let mut n = 0usize;
-        for f in &fns {
-            n += add_function_from_text(&ctx, &module, f).unwrap_or_else(|e| panic!("{e:#}"));
-        }
-        assert!(
-            n > 1000,
-            "expected a real corpus, built only {n} instructions"
-        );
-        module
-            .verify()
-            .unwrap_or_else(|e| panic!("verifier rejected native module:\n{}", e.to_string()));
-    }
-
-    #[test]
-    fn corpus_spike() {
-        corpus_roundtrip(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../experiments/llvm-inprocess-spike/spike_text.ll"
-        ));
-    }
-
-    #[test]
-    fn corpus_batch_kernel() {
-        corpus_roundtrip(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../experiments/llvm-inprocess-spike/batch_kernel.ll"
-        ));
     }
 }
