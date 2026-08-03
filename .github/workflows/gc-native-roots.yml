@@ -5,7 +5,8 @@
 # oracle, natively on the Linux runner — the same matrix the branch runs on
 # macOS, webserver-class x86-64, and the Pi 5. Two liveness asserts keep
 # this from being a gate that cannot fail (CLAUDE.md's four ways):
-# the binary must carry a non-empty .llvm_stackmaps section, and at least
+# the binary must carry a .perry_gcmap section (and no .llvm_stackmaps,
+# proving the compact rewrite ran), and at least
 # one probe must report a copying collection.
 name: gc-native-roots
 on:
@@ -40,9 +41,14 @@ jobs:
             name=$(basename "$probe" .ts)
             node --expose-gc --experimental-strip-types "$probe" > "/tmp/$name.oracle"
             PERRY_STATEPOINTS=1 ./target/perry-dev/perry "$probe" -o "/tmp/$name"
-            # Liveness assert 1: the subject (stackmap section) must exist.
+            # Liveness assert 1: the subject must exist. The compact map
+            # replaced LLVM's section, so assert BOTH facts — the new section
+            # is present AND the old one is gone. Checking only the former
+            # would still pass if compaction silently stopped running.
+            readelf -S "/tmp/$name" | grep -q "\.perry_gcmap" \
+              || { echo "::error::$name has no .perry_gcmap section — statepoint mode was not live"; exit 1; }
             readelf -S "/tmp/$name" | grep -q "\.llvm_stackmaps" \
-              || { echo "::error::$name has no .llvm_stackmaps section — statepoint mode was not live"; exit 1; }
+              && { echo "::error::$name still carries .llvm_stackmaps — the compact rewrite did not run"; exit 1; }
             PERRY_STATEPOINTS=1 PERRY_GC_FORCE_EVACUATE=1 PERRY_GC_VERIFY_EVACUATION=1 \
               "/tmp/$name" > "/tmp/$name.out" 2> "/tmp/$name.err"
             diff "/tmp/$name.oracle" "/tmp/$name.out" \
