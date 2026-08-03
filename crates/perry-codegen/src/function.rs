@@ -657,42 +657,11 @@ impl LlFunction {
         .unwrap_or_else(|e| match e {});
         ir.push_str("}\n");
 
-        // Return-site rewrite hooks.
-        //
-        // Shadow-stack pop (gen-GC Phase A sub-phase 2) and entry
-        // diagnostics both need to run before every normal return,
-        // regardless of which lowering path emitted it. Textual rewrite
-        // on the full IR catches implicit returns, Stmt::Return, and any
-        // hand-emitted `ret`.
-        let ir = if self.shadow_frame_slot.is_some() || !self.pre_return_void_calls.is_empty() {
-            let mut out = String::with_capacity(ir.len() + 512);
-            let mut seq: u32 = 0;
-            for line in ir.lines() {
-                let trimmed = line.trim_start();
-                if (trimmed.starts_with("ret ") || trimmed == "ret void")
-                    && !trimmed.starts_with("ret ptr ")
-                // skip rare ptr rets
-                {
-                    for func_name in &self.pre_return_void_calls {
-                        out.push_str(&format!("  call void @{}()\n", func_name));
-                    }
-                    if let Some(handle_slot) = &self.shadow_frame_slot {
-                        let load_reg = format!("%shadow_pop_l_{}", seq);
-                        seq += 1;
-                        out.push_str(&format!("  {} = load i64, ptr {}\n", load_reg, handle_slot));
-                        out.push_str(&format!(
-                            "  call void @js_shadow_frame_pop(i64 {})\n",
-                            load_reg
-                        ));
-                    }
-                }
-                out.push_str(line);
-                out.push('\n');
-            }
-            out
-        } else {
-            ir
-        };
+        // The return-site rewrite hooks (shadow-stack pop, entry diagnostics)
+        // live in `for_each_final_item`, which the loop above already streamed
+        // through. This branch used to re-apply them here; after main moved
+        // them, doing both emitted `%shadow_pop_l_0` twice in the same
+        // function and clang rejected every module with a shadow frame.
 
         // Research backend: turn the existing shadow-slot binding IR into
         // native-frame stack maps only after lowering is complete, when every
@@ -707,6 +676,27 @@ impl LlFunction {
                 PreciseRootBackend::StackMap
             };
             lower_precise_roots_to_native_stack(&ir, &self.name, self.stack_map_slot_count, backend)
+        } else {
+            ir
+        };
+
+        // RS4GC uses the unwind destination's landing pad **as the token** for
+        // the relocates it inserts on the exceptional edge, so
+        // `statepoint-example` requires that pad to be `landingpad token`.
+        // Perry emits the Itanium `{ ptr, i32 }` form, which makes RS4GC
+        // produce `gc.relocate({ ptr, i32 } %lpad, ...)` and the verifier
+        // reject the module — a try-carrying function simply fails to compile.
+        //
+        // Retyping is safe because the pad's value is dead: `try_stmt` emits it
+        // purely to anchor the edge and branches straight on, taking the
+        // exception from the runtime rather than the pad payload. Only the type
+        // is load-bearing, and only to RS4GC.
+        //
+        // Conditioned on the same fact as `gc_strategy` above — a function that
+        // does not carry the strategy must keep the Itanium form, or its pad
+        // becomes untypeable for ordinary EH lowering.
+        let ir = if !gc_strategy.is_empty() && crate::codegen::helpers::rs4gc_enabled() {
+            retype_landing_pads_for_statepoints(&ir)
         } else {
             ir
         };
@@ -1656,8 +1646,103 @@ fn lower_precise_roots_to_native_stack(
     out
 }
 
+/// Retype Itanium landing pads to `token` for `statepoint-example`.
+///
+/// RS4GC uses the unwind destination's landing pad **as the token** for the
+/// relocates it inserts on the exceptional edge, so the pad must already be
+/// `landingpad token`. Given `{ ptr, i32 }` it emits
+/// `gc.relocate({ ptr, i32 } %lpad, ...)` and the verifier rejects the module,
+/// which is why a try-carrying function failed to compile under RS4GC at all.
+///
+/// This is only sound because the pad's value is **dead**: `try_stmt` emits it
+/// to anchor the edge and branches straight on, taking the exception from the
+/// runtime rather than the pad payload. So a pad whose register IS referenced
+/// is left alone — retyping a value someone reads would swap a silent
+/// miscompile for the loud one this fixes.
+fn retype_landing_pads_for_statepoints(ir: &str) -> String {
+    const ITANIUM: &str = "landingpad { ptr, i32 } catch ptr null";
+    if !ir.contains(ITANIUM) {
+        return ir.to_string();
+    }
+    let mut out = String::with_capacity(ir.len());
+    for line in ir.lines() {
+        let rewritten = match line.split_once(" = ") {
+            Some((reg, rest)) if rest.trim() == ITANIUM => {
+                let reg = reg.trim();
+                // Referenced anywhere else? Then its payload is live.
+                let used = ir.lines().any(|other| {
+                    !std::ptr::eq(other.as_ptr(), line.as_ptr()) && mentions_register(other, reg)
+                });
+                if used {
+                    None
+                } else {
+                    Some(format!("{} = landingpad token cleanup", reg))
+                }
+            }
+            _ => None,
+        };
+        match rewritten {
+            Some(r) => out.push_str(&r),
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Whether `line` mentions SSA register `reg` as a whole token rather than as
+/// a prefix of a longer name (`%r2` must not match `%r21`).
+fn mentions_register(line: &str, reg: &str) -> bool {
+    let mut from = 0;
+    while let Some(idx) = line[from..].find(reg) {
+        let at = from + idx;
+        let after = line[at + reg.len()..].chars().next();
+        if !matches!(after, Some(c) if c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+            return true;
+        }
+        from = at + reg.len();
+    }
+    false
+}
+
 #[cfg(test)]
 mod stack_map_tests {
+
+    #[test]
+    fn retypes_dead_landing_pads_for_rs4gc() {
+        let ir = "define void @probe() {\n\
+                  entry:\n\
+                  %lp = landingpad { ptr, i32 } catch ptr null\n\
+                  br label %next\n\
+                  }\n";
+        let out = super::retype_landing_pads_for_statepoints(ir);
+        assert!(out.contains("%lp = landingpad token cleanup"), "{out}");
+    }
+
+    #[test]
+    fn leaves_a_used_landing_pad_alone() {
+        // If the pad's payload is read, retyping it to `token` would break the
+        // consumer silently. Fail closed: RS4GC's loud verifier error is the
+        // better outcome.
+        let ir = "define void @probe() {\n\
+                  entry:\n\
+                  %lp = landingpad { ptr, i32 } catch ptr null\n\
+                  %exn = extractvalue { ptr, i32 } %lp, 0\n\
+                  br label %next\n\
+                  }\n";
+        let out = super::retype_landing_pads_for_statepoints(ir);
+        assert!(
+            out.contains("%lp = landingpad { ptr, i32 } catch ptr null"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn register_match_is_whole_token() {
+        // `%r2` must not be considered used by a mention of `%r21`.
+        assert!(super::mentions_register("  br label %r2", "%r2"));
+        assert!(!super::mentions_register("  %x = add i64 %r21, 1", "%r2"));
+    }
     use super::{
         direct_callee_name, lower_precise_roots_to_native_stack, parse_direct_statepoint_call,
         PreciseRootBackend,
