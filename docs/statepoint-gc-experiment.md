@@ -959,3 +959,56 @@ After that work lands:
 5. Re-run the 11-way interleaved suite on an idle pinned host, with separate
    profiles for mutator root maintenance, relocation reloads, unwinding, and
    collector root scanning.
+
+## invoke-EH lands on main; try functions covered (2026-08-03)
+
+main replaced setjmp/longjmp exception lowering with `invoke`/`landingpad`
+(#7302, PR #7305) and deleted `volatile_setjmp.rs` and `setjmp_abi.rs`. That
+retires this branch's correctness blocker: a `longjmp` could jump past a
+`gc.relocate`, which is why try-carrying functions were excluded from
+statepoints and routed to the plain-stack-map lowering — itself unsound, since
+LLVM may record a root slot's address in a caller-saved register that cannot
+be recovered at collection time.
+
+The exclusion was not merely obsolete but **unrepresentable**: main deleted the
+`has_try` field, so the compiler forced its removal.
+
+### The probe that had no equivalent
+
+Nothing in the suite contained a `try` — 0 of 8 probes — so the newly covered
+case was exercised by nothing at all, and a green run said nothing about it.
+`09_try_catch_roots.ts` closes that: objects allocated inside a `try` surviving
+a collection inside the same `try`; locals live across a throw and read in the
+`catch`; a throw crossing several frames so the rewritten roots sit in a
+caller's frame; `finally` on both edges; and a rethrow caught one frame up.
+Every survivor folds into the checksum, so a lost or stale root is a wrong
+number rather than a crash.
+
+Its map is 1,116 bytes — the largest of any probe — which is the liveness
+evidence that try-carrying functions now genuinely carry statepoint records.
+
+### Result, and a real limitation it exposed
+
+**Explicit statepoint bridge: 9/9**, byte-matching the pinned Node oracle
+normally and under `PERRY_GC_FORCE_EVACUATE=1 PERRY_GC_VERIFY_EVACUATION=1
+PERRY_STACKMAP_WALKER=verify`.
+
+**RS4GC: 8/9 — it cannot compile a try-carrying function.** The LLVM verifier
+rejects the module:
+
+```
+%lpad = landingpad { ptr, i32 }
+token  %r2.0.relocated = call coldcc ptr addrspace(1)
+         @llvm.experimental.gc.relocate.p1({ ptr, i32 } %lpad, i32 1, i32 0)
+```
+
+`gc.relocate`'s first operand must be a `token`. RS4GC emitted the relocates on
+the unwind edge against the landing pad's `{ ptr, i32 }` result, because
+`statepoint-example` expects a statepoint-invoke's unwind destination to carry
+`landingpad token` rather than the Itanium form `try_stmt.rs` emits.
+
+This matters for the size ranking: **RS4GC is the leanest arm measured
+(−131,624 B versus shadow) but cannot handle `try` yet, so the arm that is
+actually complete today is the explicit bridge at −49,072 B.** Both still beat
+the shadow stack on size; the RS4GC/EH interaction is the remaining work, and
+it is an LLVM-convention problem rather than anything the compact map touches.
