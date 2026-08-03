@@ -500,9 +500,16 @@ pub fn compact_stack_map_asm(asm: &str, elf: bool) -> Option<(String, GcMapStats
 /// Rewrite the stack map in `asm_path` into Perry's compact form, then
 /// assemble it to `obj_path`.
 ///
-/// A module with no stack-map block, or one whose block does not parse, is
-/// assembled unchanged — LLVM's section is correct, merely large, so falling
-/// back costs bytes rather than roots.
+/// A module with no stack-map block is assembled unchanged — there is nothing
+/// to compact.
+///
+/// A module that HAS a block which does not parse is a hard error, not a
+/// fallback. Keeping LLVM's section there looks conservative and is not: the
+/// runtime reads only `__perry_gcmap`, so that module's records would be
+/// present in the binary, unread, and its roots invisible to the collector —
+/// while other modules still emit a valid section, so even the "section
+/// present but undecodable" guard in the runtime stays quiet. Silent lost
+/// roots are precisely what this backend exists to make impossible.
 pub fn compact_and_assemble(
     clang: &Path,
     target: &str,
@@ -523,7 +530,23 @@ pub fn compact_and_assemble(
         return assemble(clang, target, asm_path, obj_path);
     }
 
-    if let Some((rewritten, stats)) = compact_stack_map_asm(&asm, elf) {
+    let has_block = asm.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with(".section")
+            && (t.contains("__LLVM_STACKMAPS") || t.contains(".llvm_stackmaps"))
+    });
+    let compacted = compact_stack_map_asm(&asm, elf);
+    if has_block && compacted.is_none() {
+        return Err(anyhow!(
+            "perry: this module emits an LLVM stack map that the compact-map \
+             rewriter could not parse, so its GC roots would be invisible to \
+             the collector (the runtime reads only the compact section). \
+             Refusing to emit a binary that would lose roots silently. \
+             Assembly left at: {}",
+            asm_path.display()
+        ));
+    }
+    if let Some((rewritten, stats)) = compacted {
         fs::write(asm_path, rewritten).with_context(|| {
             format!(
                 "Failed to write compacted assembly at {}",

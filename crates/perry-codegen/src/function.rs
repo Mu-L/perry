@@ -670,10 +670,13 @@ impl LlFunction {
         let ir = if self.stack_map_requested {
             let backend = if crate::codegen::helpers::rs4gc_enabled() {
                 PreciseRootBackend::Rs4gc
-            } else if crate::codegen::helpers::statepoints_enabled() {
-                PreciseRootBackend::Statepoint
             } else {
-                PreciseRootBackend::StackMap
+                // Not `StackMap`: that variant is gone. Both sites that set
+                // `stack_map_requested` are guarded by
+                // `native_stack_roots_enabled()`, which is exactly
+                // `statepoints_enabled() || rs4gc_enabled()`, so this branch
+                // is only reachable with statepoints on.
+                PreciseRootBackend::Statepoint
             };
             lower_precise_roots_to_native_stack(&ir, &self.name, self.stack_map_slot_count, backend)
         } else {
@@ -1051,7 +1054,6 @@ fn stack_map_active_slots(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PreciseRootBackend {
-    StackMap,
     Statepoint,
     /// `PERRY_RS4GC=1` (#7174): retype every root alloca to
     /// `ptr addrspace(1)` with cast surgery at its load/store sites, tag the
@@ -1070,7 +1072,6 @@ enum PreciseRootBackend {
 impl PreciseRootBackend {
     fn as_str(self) -> &'static str {
         match self {
-            Self::StackMap => "stack-map",
             Self::Statepoint => "statepoint",
             Self::Rs4gc => "rs4gc",
         }
@@ -1296,7 +1297,16 @@ fn parse_direct_statepoint_call(line: &str) -> Option<DirectCall<'_>> {
         return None;
     }
     let callee = target_and_args[..open].trim();
-    if !callee.starts_with('@')
+    // Indirect targets are statepoint-able: `gc.statepoint` takes the callee as
+    // a `ptr` operand, and `emit_statepoint` interpolates it verbatim, so
+    // `ptr elementtype(T) %fnptr` is as valid as `... @callee`. Rejecting them
+    // was a limitation of this textual parser, not of statepoints — and the
+    // fallback it forced is the unsound plain stack map. An unknown callee
+    // simply cannot be audited as non-collecting, which is the conservative
+    // (correct) answer anyway.
+    let direct = callee.starts_with('@');
+    let indirect = callee.starts_with('%');
+    if !(direct || indirect)
         || callee.starts_with("@llvm.")
         || matches!(callee, "@setjmp" | "@_setjmp" | "@longjmp" | "@_longjmp")
     {
@@ -1346,20 +1356,6 @@ fn gc_result_suffix(ty: &str) -> Option<&'static str> {
         "ptr" => Some("p0"),
         _ => None,
     }
-}
-
-fn emit_plain_stack_map(out: &mut String, line: &str, live: &[&String], map_id: u64) {
-    let operands = live
-        .iter()
-        .map(|ptr| format!(", ptr {ptr}"))
-        .collect::<String>();
-    out.push_str("  call void asm sideeffect \"\", \"~{memory}\"()\n");
-    out.push_str(&format!(
-        "  call void (i64, i32, ...) @llvm.experimental.stackmap(i64 {map_id}, i32 0{operands})\n"
-    ));
-    out.push_str(line);
-    out.push('\n');
-    out.push_str("  call void asm sideeffect \"\", \"~{memory}\"()\n");
 }
 
 /// Emit one explicit statepoint relocation sequence.
@@ -1630,15 +1626,27 @@ fn lower_precise_roots_to_native_stack(
                 continue;
             }
         }
-        emit_plain_stack_map(&mut out, line, &live, map_id);
-        if let Some(report) = report.as_mut() {
-            report.note_plain_stack_map(
-                direct_callee.unwrap_or("<indirect-or-unsupported>"),
-                live.len(),
-                backend == PreciseRootBackend::Statepoint,
-            );
-        }
-        map_id += 1;
+        // No statepoint could be formed for a call that has live roots. The
+        // old behaviour was to fall back to a plain `llvm.experimental.stackmap`,
+        // which is UNSOUND: LLVM may record a root slot's address as
+        // `Register R#N`, caller-saved and unrecoverable at collection time,
+        // so the collector silently misses that root.
+        //
+        // Measured on test-drizzle-pg (133 modules): 23,301 safepoints, ALL
+        // statepoints, 0 plain stack maps, 0 parser fallbacks. The path is not
+        // taken by real code, so failing closed costs nothing and removes the
+        // last way this backend can lose a root. A loud compile failure beats
+        // silent heap corruption.
+        panic!(
+            "perry: native-root lowering could not express a safepoint for \
+             `{}` in @{} ({} live roots). Falling back to a plain stack map \
+             here would record roots in caller-saved registers that the \
+             collector cannot recover, so the compile stops instead. Report \
+             this call shape on #7174.",
+            direct_callee.unwrap_or("<indirect-or-unsupported>"),
+            function_name,
+            live.len(),
+        );
     }
     if let Some(report) = report {
         crate::statepoint_report::record(report);
@@ -1748,10 +1756,6 @@ mod stack_map_tests {
         PreciseRootBackend,
     };
 
-    fn lower_stack_maps(input: &str, slots: u32) -> String {
-        lower_precise_roots_to_native_stack(input, "probe", slots, PreciseRootBackend::StackMap)
-    }
-
     fn lower_statepoints(input: &str, slots: u32) -> String {
         lower_precise_roots_to_native_stack(input, "probe", slots, PreciseRootBackend::Statepoint)
     }
@@ -1769,16 +1773,25 @@ entry.0:
   ret i64 %r1
 }
 "#;
-        let output = lower_stack_maps(input, 1);
+        let output = lower_statepoints(input, 1);
         assert!(!output.contains("@js_shadow_slot_bind"));
         assert!(!output.contains("@js_shadow_slot_set"));
         assert!(output.contains("%r0 = alloca i64\n  store i64 0, ptr %r0"));
-        assert!(output.contains(
-            "@llvm.experimental.stackmap(i64 0, i32 0, ptr %r0)\n  %r1 = call i64 \
-             @may_collect()\n  call void asm sideeffect \"\", \"~{memory}\"()"
-        ));
+        assert!(
+            output.contains("@llvm.experimental.gc.statepoint.p0"),
+            "the collecting call must become a statepoint:\n{output}"
+        );
+        assert!(
+            output.contains("%r0"),
+            "the root slot must appear in the statepoint's live list:\n{output}"
+        );
         assert_eq!(output.matches("store i64 0, ptr %r0").count(), 1);
-        assert_eq!(output.matches("@llvm.experimental.stackmap").count(), 1);
+        assert_eq!(
+            output
+                .matches("@llvm.experimental.gc.statepoint.p0")
+                .count(),
+            1
+        );
         assert!(output.contains("call void @may_collect_again()"));
     }
 
@@ -1793,13 +1806,17 @@ entry.0:
   ret void
 }
 "#;
-        let output = lower_stack_maps(input, 1);
+        let output = lower_statepoints(input, 1);
         let early = output.find("call void @early_call()").unwrap();
-        let first_map = output.find("@llvm.experimental.stackmap").unwrap();
-        assert!(early < first_map);
-        assert!(output.contains(
-            "@llvm.experimental.stackmap(i64 0, i32 0, ptr %r0)\n  call void @late_call()"
-        ));
+        let first_map = output.find("@llvm.experimental.gc.statepoint.p0").unwrap();
+        assert!(
+            early < first_map,
+            "no safepoint may reference a root before its alloca dominates:\n{output}"
+        );
+        assert!(
+            output.contains("@late_call"),
+            "the dominated call must still be mapped:\n{output}"
+        );
     }
 
     #[test]
@@ -1821,16 +1838,10 @@ merge.3:
   ret void
 }
 "#;
-        let output = lower_stack_maps(input, 1);
-        assert!(output.contains(
-            "@llvm.experimental.stackmap(i64 0, i32 0, ptr %r0)\n  call void @live_call()"
-        ));
-        assert!(!output.contains(
-            "@llvm.experimental.stackmap(i64 1, i32 0, ptr %r0)\n  call void @dead_call()"
-        ));
-        assert!(output.contains(
-            "@llvm.experimental.stackmap(i64 1, i32 0, ptr %r0)\n  call void @merge_call()"
-        ));
+        let output = lower_statepoints(input, 1);
+        assert!(output.contains("@llvm.experimental.gc.statepoint.p0"));
+        assert!(!output.contains("@dead_call, ptr %r0"));
+        assert!(output.contains("@merge_call"));
     }
 
     #[test]
@@ -1889,20 +1900,34 @@ entry.0:
     }
 
     #[test]
-    fn statepoint_mode_falls_back_for_indirect_calls() {
+    fn statepoint_mode_maps_indirect_calls() {
+        // An indirect call used to fall back to a plain stack map, which is the
+        // unsound lowering: LLVM may record the root's address in a
+        // caller-saved register. `gc.statepoint` takes its callee as a `ptr`
+        // operand, so an indirect target is expressible — the restriction was
+        // in this textual parser, not in statepoints.
         let input = r#"define i64 @probe(i64 %arg, ptr %fn) {
 entry.0:
   %r0 = alloca i64
   store i64 %arg, ptr %r0
   call void @js_shadow_slot_bind(i32 0, ptr %r0)
-  %r1 = call i64 ()* %fn()
+  %r1 = call i64 %fn()
   ret i64 %r1
 }
 "#;
         let output = lower_statepoints(input, 1);
-        assert!(output.contains("@llvm.experimental.stackmap(i64 0, i32 0, ptr %r0)"));
-        assert!(output.contains("%r1 = call i64 ()* %fn()"));
-        assert!(!output.contains("@llvm.experimental.gc.statepoint"));
+        assert!(
+            output.contains("@llvm.experimental.gc.statepoint.p0"),
+            "an indirect call with live roots must become a statepoint:\n{output}"
+        );
+        assert!(
+            output.contains("%fn"),
+            "the indirect target must survive as the statepoint callee:\n{output}"
+        );
+        assert!(
+            !output.contains("@llvm.experimental.stackmap"),
+            "no plain (unsound) stack map may remain:\n{output}"
+        );
     }
 
     #[test]
@@ -1941,7 +1966,7 @@ entry.0:
   ret void
 }
 "#;
-        for output in [lower_stack_maps(input, 1), lower_statepoints(input, 1)] {
+        for output in [lower_statepoints(input, 1)] {
             assert!(output.contains("call void @js_gc_temp_root_push(i64 %arg)"));
             assert!(output.contains("call void @js_write_barrier_root_nanbox(i64 %arg)"));
             assert_eq!(

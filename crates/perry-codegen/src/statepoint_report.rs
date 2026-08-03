@@ -78,24 +78,6 @@ impl FunctionRecord {
             .entry(callee.to_string())
             .or_default() += 1;
     }
-
-    pub(crate) fn note_plain_stack_map(
-        &mut self,
-        callee: &str,
-        live_roots: usize,
-        is_statepoint_fallback: bool,
-    ) {
-        self.plain_stack_maps += 1;
-        self.stack_map_operands += live_roots as u64;
-        self.note_emitted_roots(live_roots);
-        if is_statepoint_fallback {
-            self.statepoint_fallbacks += 1;
-            *self
-                .fallbacks_by_callee
-                .entry(callee.to_string())
-                .or_default() += 1;
-        }
-    }
 }
 
 pub fn enabled() -> bool {
@@ -302,18 +284,20 @@ mod tests {
         record.note_call(1);
         record.note_skipped("@js_gc_temp_root_get");
         record.note_call(1);
-        record.note_plain_stack_map("<indirect>", 1, true);
 
         let text = render_text(std::slice::from_ref(&record));
         assert!(text.contains("2 bound native root slots"));
         assert!(text.contains("1 non-collecting calls skipped"));
-        assert!(text.contains("1 statepoint parser fallback(s)"));
+        // The plain-map fallback is gone, so this can only ever report zero —
+        // which is the point: it is the report's evidence that no root was
+        // recorded in an unrecoverable location.
+        assert!(text.contains("0 statepoint parser fallback(s)"));
         assert!(text.contains("@js_gc_temp_root_get"));
 
         let json = render_json(&[record]);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["schema_version"], 1);
         assert_eq!(parsed["totals"]["relocations"], 2);
-        assert_eq!(parsed["totals"]["statepoint_fallbacks"], 1);
+        assert_eq!(parsed["totals"]["statepoint_fallbacks"], 0);
     }
 }
