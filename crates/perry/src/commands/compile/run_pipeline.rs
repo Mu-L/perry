@@ -2906,6 +2906,22 @@ pub fn run_with_parse_cache(
                                 &resolved_path_str,
                                 &ctx.project_root,
                             );
+                            let default_is_var = all_module_exports
+                                .get(&resolved_path_str)
+                                .and_then(|exports| exports.get("default"))
+                                .is_some_and(|origin_path| {
+                                    let origin_name = all_module_export_origin_names
+                                        .get(&resolved_path_str)
+                                        .and_then(|names| names.get("default"))
+                                        .cloned()
+                                        .unwrap_or_else(|| "default".to_string());
+                                    exported_var_names
+                                        .contains(&(origin_path.clone(), origin_name))
+                                })
+                                || exported_var_names.contains(&(
+                                    resolved_path_str.clone(),
+                                    "default".to_string(),
+                                ));
                             // CJS namespace exotic objects expose both names
                             // as aliases of the evaluated exports object. The
                             // per-namespace origin map makes `module.exports`
@@ -2926,7 +2942,9 @@ pub fn run_with_parse_cache(
                                 import_function_origin_names
                                     .entry(member.to_string())
                                     .or_insert_with(|| "default".to_string());
-                                imported_vars.insert(member.to_string());
+                                if member == "module.exports" || default_is_var {
+                                    imported_vars.insert(member.to_string());
+                                }
                             }
                         }
                         continue;

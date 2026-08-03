@@ -135,11 +135,13 @@ pub(super) fn transform_static_literal_requires(
             // semantics. The side-effect import only makes the statically-known
             // module part of the AOT graph.
             if let Some(target) = require_target.as_ref() {
+                let is_native_addon =
+                    target.extension().and_then(|extension| extension.to_str()) == Some("node");
                 if !matches!(
                     target.extension().and_then(|e| e.to_str()),
                     Some("ts" | "tsx" | "mts" | "cts" | "js" | "mjs")
                 ) {
-                    if discovered_side_effects.insert(target.clone()) {
+                    if !is_native_addon && discovered_side_effects.insert(target.clone()) {
                         let binding = unique_lazy_require_name(source, &mut next_id);
                         imports.push(format!(
                             "import {binding} from {:?};",
@@ -246,7 +248,10 @@ fn resolve_require_path(path: &Path) -> Option<std::path::PathBuf> {
         return path.canonicalize().ok();
     }
     for ext in ["ts", "tsx", "mts", "cts", "js", "json", "node", "cjs"] {
-        let candidate = path.with_extension(ext);
+        let mut candidate = path.as_os_str().to_os_string();
+        candidate.push(".");
+        candidate.push(ext);
+        let candidate = std::path::PathBuf::from(candidate);
         if candidate.is_file() {
             return candidate.canonicalize().ok();
         }
@@ -436,9 +441,6 @@ fn unique_lazy_require_name(source: &str, next_id: &mut usize) -> String {
     }
 }
 
-/// Does a relative/absolute `specifier` name a file that exists next to the
-/// module being compiled? Mirrors the extension set the module resolver tries.
-/// Non-relative specifiers return `true` so they keep today's hoisting.
 /// Is byte offset `at` lexically inside the block of a `try { ... }`?
 ///
 /// `masked` is the comment/string-blanked copy of the source (identical byte

@@ -1289,9 +1289,16 @@ fn collect_module_one(
             // later at the V8-free gate. Promote the discovered file itself,
             // rather than its whole package, so runtime-computed package loads
             // still retain the compilePackages trust boundary.
+            let package_is_authorized =
+                super::audit_manifest::package_name_for_path(&resolved_path.to_string_lossy())
+                    .is_none_or(|package| {
+                        ctx.compile_packages.contains(&package)
+                            && super::allowlist_matches(&package, &ctx.allow_compile_packages)
+                    });
             let kind = if resolved.kind == ModuleKind::Interpreted
                 && !is_in_perry_native_package(&resolved_path)
                 && !is_declaration_file(&resolved_path)
+                && package_is_authorized
             {
                 ctx.aot_discovered_modules.insert(resolved_path.clone());
                 ModuleKind::NativeCompiled

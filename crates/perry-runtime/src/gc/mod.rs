@@ -679,6 +679,7 @@ pub fn gc_init() {
     gc_register_mutable_root_scanner(crate::tls::scan_tls_roots_mut);
     gc_register_mutable_root_scanner(crate::process::scan_process_finalization_roots_mut);
     gc_register_mutable_root_scanner(crate::process::scan_process_module_loader_roots_mut);
+    gc_register_mutable_root_scanner(crate::module_require::scan_module_path_registry_roots_mut);
     // #7231: the materialize-once `process.*` caches. Each is a thread-local
     // cell holding a NURSERY-allocated object that nothing else refers to —
     // `process.env` / `.permission` / `.report` are getter CALLS, not fields

@@ -190,8 +190,7 @@ enum ResolveError {
 }
 
 fn require_base_dir(closure: *const ClosureHeader) -> std::path::PathBuf {
-    let base = value_to_string(js_closure_get_capture_f64(closure, 0), "filename");
-    let path = std::path::PathBuf::from(base);
+    let path = std::path::PathBuf::from(require_base_filename(closure));
     path.parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .to_path_buf()
@@ -213,7 +212,10 @@ fn resolve_file(path: &std::path::Path) -> Option<std::path::PathBuf> {
         return Some(std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
     }
     for ext in ["js", "json", "node"] {
-        let candidate = path.with_extension(ext);
+        let mut candidate = path.as_os_str().to_os_string();
+        candidate.push(".");
+        candidate.push(ext);
+        let candidate = std::path::PathBuf::from(candidate);
         if candidate.is_file() {
             return Some(std::fs::canonicalize(&candidate).unwrap_or(candidate));
         }
@@ -420,16 +422,76 @@ fn link_parent(cache: f64, record: f64, parent_filename: &str) {
     let cache_key = js_string_from_bytes(parent_filename.as_ptr(), parent_filename.len() as u32);
     let cached_parent =
         js_object_get_field_by_name(object_ptr(cache_handle.get_nanbox_f64()), cache_key);
-    let parent = if cached_parent.is_undefined() {
-        let parent = js_object_alloc(0, 1);
+    let parent = scope.root_nanbox_f64(if cached_parent.is_undefined() {
+        let parent = js_object_alloc(0, 2);
         let parent_handle = scope.root_raw_mut_ptr(parent);
         let id = string_value(parent_filename);
         set_field(parent_handle.get_raw_mut_ptr(), "id", id);
+        let children = scope.root_nanbox_f64(f64::from_bits(
+            JSValue::array_ptr(crate::array::js_array_alloc_with_length(0)).bits(),
+        ));
+        set_field(
+            parent_handle.get_raw_mut_ptr(),
+            "children",
+            children.get_nanbox_f64(),
+        );
         object_value(parent_handle.get_raw_mut_ptr())
     } else {
         f64::from_bits(cached_parent.bits())
+    });
+    set_field(
+        object_ptr(record_handle.get_nanbox_f64()),
+        "parent",
+        parent.get_nanbox_f64(),
+    );
+    let children_key = js_string_from_bytes(b"children".as_ptr(), 8);
+    let children = js_object_get_field_by_name(object_ptr(parent.get_nanbox_f64()), children_key);
+    let mut children_ptr = if children.is_pointer() {
+        let ptr = children.as_pointer::<u8>();
+        if crate::value::addr_class::is_plausible_heap_addr(ptr as usize)
+            && unsafe {
+                (*(ptr.sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader)).obj_type
+                    == crate::gc::GC_TYPE_ARRAY
+            }
+        {
+            ptr as *mut crate::array::ArrayHeader
+        } else {
+            std::ptr::null_mut()
+        }
+    } else {
+        std::ptr::null_mut()
     };
-    set_field(object_ptr(record_handle.get_nanbox_f64()), "parent", parent);
+    if children_ptr.is_null() {
+        let children = scope.root_nanbox_f64(f64::from_bits(
+            JSValue::array_ptr(crate::array::js_array_alloc_with_length(0)).bits(),
+        ));
+        js_object_set_field_by_name(
+            object_ptr(parent.get_nanbox_f64()),
+            children_key,
+            children.get_nanbox_f64(),
+        );
+        children_ptr = crate::value::js_nanbox_get_pointer(children.get_nanbox_f64())
+            as *mut crate::array::ArrayHeader;
+    }
+    if crate::array::js_array_includes_f64(children_ptr, record_handle.get_nanbox_f64()) == 0 {
+        let children_ptr =
+            crate::array::js_array_push_f64(children_ptr, record_handle.get_nanbox_f64());
+        js_object_set_field_by_name(
+            object_ptr(parent.get_nanbox_f64()),
+            children_key,
+            f64::from_bits(JSValue::array_ptr(children_ptr).bits()),
+        );
+    }
+}
+
+struct PendingRequireParentGuard;
+
+impl Drop for PendingRequireParentGuard {
+    fn drop(&mut self) {
+        PENDING_REQUIRE_PARENT.with(|pending| {
+            pending.borrow_mut().take();
+        });
+    }
 }
 
 fn require_path(cache: f64, path: &std::path::Path, parent_filename: &str) -> f64 {
@@ -444,8 +506,8 @@ fn require_path(cache: f64, path: &std::path::Path, parent_filename: &str) -> f6
         PENDING_REQUIRE_PARENT.with(|pending| {
             *pending.borrow_mut() = Some(parent_filename.to_string());
         });
+        let _pending_parent_guard = PendingRequireParentGuard;
         let result = js_require_path_module(string_value(&filename));
-        PENDING_REQUIRE_PARENT.with(|pending| pending.borrow_mut().take());
         registered_path_module_value(&filename).unwrap_or(result)
     });
     if let Some((record, exports)) = cached_record(cache_handle.get_nanbox_f64(), &filename) {
@@ -565,11 +627,18 @@ fn run_custom_extension(path: &std::path::Path, record: f64, filename: &str) {
             let key = js_string_from_bytes(extension.as_ptr(), extension.len() as u32);
             let handler =
                 js_object_get_field_by_name(object_ptr(extensions_handle.get_nanbox_f64()), key);
-            if !handler.is_undefined() {
+            if !handler.is_undefined() && !handler.is_null() {
                 let handler_handle = scope.root_nanbox_f64(f64::from_bits(handler.bits()));
+                let handler_ptr =
+                    crate::value::js_nanbox_get_pointer(handler_handle.get_nanbox_f64()) as usize;
+                if !handler.is_pointer() || !crate::closure::is_closure_ptr(handler_ptr) {
+                    crate::process::module_throw_plain_type_error(
+                        "Module._extensions[extension] is not a function",
+                    );
+                }
                 let filename_value = string_value(&filename);
                 crate::closure::js_closure_call2(
-                    object_ptr(handler_handle.get_nanbox_f64()) as *mut ClosureHeader,
+                    handler_ptr as *mut ClosureHeader,
                     record_handle.get_nanbox_f64(),
                     filename_value,
                 );
@@ -729,6 +798,16 @@ pub extern "C" fn js_module_create_require_devirt(filename_or_url: f64) -> f64 {
 /// compiled module self-registers at the end of its CJS wrapper init.
 static MODULE_PATH_REGISTRY: std::sync::RwLock<Option<std::collections::HashMap<String, u64>>> =
     std::sync::RwLock::new(None);
+
+pub(crate) fn scan_module_path_registry_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
+    if let Some(modules) = MODULE_PATH_REGISTRY.write().unwrap().as_mut() {
+        for bits in modules.values_mut() {
+            let mut value = f64::from_bits(*bits);
+            visitor.visit_nanbox_f64_slot(&mut value);
+            *bits = value.to_bits();
+        }
+    }
+}
 
 thread_local! {
     static PENDING_REQUIRE_PARENT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };

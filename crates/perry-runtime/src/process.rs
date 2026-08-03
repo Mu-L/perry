@@ -66,6 +66,7 @@ pub use finalization::{
 pub(crate) use permission::{process_permission_enabled, scan_permission_cache_roots_mut};
 
 // ── report re-exports ───────────────────────────────────────────────────────
+pub(crate) use node_module::js_module_instance_require;
 pub(crate) use report::scan_report_cache_roots_mut;
 
 // ── node_module re-exports ──────────────────────────────────────────────────

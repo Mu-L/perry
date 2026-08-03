@@ -37,44 +37,48 @@ pub extern "C" fn js_module_source_map_new(payload: f64, options: f64) -> f64 {
             "ERR_INVALID_ARG_TYPE",
         );
     }
-    // Materialize the singleton before allocating the instance. Building the
-    // prototype allocates its methods/getters and can therefore run GC; doing
-    // that after `obj` was allocated left the raw instance pointer stale.
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let payload = scope.root_nanbox_f64(payload);
+    let options = scope.root_nanbox_f64(options);
     let _ = source_map_prototype();
-    let cloned_payload = crate::builtins::js_structured_clone(payload);
-    let line_lengths = module_object_ptr(options)
+    let cloned_payload = crate::builtins::js_structured_clone(payload.get_nanbox_f64());
+    let line_lengths = module_object_ptr(options.get_nanbox_f64())
         .map(|obj| module_get_named_field(obj, "lineLengths"))
         .unwrap_or_else(module_undefined);
-    let scope = crate::gc::RuntimeHandleScope::new();
     let cloned_payload = scope.root_nanbox_f64(cloned_payload);
     let line_lengths = scope.root_nanbox_f64(line_lengths);
     let keys = b"_payload\0_lineLengths\0";
-    let obj = crate::object::js_object_alloc_with_shape(
+    let obj = scope.root_raw_mut_ptr(crate::object::js_object_alloc_with_shape(
         SOURCE_MAP_CLASS_ID,
         2,
         keys.as_ptr(),
         keys.len() as u32,
-    );
+    ));
     // The first `js_object_alloc_with_shape` argument identifies the cached
     // shape; it does not initialize ObjectHeader::class_id.
     unsafe {
+        let obj = obj.get_raw_mut_ptr::<crate::object::ObjectHeader>();
         (*obj).class_id = SOURCE_MAP_CLASS_ID;
+        (*obj).keys_array = std::ptr::null_mut();
     }
     crate::object::js_object_set_field(
-        obj,
+        obj.get_raw_mut_ptr(),
         0,
         JSValue::from_bits(cloned_payload.get_nanbox_f64().to_bits()),
     );
     crate::object::js_object_set_field(
-        obj,
+        obj.get_raw_mut_ptr(),
         1,
         JSValue::from_bits(line_lengths.get_nanbox_f64().to_bits()),
     );
     // `proto` may have moved while cloning/allocating above; reload the rooted
     // singleton before recording the instance chain.
     let proto = source_map_prototype();
-    crate::object::prototype_chain::object_set_static_prototype(obj as usize, proto.to_bits());
-    module_object_value(obj)
+    crate::object::prototype_chain::object_set_static_prototype(
+        obj.get_raw_mut_ptr::<crate::object::ObjectHeader>() as usize,
+        proto.to_bits(),
+    );
+    module_object_value(obj.get_raw_mut_ptr())
 }
 
 type SourceMapThunk = extern "C" fn(*const ClosureHeader, f64) -> f64;
@@ -91,19 +95,25 @@ fn source_map_method(name: &str, thunk: SourceMapThunk) -> f64 {
 
 extern "C" fn source_map_payload_getter(_closure: *const ClosureHeader) -> f64 {
     let obj = source_map_receiver();
-    let payload = crate::object::js_object_get_field(obj, 0);
-    crate::builtins::js_structured_clone(f64::from_bits(payload.bits()))
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let payload = scope.root_nanbox_f64(f64::from_bits(
+        crate::object::js_object_get_field(obj, 0).bits(),
+    ));
+    crate::builtins::js_structured_clone(payload.get_nanbox_f64())
 }
 
 extern "C" fn source_map_line_lengths_getter(_closure: *const ClosureHeader) -> f64 {
     let obj = source_map_receiver();
-    let value = f64::from_bits(crate::object::js_object_get_field(obj, 1).bits());
-    let jv = JSValue::from_bits(value.to_bits());
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let value = scope.root_nanbox_f64(f64::from_bits(
+        crate::object::js_object_get_field(obj, 1).bits(),
+    ));
+    let jv = JSValue::from_bits(value.get_nanbox_f64().to_bits());
     if !jv.is_pointer() {
         return module_undefined();
     }
     let ptr = jv.as_pointer::<u8>();
-    if ptr.is_null() {
+    if !crate::value::addr_class::is_plausible_heap_addr(ptr as usize) {
         return module_undefined();
     }
     let gc = unsafe { &*(ptr.sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader) };
@@ -233,6 +243,11 @@ pub fn module_source_map_attach_constructor(closure_addr: usize) {
         "prototype",
         proto_value.get_nanbox_f64(),
     );
+    crate::object::set_builtin_property_attrs(
+        constructor.get_raw_mut_ptr::<ClosureHeader>() as usize,
+        "prototype".to_string(),
+        crate::object::PropertyAttrs::new(false, false, false),
+    );
 }
 
 /// Decode a base64 VLQ alphabet byte to its 0–63 value.
@@ -257,9 +272,24 @@ fn source_map_decode_segment(seg: &[u8]) -> Vec<i64> {
             continue;
         };
         let cont = (digit & 0x20) != 0;
-        value += (digit & 0x1f) << shift;
+        let Some(part) = (digit & 0x1f).checked_shl(shift) else {
+            return Vec::new();
+        };
+        let Some(next) = value.checked_add(part) else {
+            return Vec::new();
+        };
+        if next > u32::MAX as i64 {
+            return Vec::new();
+        }
+        value = next;
         if cont {
-            shift += 5;
+            let Some(next_shift) = shift.checked_add(5) else {
+                return Vec::new();
+            };
+            if next_shift >= 35 {
+                return Vec::new();
+            }
+            shift = next_shift;
         } else {
             let negative = (value & 1) != 0;
             let decoded = value >> 1;
@@ -270,28 +300,25 @@ fn source_map_decode_segment(seg: &[u8]) -> Vec<i64> {
     }
     if out.is_empty() && !seg.is_empty() {
         vec![0, 0, 0, 0]
-    } else {
+    } else if shift == 0 {
         out
+    } else {
+        Vec::new()
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SourceMapEntry {
     generated_line: i64,
     generated_column: i64,
-    source_payload: f64,
+    section_path: Vec<u32>,
     // `None` for genCol-only (1-field) segments that mark an unmapped position.
-    // The inner name index is `Some` only for segments that carried an explicit
-    // 5th VLQ field (a named mapping).
     original: Option<(i64, i64, i64, Option<i64>)>, // (source_index, line, column, name_index)
 }
 
 /// Decode the full `mappings` string into ordered entries with cumulative
-/// source/line/column/name indices per the Source Map v3 grammar. `name_index`
-/// is attached only to genuinely-named (5-field) segments, matching how a
-/// position with no explicit name resolves (Node returns no `name` for the
-/// names-less mapping in the issue repro).
-fn source_map_decode(payload: f64, mappings: &str) -> Vec<SourceMapEntry> {
+/// source/line/column/name indices per Node's SourceMap behavior.
+fn source_map_decode(mappings: &str) -> Vec<SourceMapEntry> {
     let mut entries = Vec::new();
     let (mut src_idx, mut src_line, mut src_col, mut name_idx) = (0i64, 0i64, 0i64, 0i64);
     let mut has_name = false;
@@ -330,7 +357,7 @@ fn source_map_decode(payload: f64, mappings: &str) -> Vec<SourceMapEntry> {
             entries.push(SourceMapEntry {
                 generated_line: gen_line as i64,
                 generated_column: gen_col,
-                source_payload: payload,
+                section_path: Vec::new(),
                 original,
             });
         }
@@ -369,12 +396,14 @@ fn source_map_array_element(payload: f64, field: &str, index: i64) -> f64 {
         return undefined_value();
     }
     let arr_value = source_map_field(payload, field);
-    let av = JSValue::from_bits(arr_value.to_bits());
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let arr_value = scope.root_nanbox_f64(arr_value);
+    let av = JSValue::from_bits(arr_value.get_nanbox_f64().to_bits());
     if !av.is_pointer() {
         return undefined_value();
     }
-    let ptr = crate::value::js_nanbox_get_pointer(arr_value) as *const u8;
-    if ptr.is_null() {
+    let ptr = crate::value::js_nanbox_get_pointer(arr_value.get_nanbox_f64()) as *const u8;
+    if !crate::value::addr_class::is_plausible_heap_addr(ptr as usize) {
         return undefined_value();
     }
     let gc = unsafe { &*(ptr.sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader) };
@@ -383,38 +412,37 @@ fn source_map_array_element(payload: f64, field: &str, index: i64) -> f64 {
     }
     let arr = ptr as *const crate::array::ArrayHeader;
     let len = crate::array::js_array_length(arr);
-    if index as u32 >= len {
+    if index >= i64::from(len) {
         return undefined_value();
     }
     crate::array::js_array_get_f64(arr, index as u32)
 }
 
-fn source_map_collect_args(rest: f64) -> Vec<f64> {
+fn source_map_arg(rest: f64, index: u32) -> f64 {
     let rv = JSValue::from_bits(rest.to_bits());
     if !rv.is_pointer() {
-        return Vec::new();
+        return module_undefined();
     }
     let arr = crate::value::js_nanbox_get_pointer(rest) as *const crate::array::ArrayHeader;
-    if arr.is_null() {
-        return Vec::new();
+    if !crate::value::addr_class::is_plausible_heap_addr(arr as usize) {
+        return module_undefined();
     }
     let len = crate::array::js_array_length(arr);
-    (0..len)
-        .map(|i| crate::array::js_array_get_f64(arr, i))
-        .collect()
+    if index >= len {
+        module_undefined()
+    } else {
+        crate::array::js_array_get_f64(arr, index)
+    }
 }
 
 /// Coerce call argument `idx` to a finite number, if it is one.
-fn source_map_arg_number(args: &[f64], idx: usize) -> Option<f64> {
-    args.get(idx)
-        .map(|v| JSValue::from_bits(v.to_bits()).to_number())
-        .filter(|n| n.is_finite())
+fn source_map_arg_number(value: f64) -> Option<f64> {
+    let number = JSValue::from_bits(value.to_bits()).to_number();
+    number.is_finite().then_some(number)
 }
 
-fn source_map_arg_i64(args: &[f64], idx: usize) -> i64 {
-    source_map_arg_number(args, idx)
-        .map(|n| n as i64)
-        .unwrap_or(0)
+fn source_map_arg_i64(value: f64) -> i64 {
+    source_map_arg_number(value).map(|n| n as i64).unwrap_or(0)
 }
 
 /// Decode the payload's `mappings` and return the greatest entry whose
@@ -432,26 +460,33 @@ fn source_map_lookup(payload: f64, line: i64, col: i64) -> Option<SourceMapEntry
         let len = crate::array::js_array_length(sections_ptr());
         let mut best = None;
         for index in 0..len {
-            let section = crate::array::js_array_get_f64(sections_ptr(), index);
-            let offset = source_map_field(section, "offset");
-            if module_object_ptr(offset).is_none() {
+            let section =
+                scope.root_nanbox_f64(crate::array::js_array_get_f64(sections_ptr(), index));
+            let offset =
+                scope.root_nanbox_f64(source_map_field(section.get_nanbox_f64(), "offset"));
+            if module_object_ptr(offset.get_nanbox_f64()).is_none() {
                 continue;
             }
             let offset_line =
-                JSValue::from_bits(source_map_field(offset, "line").to_bits()).to_number() as i64;
+                JSValue::from_bits(source_map_field(offset.get_nanbox_f64(), "line").to_bits())
+                    .to_number() as i64;
             let offset_col =
-                JSValue::from_bits(source_map_field(offset, "column").to_bits()).to_number() as i64;
+                JSValue::from_bits(source_map_field(offset.get_nanbox_f64(), "column").to_bits())
+                    .to_number() as i64;
             if (offset_line, offset_col) > (line, col) {
                 break;
             }
-            let nested = source_map_field(section, "map");
+            let nested = scope.root_nanbox_f64(source_map_field(section.get_nanbox_f64(), "map"));
             let local_line = line - offset_line;
             let local_col = if local_line == 0 {
                 col - offset_col
             } else {
                 col
             };
-            if let Some(mut entry) = source_map_lookup(nested, local_line, local_col) {
+            if let Some(mut entry) =
+                source_map_lookup(nested.get_nanbox_f64(), local_line, local_col)
+            {
+                entry.section_path.insert(0, index);
                 entry.generated_line += offset_line;
                 if entry.generated_line == offset_line {
                     entry.generated_column += offset_col;
@@ -464,7 +499,7 @@ fn source_map_lookup(payload: f64, line: i64, col: i64) -> Option<SourceMapEntry
     let payload = payload.get_nanbox_f64();
     let mappings = source_map_field_string(payload, "mappings")?;
     let mut best = None;
-    for entry in source_map_decode(payload, &mappings) {
+    for entry in source_map_decode(&mappings) {
         if (entry.generated_line, entry.generated_column) <= (line, col) {
             best = Some(entry);
         } else {
@@ -481,18 +516,37 @@ fn source_map_array_value(payload: f64, field: &str) -> Option<f64> {
         return None;
     }
     let ptr = jv.as_pointer::<u8>();
-    if ptr.is_null() {
+    if !crate::value::addr_class::is_plausible_heap_addr(ptr as usize) {
         return None;
     }
     let gc = unsafe { &*(ptr.sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader) };
     (gc.obj_type == crate::gc::GC_TYPE_ARRAY).then_some(value)
 }
 
+fn source_map_entry_payload(payload: f64, section_path: &[u32]) -> f64 {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let current = scope.root_nanbox_f64(payload);
+    for &index in section_path {
+        let Some(sections) = source_map_array_value(current.get_nanbox_f64(), "sections") else {
+            return module_undefined();
+        };
+        let sections = scope.root_nanbox_f64(sections);
+        let sections_ptr = crate::value::js_nanbox_get_pointer(sections.get_nanbox_f64())
+            as *const crate::array::ArrayHeader;
+        if index >= crate::array::js_array_length(sections_ptr) {
+            return module_undefined();
+        }
+        let section = scope.root_nanbox_f64(crate::array::js_array_get_f64(sections_ptr, index));
+        current.set_nanbox_f64(source_map_field(section.get_nanbox_f64(), "map"));
+    }
+    current.get_nanbox_f64()
+}
+
 /// Build the `{ name?, fileName, lineNumber, columnNumber }` shape Node's
 /// `findOrigin` echoes (name/fileName from the matched entry; line/column from
 /// the call arguments). Insertion order matches Node for byte-identical JSON.
 fn source_map_origin_object(
-    _payload: f64,
+    payload: f64,
     entry: Option<SourceMapEntry>,
     line: Option<f64>,
     col: Option<f64>,
@@ -501,15 +555,18 @@ fn source_map_origin_object(
         return module_object_value(crate::object::js_object_alloc(0, 0));
     };
     let scope = crate::gc::RuntimeHandleScope::new();
+    let payload = scope.root_nanbox_f64(payload);
+    let source_payload = scope.root_nanbox_f64(source_map_entry_payload(
+        payload.get_nanbox_f64(),
+        &entry.section_path,
+    ));
     let obj = crate::object::js_object_alloc(0, 4);
     let obj = scope.root_raw_mut_ptr(obj);
     if let SourceMapEntry {
-        source_payload,
         original: Some((source_index, _, _, name_index)),
         ..
     } = entry
     {
-        let source_payload = scope.root_nanbox_f64(source_payload);
         if let Some(name_index) = name_index {
             let name =
                 source_map_array_element(source_payload.get_nanbox_f64(), "names", name_index);
@@ -544,16 +601,20 @@ fn source_map_origin_object(
 extern "C" fn source_map_find_entry_thunk(closure: *const ClosureHeader, rest: f64) -> f64 {
     let _ = closure;
     let receiver = source_map_receiver();
-    let payload = f64::from_bits(crate::object::js_object_get_field(receiver, 0).bits());
-    let args = source_map_collect_args(rest);
-    let query_line = source_map_arg_i64(&args, 0);
-    let query_col = source_map_arg_i64(&args, 1);
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let payload = scope.root_nanbox_f64(f64::from_bits(
+        crate::object::js_object_get_field(receiver, 0).bits(),
+    ));
+    let rest = scope.root_nanbox_f64(rest);
+    let line = scope.root_nanbox_f64(source_map_arg(rest.get_nanbox_f64(), 0));
+    let column = scope.root_nanbox_f64(source_map_arg(rest.get_nanbox_f64(), 1));
+    let query_line = source_map_arg_i64(line.get_nanbox_f64());
+    let query_col = source_map_arg_i64(column.get_nanbox_f64());
 
-    let Some(entry) = source_map_lookup(payload, query_line, query_col) else {
+    let Some(entry) = source_map_lookup(payload.get_nanbox_f64(), query_line, query_col) else {
         return module_object_value(crate::object::js_object_alloc(0, 0));
     };
 
-    let scope = crate::gc::RuntimeHandleScope::new();
     let obj = scope.root_raw_mut_ptr(crate::object::js_object_alloc(0, 6));
     module_set_field(
         obj.get_raw_mut_ptr(),
@@ -566,7 +627,10 @@ extern "C" fn source_map_find_entry_thunk(closure: *const ClosureHeader, rest: f
         entry.generated_column as f64,
     );
     if let Some((source_index, original_line, original_column, name_index)) = entry.original {
-        let source_payload = scope.root_nanbox_f64(entry.source_payload);
+        let source_payload = scope.root_nanbox_f64(source_map_entry_payload(
+            payload.get_nanbox_f64(),
+            &entry.section_path,
+        ));
         module_set_field(
             obj.get_raw_mut_ptr(),
             "originalSource",
@@ -597,10 +661,15 @@ extern "C" fn source_map_find_entry_thunk(closure: *const ClosureHeader, rest: f
 extern "C" fn source_map_find_origin_thunk(closure: *const ClosureHeader, rest: f64) -> f64 {
     let _ = closure;
     let receiver = source_map_receiver();
-    let payload = f64::from_bits(crate::object::js_object_get_field(receiver, 0).bits());
-    let args = source_map_collect_args(rest);
-    let line = source_map_arg_number(&args, 0);
-    let col = source_map_arg_number(&args, 1);
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let payload = scope.root_nanbox_f64(f64::from_bits(
+        crate::object::js_object_get_field(receiver, 0).bits(),
+    ));
+    let rest = scope.root_nanbox_f64(rest);
+    let line_arg = scope.root_nanbox_f64(source_map_arg(rest.get_nanbox_f64(), 0));
+    let col_arg = scope.root_nanbox_f64(source_map_arg(rest.get_nanbox_f64(), 1));
+    let line = source_map_arg_number(line_arg.get_nanbox_f64());
+    let col = source_map_arg_number(col_arg.get_nanbox_f64());
 
     if line == Some(0.0) && col == Some(0.0) {
         return module_object_value(crate::object::js_object_alloc(0, 0));
@@ -611,14 +680,15 @@ extern "C" fn source_map_find_origin_thunk(closure: *const ClosureHeader, rest: 
     // mapping for a non-numeric line receiver; preserve that observable quirk.
     let entry = if let Some(line) = line {
         source_map_lookup(
-            payload,
-            line as i64 - 1,
-            col.map(|n| n as i64 - 1).unwrap_or(i64::MAX),
+            payload.get_nanbox_f64(),
+            (line as i64).saturating_sub(1),
+            col.map(|n| (n as i64).saturating_sub(1))
+                .unwrap_or(i64::MAX),
         )
     } else {
-        source_map_lookup(payload, i64::MAX, i64::MAX)
+        source_map_lookup(payload.get_nanbox_f64(), i64::MAX, i64::MAX)
     };
-    source_map_origin_object(payload, entry, line, col)
+    source_map_origin_object(payload.get_nanbox_f64(), entry, line, col)
 }
 
 fn source_map_normalize_inline_sources(payload: f64, generated_file: &std::path::Path) {
@@ -651,7 +721,10 @@ fn source_map_normalize_inline_sources(payload: f64, generated_file: &std::path:
         // fail. Components still removes lexical `.` segments in that case.
         let normalized: std::path::PathBuf = path.components().collect();
         let path = std::fs::canonicalize(&path).unwrap_or(normalized);
-        let url = format!("file://{}", path.to_string_lossy());
+        let url = crate::url::node_compat::path_to_file_url_string(
+            &path.to_string_lossy(),
+            cfg!(windows),
+        );
         let url = module_string_value(&url);
         crate::array::js_array_set_f64(sources_ptr() as *mut _, index, url);
     }
@@ -678,15 +751,28 @@ pub extern "C" fn js_module_find_source_map(filename: f64) -> f64 {
     let Ok(source) = std::fs::read_to_string(&filename) else {
         return module_undefined();
     };
-    let Some(marker) = source.rfind("sourceMappingURL=data:application/json;base64,") else {
+    let prefix = "sourceMappingURL=data:application/json";
+    let Some(marker) = source.rfind(prefix) else {
         return module_undefined();
     };
-    let encoded = source[marker + "sourceMappingURL=data:application/json;base64,".len()..]
-        .lines()
+    let suffix = source[marker + prefix.len()..].lines().next().unwrap_or("");
+    let Some(encoded) = suffix
+        .strip_prefix(";base64,")
+        .or_else(|| suffix.strip_prefix(";charset=utf-8;base64,"))
+    else {
+        return module_undefined();
+    };
+    let encoded = encoded
+        .trim_start()
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=')))
         .next()
-        .unwrap_or("")
-        .trim();
-    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        .unwrap_or("");
+    let engine = base64::engine::general_purpose::GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        base64::engine::general_purpose::GeneralPurposeConfig::new()
+            .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+    );
+    let Ok(decoded) = engine.decode(encoded) else {
         return module_undefined();
     };
     let text = js_string_from_bytes(decoded.as_ptr(), decoded.len() as u32);

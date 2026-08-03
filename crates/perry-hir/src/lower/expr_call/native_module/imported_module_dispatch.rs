@@ -149,9 +149,6 @@ pub(super) fn try_imported_module_dispatch(
                                     | perry_api_manifest::ApiKind::Class
                             )
                         });
-                    if imported_callable {
-                        return Ok(Err(args));
-                    }
                     if normalized_module == "stream"
                         && matches!(imported_method, None | Some("Stream"))
                     {
@@ -192,6 +189,9 @@ pub(super) fn try_imported_module_dispatch(
                             type_args: Vec::new(),
                             byte_offset: 0,
                         }));
+                    }
+                    if imported_callable {
+                        return Ok(Err(args));
                     }
                 }
                 // Unimplemented-API gate (#463 / #525) for the 2-deep

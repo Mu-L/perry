@@ -723,7 +723,8 @@ pub unsafe extern "C" fn js_object_get_symbol_property(obj_f64: f64, sym_f64: f6
     }
     // Buffers inherit TypedArray iteration semantics in Node: the default
     // iterator is `values()`, yielding numeric bytes.
-    let raw_addr = if (bits >> 48) >= 0x7FF8 {
+    let is_pointer = (bits >> 48) == 0x7FFD;
+    let raw_addr = if is_pointer {
         (bits & POINTER_MASK) as usize
     } else {
         bits as usize
@@ -732,7 +733,10 @@ pub unsafe extern "C" fn js_object_get_symbol_property(obj_f64: f64, sym_f64: f6
     // namespaces share one synthetic class and virtualize their exports, so
     // resolve the tag from the stored module name instead of duplicating a
     // physical symbol property on every namespace instance.
-    if crate::value::addr_class::is_above_handle_band(raw_addr) {
+    if is_pointer
+        && crate::value::addr_class::is_above_handle_band(raw_addr)
+        && crate::object::is_valid_obj_ptr(raw_addr as *const u8)
+    {
         let obj = raw_addr as *const crate::object::ObjectHeader;
         if unsafe { (*obj).class_id } == crate::object::NATIVE_MODULE_CLASS_ID {
             let tag_wk = well_known_symbol("toStringTag");

@@ -399,7 +399,7 @@ pub(in crate::commands::compile) fn wrap_commonjs_with_body_offset(
                             String::new()
                         };
                         format!(
-                            "const childBefore = require.cache[{path:?}]; {warnings}globalThis.__perry_cjs_pending_parent = module; const required = __perry_require_path_module({path:?}); globalThis.__perry_cjs_pending_parent = undefined; {link_child}return required;",
+                            "const childBefore = require.cache[{path:?}]; {warnings}globalThis.__perry_cjs_pending_parent = module; let required; try {{ required = __perry_require_path_module({path:?}); }} finally {{ globalThis.__perry_cjs_pending_parent = undefined; }} {link_child}return required;",
                             path = target.to_string_lossy(),
                         )
                     })

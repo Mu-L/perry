@@ -83,13 +83,20 @@ pub(crate) fn module_cjs_global_paths_value() -> f64 {
         }
 
         let mut paths = Vec::new();
-        if let Some(home) = std::env::var_os("HOME") {
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
             let home = std::path::PathBuf::from(home);
             paths.push(home.join(".node_modules").to_string_lossy().into_owned());
             paths.push(home.join(".node_libraries").to_string_lossy().into_owned());
         }
-        let prefix = std::env::var("PREFIX").unwrap_or_else(|_| "/usr/local".to_string());
-        paths.push(format!("{prefix}/lib/node"));
+        let prefix = std::env::var_os("PREFIX")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|path| path.parent()?.parent().map(std::path::Path::to_path_buf))
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("/usr/local"));
+        paths.push(prefix.join("lib/node").to_string_lossy().into_owned());
 
         let scope = crate::gc::RuntimeHandleScope::new();
         let arr = scope.root_nanbox_f64(f64::from_bits(
@@ -250,11 +257,20 @@ extern "C" fn module_prototype_load_thunk(
     crate::process::js_module_instance_load(filename)
 }
 
+extern "C" fn module_prototype_require_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    specifier: f64,
+    _b: f64,
+    _c: f64,
+) -> f64 {
+    crate::process::js_module_instance_require(specifier)
+}
+
 fn module_prototype_method(name: &str, length: u32) -> f64 {
-    let func = if name == "load" {
-        module_prototype_load_thunk as *const u8
-    } else {
-        module_prototype_method_thunk as *const u8
+    let func = match name {
+        "load" => module_prototype_load_thunk as *const u8,
+        "require" => module_prototype_require_thunk as *const u8,
+        _ => module_prototype_method_thunk as *const u8,
     };
     crate::closure::js_register_closure_arity(func, 3);
     let closure = crate::closure::js_closure_alloc(func, 0);

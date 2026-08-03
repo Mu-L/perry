@@ -57,9 +57,35 @@ pub extern "C" fn js_module_constants() -> f64 {
 
 extern "C" fn module_require_thunk(
     _closure: *const crate::closure::ClosureHeader,
-    _specifier: f64,
+    specifier: f64,
 ) -> f64 {
-    f64::from_bits(crate::value::TAG_UNDEFINED)
+    js_module_instance_require(specifier)
+}
+
+pub(crate) fn js_module_instance_require(specifier: f64) -> f64 {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let receiver = scope.root_nanbox_f64(crate::object::js_implicit_this_get());
+    let specifier = scope.root_nanbox_f64(specifier);
+    let Some(_) = module_object_ptr(receiver.get_nanbox_f64()) else {
+        module_throw_plain_type_error("Module.prototype.require called on incompatible receiver");
+    };
+    let filename = module_get_named_field(
+        module_object_ptr(receiver.get_nanbox_f64()).unwrap(),
+        "filename",
+    );
+    let filename = scope.root_nanbox_f64(if module_value_to_string(filename).is_some() {
+        filename
+    } else {
+        module_get_named_field(module_object_ptr(receiver.get_nanbox_f64()).unwrap(), "id")
+    });
+    let require = scope.root_nanbox_f64(crate::module_require::js_module_create_require(
+        filename.get_nanbox_f64(),
+    ));
+    crate::closure::js_closure_call1(
+        crate::value::js_nanbox_get_pointer(require.get_nanbox_f64())
+            as *const crate::closure::ClosureHeader,
+        specifier.get_nanbox_f64(),
+    )
 }
 
 fn module_null() -> f64 {
@@ -124,8 +150,7 @@ pub extern "C" fn js_module_module_new(id: f64, parent: f64) -> f64 {
         5,
         JSValue::from_bits(children.get_nanbox_f64().to_bits()),
     );
-    let parent_value = JSValue::from_bits(parent.get_nanbox_f64().to_bits());
-    let has_parent = parent_value.is_pointer() && !parent_value.is_string();
+    let has_parent = module_object_ptr(parent.get_nanbox_f64()).is_some();
     crate::object::js_object_set_field(
         obj_ptr(),
         6,
@@ -143,14 +168,13 @@ pub extern "C" fn js_module_module_new(id: f64, parent: f64) -> f64 {
     );
     let value = obj.get_nanbox_f64();
     if has_parent {
-        let parent_value = JSValue::from_bits(parent.get_nanbox_f64().to_bits());
-        let parent_obj = parent_value.as_pointer::<crate::object::ObjectHeader>() as *mut _;
+        let parent_obj = module_object_ptr(parent.get_nanbox_f64()).unwrap() as *mut _;
         let parent_children = crate::object::js_object_get_field(parent_obj, 5);
         if parent_children.is_pointer() {
             let children = parent_children.as_pointer::<crate::array::ArrayHeader>() as *mut _;
             let children = crate::array::js_array_push_f64(children, value);
             crate::object::js_object_set_field(
-                parent_obj,
+                module_object_ptr(parent.get_nanbox_f64()).unwrap() as *mut _,
                 5,
                 JSValue::from_bits(JSValue::array_ptr(children).bits()),
             );
@@ -449,9 +473,16 @@ pub extern "C" fn js_module_instance_load(filename: f64) -> f64 {
         module_object_ptr(cache.get_nanbox_f64()).unwrap_or(std::ptr::null()) as *mut _,
         key,
     );
-    let receiver_ptr = module_object_ptr(receiver.get_nanbox_f64()).unwrap() as *mut _;
-    module_set_field(receiver_ptr, "exports", exports.get_nanbox_f64());
-    module_set_field(receiver_ptr, "loaded", module_bool_value(true));
+    module_set_field(
+        module_object_ptr(receiver.get_nanbox_f64()).unwrap() as *mut _,
+        "exports",
+        exports.get_nanbox_f64(),
+    );
+    module_set_field(
+        module_object_ptr(receiver.get_nanbox_f64()).unwrap() as *mut _,
+        "loaded",
+        module_bool_value(true),
+    );
     module_undefined()
 }
 
@@ -1002,15 +1033,23 @@ extern "C" fn module_loader_hook_chain(
 }
 
 fn module_loader_hook_chain_function(callback: f64, next: f64, name: &str) -> f64 {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let callback = scope.root_nanbox_f64(callback);
+    let next = scope.root_nanbox_f64(next);
     let func_ptr = module_loader_hook_chain as *const u8;
     crate::closure::js_register_closure_arity(func_ptr, 2);
     crate::closure::js_register_closure_length(func_ptr, 2);
-    let closure = crate::closure::js_closure_alloc(func_ptr, 2);
-    js_closure_set_capture_f64(closure, 0, callback);
-    js_closure_set_capture_f64(closure, 1, next);
-    crate::object::set_bound_native_closure_name(closure, name);
-    crate::object::set_builtin_closure_length(closure as usize, 2);
-    crate::value::js_nanbox_pointer(closure as i64)
+    let closure = scope.root_raw_mut_ptr(crate::closure::js_closure_alloc(func_ptr, 2));
+    js_closure_set_capture_f64(closure.get_raw_mut_ptr(), 0, callback.get_nanbox_f64());
+    js_closure_set_capture_f64(closure.get_raw_mut_ptr(), 1, next.get_nanbox_f64());
+    crate::object::set_bound_native_closure_name(closure.get_raw_mut_ptr(), name);
+    crate::object::set_builtin_closure_length(
+        closure.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as usize,
+        2,
+    );
+    crate::value::js_nanbox_pointer(
+        closure.get_raw_mut_ptr::<crate::closure::ClosureHeader>() as i64
+    )
 }
 
 fn module_loader_build_hook_chain(
@@ -1039,7 +1078,8 @@ fn module_loader_build_hook_chain(
 /// Apply active synchronous `module.registerHooks()` callbacks to a dynamic
 /// import known to Perry's compile-time graph. This supports observable
 /// resolve/load callback participation and deregistration; arbitrary new
-/// runtime-loaded modules remain outside Perry's static import model.
+/// runtime-loaded modules and load-hook source replacement remain outside
+/// Perry's static import model.
 #[no_mangle]
 pub extern "C" fn js_module_dynamic_import_apply_hooks(specifier: f64) -> f64 {
     let entries = MODULE_LOADER_HOOKS.with(|hooks| {
@@ -1145,6 +1185,56 @@ fn module_word_at(bytes: &[u8], index: usize, word: &[u8]) -> bool {
     !before.is_some_and(module_is_ident_byte) && !after.is_some_and(module_is_ident_byte)
 }
 
+fn module_regex_can_start(bytes: &[u8], index: usize, previous: Option<u8>) -> bool {
+    if previous.is_none_or(|byte| {
+        matches!(
+            byte,
+            b'(' | b'['
+                | b'{'
+                | b'='
+                | b':'
+                | b','
+                | b';'
+                | b'!'
+                | b'?'
+                | b'+'
+                | b'-'
+                | b'*'
+                | b'%'
+                | b'&'
+                | b'|'
+                | b'^'
+                | b'~'
+                | b'<'
+                | b'>'
+        )
+    }) {
+        return true;
+    }
+    let mut end = index;
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 && module_is_ident_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    matches!(
+        &bytes[start..end],
+        b"return"
+            | b"throw"
+            | b"case"
+            | b"delete"
+            | b"void"
+            | b"typeof"
+            | b"instanceof"
+            | b"in"
+            | b"new"
+            | b"yield"
+            | b"await"
+    )
+}
+
 fn module_typescript_code_mask(bytes: &[u8]) -> Vec<bool> {
     const CODE: u8 = 0;
     const SINGLE: u8 = 1;
@@ -1152,13 +1242,31 @@ fn module_typescript_code_mask(bytes: &[u8]) -> Vec<bool> {
     const TEMPLATE: u8 = 3;
     const LINE_COMMENT: u8 = 4;
     const BLOCK_COMMENT: u8 = 5;
+    const REGEX: u8 = 6;
 
     let mut mask = vec![false; bytes.len()];
     let mut state = CODE;
+    let mut template_depths = Vec::<usize>::new();
+    let mut regex_class = false;
+    let mut previous_code = None;
     let mut index = 0;
     while index < bytes.len() {
         match state {
             CODE => match bytes[index] {
+                b'}' if template_depths.last() == Some(&1) => {
+                    template_depths.pop();
+                    state = TEMPLATE;
+                }
+                b'{' if !template_depths.is_empty() => {
+                    *template_depths.last_mut().unwrap() += 1;
+                    mask[index] = true;
+                    previous_code = Some(b'{');
+                }
+                b'}' if !template_depths.is_empty() => {
+                    *template_depths.last_mut().unwrap() -= 1;
+                    mask[index] = true;
+                    previous_code = Some(b'}');
+                }
                 b'\'' => state = SINGLE,
                 b'"' => state = DOUBLE,
                 b'`' => state = TEMPLATE,
@@ -1170,16 +1278,56 @@ fn module_typescript_code_mask(bytes: &[u8]) -> Vec<bool> {
                     state = BLOCK_COMMENT;
                     index += 1;
                 }
-                _ => mask[index] = true,
+                b'/' if module_regex_can_start(bytes, index, previous_code) => {
+                    state = REGEX;
+                    regex_class = false;
+                }
+                byte => {
+                    mask[index] = true;
+                    if !byte.is_ascii_whitespace() {
+                        previous_code = Some(byte);
+                    }
+                }
             },
-            SINGLE | DOUBLE | TEMPLATE => {
+            SINGLE | DOUBLE => {
                 if bytes[index] == b'\\' {
                     index += 1;
                 } else if (state == SINGLE && bytes[index] == b'\'')
                     || (state == DOUBLE && bytes[index] == b'"')
-                    || (state == TEMPLATE && bytes[index] == b'`')
                 {
                     state = CODE;
+                    previous_code = Some(b'x');
+                }
+            }
+            TEMPLATE => {
+                if bytes[index] == b'\\' {
+                    index += 1;
+                } else if bytes[index] == b'`' {
+                    state = CODE;
+                    previous_code = Some(b'x');
+                } else if bytes[index] == b'$' && bytes.get(index + 1) == Some(&b'{') {
+                    template_depths.push(1);
+                    state = CODE;
+                    index += 1;
+                    previous_code = Some(b'{');
+                }
+            }
+            REGEX => {
+                if bytes[index] == b'\\' {
+                    index += 1;
+                } else if bytes[index] == b'[' {
+                    regex_class = true;
+                } else if bytes[index] == b']' {
+                    regex_class = false;
+                } else if bytes[index] == b'/' && !regex_class {
+                    while bytes
+                        .get(index + 1)
+                        .is_some_and(|byte| byte.is_ascii_alphabetic())
+                    {
+                        index += 1;
+                    }
+                    state = CODE;
+                    previous_code = Some(b'x');
                 }
             }
             LINE_COMMENT => {
@@ -1278,11 +1426,49 @@ fn module_strip_interfaces(bytes: &mut [u8], mask: &[bool]) {
 fn module_strip_type_aliases(bytes: &mut [u8], mask: &[bool]) {
     let mut index = 0;
     while index < bytes.len() {
-        if !module_word_at_code(bytes, mask, index, b"type") {
+        let type_start = if module_word_at_code(bytes, mask, index, b"type") {
+            index
+        } else if module_word_at_code(bytes, mask, index, b"import")
+            || module_word_at_code(bytes, mask, index, b"export")
+        {
+            let type_start = module_skip_ws(
+                bytes,
+                index
+                    + if bytes[index] == b'i' {
+                        "import".len()
+                    } else {
+                        "export".len()
+                    },
+            );
+            if !module_word_at_code(bytes, mask, type_start, b"type") {
+                index += 1;
+                continue;
+            }
+            let mut cursor = type_start + "type".len();
+            let mut depth = 0usize;
+            while cursor < bytes.len() {
+                if mask[cursor] {
+                    match bytes[cursor] {
+                        b'{' | b'[' | b'(' => depth += 1,
+                        b'}' | b']' | b')' => depth = depth.saturating_sub(1),
+                        b';' if depth == 0 => {
+                            cursor += 1;
+                            break;
+                        }
+                        b'\n' | b'\r' if depth == 0 => break,
+                        _ => {}
+                    }
+                }
+                cursor += 1;
+            }
+            module_space_span(bytes, index, cursor);
+            index = cursor;
+            continue;
+        } else {
             index += 1;
             continue;
-        }
-        let mut cursor = module_skip_ws(bytes, index + "type".len());
+        };
+        let mut cursor = module_skip_ws(bytes, type_start + "type".len());
         if cursor >= bytes.len() || !module_is_ident_byte(bytes[cursor]) {
             index += 1;
             continue;
@@ -1296,9 +1482,16 @@ fn module_strip_type_aliases(bytes: &mut [u8], mask: &[bool]) {
             index += 1;
             continue;
         }
-        while cursor < bytes.len()
-            && !(mask[cursor] && matches!(bytes[cursor], b';' | b'\n' | b'\r'))
-        {
+        let mut depth = 0usize;
+        while cursor < bytes.len() {
+            if mask[cursor] {
+                match bytes[cursor] {
+                    b'{' | b'[' | b'(' => depth += 1,
+                    b'}' | b']' | b')' => depth = depth.saturating_sub(1),
+                    b';' | b'\n' | b'\r' if depth == 0 => break,
+                    _ => {}
+                }
+            }
             cursor += 1;
         }
         if cursor < bytes.len() && bytes[cursor] == b';' {

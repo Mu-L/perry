@@ -991,6 +991,9 @@ pub extern "C" fn js_native_module_esm_export_value(module: f64, property: f64) 
             false,
         )
     };
+    if value.to_bits() == crate::value::TAG_UNDEFINED {
+        return value;
+    }
     NATIVE_ESM_EXPORT_VALUES.with(|values| {
         values.borrow_mut().insert(key, value.to_bits());
     });
@@ -1036,6 +1039,8 @@ pub extern "C" fn js_module_sync_builtin_esm_exports() -> f64 {
 
 #[no_mangle]
 pub extern "C" fn js_module_run_main() -> f64 {
+    // Perry's AOT entry point has already run before JavaScript can call this
+    // compatibility export, so there is no unevaluated main module to dispatch.
     f64::from_bits(crate::value::TAG_UNDEFINED)
 }
 
