@@ -10,8 +10,14 @@
 # one probe must report a copying collection.
 name: gc-native-roots
 on:
+  # Must run where it can actually gate something. Branch-scoped triggers were
+  # right while this lived only on exp/stackmap-viability; on main that same
+  # filter would mean the job never runs at all — CLAUDE.md's second way a gate
+  # cannot fail. Cancellation is deliberately NOT set here: a `main` run that
+  # gets cancelled by the next merge is the third way.
   push:
-    branches: [exp/stackmap-viability]
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 jobs:

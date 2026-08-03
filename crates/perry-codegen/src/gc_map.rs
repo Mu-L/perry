@@ -52,18 +52,23 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{anyhow, Context, Result};
 
 /// Magic at the start of every emitted blob.
-pub const GC_MAP_MAGIC: &[u8; 4] = b"PGCM";
+const GC_MAP_MAGIC: &[u8; 4] = b"PGCM";
 /// Format version. Bump on any layout change — the runtime rejects others.
-pub const GC_MAP_VERSION: u8 = 2;
+const GC_MAP_VERSION: u8 = 2;
 /// Section the compact map is emitted into, and the label it is given.
 const GC_MAP_LABEL: &str = "_perry_gc_map";
 const MACHO_SECTION: &str = "__PERRY_GCMAP,__perry_gcmap";
-const ELF_SECTION: &str = ".perry_gcmap,\"a\",@progbits";
+/// `R` is SHF_GNU_RETAIN, the ELF analogue of Mach-O's `.no_dead_strip`.
+/// Perry links with `-Wl,--gc-sections`, and nothing in the program
+/// references this section — the collector finds it by name at runtime — so
+/// without RETAIN the linker discards it and the binary ships with no GC map
+/// at all. Measured: the section is present in the object (PROGBITS, SHF_ALLOC,
+/// with relocations) and absent from the linked binary.
+const ELF_SECTION: &str = ".perry_gcmap,\"aR\",@progbits";
 
 /// LLVM stack-map v3 location kinds. Only these two describe a frame slot;
 /// `Constant`/`ConstIndex` carry the statepoint preamble and `Register` cannot
@@ -411,7 +416,10 @@ fn emit_asm(functions: &[FunctionMap], stream: &[u8], elf: bool) -> String {
     }
     out.push_str("\t.p2align\t3\n");
     out.push_str(&format!("{GC_MAP_LABEL}:\n"));
-    out.push_str("\t.ascii\t\"PGCM\"\n");
+    out.push_str(&format!(
+        "\t.ascii\t\"{}\"\n",
+        std::str::from_utf8(GC_MAP_MAGIC).expect("magic is ASCII")
+    ));
     out.push_str(&format!("\t.byte\t{GC_MAP_VERSION}\n"));
     out.push_str("\t.byte\t0\n");
     out.push_str("\t.short\t0\n");
@@ -437,12 +445,12 @@ fn emit_asm(functions: &[FunctionMap], stream: &[u8], elf: bool) -> String {
 /// Statistics for the caller to log — a compaction that silently did nothing
 /// must be distinguishable from one that ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GcMapStats {
-    pub original_bytes: usize,
-    pub compact_bytes: usize,
-    pub functions: usize,
-    pub records: usize,
-    pub roots: usize,
+struct GcMapStats {
+    original_bytes: usize,
+    compact_bytes: usize,
+    functions: usize,
+    records: usize,
+    roots: usize,
 }
 
 /// Rewrite the LLVM stack-map block in `asm` into the compact map.
@@ -451,7 +459,7 @@ pub struct GcMapStats {
 /// for a module without safepoints) or when the block does not parse — a
 /// module whose metadata we do not fully understand keeps LLVM's section
 /// rather than shipping a map that might be missing roots.
-pub fn compact_stack_map_asm(asm: &str, elf: bool) -> Option<(String, GcMapStats)> {
+fn compact_stack_map_asm(asm: &str, elf: bool) -> Option<(String, GcMapStats)> {
     let lines: Vec<&str> = asm.lines().collect();
     let block = parse_block(&lines)?;
     let functions = decode_v3(&block)?;
@@ -553,8 +561,6 @@ pub fn compact_and_assemble(
                 asm_path.display()
             )
         })?;
-        GC_MAP_ORIGINAL_BYTES.fetch_add(stats.original_bytes as u64, Ordering::Relaxed);
-        GC_MAP_COMPACT_BYTES.fetch_add(stats.compact_bytes as u64, Ordering::Relaxed);
         log::debug!(
             "perry-codegen: gc map {} -> {} bytes ({} functions, {} records, {} roots)",
             stats.original_bytes,
@@ -591,20 +597,6 @@ fn assemble(clang: &Path, target: &str, asm_path: &Path, obj_path: &Path) -> Res
     }
     let _ = fs::remove_file(asm_path);
     Ok(())
-}
-
-/// Totals for the whole process, so a build can report what compaction did.
-/// A run where these stay zero did not compact anything — the distinction a
-/// gate needs in order to be able to fail.
-static GC_MAP_ORIGINAL_BYTES: AtomicU64 = AtomicU64::new(0);
-static GC_MAP_COMPACT_BYTES: AtomicU64 = AtomicU64::new(0);
-
-/// `(llvm_bytes, compact_bytes)` summed across every module compiled so far.
-pub fn gc_map_compaction_totals() -> (u64, u64) {
-    (
-        GC_MAP_ORIGINAL_BYTES.load(Ordering::Relaxed),
-        GC_MAP_COMPACT_BYTES.load(Ordering::Relaxed),
-    )
 }
 
 #[cfg(test)]
