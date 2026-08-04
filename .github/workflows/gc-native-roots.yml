@@ -80,10 +80,18 @@
 #   PERRY_GC_SAFEPOINT_ONLY  -> native-roots-rs4gc, "safepoint-only" steps
 #   PERRY_STACKMAP_WALKER    -> native-roots-rs4gc, "both non-default walkers"
 #   PERRY_RS4GC              -> native-roots-rs4gc
-#   PERRY_STATEPOINT_REPORT  -> deleted. It was a second spelling of
-#                               `--statepoint-report`; the flag is now the only
-#                               entry point and the "fails closed" step is its
-#                               arm.
+#   PERRY_STATEPOINT_REPORT  -> not a knob. It survives as the driver's
+#                               internal handoff to the rayon module workers,
+#                               and `run_pipeline.rs` `remove_var`s it when the
+#                               flag is absent so a value inherited from the
+#                               user's environment cannot switch reporting on.
+#                               The env *spelling* was deleted (#7314); the
+#                               `--statepoint-report` flag is the only entry
+#                               point, and the "fails closed" step is its arm.
+#                               Said precisely because this block is a ledger:
+#                               an entry reading "deleted" for a name still
+#                               greppable in the tree makes the whole list
+#                               look stale.
 name: gc-native-roots
 on:
   # Must run where it can actually gate something. Branch-scoped triggers were
