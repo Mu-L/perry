@@ -52,9 +52,9 @@
 #
 # x86-64 was refused outright until #7349 taught the runtime to derive an
 # SP-relative base from the CFA; it is a first-class arm of the matrix now. The
-# old note said (#7324) that a run there would only
-# binary that crashes under collection, so an x86-64 run of this matrix would
-# test nothing but the refusal — no longer true, and that job is gone.
+# note that used to sit here — that an x86-64 run could only ever produce a
+# binary crashing under collection, so such a run would test nothing but the
+# refusal — described the world before #7349 and is no longer true.
 #
 # The same walk is unsound on aarch64 **Linux** too, where it is merely the
 # non-default path: #7333.
@@ -103,9 +103,27 @@ jobs:
   # Mach-O underscore convention in eh_walker). Windows covers x86-64 + PE/COFF
   # with the RtlVirtualUnwind walker (#7354) — the one walker with no Itanium
   # unwinder under it, which is why its arm alone carries the
-  # `--require-locations` telemetry gate below. ARM64 Linux would cover a
-  # fifth corner, but those runners queue for hours here, and its two
-  # components are each covered above.
+  # `--require-locations` telemetry gate below.
+  #
+  # ARM64 Linux is the fourth arm, and the note that used to sit here — that
+  # its "two components are each covered above" — was the exact compositional
+  # fallacy `word_width_for` in `gc_map.rs` exists to warn about. `.word` is
+  # not a fixed size: GNU `as` defines it as the target's natural machine word,
+  # so LLVM's AArch64 **ELF** backend spells every 32-bit stack-map field
+  # `.word`, while both previously-covered arms spell it `.long` (Mach-O uses
+  # `.long` on aarch64; on x86 `.word` means *two* bytes, so LLVM will not use
+  # it for a 32-bit field). The directive width is a property of the
+  # intersection, not of either component.
+  #
+  # To be precise about what this arm adds, because overclaiming here is how
+  # #7321's wrong explanation survived into an issue and a job name: the
+  # `.word` spelling IS unit-tested, by `aarch64_elf_word_directives_decode_to_
+  # the_right_root` and `word_width_is_load_bearing_not_cosmetic`, and those
+  # run on every arm. What they use is a hand-written sample. What no arm has
+  # ever exercised is the end-to-end chain on this target — real LLVM asm
+  # output, real ELF linking, real runtime walking — where the failure mode is
+  # not a parse error but a wrong answer: two bytes of drift per field
+  # silently relocates every root that follows, and every arm stays green.
   native-roots-rs4gc:
     strategy:
       fail-fast: false
@@ -120,6 +138,9 @@ jobs:
           - os: windows-latest
             arch: x86-64
             format: PE
+          - os: ubuntu-24.04-arm
+            arch: aarch64
+            format: ELF
     runs-on: ${{ matrix.os }}
     # The ubuntu/macos steps were written for bash and windows-latest defaults
     # to pwsh; one explicit default keeps a single script dialect per step.
