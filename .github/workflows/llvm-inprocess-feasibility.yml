@@ -33,7 +33,7 @@ jobs:
           - { label: macos-aarch64 (control), os: macos-14,      how: brew }
           - { label: linux-x86_64-gnu,        os: ubuntu-latest,  how: apt }
           - { label: linux-x86_64-musl,       os: ubuntu-latest,  how: apt,  musl: true }
-          - { label: windows-x86_64-msvc,     os: windows-latest, how: choco }
+          - { label: windows-x86_64-msvc,     os: windows-latest, how: llvm-release }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -65,14 +65,23 @@ jobs:
           llvm-config-22 --version | grep -q '^22\.'
           echo "LLVM_SYS_221_PREFIX=$(llvm-config-22 --prefix)" >> "$GITHUB_ENV"
 
-      - name: Provision LLVM 22 (choco)
-        if: ${{ matrix.how == 'choco' }}
+      # Chocolatey's `llvm` package is the CLANG TOOLCHAIN, not an SDK: it
+      # ships no `llvm-config.exe` and none of the static libraries llvm-sys
+      # links against, and it has no 22.x pin. The official
+      # `clang+llvm-...-pc-windows-msvc.tar.xz` (822 MB) is the full
+      # distribution including lib/ and include/, which is what llvm-sys needs.
+      - name: Provision LLVM 22 (official MSVC tarball)
+        if: ${{ matrix.how == 'llvm-release' }}
         shell: pwsh
         run: |
-          choco install llvm --version=22.1.0 -y --no-progress
-          $p = "C:\Program Files\LLVM"
-          & "$p\bin\llvm-config.exe" --version
-          "LLVM_SYS_221_PREFIX=$p" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $ver = "22.1.8"
+          $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$ver/clang+llvm-$ver-x86_64-pc-windows-msvc.tar.xz"
+          Write-Host "downloading $url"
+          curl.exe -sSL -o llvm.tar.xz $url
+          New-Item -ItemType Directory -Force -Path C:\llvm | Out-Null
+          tar -xf llvm.tar.xz -C C:\llvm --strip-components=1
+          & "C:\llvm\bin\llvm-config.exe" --version
+          "LLVM_SYS_221_PREFIX=C:\llvm" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Build perry with llvm-inprocess (STATIC)
         id: build
