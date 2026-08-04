@@ -163,6 +163,38 @@ fn directive_width(directive: &str, word_width: usize) -> Option<usize> {
 /// everything after it; the decode then either fails somewhere unrelated or,
 /// worse, succeeds against garbage. Anything not on this list and not in
 /// `directive_width` is a refusal that names the directive.
+/// Is this a GNU-as symbol assignment (`sym = expr`) rather than a directive?
+///
+/// Assemblers accept `.set sym, expr` and the bare `sym = expr` for the same
+/// thing. Only the former starts with a `.`, so the directive dispatch sees the
+/// SYMBOL as the mnemonic and refuses it. Both emit zero bytes.
+///
+/// Deliberately narrow: the name must be a single token that is not itself a
+/// directive, and the `=` must not be part of a comparison inside a longer
+/// expression. `.size sym, .-sym` and `.byte 1` are unaffected.
+fn is_symbol_assignment(line: &str) -> bool {
+    let Some((lhs, _rhs)) = line.split_once('=') else {
+        return false;
+    };
+    // `==`, `>=`, `<=`, `!=` are expression operators, not an assignment.
+    if lhs.ends_with(['=', '>', '<', '!']) {
+        return false;
+    }
+    let name = lhs.trim();
+    // ELF local labels start with `.L`, so "does not start with a dot" is the
+    // wrong test -- it would reject `.Lperry_ic_8 = …`, which -O3 emits. Test
+    // what actually matters instead: the LHS must not be a directive this
+    // module already models. Anything else that is a single bare token before
+    // an `=` is a symbol assignment.
+    !name.is_empty()
+        && !name.contains(char::is_whitespace)
+        && directive_width(name, 8).is_none()
+        && !is_zero_width_directive(name)
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '$' || c == '.')
+}
+
 fn is_zero_width_directive(directive: &str) -> bool {
     matches!(
         directive,
@@ -235,6 +267,20 @@ fn parse_block(lines: &[&str], word_width: usize) -> Result<RawBlock, String> {
         {
             continue;
         }
+        // GNU-as symbol assignment: `sym = expr`, the bare form of `.set`.
+        // It defines a symbol and emits ZERO bytes. `.set`/`.equ` are already on
+        // the zero-width list; this spelling is not a directive at all, so the
+        // dispatch below would report the SYMBOL as an unrecognised directive.
+        //
+        // It only shows up at -O3, which is why the arm CI caught it and the -O2
+        // paths never did: the optimiser materialises absolute-symbol aliases
+        // (`perry_null_guard_zero = …`, `perry_class_keys__… = …`) and the ELF
+        // asm printer emits them in this form. Mach-O output does not, so this
+        // is invisible on the macOS arms.
+        if is_symbol_assignment(line) {
+            continue;
+        }
+
         let mut parts = line.splitn(2, char::is_whitespace);
         let directive = parts.next().unwrap_or_default();
         let operand = parts.next().unwrap_or_default();
@@ -867,6 +913,7 @@ pub fn compact_and_assemble(
     target: &str,
     asm_path: &Path,
     obj_path: &Path,
+    codegen_args: &[String],
 ) -> Result<()> {
     let asm = fs::read_to_string(asm_path)
         .with_context(|| format!("Failed to read assembly at {}", asm_path.display()))?;
@@ -967,15 +1014,47 @@ pub fn compact_and_assemble(
         crate::statepoint_report::note_gc_map(stats.functions, stats.records, stats.roots);
     }
 
-    assemble(clang, target, asm_path, obj_path)
+    assemble(clang, target, asm_path, obj_path, codegen_args)
 }
 
-fn assemble(clang: &Path, target: &str, asm_path: &Path, obj_path: &Path) -> Result<()> {
+/// The subset of the codegen's clang argv that selects the target MACHINE.
+///
+/// The assembler must be told the same machine the code generator was told, or
+/// it rejects instructions the generator legitimately emitted. Optimisation and
+/// output flags are excluded: they mean nothing to an assembler, and forwarding
+/// them wholesale would be a second way for the two invocations to disagree.
+fn cpu_selection_flags(codegen_args: &[String]) -> Vec<&String> {
+    codegen_args
+        .iter()
+        .filter(|a| a.starts_with("-mcpu=") || a.starts_with("-march=") || a.starts_with("-mtune="))
+        .collect()
+}
+
+fn assemble(
+    clang: &Path,
+    target: &str,
+    asm_path: &Path,
+    obj_path: &Path,
+    codegen_args: &[String],
+) -> Result<()> {
+    // Mirror the codegen's CPU selection onto the assembler.
+    //
+    // Perry compiles with `-mcpu=native`, so on a host with SVE (Graviton, and
+    // any aarch64 server part) LLVM emits SVE instructions -- `mov z1.d, #…`.
+    // Assembling that text with a clang that was given no `-mcpu` fails with
+    // `instruction requires: sve or sme`, because the assembler defaults to the
+    // portable baseline while the code generator did not.
+    //
+    // The two invocations describe the SAME machine and must agree. Forwarding
+    // only the CPU-selection flags keeps that contract without dragging along
+    // optimisation or output flags, which mean nothing to an assembler.
+    let cpu_flags = cpu_selection_flags(codegen_args);
     let output = Command::new(clang)
         .arg("-c")
         .arg(asm_path)
         .arg("-o")
         .arg(obj_path)
+        .args(&cpu_flags)
         .arg("-target")
         .arg(target)
         .output()
@@ -1302,6 +1381,79 @@ mod tests {
         assert!(!out.contains("__LLVM_StackMaps"));
         // The dead-strip guard must survive, retargeted.
         assert!(out.contains(".no_dead_strip\t_perry_gc_map"));
+
+        // Guard the -O3 ELF shapes that broke the aarch64-linux arm. Both are
+        // GNU-as symbol assignments -- zero bytes, no leading directive -- so
+        // the dispatch reported the SYMBOL as an unrecognised directive and
+        // refused the module. Mach-O never emits this spelling, which is why
+        // every macOS arm stayed green.
+    }
+
+    #[test]
+    fn the_assembler_is_told_the_same_machine_as_the_code_generator() {
+        // `-mcpu=native` on a host with SVE makes LLVM emit `mov z1.d, #…`.
+        // Assembling that with a clang given no `-mcpu` fails with
+        // `instruction requires: sve or sme` — the aarch64-linux arm's second
+        // failure, after the parse fix. Forward machine selection, nothing else.
+        let args: Vec<String> = [
+            "-O3",
+            "-mcpu=native",
+            "-fno-math-errno",
+            "-march=armv8.3-a",
+            "-mtune=neoverse-n1",
+            "-o",
+            "out.o",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let got: Vec<&str> = super::cpu_selection_flags(&args)
+            .into_iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(
+            got,
+            ["-mcpu=native", "-march=armv8.3-a", "-mtune=neoverse-n1"]
+        );
+    }
+
+    #[test]
+    fn elf_symbol_assignments_parse_as_zero_width() {
+        let asm = concat!(
+            "\t.section\t.llvm_stackmaps,\"a\",@progbits\n",
+            "__LLVM_StackMaps:\n",
+            "\t.byte\t3\n",
+            "perry_null_guard_zero = 0\n",
+            "\t.byte\t0\n",
+            ".Lperry_ic_8 = .Ltmp3-4\n",
+            "\t.hword\t0\n",
+            "\t.word\t2\n",
+        );
+        let lines: Vec<&str> = asm.lines().collect();
+        let block = super::parse_block(&lines, 4).expect("ELF symbol assignments must parse");
+        // 1 + 1 + 2 + 4 -- the assignments contribute nothing.
+        assert_eq!(block.bytes.len(), 8);
+    }
+
+    #[test]
+    fn expression_operators_are_not_mistaken_for_assignments() {
+        for line in [
+            ".byte\t1",
+            "\t.size\tsym, .-sym",
+            "\t.if a == b",
+            "\t.if a != b",
+        ] {
+            assert!(
+                !super::is_symbol_assignment(line),
+                "`{line}` must not be treated as a symbol assignment"
+            );
+        }
+        for line in ["sym = 1", ".Lfoo = .Ltmp1-4", "a$b = 7"] {
+            assert!(
+                super::is_symbol_assignment(line),
+                "`{line}` is a symbol assignment"
+            );
+        }
     }
 
     #[test]
