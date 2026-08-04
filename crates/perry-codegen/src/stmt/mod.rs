@@ -592,6 +592,9 @@ pub(crate) fn lower_stmt(ctx: &mut FnCtx<'_>, stmt: &Stmt) -> Result<()> {
 
 fn emit_preallocate_boxes(ctx: &mut FnCtx<'_>, ids: &[u32], tdz: bool) -> Result<()> {
     for id in ids {
+        if ctx.module_globals.contains_key(id) {
+            continue;
+        }
         if ctx.locals.contains_key(id) {
             // A previous PreallocateBoxes (or an unusual nesting)
             // already set this up -- skip to keep the existing slot.

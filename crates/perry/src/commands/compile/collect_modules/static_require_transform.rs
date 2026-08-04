@@ -3,6 +3,8 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use regex::Regex;
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::Deserialize;
 
 use super::parse_package_specifier;
 use crate::commands::compile::cjs_wrap::detect::strip_comments_and_strings;
@@ -192,8 +194,8 @@ fn resolve_static_require(module_dir: &Path, specifier: &str) -> Option<std::pat
         }
         let package_json = std::fs::read_to_string(package_dir.join("package.json")).ok();
         if let Some(text) = package_json {
-            let manifest: serde_json::Value = serde_json::from_str(&text).ok()?;
-            if let Some(exports) = manifest.get("exports") {
+            let manifest: PackageManifest = serde_json::from_str(&text).ok()?;
+            if let Some(exports) = manifest.exports.as_ref() {
                 let key = subpath
                     .as_deref()
                     .map(|s| format!("./{s}"))
@@ -204,7 +206,7 @@ fn resolve_static_require(module_dir: &Path, specifier: &str) -> Option<std::pat
             if let Some(subpath) = subpath.as_deref() {
                 return resolve_require_path(&package_dir.join(subpath));
             }
-            if let Some(main) = manifest.get("main").and_then(|v| v.as_str()) {
+            if let Some(main) = manifest.main.as_ref().and_then(serde_json::Value::as_str) {
                 if let Some(path) = resolve_require_path(&package_dir.join(main)) {
                     return Some(path);
                 }
@@ -228,10 +230,10 @@ fn package_subpath_is_blocked(module_dir: &Path, specifier: &str) -> bool {
         let Ok(text) = std::fs::read_to_string(package_dir.join("package.json")) else {
             return false;
         };
-        let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) else {
+        let Ok(manifest) = serde_json::from_str::<PackageManifest>(&text) else {
             return false;
         };
-        let Some(exports) = manifest.get("exports") else {
+        let Some(exports) = manifest.exports.as_ref() else {
             return false;
         };
         let key = subpath
@@ -258,8 +260,8 @@ fn resolve_require_path(path: &Path) -> Option<std::path::PathBuf> {
     }
     if path.is_dir() {
         if let Ok(text) = std::fs::read_to_string(path.join("package.json")) {
-            if let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(main) = manifest.get("main").and_then(|v| v.as_str()) {
+            if let Ok(manifest) = serde_json::from_str::<PackageManifest>(&text) {
+                if let Some(main) = manifest.main.as_ref().and_then(serde_json::Value::as_str) {
                     if let Some(found) = resolve_require_path(&path.join(main)) {
                         return Some(found);
                     }
@@ -276,14 +278,96 @@ fn resolve_require_path(path: &Path) -> Option<std::path::PathBuf> {
     None
 }
 
-fn resolve_require_exports(exports: &serde_json::Value, key: &str) -> Option<String> {
+#[derive(Deserialize)]
+struct PackageManifest {
+    main: Option<serde_json::Value>,
+    exports: Option<OrderedJson>,
+}
+
+enum OrderedJson {
+    String(String),
+    Array(Vec<Self>),
+    Object(Vec<(String, Self)>),
+    Other,
+}
+
+impl<'de> Deserialize<'de> for OrderedJson {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct OrderedJsonVisitor;
+
+        impl<'de> Visitor<'de> for OrderedJsonVisitor {
+            type Value = OrderedJson;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON value")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(OrderedJson::String(value.to_owned()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(OrderedJson::String(value))
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut values = Vec::new();
+                while let Some(value) = seq.next_element()? {
+                    values.push(value);
+                }
+                Ok(OrderedJson::Array(values))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut values = Vec::new();
+                while let Some(value) = map.next_entry()? {
+                    values.push(value);
+                }
+                Ok(OrderedJson::Object(values))
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(OrderedJson::Other)
+            }
+
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(OrderedJson::Other)
+            }
+
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(OrderedJson::Other)
+            }
+
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(OrderedJson::Other)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(OrderedJson::Other)
+            }
+        }
+
+        deserializer.deserialize_any(OrderedJsonVisitor)
+    }
+}
+
+fn resolve_require_exports(exports: &OrderedJson, key: &str) -> Option<String> {
     match exports {
-        serde_json::Value::String(target) => Some(target.clone()),
-        serde_json::Value::Array(items) => items
+        OrderedJson::String(target) => Some(target.clone()),
+        OrderedJson::Array(items) => items
             .iter()
             .find_map(|item| resolve_require_exports(item, key)),
-        serde_json::Value::Object(map) => {
-            if let Some(target) = map.get(key) {
+        OrderedJson::Object(map) => {
+            if let Some((_, target)) = map.iter().find(|(name, _)| name == key) {
                 return resolve_require_exports(target, key);
             }
             for (condition, target) in map {

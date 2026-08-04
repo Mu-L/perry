@@ -601,7 +601,8 @@ fn find_nearest_package_json(specifier: &str, base: &str) -> Option<String> {
             .unwrap_or_else(|| PathBuf::from("."))
     };
 
-    let is_bare = !Path::new(specifier).is_absolute()
+    let is_bare = !matches!(specifier, "." | "..")
+        && !Path::new(specifier).is_absolute()
         && !specifier.starts_with("./")
         && !specifier.starts_with("../");
     if is_bare {
