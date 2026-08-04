@@ -984,18 +984,9 @@ fn loaded_stack_map_section() -> Option<&'static [u8]> {
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
 mod unwind {
     use super::*;
-
-    #[repr(C)]
-    struct UnwindContext {
-        _private: [u8; 0],
-    }
+    use crate::eh::{_Unwind_Backtrace, _Unwind_GetIP, UnwindContext, UnwindReasonCode};
 
     unsafe extern "C" {
-        fn _Unwind_Backtrace(
-            trace: unsafe extern "C" fn(*mut UnwindContext, *mut c_void) -> i32,
-            argument: *mut c_void,
-        ) -> i32;
-        fn _Unwind_GetIP(context: *mut UnwindContext) -> usize;
         fn _Unwind_GetGR(context: *mut UnwindContext, register: i32) -> usize;
         /// The frame's canonical frame address — the supported way to reach a
         /// frame's stack pointer. `_Unwind_GetGR` on the SP column is not a
@@ -1033,7 +1024,7 @@ mod unwind {
     unsafe extern "C" fn walk_frame<F: FnMut(MutableRootSlot)>(
         context: *mut UnwindContext,
         argument: *mut c_void,
-    ) -> i32 {
+    ) -> UnwindReasonCode {
         let state = &mut *argument.cast::<WalkState<'_, F>>();
         state.stats.frames_visited = state.stats.frames_visited.saturating_add(1);
         let ip = _Unwind_GetIP(context);
@@ -1360,11 +1351,7 @@ mod fp_chain {
     // the alternative was this module quietly not existing there.
     #[cfg(target_vendor = "apple")]
     fn stack_top() -> usize {
-        unsafe extern "C" {
-            fn pthread_self() -> usize;
-            fn pthread_get_stackaddr_np(thread: usize) -> *mut c_void;
-        }
-        unsafe { pthread_get_stackaddr_np(pthread_self()) as usize }
+        unsafe { libc::pthread_get_stackaddr_np(libc::pthread_self()) as usize }
     }
 
     /// Linux (#7173): stack bounds via pthread attrs — the returned address

@@ -35,6 +35,7 @@ mod tests;
 /// native path pre-declares every define before reading any body — calls to
 /// module-internal functions are forward references at module scope, exactly
 /// like registers are at function scope.
+#[cfg(test)]
 pub(crate) fn predeclare_function_from_text<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
@@ -104,6 +105,7 @@ impl<'ctx, 'm> FnStream<'ctx, 'm> {
 
 /// Parse `fn_text` (a complete `define ... { ... }`) and build it into
 /// `module`. Returns the number of instructions constructed.
+#[cfg(test)]
 pub(crate) fn add_function_from_text<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,

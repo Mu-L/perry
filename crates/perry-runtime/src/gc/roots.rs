@@ -663,14 +663,7 @@ pub(super) fn try_mark_value_or_raw(word: u64, valid_ptrs: &ValidPointerSet) -> 
 #[inline(always)]
 #[cfg(target_os = "macos")]
 pub(super) fn get_stack_bottom() -> usize {
-    extern "C" {
-        fn pthread_self() -> *mut std::ffi::c_void;
-        fn pthread_get_stackaddr_np(thread: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
-    }
-    unsafe {
-        let thread = pthread_self();
-        pthread_get_stackaddr_np(thread) as usize
-    }
+    unsafe { libc::pthread_get_stackaddr_np(libc::pthread_self()) as usize }
 }
 
 #[cfg(target_os = "linux")]

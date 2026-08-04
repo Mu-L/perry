@@ -448,11 +448,8 @@ fn link_parent(cache: f64, record: f64, parent_filename: &str) {
     let children = js_object_get_field_by_name(object_ptr(parent.get_nanbox_f64()), children_key);
     let mut children_ptr = if children.is_pointer() {
         let ptr = children.as_pointer::<u8>();
-        if crate::value::addr_class::is_plausible_heap_addr(ptr as usize)
-            && unsafe {
-                (*(ptr.sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader)).obj_type
-                    == crate::gc::GC_TYPE_ARRAY
-            }
+        if unsafe { crate::value::addr_class::try_read_gc_header(ptr as usize) }
+            .is_some_and(|header| header.obj_type == crate::gc::GC_TYPE_ARRAY)
         {
             ptr as *mut crate::array::ArrayHeader
         } else {

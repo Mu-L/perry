@@ -1283,12 +1283,8 @@ fn collect_module_one(
         {
             let resolved_path = resolved.canonical_path;
             let source_path = resolved.source_path;
-            // A resolved HIR import is an explicit member of the AOT graph.
-            // Since Perry no longer ships a JavaScript runtime, routing that
-            // exact `.js`/`.mjs`/`.cjs` target to `Interpreted` can only fail
-            // later at the V8-free gate. Promote the discovered file itself,
-            // rather than its whole package, so runtime-computed package loads
-            // still retain the compilePackages trust boundary.
+            // A resolved HIR import must be compiled; promote only that file so
+            // runtime-computed package loads retain the compilePackages boundary.
             let package_is_authorized =
                 super::audit_manifest::package_name_for_path(&resolved_path.to_string_lossy())
                     .is_none_or(|package| {
@@ -1625,9 +1621,8 @@ fn collect_module_one(
                 import.is_deferred_require = true;
             }
             if was_cjs_wrapped {
-                // #5257: every import in a wrapped CJS module was synthesized
-                // from `require('S')`, so it follows CommonJS default/namespace
-                // interop rather than the static-ESM default gate.
+                // #5257: wrapped `require('S')` imports follow CommonJS
+                // default/namespace interop rather than the static-ESM gate.
                 import.is_adopted_require = true;
             }
         }

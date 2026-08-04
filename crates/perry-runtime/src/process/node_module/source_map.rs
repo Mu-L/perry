@@ -59,6 +59,7 @@ pub extern "C" fn js_module_source_map_new(payload: f64, options: f64) -> f64 {
     unsafe {
         let obj = obj.get_raw_mut_ptr::<crate::object::ObjectHeader>();
         (*obj).class_id = SOURCE_MAP_CLASS_ID;
+        // GC_STORE_AUDIT(INIT): the fresh object is still rooted and unpublished.
         (*obj).keys_array = std::ptr::null_mut();
     }
     crate::object::js_object_set_field(

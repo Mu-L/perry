@@ -713,11 +713,14 @@ fn compile_ll_inprocess_in(
     policy: TempFilePolicy,
 ) -> Result<Vec<u8>> {
     let (paths, _pid, _nonce) = llvm_temp_paths(tmp_dir, ll_text);
+    // The in-process backend still needs a companion clang for structural
+    // analysis metadata and, for statepoints, final assembly.
+    let companion_clang = find_clang().unwrap_or_else(|| PathBuf::from("(in-process)"));
     // Same decision inputs as the clang path — opt level (#4880 fallback
     // included), CPU tuning, inlinehint threshold — via the same plan
     // constructor, so the backends cannot drift on a decision independently.
     let plan = build_clang_compile_plan(
-        PathBuf::from("(in-process)"),
+        companion_clang,
         paths.ll_path.clone(),
         paths.obj_path.clone(),
         target_triple,
@@ -767,8 +770,9 @@ fn compile_ll_inprocess_in(
             }
             fs::write(asm_path, &bytes)
                 .with_context(|| format!("Failed to write {}", asm_path.display()))?;
-            // `plan.clang` is the literal `(in-process)` placeholder here, so
-            // resolve a real assembler. Using the system clang for this step is
+            // Resolve the assembler again so a missing companion recorded as
+            // `(in-process)` above still gets a precise error here. Using the
+            // system clang for this step is
             // sound: the version skew that motivated the in-process backend was
             // an *IR* parse failure (`unterminated attribute group`), and by
             // this point the IR is gone — what is being assembled is text this

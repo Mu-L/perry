@@ -82,6 +82,7 @@ const ELF_SECTION: &str = ".perry_gcmap,\"awR\",@progbits";
 const COFF_SECTION: &str = ".pgcmap,\"dw\"";
 /// What the runtime looks for in a PE image. Must match `COFF_SECTION`'s name
 /// and stay within eight bytes.
+#[cfg(test)]
 pub(crate) const COFF_SECTION_NAME: &str = ".pgcmap";
 
 /// LLVM stack-map v3 location kinds. Only these two describe a frame slot;
