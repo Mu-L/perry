@@ -81,7 +81,7 @@ pub fn compile_ll_to_object_inprocess(
     clang_style_args: &[String],
     module_name: &str,
 ) -> Result<Vec<u8>> {
-    let (opt, mcpu_native, explicit_cpu, mllvm) = interpret_plan_args(clang_style_args)?;
+    let (opt, mcpu_native, explicit_cpu, mllvm, emit_asm) = interpret_plan_args(clang_style_args)?;
     let context = Context::create();
     let module = parse_ir_text(&context, ll_text, module_name)?;
     optimize_and_emit(
@@ -91,7 +91,39 @@ pub fn compile_ll_to_object_inprocess(
         mcpu_native,
         explicit_cpu.as_deref(),
         &mllvm,
+        emit_asm,
     )
+}
+
+/// The CPU an empty `-mcpu` means for this triple.
+///
+/// LLVM's `create_target_machine` with an empty CPU selects `generic`, which on
+/// aarch64 is **ARMv8.0**. Clang does not do that: for an Apple arm64 triple it
+/// defaults to `apple-m1` (ARMv8.5). The gap is not academic — codegen decides
+/// whether to emit `llvm.aarch64.fjcvtzs` (FEAT_JSCVT, ARMv8.3+, the
+/// single-instruction ECMAScript `ToInt32`) from the TRIPLE ALONE, in
+/// `codegen::helpers::set_jscvt_for_target`, precisely because clang's default
+/// for that triple has the feature. Handing the same IR to a `generic`
+/// TargetMachine gives `LLVM ERROR: Cannot select: intrinsic
+/// %llvm.aarch64.fjcvtzs` and aborts the compile.
+///
+/// So this is the second half of a pair: `set_jscvt_for_target` decides what to
+/// EMIT from the triple, and this decides what the target can EXECUTE from the
+/// same triple. They must agree. If a triple is added to one, add it to the
+/// other — a mismatch is a hard abort at `-O`-time, not a silent miscompile,
+/// which is the one mercy here.
+fn default_cpu_for_triple(triple: &str) -> &'static str {
+    let is_aarch64 = triple.starts_with("arm64") || triple.starts_with("aarch64");
+    let is_apple = triple.contains("apple");
+    if is_aarch64 && is_apple {
+        // Matches clang's default for arm64-apple-*, and is the assumption
+        // `set_jscvt_for_target` already bakes in for macOS/darwin.
+        "apple-m1"
+    } else {
+        // Every other triple keeps LLVM's portable baseline, which is what the
+        // clang path gets too when no tuning flag is passed.
+        ""
+    }
 }
 
 /// Interpret the plan argv. Unknown dash-flags are an error on purpose:
@@ -100,8 +132,14 @@ pub fn compile_ll_to_object_inprocess(
 #[allow(clippy::type_complexity)]
 fn interpret_plan_args(
     clang_style_args: &[String],
-) -> Result<(char, bool, Option<String>, Vec<String>)> {
+) -> Result<(char, bool, Option<String>, Vec<String>, bool)> {
     let mut opt = '0';
+    // `-S` asks for assembly rather than an object. The statepoint backends
+    // need it: #7314's compact-map rewriter rewrites `.llvm_stackmaps` at
+    // ASSEMBLY time, where LLVM prints function addresses as symbol names, so
+    // one text parser replaces Mach-O and ELF relocation parsing plus a second
+    // link pass. Emitting an object here would skip that rewrite entirely.
+    let mut emit_asm = false;
     let mut mcpu_native = false;
     let mut explicit_cpu: Option<String> = None;
     let mut mllvm: Vec<String> = Vec::new();
@@ -111,6 +149,7 @@ fn interpret_plan_args(
             // `-g` is a measured no-op on Perry IR (no DI metadata; see the
             // TEMP_NONCE_COUNTER doc block in linker.rs), matching clang.
             "-c" | "-fno-math-errno" | "-g" => {}
+            "-S" => emit_asm = true,
             "-o" | "-target" => {
                 it.next();
             }
@@ -132,7 +171,7 @@ fn interpret_plan_args(
             }
         }
     }
-    Ok((opt, mcpu_native, explicit_cpu, mllvm))
+    Ok((opt, mcpu_native, explicit_cpu, mllvm, emit_asm))
 }
 
 /// Parse IR text into a module in `context`. Shared by the transport path
@@ -162,7 +201,7 @@ pub(crate) fn optimize_and_emit_module(
     effective_target: &str,
     clang_style_args: &[String],
 ) -> Result<Vec<u8>> {
-    let (opt, mcpu_native, explicit_cpu, mllvm) = interpret_plan_args(clang_style_args)?;
+    let (opt, mcpu_native, explicit_cpu, mllvm, emit_asm) = interpret_plan_args(clang_style_args)?;
     optimize_and_emit(
         module,
         effective_target,
@@ -170,6 +209,7 @@ pub(crate) fn optimize_and_emit_module(
         mcpu_native,
         explicit_cpu.as_deref(),
         &mllvm,
+        emit_asm,
     )
 }
 
@@ -180,6 +220,7 @@ fn optimize_and_emit(
     mcpu_native: bool,
     explicit_cpu: Option<&str>,
     mllvm: &[String],
+    emit_asm: bool,
 ) -> Result<Vec<u8>> {
     global_init(mllvm);
     announce();
@@ -203,7 +244,10 @@ fn optimize_and_emit(
     } else if let Some(cpu) = explicit_cpu {
         (cpu.to_string(), String::new())
     } else {
-        (String::new(), String::new())
+        (
+            default_cpu_for_triple(effective_target).to_string(),
+            String::new(),
+        )
     };
     let opt_level = match opt {
         '0' => OptimizationLevel::None,
@@ -228,6 +272,37 @@ fn optimize_and_emit(
     module.set_triple(&triple);
     module.set_data_layout(&tm.get_target_data().get_data_layout());
 
+    // RS4GC must run BEFORE the optimization pipeline, and — critically — in
+    // this process, against this LLVM.
+    //
+    // The external path shells `rewrite-statepoints-for-gc` out to an `opt`
+    // binary and then hands the rewritten IR to `clang -c`. When those are
+    // different LLVM versions (Homebrew 22 and Apple clang 21 is the ordinary
+    // macOS case) the emitted IR uses constructs the older parser rejects, and
+    // the compile dies with `error: unterminated attribute group`. That is why
+    // RS4GC needed `PERRY_LLVM_CLANG` pointed at a version-matched toolchain,
+    // and why it did not work on a stock install at all.
+    //
+    // Here the same `TargetMachine` runs the pass and emits the object, so the
+    // skew cannot exist. This matters beyond convenience: RS4GC is the only
+    // backend that can root an `invoke`, and since #7302 every call inside a
+    // `try` is one — 26% of the gap suite (128 of 479 files) contains a `try`,
+    // which the explicit bridge refuses outright (#7327/#7330).
+    if crate::codegen::helpers::rs4gc_enabled() {
+        module
+            .run_passes(
+                "function(mem2reg),rewrite-statepoints-for-gc",
+                &tm,
+                PassBuilderOptions::create(),
+            )
+            .map_err(|e| {
+                anyhow!(
+                    "in-process rewrite-statepoints-for-gc failed:\n{}",
+                    e.to_string()
+                )
+            })?;
+    }
+
     let pipeline = match opt {
         '0' => "default<O0>",
         '1' => "default<O1>",
@@ -240,9 +315,14 @@ fn optimize_and_emit(
         .run_passes(pipeline, &tm, PassBuilderOptions::create())
         .map_err(|e| anyhow!("pass pipeline `{pipeline}` failed:\n{}", e.to_string()))?;
 
+    let kind = if emit_asm {
+        FileType::Assembly
+    } else {
+        FileType::Object
+    };
     let obj = tm
-        .write_to_memory_buffer(&module, FileType::Object)
-        .map_err(|e| anyhow!("object emission failed:\n{}", e.to_string()))?;
+        .write_to_memory_buffer(&module, kind)
+        .map_err(|e| anyhow!("{kind:?} emission failed:\n{}", e.to_string()))?;
     Ok(obj.as_slice().to_vec())
 }
 
@@ -300,5 +380,105 @@ entry:
             "live GC pointer not relocated across the call:\n{printed}"
         );
         module.verify().expect("statepoint IR verifies");
+    }
+
+    /// #7327 CI regression: an empty CPU string makes LLVM pick `generic`,
+    /// which on aarch64 is ARMv8.0 and has no FEAT_JSCVT — so the
+    /// `llvm.aarch64.fjcvtzs` that codegen emits for any Apple arm64 triple
+    /// cannot be selected and the compile aborts. Clang defaults that triple to
+    /// `apple-m1`, which is the assumption `set_jscvt_for_target` already makes.
+    /// Reproduced with `PERRY_TARGET_CPU=generic`, which is the path CI took.
+    #[test]
+    fn apple_aarch64_defaults_to_a_cpu_with_feat_jscvt() {
+        for triple in [
+            "arm64-apple-macosx",
+            "arm64-apple-darwin",
+            "aarch64-apple-darwin",
+            "arm64-apple-ios",
+        ] {
+            assert_eq!(
+                default_cpu_for_triple(triple),
+                "apple-m1",
+                "{triple} must not fall back to LLVM's ARMv8.0 `generic`: codegen \
+                 emits llvm.aarch64.fjcvtzs for Apple arm64 triples"
+            );
+        }
+        // Everything else keeps LLVM's portable baseline, matching the clang
+        // path when no tuning flag is passed.
+        for triple in [
+            "x86_64-apple-darwin",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-unknown-linux-gnu",
+        ] {
+            assert_eq!(default_cpu_for_triple(triple), "", "{triple}");
+        }
+    }
+
+    /// `-S` used to be swallowed by the catch-all that ignores `-c`, so the
+    /// statepoint backends asked for assembly and were handed an object. The
+    /// failure was invisible here and surfaced two steps later as
+    /// `ld: unknown file type`, because #7314's compact-map rewriter rewrites
+    /// `.llvm_stackmaps` in assembly *text* and had nothing to rewrite.
+    #[test]
+    fn dash_s_requests_assembly_and_dash_c_does_not() {
+        let (_, _, _, _, emit_asm) =
+            interpret_plan_args(&["-O2".into(), "-S".into()]).expect("args parse");
+        assert!(emit_asm, "-S must request assembly");
+
+        let (_, _, _, _, emit_asm) =
+            interpret_plan_args(&["-O2".into(), "-c".into()]).expect("args parse");
+        assert!(!emit_asm, "-c must still request an object");
+    }
+
+    /// The property the wiring depends on: the same module emitted with
+    /// `FileType::Assembly` is assembler text carrying a stack-map section,
+    /// not an object. If this ever silently produced an object again, the
+    /// compact-map rewrite would find no `.llvm_stackmaps` to shrink and the
+    /// GC would be reading an empty map — the #7332 shape, a binary that
+    /// looks correct until a collection frees something live.
+    #[test]
+    fn assembly_emission_is_text_not_an_object() {
+        let context = Context::create();
+        let ir = r#"
+define i32 @f(i32 %x) {
+entry:
+  %y = add i32 %x, 1
+  ret i32 %y
+}
+"#;
+        let module = parse_ir_text(&context, ir, "asm_probe").expect("probe parses");
+        global_init(&[]);
+        let triple = TargetMachine::get_default_triple();
+        let target = Target::from_triple(&triple).expect("host target");
+        let tm = target
+            .create_target_machine(
+                &triple,
+                "",
+                "",
+                OptimizationLevel::None,
+                RelocMode::PIC,
+                CodeModel::Default,
+            )
+            .expect("target machine");
+
+        let asm = tm
+            .write_to_memory_buffer(&module, FileType::Assembly)
+            .expect("assembly emission");
+        let text = String::from_utf8_lossy(asm.as_slice()).to_string();
+        assert!(
+            text.contains(".globl") || text.contains(".global"),
+            "expected assembler directives, got:\n{}",
+            &text[..text.len().min(200)]
+        );
+
+        let obj = tm
+            .write_to_memory_buffer(&module, FileType::Object)
+            .expect("object emission");
+        assert_ne!(
+            asm.as_slice(),
+            obj.as_slice(),
+            "assembly and object emission returned identical bytes — `-S` is \
+             being ignored somewhere in the emission path"
+        );
     }
 }
