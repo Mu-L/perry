@@ -1,0 +1,93 @@
+# Feasibility spike: can `llvm-inprocess` link STATICALLY on every platform
+# perry ships for?
+#
+# The owner's decision is a self-contained perry — no dynamic LLVM dependency,
+# because owning the assumption removes friction at the user's edge. That
+# decision is right; what nobody has checked is whether it is *buildable*.
+#
+# The feature has only ever been built on macOS (llvm-inprocess.yml is
+# macos-15, gc-native-roots is macos-14). `release-packages.yml` ships SEVEN
+# targets, including two musl and one Windows MSVC — the two configurations
+# where statically linking LLVM is historically hardest.
+#
+# This job answers that question and nothing else. It is deliberately NOT a
+# gate: it is `workflow_dispatch` + branch-push only, so it can go red while we
+# find out, without blocking anyone. Delete it once the answer is folded into
+# the real workflows.
+name: llvm-inprocess-feasibility
+on:
+  workflow_dispatch:
+  push:
+    branches: [spike/llvm-inprocess-platform-feasibility]
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    continue-on-error: true          # a red cell is DATA here, not a failure
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: macos-aarch64 (control), os: macos-14,      how: brew }
+          - { label: linux-x86_64-gnu,        os: ubuntu-latest,  how: apt }
+          - { label: linux-x86_64-musl,       os: ubuntu-latest,  how: apt,  musl: true }
+          - { label: windows-x86_64-msvc,     os: windows-latest, how: choco }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install musl target
+        if: ${{ matrix.musl }}
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Provision LLVM 22 (brew)
+        if: ${{ matrix.how == 'brew' }}
+        run: |
+          set -euo pipefail
+          brew install llvm@22 2>/dev/null || brew install llvm
+          P="$(brew --prefix llvm@22 2>/dev/null || brew --prefix llvm)"
+          "$P/bin/llvm-config" --version | grep -q '^22\.'
+          echo "LLVM_SYS_221_PREFIX=$P" >> "$GITHUB_ENV"
+
+      - name: Provision LLVM 22 (apt)
+        if: ${{ matrix.how == 'apt' }}
+        run: |
+          set -euo pipefail
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          . /etc/os-release
+          echo "deb http://apt.llvm.org/${VERSION_CODENAME}/ llvm-toolchain-${VERSION_CODENAME}-22 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm22.list
+          sudo apt-get update
+          sudo apt-get install -y llvm-22-dev libpolly-22-dev libzstd-dev
+          llvm-config-22 --version | grep -q '^22\.'
+          echo "LLVM_SYS_221_PREFIX=$(llvm-config-22 --prefix)" >> "$GITHUB_ENV"
+
+      - name: Provision LLVM 22 (choco)
+        if: ${{ matrix.how == 'choco' }}
+        shell: pwsh
+        run: |
+          choco install llvm --version=22.1.0 -y --no-progress
+          $p = "C:\Program Files\LLVM"
+          & "$p\bin\llvm-config.exe" --version
+          "LLVM_SYS_221_PREFIX=$p" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build perry with llvm-inprocess (STATIC)
+        id: build
+        run: cargo build --release -p perry --features llvm-inprocess ${{ matrix.musl && '--target x86_64-unknown-linux-musl' || '' }}
+
+      - name: Report binary size + link kind
+        if: ${{ always() && steps.build.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=$(find target -name 'perry' -o -name 'perry.exe' | grep release | head -1)
+          echo "binary: $BIN  size: $(wc -c < "$BIN") bytes"
+          # The whole point is self-containment: assert nothing links libLLVM.
+          case "${{ runner.os }}" in
+            macOS) otool -L "$BIN" | grep -i llvm && { echo "::error::links libLLVM dynamically"; exit 1; } || echo "no dynamic LLVM ✅" ;;
+            Linux) ldd "$BIN" | grep -i llvm && { echo "::error::links libLLVM dynamically"; exit 1; } || echo "no dynamic LLVM ✅" ;;
+            Windows) echo "(skip: dumpbin not always present)" ;;
+          esac
