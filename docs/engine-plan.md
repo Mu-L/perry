@@ -215,18 +215,33 @@ flipping it globally, and neither is correctness:
 So the honest state is: *aarch64-viable, globally blocked on two pieces of scope
 that are both already identified.*
 
-### ★ Binary size, measured 2026-08-04 — it is a ROOT-DENSITY problem, not a metadata one
+### ★ Binary size, measured 2026-08-04 — +1.86% on real code, and it is text, not metadata
 
 The note above says *"closing that axis needs **fewer roots**, not a tighter
 encoding."* That is now measured, and the shape is sharper than "a wash".
 
-Two synthetic programs, 2000 functions each, aarch64, `PERRY_STATEPOINTS=1` vs
+**The number that matters is +1.86%**, measured on a real dependency — `zod`
+compiled from source, 81 native modules, a 29 MB binary — RS4GC in-process vs
 the shadow-stack default:
+
+| section | shadow | RS4GC | delta |
+|---|---:|---:|---:|
+| total | 28,955,656 | 29,495,048 | **+539,392 (+1.86%)** |
+| `__text` | 20,989,544 | 21,508,556 | +519,012 |
+| `__perry_gcmap` | 0 | 362,487 | new section |
+
+Two synthetics bound the range and show what drives it:
 
 | workload | total delta | `__text` | `__perry_gcmap` |
 |---|---:|---:|---:|
 | 2000 **root-free** functions (scalar only) | **+0 B** | +12 B | not emitted |
-| 2000 **root-dense** functions (3 heap values live across an alloc) | **+4,330,592 B (+18.95%)** | +4,203,608 B | 902,124 B |
+| 2000 **root-dense** functions (3 heap values live across an alloc) | +4,330,592 B (+18.95%) | +4,203,608 B | 902,124 B |
+
+**Do not quote the +18.95%.** It is a worst case constructed to isolate the
+mechanism — three heap values live across an allocation in *every* function —
+and it overstates real exposure by an order of magnitude. An earlier revision of
+this section led with it and concluded that root density was a prerequisite for
+adoption. The dependency-scale measurement says otherwise.
 
 Two things follow, and both matter for planning:
 
@@ -239,9 +254,11 @@ Two things follow, and both matter for planning:
    metadata was never the dominant term for root-dense code. The cost is the
    relocation sequence emitted per live root per safepoint.
 
-⇒ **Do not spend further effort on the encoding.** The lever is safepoint density
-and root-set size — which is the same lever #7287/#7296 are already pulling for
-speed, so the two axes are aligned rather than in tension.
+⇒ **Do not spend further effort on the encoding**, and do not treat root density
+as a blocker either. At +1.86% against −1–2% runtime, size is a cost worth
+paying rather than an obstacle. Root-set reduction remains worth doing — it is
+the same lever #7287/#7296 pull for speed, so the axes are aligned — but it is an
+optimization, not a gate on adoption.
 
 Runtime, same probes, quiet host, median of 5: statepoints are **1–2% faster**
 across the board (2054 ms → 2013 ms total; every probe neutral or faster, none
@@ -347,15 +364,12 @@ landed (#7314) and became *reachable* (#7339) and *selectable* (#7340). The spin
 `0 → 2` is done, so the ordering that remains is:
 
 1. ~~**Next:** in-process LLVM (#7241) → statepoints (#7108/#7174).~~ **Done.**
-2. **Reduce root density — now a PREREQUISITE, not a nice-to-have.** Statepoints
-   cost **+18.95% binary size on root-dense code and +0% on root-free code**
-   (measured, see Part 1), and 97% of that is `__text`. Adopting them as the
-   default today therefore *regresses* the owner's stated goal of minimal binary
-   size. Fewer roots fixes that, and it is the same lever #7296 already proved
-   worth 9.9× on `matmul`, so speed and size pull together here rather than
-   trading off. The plan predicted this lever but flagged it "expected, not
-   measured. Layer 2 must prove it first" — layer 2 has now landed, so it can be
-   measured.
+2. **Root density: worth doing, NOT a prerequisite.** Measured on `zod` at
+   dependency scale, statepoints cost **+1.86% binary size** against **−1–2%
+   runtime** — a trade worth taking. (A synthetic worst case reads +18.95%; see
+   Part 1 for why it does not transfer.) Root-set reduction is still the same
+   lever #7296 proved worth 9.9× on `matmul`, so speed and size pull together,
+   but it does not gate adoption.
 3. **Layers 1 and 3, independent of the above.** Layer 3's instrument is now
    aimed (#7342 arm 4) and has a 54-item worklist (#7341) whose dominant
    signature is a stale `GC_TYPE_STRING` at minor #0.
