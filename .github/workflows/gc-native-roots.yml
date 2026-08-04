@@ -97,12 +97,31 @@ on:
   # Must run where it can actually gate something. Branch-scoped triggers were
   # right while this lived only on exp/stackmap-viability; on main that same
   # filter would mean the job never runs at all — CLAUDE.md's second way a gate
-  # cannot fail. Cancellation is deliberately NOT set here: a `main` run that
-  # gets cancelled by the next merge is the third way.
+  # cannot fail.
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
+
+# Having NO concurrency block was a deliberate guard against CLAUDE.md's third
+# way a gate cannot fail — an unconditional `cancel-in-progress` means every
+# merge kills the previous `main` run, and `gc-ratchet` once had three
+# consecutive `main` runs cancelled with zero executed.
+#
+# But omitting it entirely trades that failure for a slower one. Nothing
+# supersedes anything, so every push to every open PR stacks another full
+# matrix run — measured 2026-08-04: **30 live runs**, each a multi-arm matrix
+# at a 120-minute timeout, roughly ninety jobs against a shared runner pool.
+# Six `main` runs sat queued behind them and none executed. A gate starved of
+# runners reports nothing, which is the same outcome by a different route.
+#
+# So: group per main COMMIT, which means `main` runs never cancel each other
+# and every merge still gets its own verdict; and cancel in progress only for
+# `pull_request`, where a newer push genuinely supersedes the older one. Same
+# shape as #7357 applied to eh-transport / llvm-inprocess / security-audit.
+concurrency:
+  group: gc-native-roots-${{ github.event_name }}-${{ github.event_name == 'push' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # Every host shape Perry supports for native roots, on one job. macOS covers
