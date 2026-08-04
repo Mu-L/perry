@@ -82,8 +82,43 @@ impl StackMapIndex {
 
 static STACK_MAPS: OnceLock<StackMapIndex> = OnceLock::new();
 
+// The two register numbers the compact format's short base tags stand for.
+// These are aarch64's by definition of the FORMAT, on every architecture — see
+// `gc_map.rs`, which deliberately keeps them literal so the compiler's idea of
+// the target and this runtime's `target_arch` can never disagree.
 const DWARF_REG_FP_AARCH64: u16 = 29;
 const DWARF_REG_SP_AARCH64: u16 = 31;
+
+// How far below the CFA this frame's return address sits, if it sits on the
+// stack at all. This is NOT a constant across architectures and getting it
+// wrong shifts every SP-relative root by a word:
+//
+//   x86-64: `call` PUSHES the return address, so CFA is the caller's SP before
+//           the call and the callee's SP starts one slot lower.
+//   aarch64: `bl` writes the return address to x30. Nothing is pushed, so the
+//           frame's SP is simply CFA - stack_size.
+//
+// The aarch64 case is easy to miss because `chain_walkable` is true there, so
+// the fast x29 walker normally runs and this path is only the fallback — an
+// eight-byte error would stay latent until the fast walk bailed.
+#[cfg(target_arch = "x86_64")]
+const CFA_RETURN_ADDRESS_BYTES: usize = std::mem::size_of::<usize>();
+#[cfg(not(target_arch = "x86_64"))]
+const CFA_RETURN_ADDRESS_BYTES: usize = 0;
+
+// Which DWARF register is the stack pointer on the machine this runtime was
+// built for. Distinct from the format constants above and used only to choose
+// how a base is resolved: `_Unwind_GetGR` is not a supported query for the SP
+// column, so an SP-relative root must come from the CFA instead. On x86-64
+// every root is `Indirect [RSP + off]` — DWARF 7, measured 56 of 56 on one
+// probe — and reading it with `GetGR` returned garbage the collector then
+// wrote through, which is the segfault the Linux gate hit.
+#[cfg(target_arch = "aarch64")]
+const ARCH_DWARF_SP: u16 = 31;
+#[cfg(target_arch = "x86_64")]
+const ARCH_DWARF_SP: u16 = 7;
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+const ARCH_DWARF_SP: u16 = u16::MAX;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WalkerMode {
@@ -447,17 +482,27 @@ fn parse_gc_map(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, Vec<StackMapLocati
         }
         let function_count = read_u32(bytes, base + 8)? as usize;
         let total_len = read_u32(bytes, base + 12)? as usize;
+        // Header flags, bit 0: the function-address field is 8 bytes wide. The
+        // emitter writes the TARGET's pointer width (watchOS `arm64_32` is
+        // ILP32), and compile target and run target are the same machine — so
+        // a mismatch here means the binary's map was produced for a different
+        // width and every function address would be misread. Fail closed.
+        let flags = read_u16(bytes, base + 6)?;
+        if (flags & 1 == 1) != (std::mem::size_of::<usize>() == 8) {
+            return None;
+        }
+        let entry = if flags & 1 == 1 { 16 } else { 12 };
         // A blob must at least cover its header and function table. Without
         // this, a `total_len` of 0 leaves `base` unchanged — and because the
         // magic still matches at that offset the resynchronisation path below
         // is never reached, so the loop spins forever. This runs inside
         // `OnceLock::get_or_init`, so that is a process hang at the first
         // collection rather than the fail-closed panic in `stack_maps`.
-        if total_len < 16 + function_count.checked_mul(16)? {
+        if total_len < 16 + function_count.checked_mul(entry)? {
             return None;
         }
         let table = base.checked_add(16)?;
-        let stream_start = table.checked_add(function_count.checked_mul(16)?)?;
+        let stream_start = table.checked_add(function_count.checked_mul(entry)?)?;
         let blob_end = base.checked_add(total_len)?;
         if blob_end > bytes.len() || stream_start > blob_end {
             return None;
@@ -484,10 +529,17 @@ fn parse_gc_map(bytes: &[u8]) -> Option<(Vec<StackMapRecord>, Vec<StackMapLocati
         let mut record_index = 0usize;
 
         for index in 0..function_count {
-            let entry = table + index * 16;
-            let function_address = read_u64(bytes, entry)? as usize;
-            let stack_size = u64::from(read_u32(bytes, entry + 8)?);
-            let record_count = read_u32(bytes, entry + 12)? as usize;
+            // Address width follows the header flag checked above, so the
+            // stack-size and record-count offsets move with it.
+            let base_off = table + index * entry;
+            let addr_bytes = entry - 8;
+            let function_address = if addr_bytes == 8 {
+                read_u64(bytes, base_off)? as usize
+            } else {
+                read_u32(bytes, base_off)? as usize
+            };
+            let stack_size = u64::from(read_u32(bytes, base_off + addr_bytes)?);
+            let record_count = read_u32(bytes, base_off + addr_bytes + 4)? as usize;
 
             let mut previous: Option<(u32, u32)> = None;
             for _ in 0..record_count {
@@ -584,11 +636,9 @@ fn read_u8(bytes: &[u8], offset: usize) -> Option<u8> {
     bytes.get(offset).copied()
 }
 
-/// ELF section headers store their counts and offsets as 16-bit fields, so
-/// this is used only by `elf_section_vaddr`. Gated to Linux because the
-/// compact GC map itself needs no 16-bit reads — deleting it as "orphaned"
-/// after a macOS-only `cargo check` is what broke the Linux build.
-#[cfg(target_os = "linux")]
+/// Used by the map header's flags field and by ELF section headers. It was
+/// briefly Linux-gated, which broke the Linux build the moment the map itself
+/// needed a 16-bit read — keep it unconditional.
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
     Some(u16::from_le_bytes(
         bytes.get(offset..offset + 2)?.try_into().ok()?,
@@ -607,7 +657,17 @@ fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
     ))
 }
 
-#[cfg(target_os = "macos")]
+/// Every 64-bit Apple platform, not only macOS. iOS, iPadOS (which reports as
+/// iOS), tvOS and visionOS are all aarch64 + Mach-O and share this loader
+/// verbatim; gating it to `target_os = "macos"` sent them to the stub below,
+/// where the section is never found and the index is empty — a collector with
+/// no native roots, silently, on exactly the platforms that cannot be debugged
+/// easily.
+///
+/// 64-bit only: watchOS's `arm64_32` has 32-bit pointers, while the map stores
+/// function addresses as `u64` and this code does `usize` arithmetic on them.
+/// The compiler refuses that target for the same reason.
+#[cfg(target_vendor = "apple")]
 fn loaded_stack_map_section() -> Option<&'static [u8]> {
     use mach2::dyld::{_dyld_get_image_header, _dyld_get_image_vmaddr_slide};
 
@@ -788,12 +848,14 @@ fn main_object_load_bias() -> Option<usize> {
     (bias != usize::MAX).then_some(bias)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 fn loaded_stack_map_section() -> Option<&'static [u8]> {
     None
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+// Same platform set as the loader above: the Itanium unwinder personality and
+// `_Unwind_*` API are present on every Apple platform, not just macOS.
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
 mod unwind {
     use super::*;
 
@@ -809,6 +871,10 @@ mod unwind {
         ) -> i32;
         fn _Unwind_GetIP(context: *mut UnwindContext) -> usize;
         fn _Unwind_GetGR(context: *mut UnwindContext, register: i32) -> usize;
+        /// The frame's canonical frame address — the supported way to reach a
+        /// frame's stack pointer. `_Unwind_GetGR` on the SP column is not a
+        /// supported query and returns garbage on x86-64.
+        fn _Unwind_GetCFA(context: *mut UnwindContext) -> usize;
     }
 
     struct WalkState<'a, F> {
@@ -853,7 +919,24 @@ mod unwind {
         for record in matched {
             for location in state.index.locations(record) {
                 state.stats.locations_visited = state.stats.locations_visited.saturating_add(1);
-                let base = _Unwind_GetGR(context, i32::from(location.dwarf_reg));
+                // SP-relative roots derive their base from the CFA. By the
+                // SysV/AAPCS definition the CFA is the caller's stack pointer
+                // immediately before the call, so this frame's body stack
+                // pointer sits one return-address slot plus this function's own
+                // frame below it — and `stack_size` is exactly that frame,
+                // recorded per function in the map.
+                let base = if location.dwarf_reg == ARCH_DWARF_SP {
+                    let cfa = _Unwind_GetCFA(context);
+                    match cfa
+                        .checked_sub(CFA_RETURN_ADDRESS_BYTES)
+                        .and_then(|v| v.checked_sub(record.stack_size as usize))
+                    {
+                        Some(sp) => sp,
+                        None => continue,
+                    }
+                } else {
+                    _Unwind_GetGR(context, i32::from(location.dwarf_reg))
+                };
                 let address = if location.offset < 0 {
                     base.checked_sub(location.offset.unsigned_abs() as usize)
                 } else {
@@ -875,7 +958,7 @@ mod unwind {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 mod unwind {
     use super::*;
 
@@ -901,7 +984,10 @@ mod unwind {
 /// whole scan through the platform unwinder. Slot visitation is idempotent
 /// (a rewritten slot no longer points at a forwarded object), so a partial
 /// fast walk followed by a full unwinder walk is safe.
-#[cfg(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64"))]
+#[cfg(all(
+    any(target_vendor = "apple", target_os = "linux"),
+    target_arch = "aarch64"
+))]
 mod fp_chain {
     use super::*;
 
@@ -913,7 +999,10 @@ mod fp_chain {
         fp
     }
 
-    #[cfg(target_os = "macos")]
+    // `pthread_get_stackaddr_np` is Apple-wide, not macOS-only. Gating it to
+    // macOS is what broke the iOS build outright — which is the good outcome:
+    // the alternative was this module quietly not existing there.
+    #[cfg(target_vendor = "apple")]
     fn stack_top() -> usize {
         unsafe extern "C" {
             fn pthread_self() -> usize;
@@ -1056,7 +1145,10 @@ mod fp_chain {
     }
 }
 
-#[cfg(not(all(any(target_os = "macos", target_os = "linux"), target_arch = "aarch64")))]
+#[cfg(not(all(
+    any(target_vendor = "apple", target_os = "linux"),
+    target_arch = "aarch64"
+)))]
 mod fp_chain {
     use super::*;
 
@@ -1116,14 +1208,23 @@ mod tests {
             }
         }
 
-        let total_len = 16 + 16 + offsets.len() + stream.len();
+        // Build for THIS host's pointer width, mirroring the emitter: the
+        // decoder rejects a blob whose recorded width disagrees with its own.
+        let ptr64 = std::mem::size_of::<usize>() == 8;
+        let entry = if ptr64 { 16 } else { 12 };
+        let total_len = 16 + entry + offsets.len() + stream.len();
         let mut bytes = Vec::new();
         bytes.extend_from_slice(GC_MAP_MAGIC);
         bytes.push(GC_MAP_VERSION);
-        bytes.extend_from_slice(&[0, 0, 0]);
+        bytes.push(0);
+        bytes.extend_from_slice(&u16::from(ptr64).to_le_bytes());
         bytes.extend_from_slice(&1u32.to_le_bytes());
         bytes.extend_from_slice(&(total_len as u32).to_le_bytes());
-        bytes.extend_from_slice(&function.to_le_bytes());
+        if ptr64 {
+            bytes.extend_from_slice(&function.to_le_bytes());
+        } else {
+            bytes.extend_from_slice(&(function as u32).to_le_bytes());
+        }
         bytes.extend_from_slice(&32u32.to_le_bytes());
         bytes.extend_from_slice(&(records.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&offsets);
@@ -1250,6 +1351,21 @@ mod tests {
             }],
         );
         assert!(!index.chain_walkable);
+    }
+
+    #[test]
+    fn rejects_a_blob_built_for_the_other_pointer_width() {
+        // The header records the width the emitter used. A blob claiming the
+        // other width would have every function address misread, so it must be
+        // refused rather than decoded — watchOS `arm64_32` is ILP32 while every
+        // other supported target is LP64.
+        let mut bytes = simple(0x1000, 0x10, -8);
+        let flags = u16::from_le_bytes([bytes[6], bytes[7]]);
+        bytes[6..8].copy_from_slice(&(flags ^ 1).to_le_bytes());
+        assert!(
+            parse_gc_map(&bytes).is_none(),
+            "a map built for the other pointer width must be refused"
+        );
     }
 
     #[test]
