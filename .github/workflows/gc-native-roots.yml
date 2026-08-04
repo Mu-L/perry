@@ -273,19 +273,26 @@ jobs:
           "$py" scripts/statepoint_report_assert.py /tmp/rs4gc-report.json \
             --only-backend rs4gc
 
-          # #7354: the Windows walker liveness gate. It is the one walker with
-          # no Itanium unwinder under it and no verify-mode cross-check, and a
-          # walker that visits zero frames still lets most probes print the
-          # right answer (other root sources cover them). Non-zero
-          # frames/records/locations telemetry is the only proof it ran.
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            PERRY_GC_TRACE=1 PERRY_RS4GC=1 \
-            PERRY_GC_FORCE_EVACUATE=1 PERRY_GC_VERIFY_EVACUATION=1 \
-            PERRY_GC_HEAP_LIMIT=8 PERRY_GC_INCREMENTAL=0 PERRY_CONSERVATIVE_STACK_SCAN=off \
-              "/tmp/rs4gc-04_dead_after_deep_stack$exe" > /dev/null 2> /tmp/rs4gc-trace.err
-            "$py" scripts/gc_walker_trace_assert.py /tmp/rs4gc-trace.err \
-              --require-locations
-          fi
+          # Walker liveness, on EVERY arm. A walker that visits zero frames
+          # still lets most probes print the right answer, because other root
+          # sources cover them — so a green matrix is not evidence the walker
+          # ran. Only non-zero frames/records/locations telemetry is.
+          #
+          # This used to be Windows-only (#7354) for a good reason: it was the
+          # only arm that could pass it. Measured on `04_dead_after_deep_stack`,
+          # macOS and Linux reported 7 frames and ZERO locations, because every
+          # probe in the suite collected from a shallow stack at exit. Windows
+          # only walked deep by accident of heap sizing.
+          #
+          # `11_collect_at_depth` collects at maximum recursion depth with a
+          # live root in every frame, so all three arms now walk a real stack —
+          # 228 frames and 221 locations on macOS, where the old best was 0.
+          PERRY_GC_TRACE=1 PERRY_RS4GC=1 \
+          PERRY_GC_FORCE_EVACUATE=1 PERRY_GC_VERIFY_EVACUATION=1 \
+          PERRY_GC_HEAP_LIMIT=8 PERRY_GC_INCREMENTAL=0 PERRY_CONSERVATIVE_STACK_SCAN=off \
+            "/tmp/rs4gc-11_collect_at_depth$exe" > /dev/null 2> /tmp/rs4gc-trace.err
+          "$py" scripts/gc_walker_trace_assert.py /tmp/rs4gc-trace.err \
+            --require-locations
 
       # #7327. Everything above pins PERRY_LLVM_OPT + PERRY_LLVM_CLANG to one
       # brew install, because RS4GC piped IR through an external `opt` and a
