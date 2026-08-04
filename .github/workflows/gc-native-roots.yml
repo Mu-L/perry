@@ -111,6 +111,35 @@ jobs:
           set -euo pipefail
           export PERRY_RUNTIME_DIR="$PWD/target/perry-dev"
           export PERRY_NO_AUTO_OPTIMIZE=1
+
+          # Pin an LLVM that registers the `statepoint-example` GC strategy.
+          # Without this the job cannot pass at all: the macos-14 image ships
+          # Apple clang 15, which does not register it, so every run died with
+          #   fatal error: error in backend: unsupported GC: statepoint-example
+          # before a single probe executed. That is CLAUDE.md's failure mode
+          # inverted — a gate that cannot PASS is as useless as one that cannot
+          # fail, and it stayed red across five consecutive main runs while
+          # looking like a real regression.
+          #
+          # Newer Apple clang does register it (21 does, locally), so this is a
+          # property of the runner image rather than of Apple clang forever.
+          # Pin explicitly rather than depend on the image. The RS4GC job below
+          # already does this for its own reasons.
+          brew list llvm >/dev/null 2>&1 || brew install llvm
+          llvm_bin="$(brew --prefix llvm)/bin"
+          if [ ! -x "$llvm_bin/clang" ]; then
+            echo "::error::no clang under $llvm_bin — cannot run the statepoint arm, and skipping it silently is the gate that cannot fail"
+            exit 1
+          fi
+          export PERRY_LLVM_CLANG="$llvm_bin/clang"
+          "$PERRY_LLVM_CLANG" --version | head -2
+          # Assert the pinned toolchain actually supports the strategy, so a
+          # future image change fails here with a clear message instead of
+          # deep inside a probe compile.
+          printf 'define void @f() gc "statepoint-example" {\n  ret void\n}\n' > /tmp/gcstrategy.ll
+          "$PERRY_LLVM_CLANG" -c /tmp/gcstrategy.ll -o /dev/null \
+            || { echo "::error::pinned clang does not support gc \"statepoint-example\""; exit 1; }
+
           pass=0
           total=0
           errs=""
@@ -470,6 +499,80 @@ jobs:
   # REFUSAL (never a silently rootless binary), and goes red the day x86-64
   # starts working, which is the prompt to widen the aarch64 matrix above (#7321).
   # Deliberately cheap: one probe, no runtime, no oracle.
+  # ELF coverage. The two GC arms above run on macos-14, so without this job
+  # nothing exercises the object format the whole compact-map design had to be
+  # rewritten for. Every bug that reached main in that area was ELF-only and
+  # invisible on Mach-O:
+  #   * the section needed SHF_GNU_RETAIN or `--gc-sections` dropped it, since
+  #     nothing references it (Mach-O has `.no_dead_strip`);
+  #   * it needed SHF_WRITE too, or the relocated function addresses forced a
+  #     DT_TEXTREL in a PIE;
+  #   * `eh_walker`'s asm defined `_perry_eh_capture_context` with the Mach-O
+  #     underscore convention, so aarch64-Linux could not even link.
+  #
+  # Runs on ARM64 because the backend is aarch64-only (#7324); on x86-64 it
+  # would exercise only the refusal, which `statepoints-refuse-x86` covers.
+  # Stock Ubuntu clang registers `statepoint-example` (verified on 18.1.3), so
+  # unlike macOS this needs no toolchain install.
+  native-roots-elf-aarch64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gc-native-roots-elf
+      - name: Build compiler and static runtime (perry-dev profile)
+        run: |
+          export RUSTFLAGS="-Cforce-frame-pointers=yes"
+          cargo build --profile perry-dev -p perry -p perry-runtime-static -p perry-stdlib-static
+      - name: Assert the toolchain registers the GC strategy
+        run: |
+          set -euo pipefail
+          printf 'define void @f() gc "statepoint-example" {\n  ret void\n}\n' > /tmp/gcstrategy.ll
+          clang -c /tmp/gcstrategy.ll -o /dev/null \
+            || { echo "::error::this clang does not support gc \"statepoint-example\" — pin one that does"; exit 1; }
+      - name: Probe matrix, statepoint mode, forced evacuation
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          export PERRY_RUNTIME_DIR="$PWD/target/perry-dev"
+          export PERRY_NO_AUTO_OPTIMIZE=1
+          pass=0
+          total=0
+          errs=""
+          for probe in benchmarks/gc_ratchet/probes/*.ts; do
+            # Same exclusion as the macOS bridge arm: the explicit bridge
+            # refuses a try-carrying probe rather than emit a frame with no
+            # roots (#7330/#7335). RS4GC covers 09.
+            [ "$(basename "$probe")" = "09_try_catch_roots.ts" ] && continue
+            total=$((total+1))
+            name=$(basename "$probe" .ts)
+            node --expose-gc --experimental-strip-types "$probe" > "/tmp/$name.oracle"
+            PERRY_STATEPOINTS=1 ./target/perry-dev/perry "$probe" -o "/tmp/$name"
+            # Liveness: the compact section must be present AND LLVM's gone,
+            # so a run where the rewrite silently stopped cannot read as green.
+            readelf -S "/tmp/$name" | grep -q "\.perry_gcmap" \
+              || { echo "::error::$name has no .perry_gcmap — the statepoint arm was not live"; exit 1; }
+            readelf -S "/tmp/$name" | grep -q "\.llvm_stackmaps" \
+              && { echo "::error::$name still carries .llvm_stackmaps — the compact rewrite did not run"; exit 1; }
+            PERRY_STATEPOINTS=1 PERRY_GC_FORCE_EVACUATE=1 PERRY_GC_VERIFY_EVACUATION=1 \
+              "/tmp/$name" > "/tmp/$name.out" 2> "/tmp/$name.err"
+            diff "/tmp/$name.oracle" "/tmp/$name.out" \
+              || { echo "::error::$name output diverged from the pinned oracle"; exit 1; }
+            errs="$errs /tmp/$name.err"
+            pass=$((pass+1))
+          done
+          echo "ELF statepoint matrix: $pass/$total"
+          [ "$total" -gt 0 ] || { echo "::error::no probes matched — the matrix ran on nothing"; exit 1; }
+          [ "$pass" -eq "$total" ]
+          grep -l "#gcmetric" $errs >/dev/null \
+            || { echo "::error::no probe emitted gc metrics — the collector never ran"; exit 1; }
+
   statepoints-refuse-x86:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -512,7 +615,13 @@ jobs:
   # branch protection to require, so adding an arm never needs a protection edit
   # and a red arm cannot hide behind a green sibling.
   gc-native-roots-complete:
-    needs: [native-roots-aarch64, native-roots-rs4gc-aarch64, statepoints-refuse-x86]
+    needs:
+      [
+        native-roots-aarch64,
+        native-roots-rs4gc-aarch64,
+        native-roots-elf-aarch64,
+        statepoints-refuse-x86,
+      ]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
