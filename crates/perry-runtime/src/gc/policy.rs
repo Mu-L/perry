@@ -1157,7 +1157,10 @@ pub(super) fn copied_minor_promotable_active_survivor_bytes() -> usize {
                 }
                 let prior_age = copied_survival_age((*header)._reserved, flags);
                 let next_age = prior_age.saturating_add(1);
-                if flags & GC_FLAG_TENURED != 0 || next_age >= GC_COPY_PROMOTION_SURVIVALS {
+                // Mirror move_young's promotion predicate, including the
+                // adaptive threshold (gc/tenuring.rs), so this pacing estimate
+                // matches what the next copying minor will actually promote.
+                if flags & GC_FLAG_TENURED != 0 || next_age >= tenuring_survivals() {
                     promotable = promotable.saturating_add((*header).size as usize);
                 }
             }

@@ -386,6 +386,12 @@ pub(super) struct CopyingNurseryCollector {
     pub(super) sticky: StickyRememberedSet,
     pub(super) stats: CopyingNurseryTraceStats,
     pub(super) live_from_bytes: usize,
+    /// Per-cycle snapshot of the adaptive tenuring threshold (gc/tenuring.rs)
+    /// so every object in one cycle sees the same policy.
+    pub(super) tenuring_survivals: u8,
+    /// Per-cycle to-survivor copy budget; once exceeded, the rest of the
+    /// cycle promotes directly (to-space overflow valve).
+    pub(super) survivor_overflow_bytes: usize,
     /// Weak target slots (WeakRef referent / WeakMap-WeakSet entry key /
     /// FinalizationRegistry record target) seen during the copy scan. The
     /// scan must NOT evacuate through them (that would strengthen the weak
@@ -399,6 +405,7 @@ pub(super) struct CopyingNurseryCollector {
 
 impl CopyingNurseryCollector {
     pub(super) fn new(ptrs: CopyingPointerSet) -> Self {
+        let tenuring_survivals = tenuring_survivals();
         Self {
             ptrs,
             worklist: Vec::new(),
@@ -409,9 +416,12 @@ impl CopyingNurseryCollector {
             stats: CopyingNurseryTraceStats {
                 eligible: true,
                 fallback_reason: CopiedMinorFallbackReason::None,
+                tenuring_survivals,
                 ..CopyingNurseryTraceStats::default()
             },
             live_from_bytes: 0,
+            tenuring_survivals,
+            survivor_overflow_bytes: survivor_overflow_bytes(),
             weak_slots: Vec::new(),
         }
     }
@@ -584,7 +594,13 @@ impl CopyingNurseryCollector {
         let payload = total - GC_HEADER_SIZE;
         let prior_age = copied_survival_age((*header)._reserved, flags);
         let next_age = prior_age.saturating_add(1);
-        let promote = flags & GC_FLAG_TENURED != 0 || next_age >= GC_COPY_PROMOTION_SURVIVALS;
+        // Adaptive tenuring (gc/tenuring.rs): the survivals threshold is
+        // re-derived from survivor influx after every cycle, and the overflow
+        // valve bounds a single cycle's copy burst before the feedback loop
+        // has its first signal.
+        let promote = flags & GC_FLAG_TENURED != 0
+            || next_age >= self.tenuring_survivals
+            || self.stats.copied_bytes >= self.survivor_overflow_bytes;
         let new_user = if promote {
             crate::arena::arena_alloc_gc_old(payload, 8, (*header).obj_type)
         } else {
@@ -632,6 +648,15 @@ impl CopyingNurseryCollector {
         } else {
             self.stats.copied_objects += 1;
             self.stats.copied_bytes += total;
+        }
+        // Survivor-influx accounting for the adaptive tenuring feedback loop:
+        // live bytes moved out of Eden this cycle, split from re-copies of
+        // survivor-space residents. Threshold-invariant (live Eden bytes get
+        // moved somewhere at any threshold), which is what makes the loop's
+        // fixed point stable.
+        match ptr.kind {
+            CopyingPointerKind::Eden => self.stats.eden_live_bytes += total,
+            _ => self.stats.survivor_live_bytes += total,
         }
         new_user as usize
     }
@@ -1243,14 +1268,17 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
         trace.capture_layout_scans();
     }
     maybe_schedule_old_reclaim_after_copied_minor();
+    retune_after_scavenge(collector.stats.eden_live_bytes);
     if std::env::var_os("PERRY_GC_DIAG").is_some() {
         eprintln!(
-            "[gc-copy-minor] ran copied_objects={} copied_bytes={} promoted_objects={} promoted_bytes={} freed_bytes={} trigger={:?} declared_safepoint={}",
+            "[gc-copy-minor] ran copied_objects={} copied_bytes={} promoted_objects={} promoted_bytes={} freed_bytes={} tenuring_survivals={} eden_live_bytes={} trigger={:?} declared_safepoint={}",
             collector.stats.copied_objects,
             collector.stats.copied_bytes,
             collector.stats.promoted_objects,
             collector.stats.promoted_bytes,
             freed_bytes,
+            collector.stats.tenuring_survivals,
+            collector.stats.eden_live_bytes,
             _trigger_kind,
             super::policy::GC_AT_DECLARED_SAFEPOINT.with(std::cell::Cell::get)
         );

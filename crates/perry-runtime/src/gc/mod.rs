@@ -83,6 +83,8 @@ use copying::*;
 // pass in `crate::weakref` (#6182), which lives outside the gc module.
 pub(crate) use copying::CopyingPointerSet;
 mod dead_owner;
+mod tenuring;
+use tenuring::*;
 mod oldgen;
 use oldgen::*;
 mod cycle;

@@ -1,3 +1,4 @@
+mod adaptive_tenuring;
 mod pointer_publish_7154;
 mod promise_side_tables;
 mod survival_and_malloc;
