@@ -353,6 +353,10 @@ pub(super) struct CopyingNurseryTestGuard {
 }
 
 fn reset_copying_nursery_runtime_test_state() {
+    // Age-sensitive tests assume the power-on tenuring threshold (promote at
+    // the 4th survival); pin it so a heavy-influx test earlier on the same
+    // thread cannot leak a lowered adaptive threshold in.
+    crate::gc::tenuring::reset_for_test();
     activate_malloc_registry_for_tests();
     crate::object::test_clear_overflow_fields_root();
     crate::object::test_clear_transition_cache_root();
