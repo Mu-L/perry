@@ -59,6 +59,106 @@ fn block_size_for(min_size: usize) -> usize {
 /// that `reserve_arena_block` then runs allocates blocks of its own through the
 /// non-injectable path, so the injected refusal cannot be consumed by the wrong
 /// allocation.
+// ---------------------------------------------------------------------------
+// #7438: recycled-block pool.
+//
+// Block dealloc/realloc round-trips through the process allocator were the
+// dominant term of tree.ts's scavenge-on peak RSS: every promoted-then-dropped
+// cohort released its old-gen blocks and the next cohort's promotions landed
+// in FRESH allocator segments, so the union of ever-dirtied pages grew with
+// cumulative promotion volume (~230 MB resident for a ~35 MB live set) while
+// a cap matrix showed the young-cap dial barely moves RSS at all (64/32/16 MB
+// caps → 235/221/226 MB). Recycling released blocks bounds ever-dirtied pages
+// at the CONCURRENT high-water instead.
+//
+// Pooled blocks are `MADV_FREE`d so the OS can take the pages under memory
+// pressure; contents are undefined on reuse, which every consumer tolerates
+// (blocks are bump-filled from offset 0 and re-registered by the arena that
+// adopts them). The pool is capped; overflow falls through to real dealloc,
+// and thread teardown (`Arena::drop`) never pools.
+// ---------------------------------------------------------------------------
+
+/// Owns the pooled blocks, so that a thread exiting with a non-empty pool
+/// releases them instead of leaking up to [`BLOCK_POOL_CAP_BYTES`].
+///
+/// The ownership has to live *here* rather than in a drain called from
+/// `Arena::drop`: both are TLS destructors, their relative order is not
+/// specified, and `LocalKey::with` panics once its own destructor has run —
+/// so a drain could be skipped exactly when it is needed. A `Drop` on the
+/// pool's own value is order-independent by construction.
+///
+/// Matters for `perry/thread`: `spawn`/`parallelMap` give every agent its own
+/// arena and GC, so each exiting agent thread would otherwise strand its
+/// pooled blocks — unbounded growth across repeated spawns, in the one change
+/// whose purpose is lowering RSS.
+struct BlockPool(Vec<(*mut u8, usize)>);
+
+impl Drop for BlockPool {
+    fn drop(&mut self) {
+        for &(data, size) in &self.0 {
+            if data.is_null() || size == 0 {
+                continue;
+            }
+            let layout = Layout::from_size_align(size, 16).unwrap();
+            unsafe {
+                // #4665, mirroring `Arena::drop`: test builds keep freed blocks
+                // mapped so unit tests holding raw GC pointers across a
+                // collection read stale bytes instead of faulting.
+                if !cfg!(test) {
+                    std::alloc::dealloc(data, layout);
+                }
+            }
+        }
+    }
+}
+
+thread_local! {
+    static BLOCK_POOL: RefCell<BlockPool> = const { RefCell::new(BlockPool(Vec::new())) };
+    static BLOCK_POOL_BYTES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Cap on pooled bytes: 64 MB, matching the young cap ceiling. Measured on
+/// tree.ts (Mac mini M1, quiet): no pool -> 225 MB peak RSS; 64 MB pool ->
+/// 190 MB; 128 MB pool -> 210 MB. Bigger is NOT better — pooled pages are
+/// MADV_FREE'd but stay resident until the OS wants them, so an oversized
+/// pool trades fresh-segment growth for held free pages past the optimum.
+/// This is a cap, not a floor — the pool holds only blocks that were
+/// actually released, and the OS can take every pooled page under pressure.
+const BLOCK_POOL_CAP_BYTES: usize = 64 * 1024 * 1024;
+
+/// Offer a released block to the pool. Returns false (caller deallocs) when
+/// the pool is full or the block is null.
+pub(crate) fn block_pool_put(data: *mut u8, size: usize) -> bool {
+    if data.is_null() || size == 0 {
+        return false;
+    }
+    if BLOCK_POOL_BYTES.with(Cell::get).saturating_add(size) > BLOCK_POOL_CAP_BYTES {
+        return false;
+    }
+    #[cfg(unix)]
+    unsafe {
+        libc::madvise(data as *mut libc::c_void, size, libc::MADV_FREE);
+    }
+    BLOCK_POOL.with(|p| p.borrow_mut().0.push((data, size)));
+    BLOCK_POOL_BYTES.with(|c| c.set(c.get().saturating_add(size)));
+    true
+}
+
+fn block_pool_take(size: usize) -> Option<*mut u8> {
+    let taken = BLOCK_POOL.with(|p| {
+        let mut pool = p.borrow_mut();
+        let idx = pool.0.iter().rposition(|&(_, s)| s == size)?;
+        Some(pool.0.swap_remove(idx).0)
+    })?;
+    BLOCK_POOL_BYTES.with(|c| c.set(c.get().saturating_sub(size)));
+    Some(taken)
+}
+
+#[cfg(test)]
+pub(crate) fn block_pool_bytes_for_test() -> usize {
+    BLOCK_POOL_BYTES.with(Cell::get)
+}
+
 fn try_alloc_block(min_size: usize, injectable: bool) -> Option<ArenaBlock> {
     let size = block_size_for(min_size);
     let layout = Layout::from_size_align(size, 16).unwrap();
@@ -68,6 +168,14 @@ fn try_alloc_block(min_size: usize, injectable: bool) -> Option<ArenaBlock> {
     }
     #[cfg(not(test))]
     let _ = injectable;
+    if let Some(data) = block_pool_take(size) {
+        return Some(ArenaBlock {
+            data,
+            size,
+            offset: 0,
+            dead_cycles: 0,
+        });
+    }
     let data = unsafe { alloc(layout) };
     if data.is_null() {
         return None;
