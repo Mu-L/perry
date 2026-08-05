@@ -313,7 +313,7 @@ jobs:
       - uses: ./.github/actions/setup-llvm22
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       # Same tarball'd-disk-cache pattern as api-docs-drift (see the comment
       # there for why SCCACHE_GHA_ENABLED is off).
@@ -383,7 +383,7 @@ jobs:
       - uses: ./.github/actions/setup-llvm22
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Cache sccache objects
         uses: actions/cache@v6
@@ -451,7 +451,7 @@ jobs:
       - uses: ./.github/actions/setup-llvm22
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       # Persist the sccache disk cache across runs. The github.job +
       # github.run_id key makes every run (including PRs) save its own fresh
@@ -562,7 +562,7 @@ jobs:
       - uses: ./.github/actions/setup-llvm22
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       # Persist the sccache disk cache across runs. The github.job +
       # github.run_id key makes every run (including PRs) save its own fresh
@@ -822,7 +822,7 @@ jobs:
 
       - name: Install sccache
         if: steps.scope.outputs.suites != ''
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Cache sccache objects
         if: steps.scope.outputs.suites != ''
@@ -1161,7 +1161,7 @@ jobs:
       - uses: ./.github/actions/setup-llvm22
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       # Persist the sccache disk cache across runs. The github.job +
       # github.run_id key makes every run (including PRs) save its own fresh
@@ -1338,7 +1338,7 @@ jobs:
       - uses: ./.github/actions/setup-llvm22
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Cache sccache objects
         uses: actions/cache@v6
@@ -1495,7 +1495,7 @@ jobs:
       - uses: ./.github/actions/setup-llvm22
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Cache sccache objects
         uses: actions/cache@v6
