@@ -77,14 +77,44 @@ pub(super) const GC_TRIGGER_ABSOLUTE_CEILING: usize = 128 * 1024 * 1024;
 /// ceiling — headroom floor over a big live set, medium-parse bumps), the
 /// device-derived ceiling while the cell still holds its desktop-default
 /// const initializer.
-pub(super) fn effective_next_arena_trigger() -> usize {
-    let base = if GC_TRIGGER_ARMED.with(|a| a.get()) {
+/// The adaptive/armed arena trigger WITHOUT the scavenge nursery cap:
+/// compared against `arena_total_bytes()` (all generations), as it always
+/// was. The cap is deliberately not part of this value — it is
+/// young-generation-scoped and lives in [`young_scavenge_cap_due`].
+pub(super) fn next_arena_trigger_base() -> usize {
+    if GC_TRIGGER_ARMED.with(|a| a.get()) {
         GC_NEXT_TRIGGER_BYTES.with(|c| c.get())
     } else {
         GC_NEXT_TRIGGER_BYTES
             .with(|c| c.get())
             .min(gc_trigger_absolute_ceiling_bytes())
-    };
+    }
+}
+
+/// True when the young generation (Eden + active survivor space) has
+/// reached the effective scavenge nursery cap.
+///
+/// The basis is young-gen occupancy, NOT `arena_total_bytes()`. Comparing
+/// the cap against the total put every old-gen byte on the young budget:
+/// once old-gen in-use crossed 16 MB, every fresh 1 MB Eden block
+/// re-crossed the trigger, degenerating the scavenge cadence to
+/// once-per-block on any program with a large tenured set. That cadence is
+/// the actual mechanism behind the tree.ts survivor-saturation regression
+/// — objects were scavenged ~1 MB of allocation after birth, so almost
+/// nothing had time to die: measured 1.05 MB of survivors per 1 MB block
+/// (near-zero infant mortality), a saturated survivor space, and 1427
+/// collections for a run that allocates ~1.4 GB.
+pub(super) fn young_scavenge_cap_due() -> bool {
+    #[cfg(test)]
+    if GC_NURSERY_CAP_TEST_SUPPRESSED.with(Cell::get) {
+        return false;
+    }
+    crate::arena::copying_from_space_in_use_bytes()
+        >= super::tenuring::scavenge_nursery_cap_effective_bytes()
+}
+
+pub(super) fn effective_next_arena_trigger() -> usize {
+    let base = next_arena_trigger_base();
     // A minor is O(live) — it copies ~1k live objects out of millions
     // allocated — so the 128 MB-and-doubling adaptive trigger, tuned for the
     // OLD world where a minor was an expensive O(heap) sweep and the advice was
@@ -1845,8 +1875,15 @@ fn gc_budgeted_due_trigger() -> Option<BudgetedGcTrigger> {
         return Some(BudgetedGcTrigger::OldReclaim);
     }
 
+    // Two separately-scoped arena arms (see `young_scavenge_cap_due` for why
+    // they must not share a basis): the adaptive base trigger against the
+    // whole arena, and the scavenge nursery cap against the young generation
+    // only.
     let total = crate::arena::arena_total_bytes();
-    if total >= effective_next_arena_trigger() {
+    if total >= next_arena_trigger_base() {
+        return Some(BudgetedGcTrigger::ArenaBytes);
+    }
+    if young_scavenge_cap_due() {
         return Some(BudgetedGcTrigger::ArenaBytes);
     }
 
