@@ -41,9 +41,25 @@
 //! (a single quiet cycle — e.g. a malloc-count trigger firing before Eden
 //! filled — must not flush the aging pipeline into a copy burst).
 //!
+//! The occupancy rule alone is not sufficient: it optimises survivor
+//! *space*, not copy *work*. A workload whose influx sits just under
+//! `desired` (tree.ts measures 1,048,536 B against the 1,048,576 B
+//! default — 40 bytes under) settles at S=2 and still copies every
+//! surviving byte exactly once for nothing, because 100% of each cohort
+//! survives its survivor round and gets promoted a cycle later anyway.
+//! The **survival-rate lock** closes that: when last cycle's survivor
+//! intake (`copied_bytes`) was substantial and ≥90% of it came back out
+//! alive this cycle (`survivor_live_bytes`), the aging round demonstrably
+//! filters nothing, so the threshold locks to 1 (promote on first copy)
+//! until the influx goes quiet. The lock's exit signal — influx below
+//! `desired/4` for two consecutive cycles — stays measurable while
+//! locked, unlike survivor occupancy, which is zero at S=1 and would
+//! leave the loop blind.
+//!
 //! There is no env knob here (see CLAUDE.md's GC knob kill-policy): the
-//! loop is always on, and its neutral state — influx below `desired` —
-//! computes S=4, which is bit-for-bit the previous fixed behaviour.
+//! loop is always on, and its neutral state — influx below `desired`,
+//! survivor cohorts that die in place — computes S=4, which is
+//! bit-for-bit the previous fixed behaviour.
 
 use super::*;
 
@@ -57,6 +73,12 @@ const RAISE_DEBOUNCE_CYCLES: u8 = 2;
 thread_local! {
     static TENURING_SURVIVALS: Cell<u8> = const { Cell::new(GC_TENURING_SURVIVALS_MAX) };
     static RAISE_STREAK: Cell<u8> = const { Cell::new(0) };
+    /// Survival-rate lock: promote-on-first-copy until influx goes quiet.
+    static PROMOTE_LOCK: Cell<bool> = const { Cell::new(false) };
+    static UNLOCK_STREAK: Cell<u8> = const { Cell::new(0) };
+    /// Bytes the previous copying minor put into the to-survivor space —
+    /// the denominator of this cycle's survival rate.
+    static PREV_COPIED_BYTES: Cell<usize> = const { Cell::new(0) };
 }
 
 /// The survivals threshold the next copying minor should promote at:
@@ -95,10 +117,56 @@ pub(super) fn compute_target_survivals(eden_live_bytes: usize, desired_bytes: us
 
 /// Feed one finished copying-minor cycle into the feedback loop.
 /// `eden_live_bytes` is the cycle's Eden survivor influx (bytes moved out
-/// of Eden, whether copied to a survivor space or promoted).
-pub(super) fn retune_after_scavenge(eden_live_bytes: usize) {
+/// of Eden, whether copied to a survivor space or promoted);
+/// `copied_bytes` is what this cycle put into the to-survivor space;
+/// `survivor_live_bytes` is what came back out of the from-survivor space
+/// alive (numerator of the survival rate against the *previous* cycle's
+/// `copied_bytes`).
+pub(super) fn retune_after_scavenge(
+    eden_live_bytes: usize,
+    copied_bytes: usize,
+    survivor_live_bytes: usize,
+) {
+    let desired = desired_survivor_bytes();
+    let substantial = desired / 4;
+    let prev_copied = PREV_COPIED_BYTES.with(|c| c.replace(copied_bytes));
     let current = TENURING_SURVIVALS.with(Cell::get);
-    let target = compute_target_survivals(eden_live_bytes, desired_survivor_bytes());
+
+    if PROMOTE_LOCK.with(Cell::get) {
+        // Locked: stay at 1 while the influx stays substantial. The exit
+        // signal is the influx itself — measurable every cycle, unlike
+        // survivor occupancy, which is identically zero at S=1.
+        if eden_live_bytes < substantial {
+            let streak = UNLOCK_STREAK.with(|s| s.get()).saturating_add(1);
+            if streak >= RAISE_DEBOUNCE_CYCLES {
+                PROMOTE_LOCK.with(|l| l.set(false));
+                UNLOCK_STREAK.with(|s| s.set(0));
+                RAISE_STREAK.with(|s| s.set(0));
+                // Resume the ladder one step up rather than snapping to the
+                // ceiling; the normal debounced rise takes it the rest of
+                // the way if the workload stays quiet.
+                set_survivals(current, 2, eden_live_bytes, "unlock");
+            } else {
+                UNLOCK_STREAK.with(|s| s.set(streak));
+            }
+        } else {
+            UNLOCK_STREAK.with(|s| s.set(0));
+        }
+        return;
+    }
+
+    // Survival-rate lock: last cycle's survivor intake was substantial and
+    // (nearly) all of it came back out alive, so the aging round filters
+    // nothing — every copied byte is a byte that will be promoted anyway.
+    if prev_copied >= substantial && survivor_live_bytes.saturating_mul(10) >= prev_copied * 9 {
+        PROMOTE_LOCK.with(|l| l.set(true));
+        UNLOCK_STREAK.with(|s| s.set(0));
+        RAISE_STREAK.with(|s| s.set(0));
+        set_survivals(current, 1, eden_live_bytes, "lock");
+        return;
+    }
+
+    let target = compute_target_survivals(eden_live_bytes, desired);
     let next = if target < current {
         RAISE_STREAK.with(|s| s.set(0));
         target
@@ -115,17 +183,22 @@ pub(super) fn retune_after_scavenge(eden_live_bytes: usize) {
         RAISE_STREAK.with(|s| s.set(0));
         current
     };
-    if next != current {
-        TENURING_SURVIVALS.with(|s| s.set(next));
-        if std::env::var_os("PERRY_GC_DIAG").is_some() {
-            eprintln!(
-                "[gc-tenuring] survivals {} -> {} (eden_live_bytes={} desired={})",
-                current,
-                next,
-                eden_live_bytes,
-                desired_survivor_bytes()
-            );
-        }
+    set_survivals(current, next, eden_live_bytes, "occupancy");
+}
+
+fn set_survivals(current: u8, next: u8, eden_live_bytes: usize, why: &str) {
+    if next == current {
+        return;
+    }
+    TENURING_SURVIVALS.with(|s| s.set(next));
+    if std::env::var_os("PERRY_GC_DIAG").is_some() {
+        eprintln!(
+            "[gc-tenuring] survivals {} -> {} ({why}, eden_live_bytes={} desired={})",
+            current,
+            next,
+            eden_live_bytes,
+            desired_survivor_bytes()
+        );
     }
 }
 
@@ -133,6 +206,9 @@ pub(super) fn retune_after_scavenge(eden_live_bytes: usize) {
 pub(super) fn reset_for_test() {
     TENURING_SURVIVALS.with(|s| s.set(GC_TENURING_SURVIVALS_MAX));
     RAISE_STREAK.with(|s| s.set(0));
+    PROMOTE_LOCK.with(|l| l.set(false));
+    UNLOCK_STREAK.with(|s| s.set(0));
+    PREV_COPIED_BYTES.with(|c| c.set(0));
 }
 
 #[cfg(test)]
@@ -160,23 +236,23 @@ mod tests {
         assert_eq!(tenuring_survivals(), 4);
 
         // Heavy influx: instant drop to 1.
-        retune_after_scavenge(desired * 2);
+        retune_after_scavenge(desired * 2, 0, 0);
         assert_eq!(tenuring_survivals(), 1);
 
         // One quiet cycle: no rise yet (debounce).
-        retune_after_scavenge(0);
+        retune_after_scavenge(0, 0, 0);
         assert_eq!(tenuring_survivals(), 1);
         // Second quiet cycle: rise by exactly one step, not to the target.
-        retune_after_scavenge(0);
+        retune_after_scavenge(0, 0, 0);
         assert_eq!(tenuring_survivals(), 2);
 
         // Heavy again: streak resets and threshold drops straight back.
-        retune_after_scavenge(desired * 2);
+        retune_after_scavenge(desired * 2, 0, 0);
         assert_eq!(tenuring_survivals(), 1);
 
         // Sustained quiet recovers to the ceiling two cycles per step.
         for _ in 0..6 {
-            retune_after_scavenge(0);
+            retune_after_scavenge(0, 0, 0);
         }
         assert_eq!(tenuring_survivals(), 4);
         reset_for_test();
@@ -187,8 +263,64 @@ mod tests {
         reset_for_test();
         let heavy = desired_survivor_bytes() + desired_survivor_bytes() / 16;
         for _ in 0..10 {
-            retune_after_scavenge(heavy);
+            retune_after_scavenge(heavy, 0, 0);
             assert_eq!(tenuring_survivals(), 1);
+        }
+        reset_for_test();
+    }
+
+    #[test]
+    fn survival_rate_lock_breaks_a_saturated_pipeline() {
+        reset_for_test();
+        let d = desired_survivor_bytes();
+        // tree.ts steady state: influx sits JUST under desired (occupancy
+        // alone settles at S=2), the survivor space holds 3 cohorts, and
+        // 100% of every intake comes back out alive.
+        let influx = d - 64;
+        retune_after_scavenge(influx, 3 * d, 3 * d);
+        assert_eq!(
+            tenuring_survivals(),
+            2,
+            "first cycle has no prior intake to rate, so occupancy decides"
+        );
+        retune_after_scavenge(influx, 3 * d, 3 * d);
+        assert_eq!(
+            tenuring_survivals(),
+            1,
+            "a substantial intake that fully survives its round must lock promote-on-first-copy"
+        );
+        // The lock holds through occupancy readings that would say S=2.
+        for _ in 0..5 {
+            retune_after_scavenge(influx, 0, 0);
+            assert_eq!(tenuring_survivals(), 1);
+        }
+        // Quiet influx exits the lock after the debounce, resuming the
+        // ladder one step up rather than snapping to the ceiling.
+        retune_after_scavenge(0, 0, 0);
+        assert_eq!(tenuring_survivals(), 1);
+        retune_after_scavenge(0, 0, 0);
+        assert_eq!(tenuring_survivals(), 2);
+        for _ in 0..4 {
+            retune_after_scavenge(0, 0, 0);
+        }
+        assert_eq!(tenuring_survivals(), 4);
+        reset_for_test();
+    }
+
+    #[test]
+    fn dying_survivor_cohorts_do_not_lock() {
+        reset_for_test();
+        let d = desired_survivor_bytes();
+        // Medium-lived objects: a substantial intake of which only half
+        // survives its survivor round. Aging is filtering — the lock must
+        // stay out and the occupancy ladder must decide.
+        for _ in 0..6 {
+            retune_after_scavenge(d / 2, d / 2, d / 4);
+            assert!(
+                tenuring_survivals() >= 3,
+                "a cohort that dies in the survivor space must keep aging (got {})",
+                tenuring_survivals()
+            );
         }
         reset_for_test();
     }

@@ -1268,7 +1268,11 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
         trace.capture_layout_scans();
     }
     maybe_schedule_old_reclaim_after_copied_minor();
-    retune_after_scavenge(collector.stats.eden_live_bytes);
+    retune_after_scavenge(
+        collector.stats.eden_live_bytes,
+        collector.stats.copied_bytes,
+        collector.stats.survivor_live_bytes,
+    );
     if std::env::var_os("PERRY_GC_DIAG").is_some() {
         eprintln!(
             "[gc-copy-minor] ran copied_objects={} copied_bytes={} promoted_objects={} promoted_bytes={} freed_bytes={} tenuring_survivals={} eden_live_bytes={} trigger={:?} declared_safepoint={}",
