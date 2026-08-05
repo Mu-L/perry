@@ -31,11 +31,14 @@ because it is good discipline, not because the artifacts are related.
 
 ## What is measured
 
-Eight probes in `probes/`, each a deterministic TypeScript workload that drives
-a different part of the collector: nursery churn with a zero live set, survivor
-aging and promotion, old-to-young stores and the remembered set, dead objects
-left under a deep stack high-water mark, closure environments, heap strings,
-array element-storage growth, and Map/Set side tables.
+Twelve probes in `probes/`, each a deterministic TypeScript workload that
+drives a different part of the collector: nursery churn with a zero live set,
+survivor aging and promotion, old-to-young stores and the remembered set, dead
+objects left under a deep stack high-water mark, closure environments, heap
+strings, array element-storage growth, Map/Set side tables, try/catch rooting,
+receiver stores across allocation points, collection under stack depth, and a
+~100 MB live set held across many collections (the shape that catches
+survivor-space saturation — every other probe's live set is small).
 
 Every probe parks its allocations in a heap container before dropping them. This
 is load-bearing. An earlier draft allocated into locals that never escaped, LLVM
