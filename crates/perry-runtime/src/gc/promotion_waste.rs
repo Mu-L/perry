@@ -59,9 +59,15 @@ thread_local! {
 /// promoted objects dying is not a regime signal.
 const WASTE_SUBSTANTIAL_BYTES: usize = 8 * 1024 * 1024;
 
-/// Engage the veto when at least this share of a substantial promotion
-/// window died by the next full.
-const WASTE_VETO_DIED_PCT: usize = 50;
+/// Engage the veto only on NEAR-TOTAL waste. The live-set-bound regime
+/// this veto exists for (tree.ts) measures 98-100% of each promotion
+/// window dead by the next full; mixed workloads that interleave a
+/// permanently-accumulating structure with transient churn
+/// (12_large_live_set) produce mid-range ratios, and a 50% bar made the
+/// veto flap there — the gc-ratchet caught +19% promoted / +13% RSS /
+/// +14% wall on that probe, which is precisely the workload the veto
+/// must never touch.
+const WASTE_VETO_DIED_PCT: usize = 90;
 
 /// Release requires post-full young live to exceed the ratcheting max by
 /// this ratio (5/4) on [`RELEASE_TRIP_WINDOWS`] CONSECUTIVE fulls: the
