@@ -120,17 +120,6 @@ pub(super) fn desired_survivor_bytes() -> usize {
     scavenge_nursery_cap_effective_bytes() / 16
 }
 
-/// Hard per-cycle valve: once a single cycle has copied this many bytes
-/// into the to-survivor space, `move_young` promotes the remainder of the
-/// cycle directly (HotSpot's to-space overflow behaviour). This bounds the
-/// one-time copy burst of the *first* heavy cycle, before the feedback
-/// loop has a signal — e.g. a program materialising a 16 MB live cohort in
-/// its first Eden fill would otherwise copy all 16 MB into a survivor
-/// space only to promote it a cycle later.
-pub(super) fn survivor_overflow_bytes() -> usize {
-    desired_survivor_bytes().saturating_mul(4)
-}
-
 pub(super) fn compute_target_survivals(eden_live_bytes: usize, desired_bytes: usize) -> u8 {
     if eden_live_bytes == 0 {
         return GC_TENURING_SURVIVALS_MAX;

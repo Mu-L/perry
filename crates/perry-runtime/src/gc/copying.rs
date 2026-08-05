@@ -387,11 +387,13 @@ pub(super) struct CopyingNurseryCollector {
     pub(super) stats: CopyingNurseryTraceStats,
     pub(super) live_from_bytes: usize,
     /// Per-cycle snapshot of the adaptive tenuring threshold (gc/tenuring.rs)
-    /// so every object in one cycle sees the same policy.
+    /// so every object in one cycle sees the same policy. Deliberately the
+    /// ONLY per-cycle promotion input: an earlier mid-cycle overflow valve
+    /// ("stop copying once N bytes are in to-space") made the
+    /// copied/promoted split depend on root traversal order, which is
+    /// address-dependent — the gc-ratchet's bit-identical-counters contract
+    /// caught it as a ±2-object jitter on the first heavy cycle.
     pub(super) tenuring_survivals: u8,
-    /// Per-cycle to-survivor copy budget; once exceeded, the rest of the
-    /// cycle promotes directly (to-space overflow valve).
-    pub(super) survivor_overflow_bytes: usize,
     /// Weak target slots (WeakRef referent / WeakMap-WeakSet entry key /
     /// FinalizationRegistry record target) seen during the copy scan. The
     /// scan must NOT evacuate through them (that would strengthen the weak
@@ -421,7 +423,6 @@ impl CopyingNurseryCollector {
             },
             live_from_bytes: 0,
             tenuring_survivals,
-            survivor_overflow_bytes: survivor_overflow_bytes(),
             weak_slots: Vec::new(),
         }
     }
@@ -595,12 +596,10 @@ impl CopyingNurseryCollector {
         let prior_age = copied_survival_age((*header)._reserved, flags);
         let next_age = prior_age.saturating_add(1);
         // Adaptive tenuring (gc/tenuring.rs): the survivals threshold is
-        // re-derived from survivor influx after every cycle, and the overflow
-        // valve bounds a single cycle's copy burst before the feedback loop
-        // has its first signal.
-        let promote = flags & GC_FLAG_TENURED != 0
-            || next_age >= self.tenuring_survivals
-            || self.stats.copied_bytes >= self.survivor_overflow_bytes;
+        // re-derived from survivor influx after every cycle. The decision is
+        // purely per-object (flags + age) so the copied/promoted split stays
+        // deterministic regardless of root traversal order.
+        let promote = flags & GC_FLAG_TENURED != 0 || next_age >= self.tenuring_survivals;
         let new_user = if promote {
             crate::arena::arena_alloc_gc_old(payload, 8, (*header).obj_type)
         } else {
