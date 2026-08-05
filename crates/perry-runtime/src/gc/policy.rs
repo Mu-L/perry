@@ -1255,11 +1255,13 @@ pub(super) fn finish_full_old_reclaim_baseline() {
     // #7438: judge the promotion window this full closes — promoted bytes
     // old-gen did not retain were wasted moves (and wasted old-gen
     // committed high-water).
-    super::promotion_waste::note_full_collection_outcome(
-        old_in_use,
-        prev_baseline,
-        crate::arena::copying_from_space_in_use_bytes(),
-    );
+    let young_live_now = crate::arena::copying_from_space_in_use_bytes();
+    super::promotion_waste::note_full_collection_outcome(old_in_use, prev_baseline, young_live_now);
+    // #7438: fulls must feed the nursery cap scale too — under the
+    // promotion-waste veto they are the only collections running, and a
+    // frozen scale collapses the collection cadence (see
+    // `retune_cap_scale_from_full`).
+    super::tenuring::retune_cap_scale_from_full(young_live_now);
     // Record the TOTAL post-full live set for major-GC pacing (young+old): the
     // full sweep is the only collection that frees forwarding stubs, so this is
     // the "clean" size the arena returns to and the base for the K× growth gate.

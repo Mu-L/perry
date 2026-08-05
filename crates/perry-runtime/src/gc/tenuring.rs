@@ -207,6 +207,18 @@ pub(super) fn retune_after_scavenge(
 /// Shrink one step when influx falls below 1% for two consecutive cycles.
 /// The 4%/1% band is wide enough that the scale cannot oscillate on a
 /// steady workload (growing halves the observed ratio, 4%/2 = 2% > 1%).
+/// Feed the cap-scale ladder from a FULL collection's post-collection young
+/// live bytes (#7438). The scale normally retunes on copying minors, but
+/// under the promotion-waste veto no copying minor runs at all — the scale
+/// froze at whatever the transient reached (×1/×2), halving-to-quartering
+/// the effective cap and with it the full-collection cadence (measured:
+/// tree.ts 10.0 s -> 29.7 s wall the moment the veto held). A full's
+/// surviving young live set is the same "objects are surviving; give them
+/// room" signal that scavenge influx is.
+pub(super) fn retune_cap_scale_from_full(young_live_bytes: usize) {
+    retune_nursery_cap_scale(young_live_bytes);
+}
+
 fn retune_nursery_cap_scale(eden_live_bytes: usize) {
     let cap = scavenge_nursery_cap_effective_bytes();
     let scale = NURSERY_CAP_SCALE.with(Cell::get);
