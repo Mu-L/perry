@@ -48,6 +48,9 @@ thread_local! {
     /// reads that natural growth as retain-like accumulation, releasing
     /// the veto exactly when it matters (measured: 133 -> 192 MB peak RSS).
     static YOUNG_LIVE_MAX_WHILE_VETOED: Cell<usize> = const { Cell::new(0) };
+    /// Consecutive vetoed fulls whose post-full young live exceeded the
+    /// ratcheting max by the release ratio.
+    static RELEASE_TRIP_STREAK: Cell<u8> = const { Cell::new(0) };
 }
 
 /// Don't judge waste on less than this much promotion — a few stray
@@ -58,12 +61,19 @@ const WASTE_SUBSTANTIAL_BYTES: usize = 8 * 1024 * 1024;
 /// window died by the next full.
 const WASTE_VETO_DIED_PCT: usize = 50;
 
-/// Release the veto when post-full young live bytes have grown past this
-/// multiple of their level at engagement: the young generation is
-/// ACCUMULATING (retain-like permanence), so promotion pays again. A
-/// live-set-bound workload (tree-like) oscillates flat and never trips it.
-const RELEASE_GROWTH_NUM: usize = 3;
-const RELEASE_GROWTH_DEN: usize = 2;
+/// Release requires post-full young live to exceed the ratcheting max by
+/// this ratio (5/4) on [`RELEASE_TRIP_WINDOWS`] CONSECUTIVE fulls: the
+/// young generation is ACCUMULATING (retain-like permanence), so
+/// promotion pays again. Two windows are load-bearing — a single window
+/// cannot distinguish accumulation from one live structure still being
+/// BUILT (tree.ts grows 14.7 -> 34.6 MB across the engagement window,
+/// 2.35×, then oscillates flat; measured releases at both a frozen and a
+/// ratcheting single-window reference put peak RSS straight back to
+/// 192 MB). Linear accumulation keeps tripping because the max only
+/// ratchets to the tripping value, not past it.
+const RELEASE_GROWTH_NUM: usize = 5;
+const RELEASE_GROWTH_DEN: usize = 4;
+const RELEASE_TRIP_WINDOWS: u8 = 2;
 
 pub(super) fn note_promoted_bytes(bytes: usize) {
     if bytes != 0 {
@@ -96,20 +106,39 @@ pub(super) fn note_full_collection_outcome(
     let promoted = PROMOTED_SINCE_FULL.with(|c| c.replace(0));
     if PROMOTION_WASTE_VETO.with(Cell::get) && promoted < WASTE_SUBSTANTIAL_BYTES {
         // Vetoed and no fresh promotion evidence: evaluate release from the
-        // young-live trajectory against the ratcheting max.
+        // young-live trajectory against the ratcheting max, debounced.
         let max_seen = YOUNG_LIVE_MAX_WHILE_VETOED.with(Cell::get);
-        let release = young_live_now < WASTE_SUBSTANTIAL_BYTES
-            || young_live_now.saturating_mul(RELEASE_GROWTH_DEN)
-                > max_seen.saturating_mul(RELEASE_GROWTH_NUM);
-        if release {
+        if young_live_now < WASTE_SUBSTANTIAL_BYTES {
             PROMOTION_WASTE_VETO.with(|v| v.set(false));
+            RELEASE_TRIP_STREAK.with(|c| c.set(0));
             if std::env::var_os("PERRY_GC_DIAG").is_some() {
                 eprintln!(
-                    "[gc-promotion-waste] veto released (young_live={} max_seen={})",
-                    young_live_now, max_seen
+                    "[gc-promotion-waste] veto released (young_live={} tiny)",
+                    young_live_now
                 );
             }
-        } else if young_live_now > max_seen {
+            return;
+        }
+        let tripped = young_live_now.saturating_mul(RELEASE_GROWTH_DEN)
+            > max_seen.saturating_mul(RELEASE_GROWTH_NUM);
+        if tripped {
+            let streak = RELEASE_TRIP_STREAK.with(|c| c.get()).saturating_add(1);
+            if streak >= RELEASE_TRIP_WINDOWS {
+                PROMOTION_WASTE_VETO.with(|v| v.set(false));
+                RELEASE_TRIP_STREAK.with(|c| c.set(0));
+                if std::env::var_os("PERRY_GC_DIAG").is_some() {
+                    eprintln!(
+                        "[gc-promotion-waste] veto released (young_live={} max_seen={} sustained growth)",
+                        young_live_now, max_seen
+                    );
+                }
+                return;
+            }
+            RELEASE_TRIP_STREAK.with(|c| c.set(streak));
+        } else {
+            RELEASE_TRIP_STREAK.with(|c| c.set(0));
+        }
+        if young_live_now > max_seen {
             YOUNG_LIVE_MAX_WHILE_VETOED.with(|c| c.set(young_live_now));
         }
         return;
@@ -126,6 +155,7 @@ pub(super) fn note_full_collection_outcome(
     let was = PROMOTION_WASTE_VETO.with(|v| v.replace(veto));
     if veto && !was {
         YOUNG_LIVE_MAX_WHILE_VETOED.with(|c| c.set(young_live_now));
+        RELEASE_TRIP_STREAK.with(|c| c.set(0));
     }
     if was != veto && std::env::var_os("PERRY_GC_DIAG").is_some() {
         eprintln!(
@@ -151,6 +181,7 @@ pub(super) fn promotion_waste_reset_for_test() {
     PROMOTED_SINCE_FULL.with(|c| c.set(0));
     PROMOTION_WASTE_VETO.with(|v| v.set(false));
     YOUNG_LIVE_MAX_WHILE_VETOED.with(|c| c.set(0));
+    RELEASE_TRIP_STREAK.with(|c| c.set(0));
 }
 
 #[cfg(test)]
@@ -209,18 +240,24 @@ mod tests {
                 "flat young must stay vetoed"
             );
         }
-        // Growth within 1.5× of the ratcheting max must NOT release (the
-        // engagement point is usually mid-growth of the live set).
-        note_full_collection_outcome(2 * MB, 2 * MB, 45 * MB);
-        assert!(
-            promotion_waste_veto_for_test(),
-            "growth within 1.5x of the observed max must stay vetoed"
-        );
-        // retain-like accumulation: young grows past 1.5× the observed max.
+        // ONE tripping window must not release — a live structure still
+        // being built looks exactly like this (tree.ts: 14.7 -> 34.6 MB
+        // across the engagement window, then flat).
         note_full_collection_outcome(2 * MB, 2 * MB, 70 * MB);
         assert!(
+            promotion_waste_veto_for_test(),
+            "a single growth window must stay vetoed"
+        );
+        // ...and after it, flat oscillation resets the streak.
+        note_full_collection_outcome(2 * MB, 2 * MB, 68 * MB);
+        assert!(promotion_waste_veto_for_test());
+        // Sustained accumulation: two CONSECUTIVE tripping windows release.
+        note_full_collection_outcome(2 * MB, 2 * MB, 95 * MB);
+        assert!(promotion_waste_veto_for_test(), "first trip of the pair");
+        note_full_collection_outcome(2 * MB, 2 * MB, 125 * MB);
+        assert!(
             !promotion_waste_veto_for_test(),
-            "young-live growth past 1.5x the max must release the veto"
+            "two consecutive growth windows must release the veto"
         );
         promotion_waste_reset_for_test();
     }
