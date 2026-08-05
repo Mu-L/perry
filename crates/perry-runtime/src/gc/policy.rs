@@ -1251,7 +1251,11 @@ pub(super) fn finish_full_old_reclaim_baseline() {
     // delta in `old_reclaim_pressure_due` stays unit-consistent.
     let old_in_use =
         old_gen_reclaimable_pressure_bytes().saturating_add(external_side_live_bytes());
-    GC_LAST_OLD_RECLAIM_IN_USE_BYTES.with(|bytes| bytes.set(old_in_use));
+    let prev_baseline = GC_LAST_OLD_RECLAIM_IN_USE_BYTES.with(|bytes| bytes.replace(old_in_use));
+    // #7438: judge the promotion window this full closes — promoted bytes
+    // old-gen did not retain were wasted moves (and wasted old-gen
+    // committed high-water).
+    super::promotion_waste::note_full_collection_outcome(old_in_use, prev_baseline);
     // Record the TOTAL post-full live set for major-GC pacing (young+old): the
     // full sweep is the only collection that frees forwarding stubs, so this is
     // the "clean" size the arena returns to and the base for the K× growth gate.
@@ -2201,7 +2205,10 @@ fn gc_start_budgeted_cycle_for_pressure(progress_kind: GcProgressKind) -> Option
             // Major-GC pacing: escalate to a full when arena live-bytes grew
             // past K× the last full's live set — the non-moving minor can't free
             // array-growth forwarding stubs (see `arena_growth_full_escalation_due`).
-            if gen_gc_enabled() && !arena_growth_full_escalation_due() {
+            if gen_gc_enabled()
+                && !arena_growth_full_escalation_due()
+                && !super::promotion_waste::promotion_waste_full_escalation_due()
+            {
                 gc_start_budgeted_minor_fallback_cycle(
                     GcTriggerKind::ArenaBytes,
                     rebaseline,
@@ -2216,7 +2223,10 @@ fn gc_start_budgeted_cycle_for_pressure(progress_kind: GcProgressKind) -> Option
                 pre_count: malloc_object_count(),
             };
             // Major-GC pacing (malloc-count trigger twin of the ArenaBytes branch).
-            if gen_gc_enabled() && !arena_growth_full_escalation_due() {
+            if gen_gc_enabled()
+                && !arena_growth_full_escalation_due()
+                && !super::promotion_waste::promotion_waste_full_escalation_due()
+            {
                 gc_start_budgeted_minor_fallback_cycle(
                     GcTriggerKind::MallocCount,
                     rebaseline,

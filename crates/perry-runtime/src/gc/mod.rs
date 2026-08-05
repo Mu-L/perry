@@ -86,6 +86,8 @@ mod dead_owner;
 mod old_free;
 use old_free::*;
 pub(crate) use old_free::{old_free_bytes, old_free_filter_range, old_free_take_exact};
+mod promotion_waste;
+use promotion_waste::*;
 mod tenuring;
 use tenuring::*;
 mod oldgen;
@@ -171,7 +173,7 @@ pub(super) fn gc_collect_minor_with_trigger(trigger: GcTriggerSnapshot) -> GcCol
     // only a full mark-sweep reclaims stubs. Escalate to a full once the arena's
     // live bytes exceed K× the last full's live set (belt-and-suspenders for
     // callers that reach a minor outside the budgeted pressure path).
-    if arena_growth_full_escalation_due() {
+    if arena_growth_full_escalation_due() || promotion_waste_full_escalation_due() {
         let outcome =
             gc_collect_full_mark_sweep_with_trigger(GcTriggerSnapshot::capture(trigger.kind));
         restore_minor_in_alloc(prev_in_alloc);

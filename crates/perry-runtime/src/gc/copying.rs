@@ -1272,6 +1272,7 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
         collector.stats.copied_bytes,
         collector.stats.survivor_live_bytes,
     );
+    note_promoted_bytes(collector.stats.promoted_bytes);
     if std::env::var_os("PERRY_GC_DIAG").is_some() {
         eprintln!(
             "[gc-copy-minor] ran copied_objects={} copied_bytes={} promoted_objects={} promoted_bytes={} freed_bytes={} tenuring_survivals={} eden_live_bytes={} trigger={:?} declared_safepoint={}",
