@@ -743,9 +743,41 @@ pub(super) fn test_malloc_trim_call_count() -> usize {
     TEST_MALLOC_TRIM_CALLS.with(Cell::get)
 }
 
-#[cfg(all(test, any(target_env = "gnu", target_os = "macos")))]
+#[cfg(test)]
 fn record_test_malloc_trim_call() {
     TEST_MALLOC_TRIM_CALLS.with(|calls| calls.set(calls.get().saturating_add(1)));
+}
+
+// Two counters, because they are two different claims and only one of them is
+// portable. `..._CALLS` witnesses that budgeted reclaim REACHED the trim call —
+// #6180's actual subject, since the bug was `ordinary_budgeted` skipping it —
+// and holds on every target. `..._EXECUTED` witnesses that a trim primitive
+// actually ran, which is only meaningful where one exists.
+//
+// Counting only the executing arms made the gate unsatisfiable on Windows and
+// musl (#7356). Counting only reaches would have quietly dropped the stronger
+// property on glibc/macOS, where nothing today separates reaching from
+// executing but a future early return would. Keeping both means neither
+// platform's gate asserts something it cannot see, and neither asserts less
+// than it could.
+#[cfg(all(test, any(target_env = "gnu", target_os = "macos")))]
+thread_local! {
+    static TEST_MALLOC_TRIM_EXECUTED: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(all(test, any(target_env = "gnu", target_os = "macos")))]
+pub(super) fn reset_test_malloc_trim_executed_count() {
+    TEST_MALLOC_TRIM_EXECUTED.with(|calls| calls.set(0));
+}
+
+#[cfg(all(test, any(target_env = "gnu", target_os = "macos")))]
+pub(super) fn test_malloc_trim_executed_count() -> usize {
+    TEST_MALLOC_TRIM_EXECUTED.with(Cell::get)
+}
+
+#[cfg(all(test, any(target_env = "gnu", target_os = "macos")))]
+fn record_test_malloc_trim_executed() {
+    TEST_MALLOC_TRIM_EXECUTED.with(|calls| calls.set(calls.get().saturating_add(1)));
 }
 
 fn run_malloc_trim(_progress_kind: GcProgressKind) -> MallocTrimOutcome {
@@ -755,10 +787,19 @@ fn run_malloc_trim(_progress_kind: GcProgressKind) -> MallocTrimOutcome {
     // the OS (2026-07-09 audit finding). Trim runs at Reclaim, outside the
     // atomic tail, and is itself bounded allocator maintenance.
 
+    // The test counter records that budgeted reclaim REACHED this call (the
+    // #6180 subject — the old bug was skipping it with `ordinary_budgeted`),
+    // not that the platform executed a trim: on targets with no trim
+    // primitive (Windows, musl) the outcome below is `Unsupported`, and
+    // counting only the executing arms made the gate impossible to satisfy
+    // there (#7356).
+    #[cfg(test)]
+    record_test_malloc_trim_call();
+
     #[cfg(target_env = "gnu")]
     {
         #[cfg(test)]
-        record_test_malloc_trim_call();
+        record_test_malloc_trim_executed();
 
         let start = Instant::now();
         unsafe {
@@ -774,7 +815,7 @@ fn run_malloc_trim(_progress_kind: GcProgressKind) -> MallocTrimOutcome {
     #[cfg(target_os = "macos")]
     {
         #[cfg(test)]
-        record_test_malloc_trim_call();
+        record_test_malloc_trim_executed();
 
         // Darwin counterpart of glibc's malloc_trim: ask every malloc zone
         // to return clean pages to the OS. Bounded allocator maintenance —
