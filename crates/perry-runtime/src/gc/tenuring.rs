@@ -110,8 +110,7 @@ pub(super) fn tenuring_survivals() -> u8 {
 /// The scale grows only while survivor influx stays a heavy fraction of
 /// Eden, so the small-live-set workloads #7377 fixed never leave 16 MB.
 pub(super) fn scavenge_nursery_cap_effective_bytes() -> usize {
-    gc_scavenge_nursery_cap_bytes()
-        .saturating_mul(NURSERY_CAP_SCALE.with(Cell::get) as usize)
+    gc_scavenge_nursery_cap_bytes().saturating_mul(NURSERY_CAP_SCALE.with(Cell::get) as usize)
 }
 
 /// Target steady-state survivor occupancy: 1/16 of the effective nursery
