@@ -70,6 +70,13 @@ pub(super) const GC_TENURING_SURVIVALS_MAX: u8 = GC_COPY_PROMOTION_SURVIVALS;
 /// before it is raised (by one step).
 const RAISE_DEBOUNCE_CYCLES: u8 = 2;
 
+/// Ceiling for the influx-driven nursery cap scale: 16 MB × 4 = 64 MB.
+/// Bounds the young-gen RSS contribution on live-set-bound workloads while
+/// still cutting their collection count 4× (each collection carries a fixed
+/// root-scan/remembered-set/eligibility cost that dominates once the
+/// adaptive threshold has eliminated the re-copying).
+const NURSERY_CAP_SCALE_MAX: u8 = 4;
+
 thread_local! {
     static TENURING_SURVIVALS: Cell<u8> = const { Cell::new(GC_TENURING_SURVIVALS_MAX) };
     static RAISE_STREAK: Cell<u8> = const { Cell::new(0) };
@@ -79,6 +86,11 @@ thread_local! {
     /// Bytes the previous copying minor put into the to-survivor space —
     /// the denominator of this cycle's survival rate.
     static PREV_COPIED_BYTES: Cell<usize> = const { Cell::new(0) };
+    /// Influx-driven multiplier (1, 2, or 4) applied to the scavenge nursery
+    /// cap. Power of two; grows/shrinks one step at a time, debounced.
+    static NURSERY_CAP_SCALE: Cell<u8> = const { Cell::new(1) };
+    static CAP_GROW_STREAK: Cell<u8> = const { Cell::new(0) };
+    static CAP_SHRINK_STREAK: Cell<u8> = const { Cell::new(0) };
 }
 
 /// The survivals threshold the next copying minor should promote at:
@@ -89,11 +101,24 @@ pub(super) fn tenuring_survivals() -> u8 {
     TENURING_SURVIVALS.with(Cell::get)
 }
 
-/// Target steady-state survivor occupancy. `desired / 16` of the nursery
-/// cap tracks `PERRY_GC_SCAVENGE_NURSERY_MB` so the two dials stay
-/// proportional.
+/// The effective scavenge nursery cap: the configured base
+/// (`PERRY_GC_SCAVENGE_NURSERY_MB`, default 16 MB) times the influx-driven
+/// scale. A fixed cap sets collection frequency independently of how much
+/// survives; on live-set-bound workloads (tree/retain/deeplist shapes) that
+/// multiplies the per-collection fixed cost by an enormous collection
+/// count AND promotes objects that a larger Eden would have let die young.
+/// The scale grows only while survivor influx stays a heavy fraction of
+/// Eden, so the small-live-set workloads #7377 fixed never leave 16 MB.
+pub(super) fn scavenge_nursery_cap_effective_bytes() -> usize {
+    gc_scavenge_nursery_cap_bytes()
+        .saturating_mul(NURSERY_CAP_SCALE.with(Cell::get) as usize)
+}
+
+/// Target steady-state survivor occupancy: 1/16 of the effective nursery
+/// cap, so the tenuring dials track both the configured base and the
+/// influx-driven scale.
 pub(super) fn desired_survivor_bytes() -> usize {
-    gc_scavenge_nursery_cap_bytes() / 16
+    scavenge_nursery_cap_effective_bytes() / 16
 }
 
 /// Hard per-cycle valve: once a single cycle has copied this many bytes
@@ -127,6 +152,7 @@ pub(super) fn retune_after_scavenge(
     copied_bytes: usize,
     survivor_live_bytes: usize,
 ) {
+    retune_nursery_cap_scale(eden_live_bytes);
     let desired = desired_survivor_bytes();
     let substantial = desired / 4;
     let prev_copied = PREV_COPIED_BYTES.with(|c| c.replace(copied_bytes));
@@ -186,6 +212,54 @@ pub(super) fn retune_after_scavenge(
     set_survivals(current, next, eden_live_bytes, "occupancy");
 }
 
+/// Grow the nursery cap one ×2 step (to at most ×4) when survivor influx
+/// exceeds 4% of the current effective cap for two consecutive cycles —
+/// objects are surviving because they aren't getting time to die, so a
+/// bigger Eden both cuts the collection count and lets them die young.
+/// Shrink one step when influx falls below 1% for two consecutive cycles.
+/// The 4%/1% band is wide enough that the scale cannot oscillate on a
+/// steady workload (growing halves the observed ratio, 4%/2 = 2% > 1%).
+fn retune_nursery_cap_scale(eden_live_bytes: usize) {
+    let cap = scavenge_nursery_cap_effective_bytes();
+    let scale = NURSERY_CAP_SCALE.with(Cell::get);
+    if eden_live_bytes > cap / 25 {
+        CAP_SHRINK_STREAK.with(|s| s.set(0));
+        if scale < NURSERY_CAP_SCALE_MAX {
+            let streak = CAP_GROW_STREAK.with(|s| s.get()).saturating_add(1);
+            if streak >= RAISE_DEBOUNCE_CYCLES {
+                CAP_GROW_STREAK.with(|s| s.set(0));
+                NURSERY_CAP_SCALE.with(|s| s.set(scale * 2));
+                diag_cap_scale(scale, scale * 2, eden_live_bytes);
+            } else {
+                CAP_GROW_STREAK.with(|s| s.set(streak));
+            }
+        }
+    } else if eden_live_bytes < cap / 100 {
+        CAP_GROW_STREAK.with(|s| s.set(0));
+        if scale > 1 {
+            let streak = CAP_SHRINK_STREAK.with(|s| s.get()).saturating_add(1);
+            if streak >= RAISE_DEBOUNCE_CYCLES {
+                CAP_SHRINK_STREAK.with(|s| s.set(0));
+                NURSERY_CAP_SCALE.with(|s| s.set(scale / 2));
+                diag_cap_scale(scale, scale / 2, eden_live_bytes);
+            } else {
+                CAP_SHRINK_STREAK.with(|s| s.set(streak));
+            }
+        }
+    } else {
+        CAP_GROW_STREAK.with(|s| s.set(0));
+        CAP_SHRINK_STREAK.with(|s| s.set(0));
+    }
+}
+
+fn diag_cap_scale(from: u8, to: u8, eden_live_bytes: usize) {
+    if std::env::var_os("PERRY_GC_DIAG").is_some() {
+        eprintln!(
+            "[gc-tenuring] nursery cap scale {from}x -> {to}x (eden_live_bytes={eden_live_bytes})"
+        );
+    }
+}
+
 fn set_survivals(current: u8, next: u8, eden_live_bytes: usize, why: &str) {
     if next == current {
         return;
@@ -209,6 +283,9 @@ pub(super) fn reset_for_test() {
     PROMOTE_LOCK.with(|l| l.set(false));
     UNLOCK_STREAK.with(|s| s.set(0));
     PREV_COPIED_BYTES.with(|c| c.set(0));
+    NURSERY_CAP_SCALE.with(|s| s.set(1));
+    CAP_GROW_STREAK.with(|s| s.set(0));
+    CAP_SHRINK_STREAK.with(|s| s.set(0));
 }
 
 #[cfg(test)]
@@ -261,11 +338,21 @@ mod tests {
     #[test]
     fn steady_heavy_influx_is_a_fixed_point() {
         reset_for_test();
-        let heavy = desired_survivor_bytes() + desired_survivor_bytes() / 16;
+        // Heavy relative to the cap-scale CEILING (desired is cap/16, so at
+        // the ×4 ceiling desired is base/4): the threshold must pin at 1 on
+        // every cycle even while the cap scale walks up underneath it. An
+        // influx only marginally above the base desired is a different case:
+        // the growing cap re-classifies it as moderate, which is correct.
+        let heavy = gc_scavenge_nursery_cap_bytes();
         for _ in 0..10 {
             retune_after_scavenge(heavy, 0, 0);
             assert_eq!(tenuring_survivals(), 1);
         }
+        assert_eq!(
+            scavenge_nursery_cap_effective_bytes(),
+            gc_scavenge_nursery_cap_bytes() * NURSERY_CAP_SCALE_MAX as usize,
+            "sustained heavy influx must also walk the cap to its ceiling"
+        );
         reset_for_test();
     }
 
@@ -304,6 +391,37 @@ mod tests {
             retune_after_scavenge(0, 0, 0);
         }
         assert_eq!(tenuring_survivals(), 4);
+        reset_for_test();
+    }
+
+    #[test]
+    fn cap_scale_grows_on_heavy_influx_and_shrinks_when_quiet() {
+        reset_for_test();
+        let base = gc_scavenge_nursery_cap_bytes();
+        assert_eq!(scavenge_nursery_cap_effective_bytes(), base);
+        // Influx above 4% of the cap: one debounce cycle, then a ×2 step.
+        retune_after_scavenge(base / 15, 0, 0);
+        assert_eq!(scavenge_nursery_cap_effective_bytes(), base);
+        retune_after_scavenge(base / 15, 0, 0);
+        assert_eq!(scavenge_nursery_cap_effective_bytes(), base * 2);
+        // Growth halves the observed ratio into the dead band: stable.
+        retune_after_scavenge(base / 15, 0, 0);
+        retune_after_scavenge(base / 15, 0, 0);
+        assert_eq!(scavenge_nursery_cap_effective_bytes(), base * 2);
+        // Heavier influx reaches the ×4 ceiling and stops there.
+        for _ in 0..4 {
+            retune_after_scavenge(base, 0, 0);
+        }
+        assert_eq!(scavenge_nursery_cap_effective_bytes(), base * 4);
+        // Quiet influx walks back one step at a time.
+        for _ in 0..2 {
+            retune_after_scavenge(0, 0, 0);
+        }
+        assert_eq!(scavenge_nursery_cap_effective_bytes(), base * 2);
+        for _ in 0..2 {
+            retune_after_scavenge(0, 0, 0);
+        }
+        assert_eq!(scavenge_nursery_cap_effective_bytes(), base);
         reset_for_test();
     }
 

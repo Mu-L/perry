@@ -131,7 +131,12 @@ pub(super) fn effective_next_arena_trigger() -> usize {
     if GC_NURSERY_CAP_TEST_SUPPRESSED.with(Cell::get) {
         return base;
     }
-    base.min(gc_scavenge_nursery_cap_bytes())
+    // The cap the clamp applies is the *effective* one: the configured base
+    // times the influx-driven scale from gc/tenuring.rs, which grows it
+    // (bounded, ×2 steps) on live-set-bound workloads where a fixed 16 MB
+    // multiplies the per-collection fixed cost by an enormous collection
+    // count. Small-live-set workloads never leave the base value.
+    base.min(super::tenuring::scavenge_nursery_cap_effective_bytes())
 }
 
 /// Nursery high-water cap used only when `PERRY_GC_SCAVENGE` is on (default
