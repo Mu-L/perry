@@ -40,9 +40,14 @@ thread_local! {
     /// baseline finisher ran.
     static PROMOTED_SINCE_FULL: Cell<usize> = const { Cell::new(0) };
     static PROMOTION_WASTE_VETO: Cell<bool> = const { Cell::new(false) };
-    /// Post-full young live bytes at the moment the veto engaged — the
-    /// reference for the retain-like release condition.
-    static YOUNG_LIVE_AT_VETO: Cell<usize> = const { Cell::new(0) };
+    /// Highest post-full young live bytes observed while vetoed — the
+    /// reference for the retain-like release condition. A RATCHETING max,
+    /// not the engagement snapshot: the veto usually engages mid-growth of
+    /// the live set (tree.ts engages at 14.7 MB while the tree is still
+    /// being built and later oscillates at ~34 MB), and a frozen reference
+    /// reads that natural growth as retain-like accumulation, releasing
+    /// the veto exactly when it matters (measured: 133 -> 192 MB peak RSS).
+    static YOUNG_LIVE_MAX_WHILE_VETOED: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Don't judge waste on less than this much promotion — a few stray
@@ -91,19 +96,21 @@ pub(super) fn note_full_collection_outcome(
     let promoted = PROMOTED_SINCE_FULL.with(|c| c.replace(0));
     if PROMOTION_WASTE_VETO.with(Cell::get) && promoted < WASTE_SUBSTANTIAL_BYTES {
         // Vetoed and no fresh promotion evidence: evaluate release from the
-        // young-live trajectory.
-        let at_veto = YOUNG_LIVE_AT_VETO.with(Cell::get);
+        // young-live trajectory against the ratcheting max.
+        let max_seen = YOUNG_LIVE_MAX_WHILE_VETOED.with(Cell::get);
         let release = young_live_now < WASTE_SUBSTANTIAL_BYTES
             || young_live_now.saturating_mul(RELEASE_GROWTH_DEN)
-                > at_veto.saturating_mul(RELEASE_GROWTH_NUM);
+                > max_seen.saturating_mul(RELEASE_GROWTH_NUM);
         if release {
             PROMOTION_WASTE_VETO.with(|v| v.set(false));
             if std::env::var_os("PERRY_GC_DIAG").is_some() {
                 eprintln!(
-                    "[gc-promotion-waste] veto released (young_live={} at_veto={})",
-                    young_live_now, at_veto
+                    "[gc-promotion-waste] veto released (young_live={} max_seen={})",
+                    young_live_now, max_seen
                 );
             }
+        } else if young_live_now > max_seen {
+            YOUNG_LIVE_MAX_WHILE_VETOED.with(|c| c.set(young_live_now));
         }
         return;
     }
@@ -118,7 +125,7 @@ pub(super) fn note_full_collection_outcome(
     let veto = died.saturating_mul(100) >= promoted.saturating_mul(WASTE_VETO_DIED_PCT);
     let was = PROMOTION_WASTE_VETO.with(|v| v.replace(veto));
     if veto && !was {
-        YOUNG_LIVE_AT_VETO.with(|c| c.set(young_live_now));
+        YOUNG_LIVE_MAX_WHILE_VETOED.with(|c| c.set(young_live_now));
     }
     if was != veto && std::env::var_os("PERRY_GC_DIAG").is_some() {
         eprintln!(
@@ -143,7 +150,7 @@ pub(super) fn promotion_waste_full_escalation_due() -> bool {
 pub(super) fn promotion_waste_reset_for_test() {
     PROMOTED_SINCE_FULL.with(|c| c.set(0));
     PROMOTION_WASTE_VETO.with(|v| v.set(false));
-    YOUNG_LIVE_AT_VETO.with(|c| c.set(0));
+    YOUNG_LIVE_MAX_WHILE_VETOED.with(|c| c.set(0));
 }
 
 #[cfg(test)]
@@ -202,11 +209,18 @@ mod tests {
                 "flat young must stay vetoed"
             );
         }
-        // retain-like accumulation: young grows past 1.5× the engagement level.
-        note_full_collection_outcome(2 * MB, 2 * MB, 50 * MB);
+        // Growth within 1.5× of the ratcheting max must NOT release (the
+        // engagement point is usually mid-growth of the live set).
+        note_full_collection_outcome(2 * MB, 2 * MB, 45 * MB);
+        assert!(
+            promotion_waste_veto_for_test(),
+            "growth within 1.5x of the observed max must stay vetoed"
+        );
+        // retain-like accumulation: young grows past 1.5× the observed max.
+        note_full_collection_outcome(2 * MB, 2 * MB, 70 * MB);
         assert!(
             !promotion_waste_veto_for_test(),
-            "young-live growth past 1.5x must release the veto"
+            "young-live growth past 1.5x the max must release the veto"
         );
         promotion_waste_reset_for_test();
     }
