@@ -592,6 +592,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -603,7 +609,7 @@ version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f3c067aa24dd4ed5c79cf222a38f260c8f23d3b82a062fba3f28c6fe563b753"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "blowfish",
  "getrandom 0.4.2",
  "subtle",
@@ -833,7 +839,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b3f109694c4f45353972af96bf97d8a057f82e2d6e496457f4d135b9867a518c"
 dependencies = [
  "ahash 0.8.12",
- "base64",
+ "base64 0.22.1",
  "bitvec",
  "getrandom 0.3.4",
  "hex",
@@ -2101,7 +2107,7 @@ version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9298e6504d9b9e780ed3f7dfd43a61be8cd0e09eb07f7706a945b0072b6670b6"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "memchr",
 ]
 
@@ -3514,7 +3520,7 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -4193,14 +4199,14 @@ version = "10.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eba32bfb4ffdeaca3e34431072faf01745c9b26d25504aa7a6cf5684334fc4fc"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "ed25519-dalek",
  "getrandom 0.2.17",
  "hmac 0.12.1",
  "js-sys",
  "p256",
  "p384",
- "pem",
+ "pem 3.0.6",
  "rand 0.8.7",
  "rsa 0.9.10",
  "serde",
@@ -4319,7 +4325,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0da65617f6cb926332d039cb578aad56178da86e128db6a1b09f4c94fa5b3349"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "email-encoding",
  "email_address",
  "fastrand",
@@ -4799,7 +4805,7 @@ version = "3.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b814038f367d212f55de0a630cb35102a9b8ca23785a86955d62c0087c93846d"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bitflags 2.12.1",
  "bson",
  "derive-where",
@@ -5517,7 +5523,17 @@ version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
 dependencies = [
- "base64",
+ "base64 0.22.1",
+ "serde_core",
+]
+
+[[package]]
+name = "pem"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d354a98a3d1251555de99e8fdd8afda05573c31b82f59063a7b0a29b5527f120"
+dependencies = [
+ "base64 0.23.1",
  "serde_core",
 ]
 
@@ -5550,7 +5566,7 @@ name = "perry"
 version = "0.5.1280"
 dependencies = [
  "anyhow",
- "base64",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "console 0.16.4",
@@ -5674,7 +5690,7 @@ name = "perry-codegen-wasm"
 version = "0.5.1280"
 dependencies = [
  "anyhow",
- "base64",
+ "base64 0.22.1",
  "perry-codegen-js",
  "perry-dispatch",
  "perry-hir",
@@ -5944,7 +5960,7 @@ dependencies = [
 name = "perry-ext-jsonwebtoken"
 version = "0.5.1280"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "jsonwebtoken",
  "perry-ffi",
  "serde",
@@ -6018,7 +6034,7 @@ version = "0.5.1280"
 dependencies = [
  "const-oid 0.9.6",
  "der 0.7.10",
- "pem",
+ "pem 4.0.0",
  "perry-ffi",
  "perry-runtime",
  "rand 0.8.7",
@@ -6186,7 +6202,7 @@ name = "perry-runtime"
 version = "0.5.1280"
 dependencies = [
  "anyhow",
- "base64",
+ "base64 0.22.1",
  "dirs",
  "encoding_rs",
  "fancy-regex",
@@ -6240,7 +6256,7 @@ dependencies = [
  "aes-kw",
  "anyhow",
  "argon2",
- "base64",
+ "base64 0.22.1",
  "bcrypt",
  "brotli",
  "bson",
@@ -6352,7 +6368,7 @@ dependencies = [
 name = "perry-ui-android"
 version = "0.5.1280"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "itoa",
  "jni 0.21.1",
  "libc",
@@ -6379,7 +6395,7 @@ dependencies = [
 name = "perry-ui-gtk4"
 version = "0.5.1280"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "cairo-rs 0.22.0",
  "dirs",
  "gstreamer",
@@ -6402,7 +6418,7 @@ dependencies = [
 name = "perry-ui-ios"
 version = "0.5.1280"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "block2",
  "libc",
  "objc2",
@@ -6418,7 +6434,7 @@ dependencies = [
 name = "perry-ui-macos"
 version = "0.5.1280"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "block2",
  "libc",
  "objc2",
@@ -6448,7 +6464,7 @@ version = "0.5.1280"
 name = "perry-ui-tvos"
 version = "0.5.1280"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "block2",
  "libc",
  "objc2",
@@ -6464,7 +6480,7 @@ dependencies = [
 name = "perry-ui-visionos"
 version = "0.5.1280"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "block2",
  "libc",
  "objc2",
@@ -6493,7 +6509,7 @@ dependencies = [
 name = "perry-ui-windows"
 version = "0.5.1280"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "libc",
  "perry-audio-miniaudio",
  "perry-runtime",
@@ -6518,7 +6534,7 @@ name = "perry-updater"
 version = "0.5.1280"
 dependencies = [
  "anyhow",
- "base64",
+ "base64 0.22.1",
  "ed25519-dalek",
  "hex",
  "perry-runtime",
@@ -6861,7 +6877,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b91dac59ed5eed56d899517c12cb9f00756738731926b54e513732a36f49a83d"
 dependencies = [
  "allsorts",
- "base64",
+ "base64 0.22.1",
  "flate2",
  "getrandom 0.3.4",
  "lopdf",
@@ -7410,7 +7426,7 @@ version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-channel",
  "futures-core",
@@ -8351,7 +8367,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05b44e85bf579a8eeb4ceaa77a3a523baf2bf0e9bac7e40f405d537b5d2d5ccb"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "cfg-if",
  "chrono",
@@ -8454,7 +8470,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "87a2bdd6e83f6b3ea525ca9fee568030508b58355a43d0b2c1674d5f79dcd65e"
 dependencies = [
  "atoi",
- "base64",
+ "base64 0.22.1",
  "bitflags 2.12.1",
  "byteorder",
  "chrono",
