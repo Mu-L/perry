@@ -51,6 +51,8 @@ thread_local! {
     /// Consecutive vetoed fulls whose post-full young live exceeded the
     /// ratcheting max by the release ratio.
     static RELEASE_TRIP_STREAK: Cell<u8> = const { Cell::new(0) };
+    /// Consecutive vetoed fulls with tiny post-full young live.
+    static TINY_STREAK: Cell<u8> = const { Cell::new(0) };
 }
 
 /// Don't judge waste on less than this much promotion — a few stray
@@ -109,16 +111,29 @@ pub(super) fn note_full_collection_outcome(
         // young-live trajectory against the ratcheting max, debounced.
         let max_seen = YOUNG_LIVE_MAX_WHILE_VETOED.with(Cell::get);
         if young_live_now < WASTE_SUBSTANTIAL_BYTES {
-            PROMOTION_WASTE_VETO.with(|v| v.set(false));
-            RELEASE_TRIP_STREAK.with(|c| c.set(0));
-            if std::env::var_os("PERRY_GC_DIAG").is_some() {
-                eprintln!(
-                    "[gc-promotion-waste] veto released (young_live={} tiny)",
-                    young_live_now
-                );
+            // Debounced: a SINGLE tiny reading is not a churn signature — a
+            // full that happens to run right after a scavenge reads a
+            // freshly-reset Eden (~1 MB) even while a 30 MB live set exists
+            // (measured: tree.ts row 5's old-reclaim full released the veto
+            // this way and row 6 promoted the whole live tree, 68 MB old
+            // high-water again). Churn holds tiny young on EVERY full.
+            let streak = TINY_STREAK.with(|c| c.get()).saturating_add(1);
+            if streak >= RELEASE_TRIP_WINDOWS {
+                PROMOTION_WASTE_VETO.with(|v| v.set(false));
+                RELEASE_TRIP_STREAK.with(|c| c.set(0));
+                TINY_STREAK.with(|c| c.set(0));
+                if std::env::var_os("PERRY_GC_DIAG").is_some() {
+                    eprintln!(
+                        "[gc-promotion-waste] veto released (young_live={} sustained tiny)",
+                        young_live_now
+                    );
+                }
+            } else {
+                TINY_STREAK.with(|c| c.set(streak));
             }
             return;
         }
+        TINY_STREAK.with(|c| c.set(0));
         let tripped = young_live_now.saturating_mul(RELEASE_GROWTH_DEN)
             > max_seen.saturating_mul(RELEASE_GROWTH_NUM);
         if tripped {
@@ -156,6 +171,7 @@ pub(super) fn note_full_collection_outcome(
     if veto && !was {
         YOUNG_LIVE_MAX_WHILE_VETOED.with(|c| c.set(young_live_now));
         RELEASE_TRIP_STREAK.with(|c| c.set(0));
+        TINY_STREAK.with(|c| c.set(0));
     }
     if was != veto && std::env::var_os("PERRY_GC_DIAG").is_some() {
         eprintln!(
@@ -182,6 +198,7 @@ pub(super) fn promotion_waste_reset_for_test() {
     PROMOTION_WASTE_VETO.with(|v| v.set(false));
     YOUNG_LIVE_MAX_WHILE_VETOED.with(|c| c.set(0));
     RELEASE_TRIP_STREAK.with(|c| c.set(0));
+    TINY_STREAK.with(|c| c.set(0));
 }
 
 #[cfg(test)]
@@ -268,7 +285,18 @@ mod tests {
         note_promoted_bytes(20 * MB);
         note_full_collection_outcome(2 * MB, MB, 30 * MB);
         assert!(promotion_waste_veto_for_test());
-        // churn-like phase: nothing worth promoting either way.
+        // A single tiny reading (a full right after a scavenge reads a
+        // freshly-reset Eden) must NOT release.
+        note_full_collection_outcome(2 * MB, 2 * MB, MB);
+        assert!(
+            promotion_waste_veto_for_test(),
+            "one post-scavenge tiny reading must stay vetoed"
+        );
+        // A live set re-appearing resets the streak.
+        note_full_collection_outcome(2 * MB, 2 * MB, 30 * MB);
+        assert!(promotion_waste_veto_for_test());
+        // Sustained tiny young (churn-like) releases after two in a row.
+        note_full_collection_outcome(2 * MB, 2 * MB, MB);
         note_full_collection_outcome(2 * MB, 2 * MB, MB);
         assert!(!promotion_waste_veto_for_test());
         promotion_waste_reset_for_test();
