@@ -142,7 +142,6 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
     //   js_write_barrier_root_heap_word(child_bits: u64)
     //   js_gc_note_slot_layout(parent_bits: u64, slot_index: u32, value_bits: u64)
     //   js_gc_init_typed_shape_layout(obj: u64, slot_count: u32, raw_f64_mask_words: *const u64, raw_f64_mask_word_count: u32, pointer_mask_words: *const u64, pointer_mask_word_count: u32)
-    //   js_gc_init_unboxed_object_layout(obj: u64, slot_count: u32, raw_f64_mask: u64, pointer_mask: u64)
     module.declare_function("js_write_barrier", VOID, &[I64, I64]);
     module.declare_function("js_write_barrier_slot", VOID, &[I64, I64, I64]);
     module.declare_function("js_write_barrier_root_nanbox", VOID, &[I64]);
@@ -155,12 +154,6 @@ pub fn declare_phase_b_arrays(module: &mut LlModule) {
         VOID,
         &[I64, I32, PTR, I32, PTR, I32],
     );
-    module.declare_function(
-        "js_gc_init_unboxed_object_layout",
-        VOID,
-        &[I64, I32, I64, I64],
-    );
-
     // Array methods (Phase B.12).
     // - js_array_pop_f64(arr) -> f64    (last element, NaN if empty)
     // - js_array_join(arr, sep) -> *mut StringHeader (i64)

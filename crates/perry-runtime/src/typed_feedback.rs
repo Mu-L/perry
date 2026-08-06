@@ -2575,7 +2575,12 @@ pub extern "C" fn js_typed_feedback_object_set_unboxed_f64_field(
         object_key_matches_field(obj, key, field_index) && is_plain_number_bits(value.to_bits()),
     );
     if pass {
-        crate::object::js_object_set_unboxed_f64_field(obj, field_index, value);
+        // The `js_object_set_unboxed_f64_field` prototype setter this wrapper
+        // once used was deleted (Phase 4b cleanup) — its store path was
+        // bit-identical to the plain indexed setter. The symbol name stays
+        // (it is a `check_runtime_symbols.sh` sentinel and part of the #854
+        // typed-feedback foundation); only the fast path changed.
+        crate::object::js_object_set_field(obj, field_index, crate::JSValue::number(value));
     } else {
         record_fallback_call(site_id);
         crate::object::js_object_set_field_by_name(obj, key, value);

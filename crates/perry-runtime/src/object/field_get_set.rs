@@ -179,10 +179,9 @@ pub use enumeration::{
     js_object_keys_value, js_object_values, js_object_values_value,
 };
 pub use field_ops::{
-    js_object_free, js_object_get_class_id, js_object_get_field_f64,
-    js_object_get_unboxed_f64_field, js_object_set_field, js_object_set_field_by_index,
-    js_object_set_field_f64, js_object_set_keys, js_object_set_unboxed_f64_field,
-    js_object_to_value, js_value_to_object,
+    js_object_free, js_object_get_class_id, js_object_get_field_f64, js_object_set_field,
+    js_object_set_field_by_index, js_object_set_field_f64, js_object_set_keys, js_object_to_value,
+    js_value_to_object,
 };
 pub use get_field_by_name::js_object_get_field_by_name;
 pub(crate) use get_field_by_name_tail::get_field_by_name_object_tail;

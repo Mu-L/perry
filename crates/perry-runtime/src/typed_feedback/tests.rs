@@ -1653,7 +1653,7 @@ fn typed_feedback_class_field_get_guard_requires_raw_f64_layout_when_requested()
 
     let class_id = 0x7EED_0043;
     let (obj, expected_keys, key_x, receiver) = class_instance(class_id, b"x");
-    crate::object::js_object_set_unboxed_f64_field(obj, 0, 5.0);
+    crate::object::js_object_set_field(obj, 0, crate::JSValue::number(5.0));
     let raw_mask = [0b1u64];
     crate::gc::js_gc_init_typed_shape_layout(
         obj as u64,
@@ -1689,7 +1689,7 @@ fn typed_feedback_class_field_set_guard_requires_raw_f64_value_and_layout() {
 
     let class_id = 0x7EED_0044;
     let (obj, expected_keys, key_x, receiver) = class_instance(class_id, b"x");
-    crate::object::js_object_set_unboxed_f64_field(obj, 0, 1.0);
+    crate::object::js_object_set_field(obj, 0, crate::JSValue::number(1.0));
     let raw_mask = [0b1u64];
     crate::gc::js_gc_init_typed_shape_layout(
         obj as u64,
