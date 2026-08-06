@@ -1,30 +1,16 @@
 use super::*;
 
-#[test]
-fn test_unboxed_object_layout_scans_zero_raw_numeric_fields() {
-    clear_marks();
-    clear_mark_seeds();
-
-    let obj = crate::object::js_object_alloc(0, 2);
-    crate::object::js_object_set_unboxed_f64_field(obj, 0, 1.25);
-    crate::object::js_object_set_unboxed_f64_field(obj, 1, -2.5);
-    js_gc_init_unboxed_object_layout(obj as u64, 2, 0b11, 0);
-
-    assert_eq!(test_layout_pointer_slot_count(obj as usize, 2), Some(0));
-    assert_eq!(test_heap_child_slot_count(obj as *mut u8), 0);
-
-    let valid_ptrs = build_valid_pointer_set();
-    assert!(try_mark_value(
-        POINTER_TAG | (obj as u64 & POINTER_MASK),
-        &valid_ptrs
-    ));
-    test_reset_trace_slot_reads();
-    trace_marked_objects(&valid_ptrs);
-    assert_eq!(test_trace_slot_reads(), 0);
-
-    clear_marks();
-    clear_mark_seeds();
-}
+// This file used to exercise the `PERRY_UNBOXED_OBJECT_FIELDS` prototype's
+// `js_gc_init_unboxed_object_layout` installer. That prototype was deleted
+// (Phase 4b cleanup): its write path was bit-identical to the default
+// typed-shape path and its read side was never implemented. The coverage the
+// file carried for behavior that still exists moved onto the load-bearing
+// `js_gc_init_typed_shape_layout` installer: raw-numeric scan skipping, the
+// copying-minor descriptor transfer, and descriptor invalidation on every
+// shape-changing mutation (dynamic add, delete, defineProperty, accessors).
+// The prototype-only twins (zero-raw-field scan, pointer-write fallback,
+// `layout_transfer` on move) were dropped — `typed_shape.rs` and
+// `object_closure_slots.rs` already pin those paths for the default installer.
 
 #[test]
 fn test_layout_scan_trace_counts_raw_numeric_object_fields() {
@@ -41,8 +27,8 @@ fn test_layout_scan_trace_counts_raw_numeric_object_fields() {
     .expect("test requested GC trace capture");
 
     let obj = crate::object::js_object_alloc(0, 2);
-    crate::object::js_object_set_unboxed_f64_field(obj, 0, 1.25);
-    crate::object::js_object_set_unboxed_f64_field(obj, 1, -2.5);
+    crate::object::js_object_set_field(obj, 0, crate::value::JSValue::number(1.25));
+    crate::object::js_object_set_field(obj, 1, crate::value::JSValue::number(-2.5));
     let raw_mask = [0b11u64];
     js_gc_init_typed_shape_layout(
         obj as u64,
@@ -94,7 +80,11 @@ fn test_layout_scan_trace_counts_mixed_raw_numeric_object_fields() {
     .expect("test requested GC trace capture");
 
     let obj = crate::object::js_object_alloc(0, 2);
-    crate::object::js_object_set_unboxed_f64_field(obj, 0, f64::from_bits(0x1000));
+    crate::object::js_object_set_field(
+        obj,
+        0,
+        crate::value::JSValue::number(f64::from_bits(0x1000)),
+    );
     let child = crate::string::js_string_from_bytes(b"mixed-child".as_ptr(), 11);
     crate::object::js_object_set_field(obj, 1, crate::value::JSValue::string_ptr(child));
     let raw_mask = [0b01u64];
@@ -136,79 +126,15 @@ fn test_layout_scan_trace_counts_mixed_raw_numeric_object_fields() {
 }
 
 #[test]
-fn test_unboxed_object_pointer_write_to_raw_slot_falls_back_and_traces() {
-    clear_marks();
-    clear_mark_seeds();
-
-    let obj = crate::object::js_object_alloc(0, 2);
-    crate::object::js_object_set_unboxed_f64_field(obj, 0, 1.0);
-    crate::object::js_object_set_unboxed_f64_field(obj, 1, 2.0);
-    js_gc_init_unboxed_object_layout(obj as u64, 2, 0b11, 0);
-    assert_eq!(test_layout_pointer_slot_count(obj as usize, 2), Some(0));
-
-    let child = crate::string::js_string_from_bytes(b"unboxed-child".as_ptr(), 13);
-    let child_header = unsafe { header_from_user_ptr(child as *mut u8) };
-    crate::object::js_object_set_field(obj, 0, crate::value::JSValue::string_ptr(child));
-
-    assert_eq!(
-        test_layout_pointer_slot_count(obj as usize, 2),
-        None,
-        "non-number writes to raw f64 slots must deopt to full scanning"
-    );
-
-    let valid_ptrs = build_valid_pointer_set();
-    assert!(try_mark_value(
-        POINTER_TAG | (obj as u64 & POINTER_MASK),
-        &valid_ptrs
-    ));
-    test_reset_trace_slot_reads();
-    trace_marked_objects(&valid_ptrs);
-    assert_eq!(test_trace_slot_reads(), 2);
-    unsafe {
-        assert_ne!((*child_header).gc_flags & GC_FLAG_MARKED, 0);
-    }
-
-    clear_marks();
-    clear_mark_seeds();
-}
-
-#[test]
-fn test_unboxed_object_descriptor_transfers_on_object_move() {
-    clear_marks();
-    clear_mark_seeds();
-
-    let src = crate::object::js_object_alloc(0, 2);
-    let dst = crate::object::js_object_alloc(0, 2);
-    crate::object::js_object_set_unboxed_f64_field(src, 0, 3.0);
-    crate::object::js_object_set_unboxed_f64_field(src, 1, 4.0);
-    js_gc_init_unboxed_object_layout(src as u64, 2, 0b11, 0);
-
-    unsafe {
-        layout_transfer(src as *mut u8, dst as *mut u8);
-    }
-
-    assert_eq!(test_layout_pointer_slot_count(dst as usize, 2), Some(0));
-    crate::object::js_object_set_unboxed_f64_field(dst, 1, 5.0);
-    assert_eq!(test_layout_pointer_slot_count(dst as usize, 2), Some(0));
-
-    let child = crate::string::js_string_from_bytes(b"moved-child".as_ptr(), 11);
-    crate::object::js_object_set_field(dst, 1, crate::value::JSValue::string_ptr(child));
-    assert_eq!(test_layout_pointer_slot_count(dst as usize, 2), None);
-
-    clear_marks();
-    clear_mark_seeds();
-}
-
-#[test]
 fn test_raw_numeric_object_descriptor_transfers_on_copying_minor_and_skips_raw_slots() {
     let _guard = CopyingNurseryTestGuard::new(1);
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
 
     let child = young_leaf();
     let obj = crate::object::js_object_alloc(0, 3);
-    crate::object::js_object_set_unboxed_f64_field(obj, 0, 10.5);
+    crate::object::js_object_set_field(obj, 0, crate::value::JSValue::number(10.5));
     crate::object::js_object_set_field(obj, 1, crate::value::JSValue::from_bits(ptr_bits(child)));
-    crate::object::js_object_set_unboxed_f64_field(obj, 2, -3.25);
+    crate::object::js_object_set_field(obj, 2, crate::value::JSValue::number(-3.25));
     let raw_mask = [0b101u64];
     let pointer_mask = [0b010u64];
     js_gc_init_typed_shape_layout(
@@ -256,7 +182,7 @@ fn test_raw_numeric_object_descriptor_transfers_on_copying_minor_and_skips_raw_s
     );
 }
 
-fn unboxed_point_for_shape_change_test(shape_id: u32) -> *mut crate::object::ObjectHeader {
+fn typed_point_for_shape_change_test(shape_id: u32) -> *mut crate::object::ObjectHeader {
     let packed_keys = b"x\0y\0";
     let obj = crate::object::js_object_alloc_with_shape(
         shape_id,
@@ -264,9 +190,17 @@ fn unboxed_point_for_shape_change_test(shape_id: u32) -> *mut crate::object::Obj
         packed_keys.as_ptr(),
         packed_keys.len() as u32,
     );
-    crate::object::js_object_set_unboxed_f64_field(obj, 0, 1.0);
-    crate::object::js_object_set_unboxed_f64_field(obj, 1, 2.0);
-    js_gc_init_unboxed_object_layout(obj as u64, 2, 0b11, 0);
+    crate::object::js_object_set_field(obj, 0, crate::value::JSValue::number(1.0));
+    crate::object::js_object_set_field(obj, 1, crate::value::JSValue::number(2.0));
+    let raw_mask = [0b11u64];
+    js_gc_init_typed_shape_layout(
+        obj as u64,
+        2,
+        raw_mask.as_ptr(),
+        raw_mask.len() as u32,
+        std::ptr::null(),
+        0,
+    );
     assert_eq!(test_layout_pointer_slot_count(obj as usize, 2), Some(0));
     obj
 }
@@ -290,18 +224,18 @@ fn descriptor_object_with_single_field(
 }
 
 #[test]
-fn test_unboxed_object_dynamic_added_property_falls_back() {
+fn test_typed_object_dynamic_added_property_falls_back() {
     clear_marks();
     clear_mark_seeds();
 
-    let obj = unboxed_point_for_shape_change_test(86_101);
+    let obj = typed_point_for_shape_change_test(86_101);
     let z_key = crate::string::js_string_from_bytes(b"z".as_ptr(), 1);
     crate::object::js_object_set_field_by_name(obj, z_key, 3.0);
 
     assert_eq!(
         test_layout_pointer_slot_count(obj as usize, 3),
         None,
-        "adding a dynamic property must invalidate the exact unboxed shape"
+        "adding a dynamic property must invalidate the exact typed shape"
     );
 
     clear_marks();
@@ -309,18 +243,18 @@ fn test_unboxed_object_dynamic_added_property_falls_back() {
 }
 
 #[test]
-fn test_unboxed_object_delete_falls_back() {
+fn test_typed_object_delete_falls_back() {
     clear_marks();
     clear_mark_seeds();
 
-    let obj = unboxed_point_for_shape_change_test(86_102);
+    let obj = typed_point_for_shape_change_test(86_102);
     let x_key = crate::string::js_string_from_bytes(b"x".as_ptr(), 1);
     assert_eq!(crate::object::js_object_delete_field(obj, x_key), 1);
 
     assert_eq!(
         test_layout_pointer_slot_count(obj as usize, 1),
         None,
-        "delete shifts keys/fields and must invalidate the exact unboxed shape"
+        "delete shifts keys/fields and must invalidate the exact typed shape"
     );
 
     clear_marks();
@@ -328,11 +262,11 @@ fn test_unboxed_object_delete_falls_back() {
 }
 
 #[test]
-fn test_unboxed_object_define_property_falls_back() {
+fn test_typed_object_define_property_falls_back() {
     clear_marks();
     clear_mark_seeds();
 
-    let obj = unboxed_point_for_shape_change_test(86_103);
+    let obj = typed_point_for_shape_change_test(86_103);
     let x_key = crate::string::js_string_from_bytes(b"x".as_ptr(), 1);
     let desc =
         descriptor_object_with_single_field(86_104, b"value", crate::value::JSValue::number(9.0));
@@ -346,7 +280,7 @@ fn test_unboxed_object_define_property_falls_back() {
     assert_eq!(
         test_layout_pointer_slot_count(obj as usize, 2),
         None,
-        "Object.defineProperty must invalidate the exact unboxed shape even for existing keys"
+        "Object.defineProperty must invalidate the exact typed shape even for existing keys"
     );
 
     clear_marks();
@@ -354,11 +288,11 @@ fn test_unboxed_object_define_property_falls_back() {
 }
 
 #[test]
-fn test_unboxed_object_accessor_define_property_falls_back() {
+fn test_typed_object_accessor_define_property_falls_back() {
     clear_marks();
     clear_mark_seeds();
 
-    let obj = unboxed_point_for_shape_change_test(86_105);
+    let obj = typed_point_for_shape_change_test(86_105);
     let x_key = crate::string::js_string_from_bytes(b"x".as_ptr(), 1);
     // #2817: an accessor descriptor's `get` must be callable — a non-function
     // value now throws. Use a real (capture-less) closure as the getter so we
@@ -379,7 +313,7 @@ fn test_unboxed_object_accessor_define_property_falls_back() {
     assert_eq!(
         test_layout_pointer_slot_count(obj as usize, 2),
         None,
-        "accessor descriptors must invalidate the exact unboxed shape"
+        "accessor descriptors must invalidate the exact typed shape"
     );
 
     clear_marks();

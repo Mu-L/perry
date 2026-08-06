@@ -5,33 +5,6 @@ use perry_hir::{
     ModuleInitKind, Stmt, UpdateOp,
 };
 
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-struct EnvVarGuard {
-    key: &'static str,
-    prev: Option<std::ffi::OsString>,
-}
-
-impl EnvVarGuard {
-    fn set(key: &'static str, value: Option<&str>) -> Self {
-        let prev = std::env::var_os(key);
-        match value {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
-        }
-        Self { key, prev }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        match &self.prev {
-            Some(value) => std::env::set_var(self.key, value),
-            None => std::env::remove_var(self.key),
-        }
-    }
-}
-
 fn empty_opts() -> CompileOptions {
     CompileOptions {
         target: None,
@@ -330,10 +303,6 @@ fn assert_typed_feedback_setter_after(ir: &str, start_pos: usize, context: &str)
     assert!(
         ir.contains("js_object_set_field_by_name"),
         "{context} should keep the safe runtime setter as the typed-feedback fallback"
-    );
-    assert!(
-        !after_start.contains("call void @js_object_set_unboxed_f64_field"),
-        "{context} should not use the raw unboxed field setter for dynamic mutation"
     );
 }
 
@@ -936,46 +905,13 @@ fn typed_object_literal_pointer_free_descriptor_precedes_dynamic_mutation() {
     );
 }
 
+// The `PERRY_UNBOXED_OBJECT_FIELDS` prototype was deleted (Phase 4b cleanup):
+// its write path was bit-identical to the default typed-shape path and its
+// read side was never implemented. This test pins the default path the flag
+// used to bypass: exact `{x, y}` number literals go through the shape-cache
+// allocator, indexed setters, and a typed-shape descriptor install.
 #[test]
-fn unboxed_point_literal_gate_on_emits_raw_setters_and_pointer_free_layout() {
-    let _lock = ENV_LOCK.lock().unwrap();
-    let _env = EnvVarGuard::set("PERRY_UNBOXED_OBJECT_FIELDS", Some("1"));
-    let point_ty = object_type(&[("x", Type::Number), ("y", Type::Number)]);
-    let module = point_module(
-        "unboxed_point_on.ts",
-        vec![
-            Stmt::Let {
-                id: 1,
-                name: "p".to_string(),
-                ty: point_ty,
-                mutable: false,
-                init: Some(Expr::Object(vec![
-                    ("x".to_string(), Expr::Number(1.5)),
-                    ("y".to_string(), Expr::Number(2.5)),
-                ])),
-            },
-            Stmt::Return(Some(Expr::LocalGet(1))),
-        ],
-    );
-
-    let ir = ir_for(module);
-    assert!(ir.contains("call i64 @js_object_alloc_with_shape"));
-    assert!(ir.contains("call void @js_object_set_unboxed_f64_field"));
-    assert!(ir.contains("call void @js_gc_init_unboxed_object_layout"));
-    assert!(
-        ir.contains("i32 2, i64 3, i64 0"),
-        "unboxed point layout should install raw f64 slots for x/y and no pointer slots"
-    );
-    assert!(
-        !ir.contains("call void @js_gc_init_typed_shape_layout"),
-        "gate-on exact point literals should use the unboxed layout installer"
-    );
-}
-
-#[test]
-fn unboxed_point_literal_gate_off_uses_existing_typed_shape_path() {
-    let _lock = ENV_LOCK.lock().unwrap();
-    let _env = EnvVarGuard::set("PERRY_UNBOXED_OBJECT_FIELDS", None);
+fn point_literal_uses_typed_shape_path() {
     let point_ty = object_type(&[("x", Type::Number), ("y", Type::Number)]);
     let module = point_module(
         "unboxed_point_off.ts",
@@ -1000,44 +936,4 @@ fn unboxed_point_literal_gate_off_uses_existing_typed_shape_path() {
     assert!(ir.contains("call void @js_gc_init_typed_shape_layout"));
     assert!(ir.contains("@perry_typed_obj_shape_raw_f64_mask_"));
     assert!(ir.contains("constant [1 x i64] [i64 3]"));
-    assert!(!ir.contains("call void @js_object_set_unboxed_f64_field"));
-    assert!(!ir.contains("call void @js_gc_init_unboxed_object_layout"));
-}
-
-#[test]
-fn unboxed_point_dynamic_mutation_still_uses_safe_by_name_setter() {
-    let _lock = ENV_LOCK.lock().unwrap();
-    let _env = EnvVarGuard::set("PERRY_UNBOXED_OBJECT_FIELDS", Some("1"));
-    let point_ty = object_type(&[("x", Type::Number), ("y", Type::Number)]);
-    let module = point_module(
-        "unboxed_point_mutation.ts",
-        vec![
-            Stmt::Let {
-                id: 1,
-                name: "p".to_string(),
-                ty: point_ty,
-                mutable: true,
-                init: Some(Expr::Object(vec![
-                    ("x".to_string(), Expr::Number(1.0)),
-                    ("y".to_string(), Expr::Number(2.0)),
-                ])),
-            },
-            Stmt::Expr(Expr::PropertySet {
-                object: Box::new(Expr::LocalGet(1)),
-                property: "x".to_string(),
-                value: Box::new(Expr::String("heap".to_string())),
-            }),
-            Stmt::Return(Some(Expr::LocalGet(1))),
-        ],
-    );
-
-    let ir = ir_for(module);
-    let layout_pos = ir
-        .find("call void @js_gc_init_unboxed_object_layout")
-        .expect("fixture should install unboxed layout");
-    assert_typed_feedback_setter_after(
-        &ir,
-        layout_pos,
-        "dynamic property mutation after an unboxed layout",
-    );
 }

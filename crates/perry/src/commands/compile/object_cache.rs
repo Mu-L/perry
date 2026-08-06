@@ -231,7 +231,7 @@ fn stable_type_key(ty: &perry_hir::types::Type) -> String {
 /// `PERRY_DEBUG_INIT`, `PERRY_DEBUG_SYMBOLS`, `PERRY_LLVM_CLANG`,
 /// `PERRY_WRITE_BARRIERS`, `PERRY_SHADOW_STACK`,
 /// `PERRY_DISABLE_BUFFER_FAST_PATH`, `PERRY_VERIFY_NATIVE_REGIONS`,
-/// `PERRY_UNBOXED_OBJECT_FIELDS`, and `PERRY_TARGET_CPU`. See the env-var
+/// and `PERRY_TARGET_CPU`. See the env-var
 /// block at the bottom of this function for the rationale.
 ///
 /// NOT captured in the key: the host CPU. By default (`PERRY_TARGET_CPU`
@@ -768,8 +768,6 @@ fn compute_object_cache_key_with_env(
     //     changes Buffer/Uint8Array lowering.
     //   - PERRY_VERIFY_NATIVE_REGIONS=1 overrides CompileOptions and must
     //     not be bypassed by a stale cache hit.
-    //   - PERRY_UNBOXED_OBJECT_FIELDS=1 changes object-literal layout
-    //     lowering for exact typed object shapes.
     //   - PERRY_TARGET_CPU (#6125, set directly or promoted from `--march` /
     //     perry.toml `[build] march`/`native_tuning`) changes the clang
     //     `-march`/`-mcpu` tuning flag, i.e. which instruction-set baseline
@@ -830,12 +828,6 @@ fn compute_object_cache_key_with_env(
     h.field(
         "env_verify_native_regions",
         env_var("PERRY_VERIFY_NATIVE_REGIONS")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    h.field(
-        "env_unboxed_object_fields",
-        env_var("PERRY_UNBOXED_OBJECT_FIELDS")
             .as_deref()
             .unwrap_or(""),
     );

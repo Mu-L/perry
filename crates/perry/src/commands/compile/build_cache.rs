@@ -43,7 +43,6 @@ const BUILD_CACHE_ENV_VARS: &[&str] = &[
     "PERRY_INLINE_SHADOW_SLOT",
     "PERRY_DISABLE_BUFFER_FAST_PATH",
     "PERRY_VERIFY_NATIVE_REGIONS",
-    "PERRY_UNBOXED_OBJECT_FIELDS",
     // #6125: the resolved CPU baseline (promoted from --march / perry.toml
     // [build] by promote_cpu_baseline_env before this probe runs). Flipping
     // it must invalidate the build-level no-op check, not just per-object

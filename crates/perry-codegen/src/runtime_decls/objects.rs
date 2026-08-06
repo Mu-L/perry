@@ -87,8 +87,6 @@ pub fn declare_phase_b_objects(module: &mut LlModule) {
     // loop hung forever. Declaring the slot as I64 routes through the
     // same register class the runtime actually reads.
     module.declare_function("js_object_set_field", VOID, &[I64, I32, I64]);
-    module.declare_function("js_object_set_unboxed_f64_field", VOID, &[I64, I32, DOUBLE]);
-    module.declare_function("js_object_get_unboxed_f64_field", DOUBLE, &[I64, I32]);
     module.declare_function("js_object_set_field_by_name", VOID, &[I64, I64, DOUBLE]);
     module.declare_function(
         "js_object_set_field_by_property_id",
