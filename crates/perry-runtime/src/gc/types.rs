@@ -190,6 +190,9 @@ pub(crate) enum GcFinalizeHookKind {
     /// so a fresh error allocated at the recycled address doesn't inherit
     /// the dead error's codes/props.
     ErrorSideTables,
+    /// #7539: free a dead lazy JSON array's tape bytes, which
+    /// `json_tape_store` owns outside the GC heap.
+    LazyArrayTape,
 }
 
 #[allow(dead_code)]
@@ -374,13 +377,26 @@ pub(super) static GC_TYPE_INFO_BY_ID: [Option<GcTypeInfo>; MALLOC_KIND_BUCKET_CO
         true,
         GcRewriteDescriptorKind::LazyArray,
         GcLayoutSlotKind::None,
-        true,
-        GcExternalBytePolicy::InlinePayload,
+        // NOT movable. `json_tape_store` keys a lazy array's tape by its
+        // header address, and every caller outside `json_tape` holds raw
+        // header pointers across allocations. The header is allocated old-gen
+        // and born tenured (`json_tape::alloc_lazy_header_bytes`), so nothing
+        // relocates it today; saying so here is what keeps old-page defrag
+        // from ever doing so. `true` was vacuous before #7539 anyway — the
+        // header was multi-megabyte and never left the old generation.
+        false,
+        // #7539: the tape is a `json_tape_store` side allocation now, not
+        // inline payload. Keeping it inline made the header ~2.4 MB on a
+        // 10 k-record blob, which `arena_alloc_gc` routed into the old
+        // generation with GC_FLAG_TENURED — reclaimable only by a FULL
+        // collection, so per-iteration-dead tapes drove `old_gen_bytes`
+        // fulls (6 of 9 fulls on the `field_access` fixture).
+        GcExternalBytePolicy::SideAllocation,
         GcLargeObjectPolicy::OldArenaWhenOverThreshold,
         false,
         GcMoveHookKind::None,
         GcRewriteHookKind::None,
-        GcFinalizeHookKind::None,
+        GcFinalizeHookKind::LazyArrayTape,
     )),
     Some(gc_type_info_entry(
         GC_TYPE_BUFFER,
@@ -750,6 +766,9 @@ pub(crate) unsafe fn gc_type_finalize_unmarked_payload(obj_type: u8, user_ptr: *
         }
         GcFinalizeHookKind::TypedArrayViewMeta => {
             crate::typedarray_view::clear_view_meta(user_ptr as usize);
+        }
+        GcFinalizeHookKind::LazyArrayTape => {
+            crate::json_tape_store::release(user_ptr as usize);
         }
     }
 }

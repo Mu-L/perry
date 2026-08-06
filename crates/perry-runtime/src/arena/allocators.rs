@@ -154,6 +154,26 @@ pub fn arena_alloc_gc_old(size: usize, align: usize, obj_type: u8) -> *mut u8 {
     unsafe { raw.add(GC_HEADER_SIZE) }
 }
 
+/// The old-gen + born-tenured shape `arena_alloc_gc` hands a LARGE object, for
+/// a caller that wants it on size-independent grounds.
+///
+/// #7539's `LazyArrayHeader` is the caller: it used to reach this arm by being
+/// multi-megabyte (its tape was inline), and every caller outside `json_tape`
+/// relies on the resulting header address being stable across allocations.
+/// Moving the tape out shrank the header to ~88 bytes, which would have made
+/// it nursery-resident and movable; asking for this shape explicitly keeps the
+/// invariant those callers were already written against.
+pub(crate) fn arena_alloc_gc_old_born_tenured(size: usize, align: usize, obj_type: u8) -> *mut u8 {
+    use crate::gc::{GcHeader, GC_FLAG_TENURED, GC_HEADER_SIZE};
+
+    let user_ptr = arena_alloc_gc_old(size, align, obj_type);
+    unsafe {
+        let header = user_ptr.sub(GC_HEADER_SIZE) as *mut GcHeader;
+        (*header).gc_flags |= GC_FLAG_TENURED;
+    }
+    user_ptr
+}
+
 pub(crate) fn arena_alloc_gc_old_excluding_pages(
     size: usize,
     align: usize,

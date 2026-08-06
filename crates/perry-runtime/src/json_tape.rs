@@ -538,8 +538,10 @@ impl<'a, 'scope> TapeSource<'a, 'scope> {
                 if hdr.is_null() || idx >= (*hdr).tape_len as usize {
                     return None;
                 }
-                let base = (hdr as *const u8).add(std::mem::size_of::<LazyArrayHeader>())
-                    as *const TapeEntry;
+                let base = (*hdr).tape as *const TapeEntry;
+                if base.is_null() {
+                    return None;
+                }
                 Some(*base.add(idx))
             }
         }
@@ -961,8 +963,25 @@ pub struct LazyArrayHeader {
     pub magic: u32,
     /// Tape index where the root ARR_START sits.
     pub root_idx: u32,
-    /// Number of `TapeEntry`s that follow inline after this header.
+    /// Number of `TapeEntry`s reachable through [`Self::tape`].
     pub tape_len: u32,
+    /// #7539: the tape's bytes, owned by `json_tape_store` rather than
+    /// allocated inline after this header.
+    ///
+    /// **Not a GC edge.** This points at a plain `std::alloc` buffer, never at
+    /// a managed object, so it is deliberately absent from the `LazyArray`
+    /// rewrite descriptor: nothing marks it, nothing rewrites it, and no write
+    /// barrier guards stores to it. The tape used to live inline, which made
+    /// the whole allocation ~2.4 MB on a 10 k-record blob — over
+    /// `LARGE_OBJECT_THRESHOLD_BYTES`, so `arena_alloc_gc` put it in the old
+    /// generation with `GC_FLAG_TENURED`, where only a FULL collection can
+    /// reclaim it. See `json_tape_store` for the measurement.
+    ///
+    /// Null once the tape is gone: either the blob had no entries, or
+    /// `force_materialize_lazy` disowned it after installing `materialized`.
+    /// Every reader checks `materialized.is_null()` before consulting the
+    /// tape, so a null here is only ever observed as "length 0".
+    pub tape: *mut TapeEntry,
     /// Owns-a-reference to the input `StringHeader`. GC must trace
     /// this to keep the blob alive while this lazy value is
     /// reachable.
@@ -1026,7 +1045,6 @@ pub struct LazyArrayHeader {
     /// tokenization included). This counter is the missing signal;
     /// `scan_flip_threshold` is where it trips.
     pub sequential_streak: u32,
-    // Followed by `tape_len` `TapeEntry` elements inline.
 }
 
 // `cached_length` at offset 0 is a CODEGEN contract, not a layout preference:
@@ -1095,12 +1113,17 @@ unsafe fn lazy_cached_count(hdr: *const LazyArrayHeader) -> u64 {
 }
 
 impl LazyArrayHeader {
-    /// Slice view over the inline tape bytes. Caller must keep the
-    /// header alive for the slice's lifetime.
+    /// Slice view over the tape bytes. Caller must keep the header alive for
+    /// the slice's lifetime.
+    ///
+    /// Empty once the tape has been disowned (`materialized` installed) — the
+    /// null check is what makes that state safe rather than a wild read.
     #[inline]
     pub unsafe fn tape_slice<'a>(this: *const LazyArrayHeader) -> &'a [TapeEntry] {
-        let base =
-            (this as *const u8).add(std::mem::size_of::<LazyArrayHeader>()) as *const TapeEntry;
+        let base = (*this).tape;
+        if base.is_null() {
+            return &[];
+        }
         std::slice::from_raw_parts(base, (*this).tape_len as usize)
     }
 
@@ -1115,9 +1138,44 @@ impl LazyArrayHeader {
     }
 }
 
-/// Arena-allocate a lazy array header with `tape_entries` copied
-/// inline after the header. Returns the pointer that `JSON.parse`
-/// hands back as a POINTER_TAG'd JSValue.
+/// Arena-allocate a lazy array header owning `tape_entries` as a side
+/// allocation. Returns the pointer that `JSON.parse` hands back as a
+/// POINTER_TAG'd JSValue.
+///
+/// #7539: the tape used to be copied INLINE after the header, making this one
+/// allocation as large as the tape (~2.4 MB on a 10 k-record blob). That is
+/// over `LARGE_OBJECT_THRESHOLD_BYTES`, so `arena_alloc_gc` routed it into the
+/// old generation with `GC_FLAG_TENURED` and only a FULL collection could ever
+/// reclaim it. The header is ~88 bytes now and is born in the nursery like any
+/// other short-lived object; `json_tape_store` owns the tape bytes.
+/// The header's own bytes.
+///
+/// **Old generation, born tenured — and that is load-bearing, not incidental.**
+/// Before #7539 the header carried its tape inline, so it was multi-megabyte
+/// and `arena_alloc_gc`'s large-object arm put it here; every caller outside
+/// this module has therefore always been free to hold a raw
+/// `*mut LazyArrayHeader` across an allocation, and several do
+/// (`json::stringify_api::try_stringify_lazy_array` reads `blob_bytes` off a
+/// raw header and then allocates the result string; the array accessors pass
+/// raw headers into `force_materialize_lazy`).
+///
+/// Shrinking the header to ~88 bytes without pinning it here made it
+/// nursery-resident and therefore MOVABLE for the first time, and the copying
+/// minor promptly relocated it out from under those callers: `field_access`
+/// went non-deterministic, emitting a JSON string of NUL bytes for
+/// `JSON.stringify(parsed)` on 3 of 60 iterations (a stale `blob_str` read
+/// through a moved-from header). Keeping the header exactly where it has
+/// always been costs ~96 bytes of old generation per parse — the tape's
+/// ~2.4 MB is what had to leave — and keeps that contract intact.
+#[inline]
+fn alloc_lazy_header_bytes() -> *mut u8 {
+    crate::arena::arena_alloc_gc_old_born_tenured(
+        std::mem::size_of::<LazyArrayHeader>(),
+        8,
+        crate::gc::GC_TYPE_LAZY_ARRAY,
+    )
+}
+
 pub unsafe fn alloc_lazy_array(
     tape_entries: &[TapeEntry],
     root_idx: u32,
@@ -1126,14 +1184,21 @@ pub unsafe fn alloc_lazy_array(
 ) -> *mut LazyArrayHeader {
     let scope = crate::gc::RuntimeHandleScope::new();
     let blob_handle = scope.root_string_ptr(blob_str);
-    let tape_bytes = std::mem::size_of_val(tape_entries);
-    let total = std::mem::size_of::<LazyArrayHeader>() + tape_bytes;
-    let raw = crate::arena::arena_alloc_gc(total, 8, crate::gc::GC_TYPE_LAZY_ARRAY);
+    // Detach the tape FIRST, while there is no header address to invalidate.
+    // The buffer itself is plain `std::alloc` memory — no arena accounting, no
+    // collection. `allocate` does account the bytes as external side pressure,
+    // which can trigger, but the only live thing we hold across it is
+    // `blob_handle`, which is rooted.
+    let (tape_ptr, tape_allocation) = crate::json_tape_store::allocate(tape_entries);
+    let raw = alloc_lazy_header_bytes();
     let hdr = raw as *mut LazyArrayHeader;
     (*hdr).cached_length = cached_length;
     (*hdr).magic = LAZY_ARRAY_MAGIC;
     (*hdr).root_idx = root_idx;
     (*hdr).tape_len = tape_entries.len() as u32;
+    // GC_STORE_AUDIT(POINTER_FREE): side-allocated tape bytes, not a heap edge —
+    // no barrier, and deliberately absent from the LazyArray rewrite descriptor.
+    (*hdr).tape = tape_ptr;
     (*hdr).blob_str = blob_handle.get_raw_const_ptr::<crate::StringHeader>();
     (*hdr).materialized = std::ptr::null_mut();
     (*hdr).materialized_elements = std::ptr::null_mut();
@@ -1165,7 +1230,24 @@ pub unsafe fn alloc_lazy_array(
     // tape itself.
     if cached_length > 0 {
         let cache_bytes = (cached_length as usize) * std::mem::size_of::<crate::value::JSValue>();
-        let cache_raw = crate::arena::arena_alloc_gc(cache_bytes, 8, crate::gc::GC_TYPE_STRING);
+        // Old-gen, like the header (#7539). Keeping the whole lazy-array
+        // cluster in ONE generation keeps every edge out of it the shape
+        // #7538/#7546 built and validated the external-slot barrier for:
+        // old owner → old cache block → young element, recorded by
+        // `note_lazy_cache_slot` and consumed by the minor's dirty scan
+        // through the owner's descriptor. A nursery cache under an old-gen
+        // header is a mixed shape nothing covers — the minor treats the old
+        // header as a black leaf, so it never visits the descriptor that can
+        // read the cache, while the cache block itself is a GC leaf whose
+        // contents no walker scans. That combination lost element identity
+        // (`parsed[i] === parsed[i]`) across a copying minor. It could not
+        // occur before: a big array's cache was already born old, and a small
+        // array's header was born young along with its cache.
+        let cache_raw = crate::arena::arena_alloc_gc_old_born_tenured(
+            cache_bytes,
+            8,
+            crate::gc::GC_TYPE_STRING,
+        );
         // arena_alloc_gc can reuse slots from the free list whose
         // bytes still hold whatever the previous occupant wrote.
         // Zero explicitly — the cache invariant relies on the
@@ -1183,7 +1265,14 @@ pub unsafe fn alloc_lazy_array(
         );
         let bitmap_words = (cached_length as usize).div_ceil(64);
         let bitmap_bytes = bitmap_words * 8;
-        let bitmap_raw = crate::arena::arena_alloc_gc(bitmap_bytes, 8, crate::gc::GC_TYPE_STRING);
+        // Same generation as the header and cache — see above. The bitmap
+        // holds no heap edges, but keeping it with its cluster keeps the
+        // page-liveness bookkeeping uniform.
+        let bitmap_raw = crate::arena::arena_alloc_gc_old_born_tenured(
+            bitmap_bytes,
+            8,
+            crate::gc::GC_TYPE_STRING,
+        );
         std::ptr::write_bytes(bitmap_raw, 0, bitmap_bytes);
         let hdr = hdr_handle.get_raw_mut_ptr::<LazyArrayHeader>();
         (*hdr).materialized_bitmap = bitmap_raw as *mut u64;
@@ -1193,11 +1282,60 @@ pub unsafe fn alloc_lazy_array(
             bitmap_raw as usize,
         );
     }
+    // Register LAST, off the rooted handle. The header is old-gen and
+    // immovable (see `alloc_lazy_header_bytes`), so this address is stable for
+    // its whole life — which is what lets the registry be keyed by it with no
+    // move hook.
     let hdr = hdr_handle.get_raw_mut_ptr::<LazyArrayHeader>();
-    let tape_dst = (hdr as *mut u8).add(std::mem::size_of::<LazyArrayHeader>()) as *mut TapeEntry;
-    // GC_STORE_AUDIT(POINTER_FREE): TapeEntry is offset/kind/link numerics, no heap edges.
-    std::ptr::copy_nonoverlapping(tape_entries.as_ptr(), tape_dst, tape_entries.len());
-    hdr_handle.get_raw_mut_ptr::<LazyArrayHeader>()
+    crate::json_tape_store::register(hdr as usize, tape_allocation);
+    hdr
+}
+
+/// Install `arr_ptr` as this header's materialized array and disown the tape.
+///
+/// Every site that sets `materialized` goes through here so the release can
+/// never drift away from the install — the tape is garbage from the instant
+/// `materialized` is non-null (`lazy_get`'s first fast path returns out of the
+/// `ArrayHeader` and never consults the tape or the sparse cache again), and a
+/// site that set the field directly would silently retain ~2.4 MB per parse
+/// again.
+///
+/// # Safety
+///
+/// `hdr` must be a live `LazyArrayHeader` and `arr_ptr` a live `ArrayHeader`.
+/// No `TapeSource::Lazy` read of this header may be in flight.
+#[inline]
+unsafe fn install_materialized(hdr: *mut LazyArrayHeader, arr_ptr: *mut crate::array::ArrayHeader) {
+    (*hdr).materialized = arr_ptr;
+    note_lazy_raw_slot(
+        hdr,
+        &(*hdr).materialized as *const _ as usize,
+        arr_ptr as usize,
+    );
+    release_tape_after_materialize(hdr);
+}
+
+/// Disown the tape once `materialized` is installed.
+///
+/// After a full materialization every read goes through the `ArrayHeader`, so
+/// the tape is provably garbage at this exact instant — no collector has to
+/// prove it. Freeing here is what keeps `field_access` flat: #7537 flips a
+/// scan to the batch parser after `scan_flip_threshold` elements, so the
+/// ~2.4 MB tape becomes dead within the first few hundred of 10 000 reads and
+/// is released immediately rather than waiting for the next full collection.
+///
+/// # Safety
+///
+/// `hdr` must be a live `LazyArrayHeader` whose `materialized` field is
+/// already non-null, and no `TapeSource::Lazy` borrow of its tape may be live.
+pub(crate) unsafe fn release_tape_after_materialize(hdr: *mut LazyArrayHeader) {
+    if hdr.is_null() || (*hdr).materialized.is_null() || (*hdr).tape.is_null() {
+        return;
+    }
+    crate::json_tape_store::release(hdr as usize);
+    // GC_STORE_AUDIT(POINTER_FREE): clears the side-allocation pointer after deregistration.
+    (*hdr).tape = std::ptr::null_mut();
+    (*hdr).tape_len = 0;
 }
 
 #[inline]
@@ -1582,12 +1720,7 @@ unsafe fn reparse_materialize(
                 }
             }
         }
-        (*hdr).materialized = arr_ptr;
-        note_lazy_raw_slot(
-            hdr,
-            &(*hdr).materialized as *const _ as usize,
-            arr_ptr as usize,
-        );
+        install_materialized(hdr, arr_ptr);
     }
     REPARSE_MATERIALIZATIONS.with(|c| c.set(c.get().wrapping_add(1)));
     (Some(arr_ptr), hdr)
@@ -1647,12 +1780,7 @@ pub unsafe fn force_materialize_lazy(hdr: *mut LazyArrayHeader) -> *mut crate::a
         let arr_handle = scope.root_nanbox_u64(js.bits());
         let arr_ptr = array_from_nanbox_handle(&arr_handle);
         let hdr = hdr_handle.get_raw_mut_ptr::<LazyArrayHeader>();
-        (*hdr).materialized = arr_ptr;
-        note_lazy_raw_slot(
-            hdr,
-            &(*hdr).materialized as *const _ as usize,
-            arr_ptr as usize,
-        );
+        install_materialized(hdr, arr_ptr);
         return arr_ptr;
     }
 
@@ -1670,12 +1798,7 @@ pub unsafe fn force_materialize_lazy(hdr: *mut LazyArrayHeader) -> *mut crate::a
         if root_entry.kind != KIND_ARR_START {
             let arr_ptr = array_from_nanbox_handle(&arr_handle);
             let hdr = hdr_handle.get_raw_mut_ptr::<LazyArrayHeader>();
-            (*hdr).materialized = arr_ptr;
-            note_lazy_raw_slot(
-                hdr,
-                &(*hdr).materialized as *const _ as usize,
-                arr_ptr as usize,
-            );
+            install_materialized(hdr, arr_ptr);
             return arr_ptr;
         }
         let end = root_entry.link as usize;
@@ -1725,12 +1848,7 @@ pub unsafe fn force_materialize_lazy(hdr: *mut LazyArrayHeader) -> *mut crate::a
     let arr_ptr = array_from_nanbox_handle(&arr_handle);
     (*arr_ptr).length = cached_length;
     let hdr = hdr_handle.get_raw_mut_ptr::<LazyArrayHeader>();
-    (*hdr).materialized = arr_ptr;
-    note_lazy_raw_slot(
-        hdr,
-        &(*hdr).materialized as *const _ as usize,
-        arr_ptr as usize,
-    );
+    install_materialized(hdr, arr_ptr);
     arr_ptr
 }
 

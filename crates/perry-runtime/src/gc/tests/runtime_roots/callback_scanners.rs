@@ -270,9 +270,19 @@ fn test_json_tape_lazy_get_header_handle_survives_copied_minor_gc() {
             JsonTapeSafepointHookGuard::new(crate::json_tape::JsonTapeSafepoint::LazyArrayRooted);
         let hdr = unsafe { test_alloc_lazy_json_array(input) };
         let original_hdr = hook.fired_ptr();
-        assert_ne!(
+        // #7539: the header is old-gen and immovable by construction, so a
+        // copied minor at the safepoint CANNOT relocate it — that is the
+        // property `try_stringify_lazy_array` and the array accessors rely on
+        // when they hold a raw header across an allocation. What must still be
+        // true is that `alloc_lazy_array` hands back the address the collector
+        // sees, i.e. the one its own rooted handle resolves to.
+        assert_eq!(
             hdr as usize, original_hdr,
-            "alloc_lazy_array should return the refreshed lazy header after copied-minor GC"
+            "the lazy header must not move across a copied-minor GC"
+        );
+        assert!(
+            crate::arena::pointer_in_old_gen(hdr as usize),
+            "…because it is old-gen, which is what makes that guaranteed"
         );
         hdr
     };
@@ -283,9 +293,9 @@ fn test_json_tape_lazy_get_header_handle_survives_copied_minor_gc() {
     let value = unsafe { crate::json_tape::lazy_get(hdr_handle.get_raw_mut_ptr(), 0) };
     let original_hdr = hook.fired_ptr();
     let hdr_after = hdr_handle.get_raw_mut_ptr::<crate::json_tape::LazyArrayHeader>();
-    assert_ne!(
+    assert_eq!(
         hdr_after as usize, original_hdr,
-        "lazy_get should refresh the rooted lazy header after copied-minor GC"
+        "the lazy header must not move across a copied-minor GC (#7539)"
     );
     unsafe {
         let bitmap = (*hdr_after).materialized_bitmap;
@@ -324,10 +334,12 @@ fn test_json_tape_lazy_get_records_its_cache_store_as_an_external_edge() {
     let _trigger_guard = GcTriggerThresholdTestGuard::suppress_automatic_triggers();
     register_runtime_handle_root_scanner_for_tests();
 
-    // Born-old header: >16 KB of inline tape. That is the shape the #7538
-    // workload had and the only one where the in-object/external distinction
-    // bites — a nursery header is traced directly and its descriptor reaches
-    // the cache without any remembered-set entry at all.
+    // Born-old header. That is the shape the #7538 workload had and the only
+    // one where the in-object/external distinction bites — a nursery header is
+    // traced directly and its descriptor reaches the cache without any
+    // remembered-set entry at all. #7539 moved the tape into a side allocation
+    // but deliberately kept the header in the old generation, so this premise
+    // still holds by construction rather than by the header being large.
     let elements = 4096;
     let mut input = String::with_capacity(elements * 8 + 2);
     input.push('[');
@@ -344,14 +356,24 @@ fn test_json_tape_lazy_get_records_its_cache_store_as_an_external_edge() {
         "the lazy header must be born old, or this test exercises nothing"
     );
 
+    // Read an element far enough into the array that its cache slot is
+    // GUARANTEED to sit on a different 4 KiB page from the header: slot 2048
+    // is 16 KiB into the cache block. The test used to read element 7, whose
+    // slot happened to be pages away only because the header itself was
+    // multi-megabyte (the inline tape). Once #7539 shrank the header to
+    // ~88 bytes the cache landed immediately after it and the two shared a
+    // page, which would have made the containment assertion below fail for a
+    // reason that has nothing to do with the barrier under test.
+    //
     // No handle scope: the header is old-gen (asserted above), automatic
     // triggers are suppressed, and nothing here collects — so `hdr` cannot
     // move for the length of this test.
-    let first = unsafe { crate::json_tape::lazy_get(hdr, 7) };
+    const PROBE: u32 = 2048;
+    let first = unsafe { crate::json_tape::lazy_get(hdr, PROBE) };
     let element_addr = first.bits() & POINTER_MASK;
     assert_ne!(
         element_addr, 0,
-        "element 7 should materialize to a heap object"
+        "the probed element should materialize to a heap object"
     );
     assert!(
         crate::arena::pointer_in_nursery(element_addr as usize),
@@ -365,7 +387,7 @@ fn test_json_tape_lazy_get_records_its_cache_store_as_an_external_edge() {
             "cold lazy_get should allocate the sparse cache"
         );
         (
-            cache.add(7) as usize,
+            cache.add(PROBE as usize) as usize,
             header_from_user_ptr(hdr as *const u8) as usize,
         )
     };
@@ -432,10 +454,13 @@ fn test_json_tape_force_materialize_sparse_cache_handles_survive_copied_minor_gc
     );
     let original_arr = hook.fired_ptr();
     let hdr_after = hdr_handle.get_raw_mut_ptr::<crate::json_tape::LazyArrayHeader>();
-    assert_ne!(
+    assert_eq!(
         hdr_after as usize, before_force_hdr,
-        "force materialization should refresh the rooted lazy header"
+        "the lazy header must not move across a copied-minor GC (#7539)"
     );
+    // The MATERIALIZED ARRAY is young and does move — which is the handle
+    // refresh this test is really about, and the reason the header being
+    // stable does not make it vacuous.
     assert_ne!(
         arr as usize, original_arr,
         "force materialization should refresh the rooted array handle"
