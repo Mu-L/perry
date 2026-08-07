@@ -19,9 +19,9 @@ use super::{
     emit_array_numeric_write_note_on_block, emit_jsvalue_slot_store_with_flags_on_block,
     emit_jsvalue_slot_store_with_value_bits_on_block, emit_root_nanbox_store_on_block,
     emit_typed_feedback_register_site, emit_write_barrier,
-    expr_has_numeric_pointer_free_array_layout, lower_expr, lower_expr_native,
-    nanbox_pointer_inline, raw_f64_layout_fact, unbox_to_i64, FnCtx, TypedFeedbackContract,
-    TypedFeedbackKind,
+    emit_write_barrier_slot_generation_tested, expr_has_numeric_pointer_free_array_layout,
+    lower_expr, lower_expr_native, nanbox_pointer_inline, raw_f64_layout_fact, unbox_to_i64, FnCtx,
+    TypedFeedbackContract, TypedFeedbackKind,
 };
 
 fn emit_array_handle_length(ctx: &mut FnCtx<'_>, array_handle: &str) -> String {
@@ -416,7 +416,19 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
 
                 // Inline store: arr+8+length*8 = value, length++.
                 ctx.current_block = inbounds_idx;
-                {
+                // #7511: the barrier is emitted separately, behind an inline
+                // live test of the PARENT's generation, so the store emitter
+                // below is told not to emit it. Everything else about the store
+                // — the slot write, the string addref, the layout note, and
+                // their ordering — is unchanged.
+                //
+                // `js_write_barrier_slot` still lands in exactly the position it
+                // did before (after the layout note, before the numeric-write
+                // note and the length bump), because a collection reached
+                // between the store and the barrier would run with the
+                // old→young edge unrecorded. The block is split here rather
+                // than the call being sunk to the end of the block.
+                let (length, element_addr, barrier_value_bits) = {
                     let blk = ctx.block();
                     let length = blk.safe_load_i32_from_ptr(&arr_handle);
                     let length_i64 = blk.zext(I32, &length, I64);
@@ -436,7 +448,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                             layout_note_needed,
                             &arr_handle,
                             &element_addr,
-                            write_barrier_needed,
+                            false,
                         )
                     } else {
                         emit_jsvalue_slot_store_with_flags_on_block(
@@ -449,17 +461,48 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                             layout_note_needed,
                             &arr_handle,
                             &element_addr,
-                            write_barrier_needed,
+                            false,
                         )
+                    };
+                    // The store emitter only hands back the bits when it needed
+                    // them itself; the barrier needs them whenever it is
+                    // emitted, so materialize them here otherwise.
+                    let barrier_value_bits = if write_barrier_needed {
+                        Some(
+                            value_bits
+                                .clone()
+                                .unwrap_or_else(|| blk.bitcast_double_to_i64(&v)),
+                        )
+                    } else {
+                        None
                     };
                     // #7469: provably dead under `declared_all_pointer` — the
                     // `nofwd` admission test proved both raw-f64 bits already
                     // clear, and clearing them is this call's only effect.
                     if !value_is_numeric && !declared_all_pointer {
-                        let value_bits =
-                            value_bits.unwrap_or_else(|| blk.bitcast_double_to_i64(&v));
+                        let value_bits = barrier_value_bits
+                            .clone()
+                            .or(value_bits)
+                            .unwrap_or_else(|| blk.bitcast_double_to_i64(&v));
                         emit_array_numeric_write_note_on_block(blk, &arr_handle, &value_bits);
                     }
+                    (length, element_addr, barrier_value_bits)
+                };
+                if let Some(child_bits) = barrier_value_bits {
+                    // `arr_handle` reached this block through the `nofwd` header
+                    // test, so it is a live, non-forwarded GC array user
+                    // pointer — the precondition for reading its header byte.
+                    emit_write_barrier_slot_generation_tested(
+                        ctx,
+                        &arr_handle,
+                        &arr_handle,
+                        &element_addr,
+                        &child_bits,
+                        "apush",
+                    );
+                }
+                {
+                    let blk = ctx.block();
                     let new_length = blk.add(I32, &length, "1");
                     let arr_ptr = blk.inttoptr(I64, &arr_handle);
                     // GC_STORE_AUDIT(POINTER_FREE): array length header update has no child pointer.
@@ -660,5 +703,194 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
         // (`perry_closure_<modprefix>__<func_id>`) earlier in
         // `compile_module` via the `compile_closure` pass.
         _ => unreachable!("expr/mod.rs dispatched a variant not handled by this submodule"),
+    }
+}
+
+#[cfg(test)]
+mod parent_gate_tests {
+    use perry_hir::types::Type;
+    use perry_hir::{Expr, Function, Module as HirModule, Stmt};
+
+    /// `const a = []; a.push({v: 1});` — a pointer-valued push into a local
+    /// array, which is the shape whose barrier #7511 gates.
+    fn pushing_ir() -> String {
+        let mut hir = HirModule::new("apush_parent_gate_test");
+        hir.functions.push(Function {
+            id: 0,
+            name: "pushes".to_string(),
+            type_params: Vec::new(),
+            params: Vec::new(),
+            return_type: Type::Any,
+            body: vec![
+                Stmt::Let {
+                    id: 0,
+                    name: "a".to_string(),
+                    ty: Type::Any,
+                    mutable: true,
+                    init: Some(Expr::Array(Vec::new())),
+                },
+                Stmt::Expr(Expr::ArrayPush {
+                    array_id: 0,
+                    value: Box::new(Expr::Object(vec![("v".to_string(), Expr::Number(1.0))])),
+                }),
+                Stmt::Return(Some(Expr::LocalGet(0))),
+            ],
+            is_async: false,
+            is_generator: false,
+            is_strict: true,
+            is_exported: false,
+            captures: Vec::new(),
+            decorators: Vec::new(),
+            was_plain_async: false,
+            was_unrolled: false,
+        });
+        let opts = crate::CompileOptions {
+            emit_ir_only: true,
+            ..Default::default()
+        };
+        let bytes = crate::compile_module(&hir, opts).expect("test module compiles");
+        String::from_utf8(bytes).expect("LLVM IR is UTF-8")
+    }
+
+    fn assert_default_barrier_env_not_disabled() {
+        assert!(
+            !matches!(
+                std::env::var("PERRY_WRITE_BARRIERS").as_deref(),
+                Ok("0") | Ok("off") | Ok("false")
+            ),
+            "this test describes DEFAULT barrier emission; PERRY_WRITE_BARRIERS must be unset or on"
+        );
+    }
+
+    /// Block labels carry a uniquing suffix (`apush.barrier.21:`), so collect
+    /// the gated block's body by walking labels rather than by substring —
+    /// `apush.barrier.done.22:` would otherwise match a `apush.barrier.` prefix
+    /// test and silently hand back the WRONG block, which is exactly the block
+    /// the store is supposed to be in.
+    fn gated_barrier_block(ir: &str) -> String {
+        let mut body = Vec::new();
+        let mut inside = false;
+        for line in ir.lines() {
+            if let Some(label) = line.strip_suffix(':') {
+                if !label.starts_with(char::is_whitespace) {
+                    inside = label.starts_with("apush.barrier.")
+                        && !label.starts_with("apush.barrier.done");
+                    continue;
+                }
+            }
+            if inside {
+                body.push(line);
+            }
+        }
+        assert!(
+            !body.is_empty(),
+            "no `apush.barrier.<n>` block in the emitted IR — the push did not take the \
+             gated inline tier, so this test would be vacuous:\n{ir}"
+        );
+        body.join("\n")
+    }
+
+    /// The barrier call must sit in its own block, reached only through the
+    /// parent-generation `cond_br`, and both clauses of the gate must be
+    /// present.
+    #[test]
+    fn array_push_barrier_is_gated_on_the_parent_header() {
+        assert_default_barrier_env_not_disabled();
+        let ir = pushing_ir();
+        assert!(
+            ir.contains("js_write_barrier_slot"),
+            "the pointer-valued push must still emit a barrier at all:\n{ir}"
+        );
+        let gated = gated_barrier_block(&ir);
+        assert!(
+            gated.contains("js_write_barrier_slot"),
+            "the gated block must be the one holding the barrier call:\n{gated}"
+        );
+        // Count CALL sites only — the module's `declare` line names the symbol
+        // too, and counting it would make this compare 2 against 1 forever.
+        assert_eq!(
+            ir.matches("call void @js_write_barrier_slot").count(),
+            gated.matches("call void @js_write_barrier_slot").count(),
+            "every array-push barrier must be inside the gate — an ungated one would be the \
+             cost this ticket exists to remove:\n{ir}"
+        );
+        assert_gate_condition_is_both_clauses(&ir);
+    }
+
+    /// Follow the `cond_br`'s condition back to its definition and require it to
+    /// be the `or` of a `GC_FLAG_TENURED` header test and the incremental-count
+    /// test.
+    ///
+    /// Checking only that the IR *contains* `and i8 …, 32` and the global's name
+    /// is not enough, and this is not hypothetical: replacing the `or` with a
+    /// constant-true left both of those substrings in place (the clauses are
+    /// still computed, just no longer consulted) and the test stayed green while
+    /// the gate had stopped gating. A branch that is always taken is precisely
+    /// the failure this ticket's perf claim rests on not happening.
+    fn assert_gate_condition_is_both_clauses(ir: &str) {
+        let br = ir
+            .lines()
+            .find(|l| l.contains("br i1") && l.contains("label %apush.barrier."))
+            .unwrap_or_else(|| panic!("no gated branch in the emitted IR:\n{ir}"));
+        let cond = br
+            .split_whitespace()
+            .nth(2)
+            .and_then(|c| c.strip_suffix(','))
+            .unwrap_or_else(|| panic!("cannot read the branch condition from {br:?}"));
+        let def = ir
+            .lines()
+            .find(|l| l.trim_start().starts_with(&format!("{cond} = ")))
+            .unwrap_or_else(|| panic!("no definition of {cond} in:\n{ir}"));
+        assert!(
+            def.contains("or i1"),
+            "the gate's branch condition must be the OR of both clauses, not {def:?} — a \
+             condition that is not an `or` of the two tests is a gate that never skips"
+        );
+        let mut operands = def
+            .split("or i1 ")
+            .nth(1)
+            .expect("or operands")
+            .split(", ")
+            .map(str::trim);
+        let tenured = operands.next().expect("tenured operand");
+        let incremental = operands.next().expect("incremental operand");
+        let def_of = |name: &str| {
+            ir.lines()
+                .find(|l| l.trim_start().starts_with(&format!("{name} = ")))
+                .unwrap_or_else(|| panic!("no definition of {name} in:\n{ir}"))
+                .to_string()
+        };
+        assert!(
+            def_of(tenured).contains("icmp ne i8"),
+            "the first clause must be the parent's header-byte test, got {:?}",
+            def_of(tenured)
+        );
+        assert!(
+            def_of(incremental).contains("icmp ne i32"),
+            "the second clause must be the incremental-count test, got {:?}",
+            def_of(incremental)
+        );
+        assert!(
+            ir.contains("and i8") && ir.contains(", 32"),
+            "the header test must mask GC_FLAG_TENURED (0x20):\n{ir}"
+        );
+        assert!(
+            ir.contains("@PERRY_INCREMENTAL_MARK_BARRIER_ACTIVE_COUNT"),
+            "dropping the incremental clause would skip the insertion barrier's shading:\n{ir}"
+        );
+    }
+
+    /// The SLOT STORE is unconditional: it must NOT be inside the gated block.
+    /// Only the bookkeeping moves.
+    #[test]
+    fn array_push_slot_store_stays_outside_the_gate() {
+        assert_default_barrier_env_not_disabled();
+        let ir = pushing_ir();
+        let gated = gated_barrier_block(&ir);
+        assert!(
+            !gated.contains("store double"),
+            "the element store must stay OUTSIDE the gate — a store that only happens when the \
+             parent is tenured would drop the value entirely:\n{gated}"
+        );
     }
 }

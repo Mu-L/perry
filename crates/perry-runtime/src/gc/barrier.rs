@@ -1234,6 +1234,19 @@ pub(super) fn barrier_parent_needs_remembering(parent_addr: usize, external_slot
         crate::arena::classify_heap_generation(parent_addr),
         crate::arena::HeapGeneration::Old
     ) {
+        // #7511: generated code skips this whole call when the parent's header
+        // has no `GC_FLAG_TENURED` (`emit_parent_may_need_remembering_check`),
+        // which is sound only while `Old ⟹ TENURED` — and nothing in the
+        // allocator enforces that, so it is pinned by
+        // `gc::tests::inline_generation_gate_contract` over the production
+        // birth paths instead.
+        //
+        // A `debug_assert!` here was tried and REVERTED: it is the right
+        // enforcement point in principle, but dozens of tests build old-gen
+        // fixtures straight from `arena_alloc_gc_old` without the bit
+        // (`alloc_old_test_object`, `alloc_old_test_promise`, the
+        // `gc/tests/oldgen.rs` family), some deliberately. It fired on those,
+        // not on a defect. Reinstating it means fixing those fixtures first.
         return true;
     }
     external_slot && malloc_gc_parent_addr(parent_addr)
