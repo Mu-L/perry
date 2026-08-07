@@ -901,6 +901,12 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
             });
         }
         ast::Stmt::ForOf(for_of_stmt) => {
+            // `for (… of m.values()/keys()/entries())` on a statically-proven
+            // Map/Set is the direct-collection loop written another way; see
+            // `for_head::rewrite_collection_view_for_of`.
+            let view_rewrite = crate::lower::rewrite_collection_view_for_of(ctx, for_of_stmt);
+            let for_of_stmt = view_rewrite.as_ref().unwrap_or(for_of_stmt);
+
             // --- Issue #237: `for await (const c of <ReadableStream>)` ---
             // Lower to a getReader/read loop so the body sees Uint8Array
             // chunks. Detect by checking the iterable's registered native
@@ -1326,49 +1332,11 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
 
             let arr_expr = lower_expr(ctx, &for_of_stmt.right)?;
 
-            // Issue #302: resolve the iterable's declared type. Was
-            // limited to `Ident` (local variable lookup) so
-            // `for (const [k, v] of this.someMap)` produced a raw Map
-            // handle that the for-loop's `.length` read returned 0 on,
-            // silently skipping the loop body. Now also resolves
-            // `Member { obj: This, prop: ident }` via the class field
-            // type registry so class instance fields work too.
-            // Issue #311 extends to plain object property access
-            // (`obj.m` where `obj` is a local with an inferred
-            // `Type::Object` shape) — same silent-zero-iterations
-            // symptom as #302, just a different missing arm.
-            let iterable_type: Option<Type> = match &*for_of_stmt.right {
-                ast::Expr::Ident(ident) => ctx.lookup_local_type(ident.sym.as_ref()).cloned(),
-                ast::Expr::Member(m) => {
-                    if matches!(m.obj.as_ref(), ast::Expr::This(_)) {
-                        if let (Some(cls), ast::MemberProp::Ident(p)) =
-                            (ctx.current_class.clone(), &m.prop)
-                        {
-                            ctx.lookup_class_field_type(&cls, p.sym.as_ref()).cloned()
-                        } else {
-                            None
-                        }
-                    } else if let ast::MemberProp::Ident(p) = &m.prop {
-                        let obj_ty = crate::lower_types::infer_type_from_expr(&m.obj, ctx);
-                        match obj_ty {
-                            Type::Object(ot) => {
-                                ot.properties.get(p.sym.as_ref()).map(|pi| pi.ty.clone())
-                            }
-                            // Class instance: receiver is `new Example()` or
-                            // a local typed `Example`. Consult the same
-                            // class_field_types registry the `this.<field>`
-                            // arm uses (populated for #302).
-                            Type::Named(cls) => {
-                                ctx.lookup_class_field_type(&cls, p.sym.as_ref()).cloned()
-                            }
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
+            // Issue #302 (class instance fields) + #311 (plain object property
+            // access) — see `for_head::resolve_for_of_iterable_type`, which
+            // both for-of desugars share.
+            let iterable_type: Option<Type> =
+                crate::lower::resolve_for_of_iterable_type(ctx, &for_of_stmt.right);
 
             // Fast path: `for (const [k, v] of mapExpr)` reads flat entries
             // directly via `MapEntryKeyAt` / `MapEntryValueAt` — no pair-Array
@@ -1386,29 +1354,11 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                 Some(Type::Union(variants)) => variants.iter().any(type_contains_map),
                 _ => false,
             };
-            // Map fast path also fires for the single-binding shapes
-            //   for (const [k] of map)        — only key
-            //   for (const [, v] of map)      — only value
-            // Each non-empty slot must be a plain Ident; nested patterns
-            // / object patterns / defaults fall through to the materialized
-            // MapEntries path so destructuring stays correct.
+            // The head shapes the index fast path accepts — and why the
+            // single-ident one is a correctness fix, not just a faster route —
+            // live in `for_head::map_index_fast_path_head`.
             let map_kv_fastpath = is_iterable_map
-                && match &for_of_stmt.left {
-                    ast::ForHead::VarDecl(var_decl) => match var_decl.decls.first() {
-                        Some(decl) => match &decl.name {
-                            ast::Pat::Array(arr_pat) => {
-                                let len = arr_pat.elems.len();
-                                (len == 1 || len == 2)
-                                    && arr_pat.elems.iter().all(|e| {
-                                        e.is_none() || matches!(e, Some(ast::Pat::Ident(_)))
-                                    })
-                            }
-                            _ => false,
-                        },
-                        None => false,
-                    },
-                    _ => false,
-                };
+                && crate::lower::map_index_fast_path_head(&for_of_stmt.left, !for_of_stmt.is_await);
             // Fast path: `for (const x of setExpr)` reads elements directly
             // via `SetValueAt` (→ `js_set_value_at`) instead of materializing
             // the buffer with `js_set_to_array`.
@@ -1718,6 +1668,8 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                                         set: Box::new(Expr::LocalGet(arr_id)),
                                         idx: Box::new(Expr::LocalGet(idx_id)),
                                     }
+                                } else if map_kv_fastpath {
+                                    crate::lower::map_entry_pair(arr_id, idx_id)
                                 } else {
                                     item_expr
                                 };
