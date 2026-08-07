@@ -17,7 +17,10 @@ use crate::expr::{
     FnCtx,
 };
 use crate::type_analysis::is_string_expr;
+
+mod char_code_at;
 use crate::types::{DOUBLE, I1, I32, I64, PTR};
+use char_code_at::lower_char_code_at_inline;
 
 fn regexp_search_method_id(property: &str) -> String {
     match property {
@@ -762,6 +765,9 @@ fn lower_string_method_dispatch(
                 let _ = lower_expr(ctx, extra)?;
             }
             let recv_box = reread_recv(ctx, recv_root, &recv_box);
+            if let Some(value) = lower_char_code_at_inline(ctx, object, &recv_box, &idx_d) {
+                return Ok(value);
+            }
             let recv_handle = str_operand_handle_tag_dispatched(ctx, object, &recv_box);
             let blk = ctx.block();
             let idx_i32 = blk.call(I32, "js_string_index_to_i32", &[(DOUBLE, &idx_d)]);
