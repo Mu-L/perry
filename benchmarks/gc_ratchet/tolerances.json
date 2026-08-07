@@ -16,7 +16,17 @@
     "class from the host the baseline was captured on: retention and GC counters",
     "transfer because they are semantic, memory and time do not. 'pinned_host' is",
     "for a maintainer re-running the suite on the same quiet box, where memory and",
-    "time are comparable and are gated."
+    "time are comparable and are gated.",
+    "",
+    "'probe_overrides' takes ONE (probe, metric) cell out of the gating family.",
+    "A profile band answers 'what is this machine class's noise floor'; whether a",
+    "metric is deterministic enough to gate at all is a property of the WORKLOAD,",
+    "and those two questions were conflated until #7554. It may only ever set",
+    "gating to false, never true, and never touches the band: an excluded cell is",
+    "still measured, still compared, and still printed, it just cannot turn the",
+    "job red. Every entry carries evidence that is checked, not merely stored --",
+    "at least 21 runs (the same number every band above is justified by) and a",
+    "spread that is actually non-zero, so a cell cannot be excluded on a hunch."
   ],
 
   "shared_ci": {
@@ -190,6 +200,21 @@
       "direction": "increase",
       "gating": true,
       "rationale": "GATED HERE ONLY. Worst cross-session spread of medians-of-7 was 0.751% on an idle box (load 1.7-2.0); worst raw within-session spread was 5.3%, which the median-of-7 damps out. 10% is ~13x the cross-session figure and ~2x the worst raw spread, so it will not fire on scheduler jitter but will catch the tens-of-percent slowdown a whole-stack conservative scan would introduce. The 15 ms floor covers the fastest probe (126 ms)."
+    }
+  },
+
+  "probe_overrides": {
+    "12_large_live_set": {
+      "heap_used_bytes": {
+        "gating": false,
+        "rationale": "NOT GATED ON THIS PROBE. Retention here is genuinely sample-dependent, so it cannot carry a band whose premise is bit-identity. The cause is the CONSERVATIVE STACK SCAN that the probe's own explicit gc() forces (PERRY_GC_DIAG prints '[gc-scan-fallback] site=manual_collect automatic=false' on every run). A conservative scan retains whatever the native stack happens to look like a pointer to, and stack residue at the moment of that final collection differs run to run. Every earlier phase is bit-identical -- diffing two full traces that disagree shows the minors, the tenuring decisions, the step cycles and every copy/promote counter matching exactly, with the ONLY difference in the last full mark-sweep's freed_bytes. Proof: with PERRY_CONSERVATIVE_STACK_SCAN=off this probe reports 51,668,688 bytes on 8 consecutive runs, bit-identical, so the residual variance is entirely false roots. The other eleven probes hold live sets one to two orders of magnitude smaller, where a stale stack word is far less likely to alias a plausible heap address, which is why they stay bit-identical and stay gated. Retention here is still measured, still compared against the baseline, and still printed as an informational drift row -- and heap_total_bytes, minor_cycles, copied_objects, promoted_bytes and freed_bytes on this same probe remain gating, so a real over-retention regression still goes red.",
+        "evidence": {
+          "observed_runs": 36,
+          "observed_spread": 9072,
+          "measured_on": "2026-08-06/07, three independent reproductions at main @ be1fc80f8 (0.5.1315): pinned quiet host perry-macos (Mac mini M1, 8 GB, load 2.2) spread 2,304 over 7 harness repeats while all eleven other probes were spread 0; a MacBook Pro under load 21 spread 9,072 over 7 (59943752 59943752 59943896 59951744 59949656 59952824 59950520); 22 ad-hoc runs of the same binary spanning 59,943,080 to 59,952,824. The 2026-08-05 pin saw the same effect as one outlier in seven (+6,768 B).",
+          "issue": "https://github.com/PerryTS/perry/issues/7554 (the gate), https://github.com/PerryTS/perry/issues/7558 (the conservative-scan cause)"
+        }
+      }
     }
   }
 }
