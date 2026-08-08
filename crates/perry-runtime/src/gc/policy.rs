@@ -2657,31 +2657,63 @@ pub extern "C" fn js_gc_collect() {
     manual_gc_collect_now();
 }
 
-/// Run an explicit (`gc()`) full collection. The `gc()` callsite may hold live
-/// module-init/top-level locals only on the native stack, so the collection
-/// forces the conservative native-stack scan (#4977); see `ManualGcScanGuard`.
+/// Run an explicit (`gc()`) full collection, with **precise roots** — the same
+/// root set every automatic collection in a production binary already uses
+/// (`conservative_stack_scan_mode()` resolves to `Auto`, i.e. `SkipDisabled`).
 ///
-/// ★ #7148 disposition: **keep, observable.** Unlike the four automatic sites
-/// this is not a collection the program pays for without asking. `gc()` is a
-/// user request with synchronous semantics — `gc(); assertFreed()` is the
-/// shape every test and every ratchet probe uses — so deferring it to the next
-/// safepoint would change the observable contract of the API, not just its
-/// cost. It is counted (`ConservativeScanSite::ManualCollect`) so its share of
-/// any census is attributable: all eight `gc_ratchet` probes end with an
-/// explicit full `gc()`, so this site fires at least once per probe *by
-/// construction*, and a census that did not separate it from the automatic
-/// sites would look alarming for no reason.
+/// ★ #7558: this site used to take `ManualGcScanGuard::force_full_scan`. It no
+/// longer does, and the removal is deliberate rather than incidental — read
+/// this before adding one back.
 ///
-/// The known cost is #6942/#6946: forcing the scan makes this path non-moving,
-/// which is why `PERRY_GC_FORCE_EVACUATE` was inert for every `gc()`-driven
-/// test. Removing the scan here needs precise roots at the `gc()` callsite PC
-/// — the safepoint contract in `docs/statepoint-gc-experiment.md` on branch
-/// `exp/stackmap-viability` (not on `main`) — not a
-/// deferral.
+/// **What the scan was for.** #4977: `const keep = {…}; gc(); keep.nested.deep`
+/// read dangling-pointer garbage, because a module-init/top-level local was
+/// held only as a native-stack alloca that neither the shadow stack nor the
+/// module-var scanners covered. Forcing the conservative scan retained it. That
+/// was a *workaround for a precise-rooting hole*, applied at the one collection
+/// site that could be made to hide it — not a statement that `gc()` needs a
+/// different root set from every other collection.
+///
+/// **Why it is no longer needed.** The hole was closed by the 2026-06→08
+/// rooting campaign, from a different direction: pointer-typed locals get a
+/// persistent shadow slot bound in the function-entry setup (#6968's
+/// `expr::scalar_slot_root`, #6951/#6972's object-literal rooting), module-level
+/// bindings are `@perry_global_*` cells registered with
+/// `js_gc_register_global_root`, and `scripts/gc_root_dominance_check.py` gates
+/// the invariant that a root store must dominate every collection point — with
+/// an **empty** allowlist. `js_gc_collect` is a collection point by that
+/// invariant like any other; nothing about it is special. #4977's own repro
+/// (`test-files/test_issue_4977_gc_toplevel_locals.ts`) prints the right answer
+/// with the scan disabled.
+///
+/// **What it cost.** A conservative scan retains whatever the native stack
+/// happens to look like a pointer to, so the reading every retained-heap number
+/// in this project is taken through — `process.memoryUsage()` after `gc()` —
+/// carried a stack-residue tax. Measured with `gc_ratchet.py classify` on
+/// `main` at `961777904`: non-zero on **nine of the twelve** ratchet probes,
+/// and 28.63% / 28.24% / 29.71% / 31.03% of reported retention on
+/// `01_nursery_churn`, `05_closure_capture`, `06_string_retention` and
+/// `11_collect_at_depth` respectively (13.80%, 8,273,888 bytes, on
+/// `12_large_live_set` — the case #7558 was filed for was the *smallest* of the
+/// four). It was also non-deterministic run to run, because stack residue is,
+/// which is why `benchmarks/gc_ratchet` had to stop gating that cell (#7554)
+/// and why retention rows were unbelievable without a manual `classify`
+/// cross-check (#7559). And it made this path non-moving, which is why
+/// `PERRY_GC_FORCE_EVACUATE` was inert for every `gc()`-driven test
+/// (#6942/#6946).
+///
+/// **A second-order effect worth knowing about.** `gc/tenuring.rs` deliberately
+/// refuses to seed the adaptive tenuring threshold from a cycle that ran the
+/// conservative scan, so on any `gc()`-driven workload that seed had never
+/// fired. It fires now. On two ratchet probes `tenuring_survivals` falls
+/// `4 -> 1` and survivors are promoted on first copy rather than copied into
+/// survivor space; the copying minor still runs and moves *more* objects.
+/// Removing a conservative scan is not only a retention change.
+///
+/// **What is unchanged.** `gc()` is still synchronous — #7148's disposition
+/// that it must not be *deferred* to a safepoint stands, because
+/// `gc(); assertFreed()` is the shape every test and every ratchet probe uses.
+/// This changes the root set, not the timing.
 fn manual_gc_collect_now() {
-    let _scan = super::roots::ManualGcScanGuard::force_full_scan(
-        super::ConservativeScanSite::ManualCollect,
-    );
     // NOTE: pending finalization jobs from earlier AUTOMATIC cycles are NOT
     // cleared here — each record enqueues exactly once (its pending flag is
     // reset at enqueue time), so dropping the vec would lose those callbacks
