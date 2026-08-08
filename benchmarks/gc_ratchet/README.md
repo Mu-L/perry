@@ -31,14 +31,16 @@ because it is good discipline, not because the artifacts are related.
 
 ## What is measured
 
-Twelve probes in `probes/`, each a deterministic TypeScript workload that
+Thirteen probes in `probes/`, each a deterministic TypeScript workload that
 drives a different part of the collector: nursery churn with a zero live set,
 survivor aging and promotion, old-to-young stores and the remembered set, dead
 objects left under a deep stack high-water mark, closure environments, heap
 strings, array element-storage growth, Map/Set side tables, try/catch rooting,
-receiver stores across allocation points, collection under stack depth, and a
+receiver stores across allocation points, collection under stack depth, a
 ~100 MB live set held across many collections (the shape that catches
-survivor-space saturation — every other probe's live set is small).
+survivor-space saturation — every other probe's live set is small), and a
+survivor cohort carried across large, infrequent copying minors (the *cadence*
+every other probe misses — see below).
 
 Every probe parks its allocations in a heap container before dropping them. This
 is load-bearing. An earlier draft allocated into locals that never escaped, LLVM
@@ -76,6 +78,82 @@ gate on really are deterministic.
 Retention and GC accounting are semantic: they are a function of the allocation
 sequence and collector policy, not of CPU speed, core count, or machine load.
 That is why they can be gated on a shared CI runner and memory and time cannot.
+
+## A probe may declare the collector it is a probe *of* (the large-Eden arm)
+
+Twelve of the thirteen probes run the shipped configuration, so every copying
+minor this matrix had ever exercised was small (~16 MB of Eden) and frequent.
+Two faults arrived from the other end of that axis and neither was reachable
+from here: #7472, and #7481, which is deterministic at
+`PERRY_GC_SCAVENGE_NURSERY_MB=64` and absent at 1, 4, 16 and 32 MB. #7481 names
+the gap itself — "a live copying-minor correctness signal at exactly the cadence
+the ratchet probes never exercise".
+
+A cadence is a property of the *run*, not of the source, so a probe may state
+the run it is a probe of, in its own source:
+
+```ts
+// gc-ratchet-env: PERRY_GC_SCAVENGE_NURSERY_MB=64
+```
+
+`13_large_eden_survivors.ts` carries exactly that one directive. It lives in the
+probe source rather than in `tolerances.json` because it is not possible to read
+the workload without reading the arm.
+
+Deliberate properties:
+
+- **The declaration reaches every run of that probe** — warmup, the timed
+  repeats, both traced runs, and both of `classify`'s scan modes — and is
+  asserted to, by a test whose stub probe *reports* whether the variable
+  arrived. A `run_env` the harness recorded but never exported would be an arm
+  that is documented, gated, and inert: CLAUDE.md's fourth failure mode.
+- **It does not reach `compile_probe`.** These are runtime knobs read through
+  `OnceLock`; Perry's object cache keys on every codegen env var (#6394), so
+  passing them at compile time would move the cache key without moving a byte
+  of emitted code.
+- **Only `PERRY_*`, never a variable the harness owns.**
+  `PERRY_CONSERVATIVE_STACK_SCAN` is `classify`'s axis and `PERRY_GC_DIAG`
+  separates the traced pass from the timed one; a probe setting either would be
+  contradicting the measurement rather than describing itself. A repeated key is
+  refused too — the losing line would look effective.
+- **The arm is pinned in the artifact and compared like a metric.** `check`
+  fails a probe whose run declares a different configuration from the one the
+  baseline recorded, *before* any band arithmetic. This is the check that
+  matters: delete the directive and every band is still satisfied, because the
+  numbers would have been re-pinned by the same act that lost the arm. `check`
+  also lists every armed probe above its table, so a reader of CI output does
+  not have to open the probe to know which rows answer a different question.
+
+### Why the probe is shaped the way it is
+
+A large Eden on top of a *small* retained set runs **zero** copying minors, and
+the first draft of this probe did exactly that. `gc/policy.rs`'s
+`arena_growth_full_escalation_due` escalates a minor to a full mark-sweep once
+arena in-use clears 32 MB *and* exceeds twice the post-full baseline; with a
+64 MB Eden and a ~1 MB retained set, every collection satisfies both and the
+copying minor is never reached. The probe would have been pinned on a collector
+it never ran — the #7024 shape, inside the arm added to close it.
+
+The fix is the retained set, which holds the pacing baseline high enough that a
+64 MB Eden is not a doubling. Measured on the pinned host at v0.5.1376:
+
+| `KEEP` | copying minors at 64 MB | at the shipped default |
+|---|---:|---:|
+| 8,192 | **0** | 15 |
+| 131,072 | 1 | 14 |
+| 262,144 (shipped) | **4** | 12 |
+
+At `KEEP = 262,144` the four minors free 37, 36, 68 and 68 MB (49.7 MB per
+minor) and the first copies 532,482 objects — 32 MB — in one cycle. Against the
+rest of the suite: **14.6–16.6 MB per minor on eleven of the twelve default-cap
+probes**, and 21.8 MB on `12_large_live_set`, whose tenured-proportional cap
+term (`gc/tenuring.rs`, `max(influx x scale, tenured/2)`) already raises its
+Eden a little. That last row is worth noticing — it is the shipped path by which
+a large Eden is reached without any knob, and it tops out around 22 MB on the
+biggest workload the suite has. The guard that keeps this honest is `check`'s existing
+liveness rule (`minor_cycles > 0` and `copied_objects + promoted_objects > 0`):
+a future change that stops reaching the copying minor at this cadence cannot be
+pinned, it fails.
 
 ## Why wall time is excluded from the shared-CI gate
 
@@ -394,6 +472,23 @@ python3 benchmarks/gc_ratchet/gc_ratchet.py measure \
 python3 benchmarks/gc_ratchet/gc_ratchet.py check --current /tmp/current.json
 ```
 
+★ **`--probes-dir` pointed at a copy outside the repo is a different
+compilation, and its retention is not comparable to the pinned artifact.** A
+probe compiled with a `package.json` in scope retains one more 1 MiB arena block
+at `gc()` than the same source compiled without one, and `09_try_catch_roots`
+sits on that boundary: 5,825,256 from the repo directory, 4,777,624 from any of
+three `/tmp` directories, and 5,825,256 again from `/tmp` **with a
+`package.json` copied in** — each stable across repeats. Read against the
+baseline that is a −17.98% "improvement" in a probe nothing touched, and it cost
+real time before it was localised. The driver and CI always compile from
+`benchmarks/gc_ratchet/probes`, so the gate is self-consistent; *ratios between
+arms measured in the same directory* are unaffected, which is what makes a
+copied directory usable for an A/B and not for a comparison against the pin.
+
+(This is not build non-determinism, which was ruled out in the same session: two
+builds of one probe from one directory differ byte-for-byte and report the
+identical retention.)
+
 ## What `heap_used_bytes` actually contains (#7559, #7558)
 
 **A retention row is not evidence of a collector regression until it has been
@@ -502,6 +597,12 @@ Adding or removing a probe changes the baseline's probe set, and the checker
 fails on a set mismatch rather than silently ignoring the new one. So a new
 probe requires a deliberate re-pin, which is the intended friction. The probe
 must trigger at least one minor collection or the harness refuses to pin it.
+
+If the probe is a probe of a *configuration* rather than only of a workload,
+declare it with a `// gc-ratchet-env:` directive (see the large-Eden arm above)
+and check that the resulting run still reaches the collector you meant: a knob
+that quietly moves a workload off the path it was chosen to exercise is the
+failure this suite has paid for most often.
 
 ## Files
 
