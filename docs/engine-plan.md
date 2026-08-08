@@ -94,11 +94,15 @@ has three homes, each needing its own mechanism.*
 Phases **1 / 2 / 3a (#6909) / 3b (#6911) / 4a (#6915 + #7421/#7425) / 4b
 (#6919)** are all merged; #6904's 26× histogram is closed (#7485 deleted the
 dead 4b prototype flag). Next gap:
-**element-shape proofs through array reads** — `keep[j].v` measured **6.2× vs
-node** on the pure shape — route decided in **#7480**: both candidate routes
-share one prerequisite (a per-array homogeneous-element-shape invariant,
-construction-maintained, self-healing like 4a's dense bit), consumed first by
-the #5093 versioned-loop clone, then by element `Ptr<Shape>`.
+**element-shape proofs through array reads** — `keep[j].v`, route decided in
+**#7480**: both candidate routes share one prerequisite (a per-array
+homogeneous-element-shape invariant, construction-maintained, self-healing
+like 4a's dense bit), consumed first by the #5093 versioned-loop clone, then
+by element `Ptr<Shape>`. Prerequisite and consumer both landed (#7496, #7612);
+the consumer's growth-forwarding crash is #7660. **The element `Ptr<Shape>`
+half is still open and the kernel re-measures at 34.5× node, not the 6.2×
+#7480 recorded** — see backlog item 6 for the current table and for why the
+named-class arm's node baseline is not the literal arm's.
 
 ### Object construction — the dominant cost (#7469 campaign)
 
@@ -456,10 +460,48 @@ already working, on a workload that happens to reach it through `JSON.parse`.
    `gc-rooting-invariant.md` records as having already shipped broken. Today's
    ~20 rooting bugs were all found by hand with `PERRY_GC_PROTECT_FROMSPACE`
    because nothing else can find them. This is the structural fix.
-6. **Repsel** — the element-shape invariant landed (#7496); the versioned-loop
-   consumer and element `Ptr<Shape>` remain. Deliberately sequenced **after**
-   the bookkeeping levers: element reads are 13% of `churn` at 4.3×, the best
-   ratio in the table, so this is an RSS/footprint play more than a time one.
+6. **Repsel** — the element-shape invariant landed (#7496) and its
+   versioned-loop consumer landed (#7612, matrix #7608, corpus #7619). What
+   remains of #7480 is **element `Ptr<Shape>` for object-literal element
+   types**, and it is the whole measured gap, not a tail: #7612's
+   `element_class_name` resolves `Array(Named(C))` only, so #7480's own kernel
+   (`keep: {v,w}[]`) never reaches the clone. Re-measured 2026-08-08 on the
+   pinned quiet host, 200k elements × 50 sweeps, checksums equal, interleaved:
+
+   | kernel | perry | node | bun | ratio |
+   |---|--:|--:|--:|--:|
+   | `keep: {v,w}[]` — #7480's kernel | 414 ms | 12 ms | 12 ms | **34.5×** |
+   | `keep: Node[]` — what #7612 covers | 13 ms‡ | 57 ms† | 15 ms | **0.23×** |
+
+   **The issue's recorded 93 ms / 6.2× is stale and was optimistic** — the
+   fourth time a figure in this plan has gone stale, and the first in that
+   direction. Two traps in this one table, both of which cost time to find:
+
+   †Node is *slower* on the named-class arm than on the literal arm (57 vs
+   12 ms). `v: number;` cannot be erased by type stripping — without the
+   annotation it is still a valid class field declaration — so V8
+   pre-initialises the slot to `undefined`, pinning the field to tagged
+   representation. **"Beat node" is therefore a different number on the two
+   arms**; re-measure the arm you are gating on, in the same run.
+
+   ‡That cell did not exist before #7660: on `main` the named-class arm
+   *SIGBUSes*, because the versioned-loop consumer derived its elements base
+   from an unresolved growth-forwarding stub for any array grown outside the
+   scope that reads it. Step 2's win was real but gated behind a crash.
+
+   The IR does not match the issue's recorded cost model either. #7480 says
+   the body has "no out-of-line guard calls, the cost is stacked inline
+   diamonds"; the object-literal arm actually carries **three calls per
+   iteration** — `js_typed_feedback_observe_property_get`,
+   `js_typed_feedback_record_guard_pass` (on the *hit* path) and
+   `js_dynamic_string_or_number_add`, because with no resolvable class the
+   field read falls into the by-name PIC tower and the accumulator loses its
+   numeric proof. That is a second, separable lever, and it is the kind of win
+   that gets misattributed to the element-shape work.
+
+   Sequencing note carried from before: element reads are 13% of `churn` at
+   4.3×, so against the bookkeeping levers this stays an RSS/footprint play
+   more than a time one — but the 34.5× above is the kernel, and it is real.
 7. **Layer 1** — migrate remaining lowerings onto the rooted-combinator API
    (`crates/perry-codegen/src/rooting.rs`). **#7615 is the ordered worklist**:
    88 modules, 694 raw-pointer sites, 262 hazard sites, grouped into ten
