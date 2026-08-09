@@ -105,12 +105,46 @@ pub(super) fn next_arena_trigger_base() -> usize {
 /// (near-zero infant mortality), a saturated survivor space, and 1427
 /// collections for a run that allocates ~1.4 GB.
 pub(super) fn young_scavenge_cap_due() -> bool {
-    #[cfg(test)]
-    if GC_NURSERY_CAP_TEST_SUPPRESSED.with(Cell::get) {
+    if !nursery_cap_active() {
         return false;
     }
     crate::arena::copying_from_space_in_use_bytes()
         >= super::tenuring::scavenge_nursery_cap_effective_bytes()
+}
+
+/// Is the scavenge nursery cap in force?
+///
+/// **Only when the collection it schedules can EVACUATE**, which for nursery
+/// pressure means only when `gc_moving_loop_polls_enabled()` routes it to a
+/// precise-root safepoint. #7056's own 2x2 says the cap and the evacuating
+/// minor "ship together, because either alone is a bad trade"; this is that
+/// sentence made load-bearing rather than advisory, and #7682 is the bill for
+/// its being advisory.
+///
+/// The cap's basis is `copying_from_space_in_use_bytes()`, and **a non-moving
+/// minor does not reduce it** — it sweeps in place into per-block free lists
+/// and from-space stays occupied. So a capped trigger that fires a non-moving
+/// minor is due again the instant the next block is taken: one whole-arena
+/// collection per 1 MB allocated, O(n^2) in the live set. That is not the
+/// "+23% wall for -33% RSS" the cap-only cell of the 2x2 measured (every
+/// collection there still evacuated) — measured on the quiet host after #7682
+/// forced the alloc-point minor non-moving, `test_gap_gc_index_get_receiver_rooting`
+/// went 0.66 s -> 6.6 s, and with the cap lifted it runs in 0.13 s. It is the
+/// same livelock shape as #7592, whose fix was likewise to key a band on
+/// something a collection actually moves.
+///
+/// So this restores the pre-#7056 gating, deliberately and with a different
+/// argument than #7056 removed it under. #7056 decoupled the cap because both
+/// gates were off in shipped builds and the cap was therefore dead — a fair
+/// reading of a world in which the alloc-point minor evacuated. It no longer
+/// does. When `PERRY_GC_MOVING_LOOP_POLLS` goes default-ON again the cap comes
+/// back with it, automatically and in the configuration it was measured in.
+fn nursery_cap_active() -> bool {
+    #[cfg(test)]
+    if GC_NURSERY_CAP_TEST_SUPPRESSED.with(Cell::get) {
+        return false;
+    }
+    gc_moving_loop_polls_enabled()
 }
 
 pub(super) fn effective_next_arena_trigger() -> usize {
@@ -123,12 +157,11 @@ pub(super) fn effective_next_arena_trigger() -> usize {
     // the cap instead of ballooning to 128–260 MB between the ~8 collections
     // the adaptive trigger otherwise allows.
     //
-    // APPLIED UNCONDITIONALLY (#7056). This used to be gated behind
-    // `PERRY_GC_SCAVENGE` / `PERRY_GC_MOVING_LOOP_POLLS`, both of which default
-    // OFF — so the cap was never active in a shipped build, and shipped Perry
-    // paid the full adaptive-trigger footprint. #7056 measured that the cap is
-    // the entire RSS win and recommended decoupling it from those gates; this
-    // is that decoupling.
+    // APPLIED WHEN THE COLLECTION IT SCHEDULES CAN EVACUATE — see
+    // [`nursery_cap_active`], which is where that condition and its evidence
+    // live. #7056 applied it unconditionally on the reading that the
+    // alloc-point minor evacuated; since #7682 it does not, and a capped
+    // trigger firing a non-moving minor is a livelock rather than a trade.
     //
     // Re-derived on the statepoint-default collector, 8 gc_ratchet probes,
     // as a full 2x2 rather than a single comparison — because the one-armed
@@ -157,8 +190,7 @@ pub(super) fn effective_next_arena_trigger() -> usize {
     //
     // `PERRY_GC_SCAVENGE_NURSERY_MB` still tunes the value; it is a
     // measurement dial, not an on/off mode, so it needs no kill-policy arm.
-    #[cfg(test)]
-    if GC_NURSERY_CAP_TEST_SUPPRESSED.with(Cell::get) {
+    if !nursery_cap_active() {
         return base;
     }
     // The cap the clamp applies is the *effective* one: the configured base
@@ -478,10 +510,34 @@ pub(crate) fn gc_moving_loop_polls_enabled() -> bool {
 
 /// Pure env→enable decision for the moving-loop minor, factored out so the
 /// default is unit-testable without touching process env / the cached `OnceLock`.
-/// **Default OFF (#7154 stopgap):** an unset var (or any value other than an
-/// explicit opt-in) selects the non-evacuating minor; only `1`/`on`/`true`
-/// enables the moving-loop path. Codegen's `moving_safepoint_polls_enabled`
-/// mirrors this exactly (same env, same predicate).
+///
+/// **Default ON since #7682.** The kill switch is `0`/`off`/`false`; anything
+/// else, including unset, selects the moving-loop path. Codegen's
+/// `moving_safepoint_polls_enabled` mirrors this exactly (same env, same
+/// predicate) — they MUST agree, or a deferred collection has no drain.
+///
+/// #7161 flipped this OFF as a stopgap, and named both conditions for putting
+/// it back. Both are met:
+///
+///  * **Its correctness reason is closed.** #7161's own title is "pending
+///    #7154"; #7154 closed on 2026-08-01. The class it belongs to now has a
+///    static gate (`gc-root-dominance.yml` over
+///    `scripts/gc_root_dominance_corpus.sh`) whose allowlist is EMPTY, so a new
+///    instance is a red build rather than a field report.
+///  * **Its codegen-quality reason is discharged.** The other half of the
+///    stopgap was that a poll at every back-edge defeats auto-vectorization;
+///    `emit_gc_loop_safepoint` now emits one only where
+///    `loop_purity::loop_may_allocate` says the body can allocate, so
+///    numeric/vectorizable loops stay call-free. A loop that cannot allocate
+///    cannot arm a trigger, so skipping it there is not a coverage hole.
+///
+/// And leaving it off had become the more dangerous state, which is the actual
+/// reason this moves now. Nursery pressure has exactly two precise collection
+/// points — this poll and the outermost microtask-pump boundary — and a
+/// compute-only program reaches neither with polls off. Every nursery
+/// collection therefore happened at the register-imprecise allocation point,
+/// where #7682 showed it must not move. So "polls off" does not mean "collect
+/// later, precisely"; it means "never collect precisely at all".
 pub(crate) fn moving_loop_polls_enabled_from_env(value: Option<&str>) -> bool {
     matches!(value, Some("1") | Some("on") | Some("true"))
 }
@@ -568,20 +624,29 @@ pub(super) fn force_moving_gc_pacing() -> LegacyGcPacingGuard {
     }
 }
 
-/// Pin the pacing combination a **shipped binary actually runs**: moving-loop
-/// polls OFF (`gc_moving_loop_polls_enabled`, default OFF since #7161) and
-/// scavenge ON (`gc_scavenge_enabled`, default ON since #7056).
+/// Pin the one pacing combination in which nursery pressure reaches the DIRECT
+/// allocation-point minor: moving-loop polls OFF (so nothing defers) and
+/// scavenge ON (so the arm in `gc_check_trigger` is open at all).
 ///
-/// This is a third combination, and its absence is part of why #7682 shipped.
+/// **This is the `PERRY_GC_MOVING_LOOP_POLLS=0` kill-switch configuration, and
+/// it is deliberately NOT called "shipped default" any more.** It *was* the
+/// shipped default — polls OFF since #7161, scavenge ON since #7056 — and it is
+/// the combination #7682 was found in. The follow-up that turned polls back ON
+/// made that name a lie in the same PR that introduced it, which is the kind of
+/// stale claim this whole line of work is about. A test naming this guard is
+/// asserting something about the kill switch; a test that wants the default
+/// must take no pacing guard at all.
+///
+/// The third combination is what needed a guard in the first place.
 /// [`force_legacy_gc_pacing`] pins polls OFF *and* scavenge OFF;
 /// [`force_moving_gc_pacing`] pins both ON. Every test in this crate therefore
-/// declared a pacing mode in which the two flags agreed — and the
+/// declared a pacing mode in which the two flags AGREED — and the
 /// alloc-point/deferral interaction that broke is precisely the one where they
-/// DISAGREE: scavenge routes nursery pressure to the direct alloc-point minor,
+/// disagree: scavenge routes nursery pressure to the direct alloc-point minor,
 /// while the deferral that was supposed to move that collection to a precise
-/// safepoint is gated on the polls flag and never runs.
+/// safepoint is gated on the polls flag.
 #[cfg(test)]
-pub(super) fn force_shipped_default_gc_pacing() -> LegacyGcPacingGuard {
+pub(super) fn force_alloc_point_minor_pacing() -> LegacyGcPacingGuard {
     let previous = GC_MOVING_LOOP_POLLS_TEST_OVERRIDE.with(|cell| cell.replace(Some(false)));
     let cap_previous = GC_NURSERY_CAP_TEST_SUPPRESSED.with(|cell| cell.replace(false));
     let scavenge_previous = super::GC_SCAVENGE_TEST_OVERRIDE.with(|cell| cell.replace(Some(true)));
@@ -1763,8 +1828,12 @@ pub fn gc_check_trigger() {
     // fall through to the budgeted mutator-assist step below, which is
     // deliberately non-moving (`low_pause_non_moving = is_budgeted()`), so a
     // reallocation-heavy loop's minors free nothing. Route those triggers to the
-    // direct (non-budgeted, atomic) minor here instead so the copying/evacuating
-    // fast path can run (see the `force_full_scan` skip below).
+    // direct (non-budgeted, atomic) minor here instead, so the collection is an
+    // atomic minor that actually reclaims rather than a budgeted step that
+    // does not. It is NOT an evacuating one: since #7682 the guard below is
+    // unconditional, so a collection that happens here is always non-moving.
+    // Scavenge is a PACING knob and nothing more; it used to also skip that
+    // guard, which is the bug.
     // `gc_moving_loop_polls_enabled()`: the SOUND moving-nursery path. When loop
     // polls are on, entering this block routes nursery pressure AWAY from the
     // budgeted non-moving stepper (which would otherwise own it and free nothing
@@ -1772,10 +1841,9 @@ pub fn gc_check_trigger() {
     // GC_SAFEPOINT_PENDING and returns — the collection then runs as an
     // evacuating MOVING minor at the next precise loop back-edge safepoint
     // (`js_gc_loop_safepoint` → `gc_safepoint_moving_minor`), NOT here at the
-    // register-imprecise alloc point. Unlike `gc_scavenge_enabled()` (which skips
-    // the conservative scan HERE — sound only if the alloc point is precise), the
-    // loop-polls path never reaches the skip: it always defers to a real
-    // safepoint.
+    // register-imprecise alloc point. That deferral is the ONLY route by which
+    // nursery pressure becomes a moving collection, and it is why the polls
+    // flag and the scavenge flag are not interchangeable.
     //
     // #7280: that used to read "so it is sound by construction". IT IS NOT, and
     // the overclaim is the kind that stops the next person looking. What
