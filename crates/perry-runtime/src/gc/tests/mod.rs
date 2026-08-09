@@ -4,6 +4,7 @@ mod barrier_arming;
 mod barrier_decoded_parent;
 mod budgeted_step_api;
 mod buffer_side_tables;
+mod clone_keys_array_init;
 mod contract;
 mod copying;
 mod copying_side_tables;
