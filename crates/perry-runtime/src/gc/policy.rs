@@ -584,6 +584,27 @@ impl Drop for LegacyGcPacingGuard {
     }
 }
 
+/// Pin moving-loop polls ON for the duration of the returned guard, so a test
+/// can drive `js_gc_loop_safepoint` without depending on the process-wide
+/// default (which the `OnceLock` fixes from the environment once per test
+/// binary — exactly the ambient dependency #7728's own regression hid behind).
+#[cfg(test)]
+pub(super) struct MovingLoopPollsGuard(Option<bool>);
+
+#[cfg(test)]
+impl MovingLoopPollsGuard {
+    pub(super) fn on() -> Self {
+        Self(GC_MOVING_LOOP_POLLS_TEST_OVERRIDE.with(|cell| cell.replace(Some(true))))
+    }
+}
+
+#[cfg(test)]
+impl Drop for MovingLoopPollsGuard {
+    fn drop(&mut self) {
+        GC_MOVING_LOOP_POLLS_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+    }
+}
+
 /// Pin legacy GC pacing (moving-loop polls OFF) for the duration of the returned
 /// guard. See [`LegacyGcPacingGuard`] and [`gc_moving_loop_polls_enabled`].
 #[cfg(test)]
@@ -2385,12 +2406,35 @@ pub extern "C" fn js_gc_loop_safepoint() {
     // #7604: the only reliable answer to "did the compile-time half take
     // effect". Past the opt-in, so a default binary never touches it.
     super::note_loop_poll_reached();
-    // Zeal (#7154 tooling) collects at EVERY poll, not only when the alloc-point
-    // arm already deferred one. Zeal cannot conjure a poll codegen never emitted,
-    // so the `gc_moving_loop_polls_enabled()` gate above still applies — see
-    // `gc/zeal.rs` for why that means "compile AND run with
-    // `PERRY_GC_MOVING_LOOP_POLLS=1`".
-    if !GC_SAFEPOINT_PENDING.with(Cell::get) && !super::gc_zeal_enabled() {
+    // Zeal (#7154 tooling) collects at polls the deferral flag would skip, not
+    // only when the alloc-point arm already deferred one. Zeal cannot conjure a
+    // poll codegen never emitted, so the `gc_moving_loop_polls_enabled()` gate
+    // above still applies — see `gc/zeal.rs` for why that means "compile AND run
+    // with `PERRY_GC_MOVING_LOOP_POLLS=1`".
+    //
+    // ★ #7728: "at polls", not "at EVERY poll". Unpaced, this arm cost ~511 µs
+    // per loop iteration to relocate a mean of 5.9 objects, which made zeal
+    // unusable on any real workload the moment #7721 turned back-edge polls on
+    // by default (24 minutes for a 19 s program). The stride is a bound on
+    // forced collections, not a heuristic — see `gc/zeal.rs`.
+    //
+    // The zeal work all sits inside the `!pending` branch on purpose: a default
+    // (zeal-off) build reaches exactly the same one cached-bool read and return
+    // it did before, and the deferral-drain path below is untouched.
+    if !GC_SAFEPOINT_PENDING.with(Cell::get) {
+        if !super::gc_zeal_enabled() {
+            return;
+        }
+        if !super::zeal::zeal_poll_collection_due(crate::arena::copying_from_space_in_use_bytes()) {
+            super::zeal::note_zeal_poll_paced();
+            return;
+        }
+        gc_safepoint_moving_minor();
+        // Rearm from the level measured AFTER the collection, so the next
+        // forced one costs a full stride of new allocation on top of whatever
+        // survived — see `gc/zeal.rs` for why this is a high-water mark and not
+        // a delta.
+        super::zeal::note_zeal_poll_collection(crate::arena::copying_from_space_in_use_bytes());
         return;
     }
     gc_safepoint_moving_minor();
