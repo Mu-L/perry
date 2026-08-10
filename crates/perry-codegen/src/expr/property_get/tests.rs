@@ -175,3 +175,95 @@ fn fs_parent_promises_property_installs_before_resolution() {
         "fs.promises submodule installation must precede property resolution:\n{ir}"
     );
 }
+
+/// #7753, paired with `pic_cache_words_match_codegen` in
+/// `perry-runtime/src/object/field_get_set/ic_miss.rs`.
+///
+/// The runtime writes a `@perry_ic_N` global through `*mut [i64;
+/// PIC_CACHE_WORDS]`. If codegen emits a NARROWER global, `pic_prime_get`'s way
+/// stores run past the end of it into whatever global the linker placed next —
+/// silent memory corruption that no property-read test would notice. This pins
+/// the emitted width to the constant both sides share, and pins the constant
+/// itself so the runtime's copy cannot drift.
+#[test]
+fn pic_cache_layout_matches_runtime() {
+    use crate::expr::property_get::generic_dispatch::{PIC_CACHE_WORDS, PIC_WAYS, PIC_WAY_BASE};
+    assert_eq!(
+        PIC_CACHE_WORDS, 12,
+        "perry-runtime's PIC_CACHE_WORDS is 12; update both sides together"
+    );
+    assert_eq!(
+        PIC_WAY_BASE + PIC_WAYS * 2,
+        PIC_CACHE_WORDS,
+        "the ways must fill the emitted global exactly"
+    );
+    let ir = emit(false, None);
+    assert!(
+        ir.contains(&format!(
+            "= private global [{PIC_CACHE_WORDS} x i64] zeroinitializer"
+        )),
+        "every @perry_ic_N must be emitted at the width the runtime writes:\n{ir}"
+    );
+}
+
+/// #7753: the polymorphic ways must be consulted BEFORE the miss call, and the
+/// monomorphic path must not have grown any work.
+///
+/// A one-entry cache misses on essentially every read at a site whose receiver
+/// alternates between shapes — the shape of every discriminated-union dispatch
+/// — and each miss runs the full `js_object_get_field_ic_miss` ladder
+/// (proxy/closure/buffer/typed-array probes, an accessors thread-local, then a
+/// linear keys scan with a `js_string_equals` per key). If the way block is
+/// ever deleted or floated below the call it stops paying for itself entirely,
+/// and nothing else in the suite would show it — the program still computes the
+/// right answer, just slowly. So assert the ORDER, not merely the presence.
+#[test]
+fn generic_property_get_tries_ways_before_calling_the_miss_handler() {
+    let ir = emit(false, None);
+    assert!(
+        ir.contains("@perry_ic_"),
+        "test premise: the generic read reaches the inline PIC:\n{ir}"
+    );
+    use crate::expr::property_get::generic_dispatch::{PIC_WAYS, PIC_WAY_BASE, PIC_WAY_STATE};
+
+    // Block *text* order is an artifact of emission order, so assert the CFG
+    // instead: the block that calls the miss handler must be reachable only as
+    // a branch target of the way block, never straight-line after it.
+    let ways = ir
+        .find("\npic.ways")
+        .unwrap_or_else(|| panic!("expected a pic.ways block:\n{ir}"));
+    let way_load = ir
+        .find("\npic.way.load")
+        .unwrap_or_else(|| panic!("expected a pic.way.load block:\n{ir}"));
+    let call_block = ir
+        .find("\npic.miss.call")
+        .unwrap_or_else(|| panic!("expected a pic.miss.call block:\n{ir}"));
+    let ways_body = &ir[ways..[way_load, call_block, ir.len()]
+        .into_iter()
+        .filter(|&x| x > ways)
+        .min()
+        .unwrap()];
+    assert!(
+        ways_body.contains("pic.way.load") && ways_body.contains("pic.miss.call"),
+        "pic.ways must end in a branch choosing between the way load and the \
+         miss call — otherwise the compares are not gating anything:\n{ways_body}"
+    );
+    assert!(
+        !ways_body.contains("call double @js_object_get_field_ic_miss"),
+        "the miss call must not sit inside the way block:\n{ways_body}"
+    );
+    // The way compares read (token, slot) pairs at words PIC_WAY_BASE.. and the
+    // gate reads the state word — all inside pic.ways, none anywhere else.
+    for w in 0..PIC_WAYS {
+        for word in [PIC_WAY_BASE + w * 2, PIC_WAY_BASE + w * 2 + 1] {
+            assert!(
+                ways_body.contains(&format!("i64 {word}\n")),
+                "way word {word} is never read in the way block:\n{ways_body}"
+            );
+        }
+    }
+    assert!(
+        ir.contains(&format!("i64 {PIC_WAY_STATE}\n")),
+        "the megamorphic gate must read the way-state word:\n{ir}"
+    );
+}
