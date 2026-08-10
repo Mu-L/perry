@@ -545,12 +545,87 @@ fn array_get_property_by_key(arr: *const ArrayHeader, key: *const crate::StringH
 /// FOR DENSE KEYS/PROPERTY ARRAYS ONLY — general JS arrays may have
 /// `length > capacity` (sparse), where this cap would be incorrect.
 pub(crate) unsafe fn keys_array_len_capped_to_capacity(arr: *const ArrayHeader) -> usize {
+    // #7765: a well-formed dense keys array answers from its own two words.
+    // `js_array_length` re-derives the same number through a proxy probe, a
+    // second header read for its lazy/object arms, and a `clean_arr_ptr`
+    // forwarding walk — once per property read on the field-get funnel.
+    // `length <= capacity` is exactly the well-formed case; the sparse and
+    // corrupted shapes this cap exists for fall through unchanged.
+    if let Some(header) = crate::value::addr_class::try_read_gc_header(arr as usize) {
+        if header.obj_type == crate::gc::GC_TYPE_ARRAY
+            && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
+            && (*arr).length <= (*arr).capacity
+        {
+            return (*arr).length as usize;
+        }
+    }
     let raw = js_array_length(arr) as usize;
     if arr.is_null() {
         raw
     } else {
         raw.min((*arr).capacity as usize)
     }
+}
+
+/// Read slot `index` of a dense internal keys/property array.
+///
+/// The object field-get funnel has already proved `keys` is a live
+/// `GC_TYPE_ARRAY` — it reads the `GcHeader` and returns `undefined` otherwise
+/// — and has capped `index` below the array's own capacity (see
+/// [`keys_array_len_capped_to_capacity`]). Those are precisely the two facts
+/// [`js_array_get_f64`] re-establishes from scratch on every call: a
+/// `clean_arr_ptr` forwarding walk, a lazy-header probe, the exotic-receiver
+/// classifications and a descriptor-flag read — per key examined, per property
+/// read. On `gc-handoff/apps/asyncpipe_big.ts` that one funnel was 78% of all
+/// `js_array_get_f64` samples.
+///
+/// Falls back to the general getter for anything it cannot serve on those
+/// terms — a forwarded array (which `clean_arr_ptr` would relocate), one
+/// carrying index descriptors, an out-of-range index, or a hole (which reads
+/// through the prototype chain) — so no general semantics move. Keys arrays
+/// are dense and descriptor-free, so the fallback is the cold arm.
+#[inline]
+pub(crate) unsafe fn keys_array_slot(
+    keys: *const ArrayHeader,
+    index: u32,
+) -> crate::value::JSValue {
+    if let Some(header) = crate::value::addr_class::try_read_gc_header(keys as usize) {
+        if header.obj_type == crate::gc::GC_TYPE_ARRAY
+            && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
+            && header._reserved & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS == 0
+            && index < (*keys).length
+            && index < (*keys).capacity
+        {
+            let elements =
+                (keys as *const u8).add(std::mem::size_of::<ArrayHeader>()) as *const f64;
+            let raw = std::ptr::read(elements.add(index as usize));
+            if raw.to_bits() != crate::value::TAG_HOLE {
+                return crate::value::JSValue::from_bits(raw.to_bits());
+            }
+        }
+    }
+    #[cfg(test)]
+    KEYS_ARRAY_SLOT_FALLBACKS.with(|c| c.set(c.get().wrapping_add(1)));
+    crate::array::js_array_get(keys, index)
+}
+
+/// Times [`keys_array_slot`] could NOT serve a slot from the dense words and
+/// had to delegate. Asserted in both directions by
+/// `array::collection_tag_tests` — zero for the dense keys arrays the fast path
+/// exists for, non-zero for every shape it must refuse — so a fast path that
+/// silently stopped applying, or one that started swallowing a shape it should
+/// have delegated, both go red.
+///
+/// Per THREAD — `cargo test` runs every case on its own thread in one process,
+/// so a process-global counter would be moved by whatever else is running.
+#[cfg(test)]
+thread_local! {
+    static KEYS_ARRAY_SLOT_FALLBACKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn test_keys_array_slot_fallbacks() -> u64 {
+    KEYS_ARRAY_SLOT_FALLBACKS.with(|c| c.get())
 }
 
 /// Auto-opt dead-strip anchor: codegen emits a bare `js_array_length` symbol in
@@ -590,10 +665,17 @@ pub extern "C" fn js_array_length(arr: *const ArrayHeader) -> u32 {
     };
     if !arr.is_null() {
         let addr = arr as usize;
-        if crate::set::is_registered_set(addr) {
+        // #7765: gate both probes on the receiver's own type tag — see
+        // `js_array_get_f64` for why the tag answers, why it is ABA-proof, and
+        // why a header-less buffer receiver still lands on the same result.
+        // This reads the byte the `GC_TYPE_LAZY_ARRAY` / `GC_TYPE_OBJECT` block
+        // a few lines below already reads, under the same magnitude guard, so
+        // it adds no dereference this function did not already perform.
+        let receiver_type = array_receiver_gc_tag(arr).0;
+        if receiver_type == crate::gc::GC_TYPE_SET && crate::set::is_registered_set(addr) {
             return crate::set::js_set_size(arr as *const crate::set::SetHeader);
         }
-        if crate::map::is_registered_map(addr) {
+        if receiver_type == crate::gc::GC_TYPE_MAP && crate::map::is_registered_map(addr) {
             return crate::map::js_map_size(arr as *const crate::map::MapHeader);
         }
     }
@@ -814,8 +896,32 @@ pub extern "C" fn js_array_get_f64(arr: *const ArrayHeader, index: u32) -> f64 {
             crate::buffer::js_buffer_get(arr as *const crate::buffer::BufferHeader, index as i32);
         return byte_val as f64;
     }
+    // #7765: ONE `GcHeader` read now gates both collection probes below and
+    // supplies the descriptor flags further down, which `array_object_flags`
+    // used to re-derive through a second `clean_arr_ptr` and a second header
+    // read. On `gc-handoff/apps/asyncpipe_big.ts` this call site was 76% of all
+    // `is_registered_set` samples and 82% of all `is_registered_map` ones —
+    // both registries are non-empty there, so the #7474 latch is correctly
+    // armed and each probe really was resolving a thread-local and hashing, on
+    // every element read of an ordinary array, to prove an array is not a Map.
+    //
+    // The tag answers because every registered `Map`/`Set` IS its
+    // `arena_alloc_gc(_, _, GC_TYPE_MAP|GC_TYPE_SET)` header (one registration
+    // site each), and it is ABA-proof by construction: it lives INSIDE the
+    // candidate bytes, so recycling the address into anything else rewrites it
+    // before the new pointer is handed out. That is exactly what an
+    // address-keyed negative memo could not offer (#7755).
+    //
+    // Correct for a header-LESS receiver too. Buffers and typed arrays are
+    // `std::alloc`-backed, so their preceding bytes are allocator bookkeeping —
+    // but both are already routed above, and whichever way those bytes read the
+    // outcome is unchanged: a bookkeeping byte that happens to read as
+    // `GC_TYPE_SET`/`GC_TYPE_MAP` still falls through to the authoritative
+    // registry (which answers `false`), and any other value skips a probe that
+    // would have answered `false` anyway.
+    let receiver_tag = array_receiver_gc_tag(arr);
     // Check if this is a Set — read from elements pointer (not inline)
-    if crate::set::is_registered_set(arr as usize) {
+    if receiver_tag.0 == crate::gc::GC_TYPE_SET && crate::set::is_registered_set(arr as usize) {
         let set = arr as *const crate::set::SetHeader;
         unsafe {
             let size = (*set).size;
@@ -827,7 +933,7 @@ pub extern "C" fn js_array_get_f64(arr: *const ArrayHeader, index: u32) -> f64 {
         }
     }
     // Check if this is a Map — return entries as [key, value] pairs
-    if crate::map::is_registered_map(arr as usize) {
+    if receiver_tag.0 == crate::gc::GC_TYPE_MAP && crate::map::is_registered_map(arr as usize) {
         let map = arr as *const crate::map::MapHeader;
         unsafe {
             let size = (*map).size;
@@ -843,7 +949,7 @@ pub extern "C" fn js_array_get_f64(arr: *const ArrayHeader, index: u32) -> f64 {
     // `array_has_own_index`) — this probe allocated two Strings on EVERY
     // checked element read once any descriptor existed process-wide, which
     // taxed every internal keys_array walk (`in`, defineProperty, Object.keys).
-    if array_object_flags(arr) & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0 {
+    if array_object_flags_from_tag(receiver_tag) & crate::gc::OBJ_FLAG_ARRAY_DESCRIPTORS != 0 {
         let key = index.to_string();
         if let Some(acc) = crate::object::get_accessor_descriptor(arr as usize, &key) {
             if acc.get != 0 {

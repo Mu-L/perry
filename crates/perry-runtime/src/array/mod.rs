@@ -25,6 +25,8 @@ mod splice_slice;
 mod subclass;
 
 #[cfg(test)]
+mod collection_tag_tests;
+#[cfg(test)]
 mod spread_dense_tests;
 #[cfg(test)]
 mod subclass_tests;
@@ -103,7 +105,7 @@ pub use self::immutable::{
 pub(crate) use self::indexing::{
     array_has_own_index, array_iteration_is_exotic, array_proto_iterator_modified,
     array_prototype_addr, array_prototype_has_index_flag, array_spec_get, array_spec_has_index,
-    invalidate_array_index_fast_path, keys_array_len_capped_to_capacity,
+    invalidate_array_index_fast_path, keys_array_len_capped_to_capacity, keys_array_slot,
     note_array_proto_iterator_write, note_object_prototype_index_write, object_prototype_addr,
     object_prototype_addr_matches, object_prototype_has_index_flag,
     PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED,
@@ -118,7 +120,9 @@ pub use self::indexing::{
     scan_prototype_addr_cache_roots_mut,
 };
 #[cfg(test)]
-pub(crate) use self::indexing::{test_array_proto_addr_cache, test_object_proto_addr_cache};
+pub(crate) use self::indexing::{
+    test_array_proto_addr_cache, test_keys_array_slot_fallbacks, test_object_proto_addr_cache,
+};
 pub use self::is_array::js_array_is_array;
 pub(crate) use self::iter_methods::throw_reduce_of_empty;
 pub use self::iter_methods::{
@@ -189,7 +193,8 @@ pub(crate) use self::header::{
     array_named_property_get, array_named_property_get_by_name, array_named_property_has,
     array_named_property_names, array_named_property_set, array_numeric_raw_f64_get,
     array_numeric_raw_f64_push_inbounds, array_numeric_raw_f64_set_inbounds, array_object_flags,
-    array_ptr_as_proxy, canonicalize_array_numeric_store_value, clean_arr_ptr, clean_arr_ptr_mut,
+    array_object_flags_from_tag, array_ptr_as_proxy, array_receiver_gc_tag,
+    canonicalize_array_numeric_store_value, clean_arr_ptr, clean_arr_ptr_mut,
     clear_array_numeric_layout, clear_array_numeric_layout_ptr, gc_element_slot_range,
     mark_array_layout_unknown, mark_array_raw_f64_holes_fresh, normalize_array_receiver,
     note_array_slot, note_array_slot_layout_only, rebuild_array_layout, rebuild_array_layout_exact,

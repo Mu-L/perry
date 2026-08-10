@@ -68,6 +68,55 @@ pub(crate) fn array_object_flags(arr: *const ArrayHeader) -> u16 {
     }
 }
 
+/// The `obj_type` and flag word of the `GcHeader` that precedes `arr`, read
+/// once, for a receiver [`clean_arr_ptr`] has already resolved. `(0, 0)` when
+/// `arr` is too low to carry a header — `0` is not a legal `obj_type`, so it
+/// reads as "unknown" at every call site.
+///
+/// A non-zero tag is NOT proof that a real header exists. `Buffer` and
+/// `TypedArray` payloads are `std::alloc`-backed, so the eight bytes below them
+/// are allocator bookkeeping and can read as any value. Use the answer only
+/// where a wrong tag is harmless:
+///
+/// * to *skip* a registry probe whose answer for that receiver would have been
+///   `false` anyway — the caller must already have routed real buffers and
+///   typed arrays elsewhere; or
+/// * as the `GC_TYPE_ARRAY` test [`array_object_flags`] already performs on
+///   this very byte, where those bookkeeping bytes are allowed to be wrong
+///   today.
+///
+/// What makes the tag *authoritative* for the collection receivers is that
+/// every GC allocation carries a header, `Map` and `Set` included:
+/// `js_map_alloc` / `js_set_alloc` stamp `GC_TYPE_MAP` / `GC_TYPE_SET` through
+/// `arena_alloc_gc`, and that is the single registration site for each. Several
+/// comments in the tree still say Map/Set headers come from a bare `alloc()`
+/// with no `GcHeader` and that only the registry can classify them; that
+/// stopped being true when they moved into the managed arena.
+#[inline]
+pub(crate) fn array_receiver_gc_tag(arr: *const ArrayHeader) -> (u8, u16) {
+    // `try_read_gc_header` rather than this file's usual
+    // `>= GC_HEADER_SIZE + 0x1000` floor: that floor sits BELOW the handle
+    // band, and `js_array_length` reaches here before its proxy/handle
+    // receivers have been routed. The canonical predicate rejects the bands
+    // without touching memory, and rejecting an address the old floor would
+    // have read costs nothing — a handle is not a Map either way.
+    match unsafe { crate::value::addr_class::try_read_gc_header(arr as usize) } {
+        Some(header) => (header.obj_type, header._reserved),
+        None => (0, 0),
+    }
+}
+
+/// [`array_object_flags`] answered from a tag [`array_receiver_gc_tag`]
+/// already read, for a receiver `clean_arr_ptr` already resolved.
+#[inline]
+pub(crate) fn array_object_flags_from_tag(tag: (u8, u16)) -> u16 {
+    if tag.0 == crate::gc::GC_TYPE_ARRAY {
+        tag.1
+    } else {
+        0
+    }
+}
+
 #[inline]
 pub(crate) fn array_is_frozen(arr: *const ArrayHeader) -> bool {
     array_object_flags(arr) & crate::gc::OBJ_FLAG_FROZEN != 0

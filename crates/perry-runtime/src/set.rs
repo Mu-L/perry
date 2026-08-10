@@ -221,7 +221,21 @@ fn register_set(ptr: *mut SetHeader, elements: *mut f64, capacity: usize) {
     });
 }
 
+/// Every entry into [`is_registered_set`]. Twin of
+/// `map::TEST_MAP_REGISTRY_PROBES` — see that counter for what it pins down.
+#[cfg(test)]
+thread_local! {
+    static TEST_SET_REGISTRY_PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn test_set_registry_probe_count() -> u64 {
+    TEST_SET_REGISTRY_PROBES.with(|c| c.get())
+}
+
 pub fn is_registered_set(addr: usize) -> bool {
+    #[cfg(test)]
+    TEST_SET_REGISTRY_PROBES.with(|c| c.set(c.get().wrapping_add(1)));
     // #7469: nothing registered ⟹ nothing to find, without a thread-local
     // resolution or a hash. See `map::is_registered_map` for the pairing.
     if set_registry_never_used() {
