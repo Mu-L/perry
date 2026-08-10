@@ -37,10 +37,12 @@
 //!    `acc = <pure numeric>` statement over tracked `arr[i].field` reads,
 //!    numeric locals, literals and pure arithmetic / `Math` — or, since
 //!    #7771, that statement preceded by exactly one `const r = arr[i]`
-//!    binding whose only uses are tracked `r.field` reads (the binding is
-//!    virtual in the fast clone: its `Let` emits nothing and the reads lower
-//!    through the fact). No store of any kind, no call, no closure, no
-//!    `await`, no update other than the counter's.
+//!    binding whose only uses are tracked `r.field` reads (#7766: the shape
+//!    the `for…of` desugar emits, and the form a parameter array reaches the
+//!    clone through — the binding is virtual in the fast clone: its `Let`
+//!    emits nothing and the reads lower through the fact). No store of any
+//!    kind, no call, no closure, no `await`, no update other than the
+//!    counter's.
 //! 2. **By construction (the lowering).** After the fast clone is emitted,
 //!    every one of its blocks is scanned for a GC-unsafe call
 //!    (`LlBlock::contains_gc_unsafe_call`). If ANY call survived — because
@@ -899,6 +901,45 @@ pub(super) fn lower_element_shape_versioned_for(
             .cond_br(&shape_ok, &fast_pre_label, &slow_pre_label);
     } else {
         ctx.block().br(&slow_pre_label);
+    }
+
+    // `--opt-report` (#7766): the clone is a runtime-guarded `Ptr<Shape>`
+    // selection for the reads it serves — the report must say so, or the
+    // parameter-array case reads as an unserved rule-1 wall (the exact
+    // mis-reading #7766 was filed on). Recorded ONLY when the deref block
+    // branches INTO the fast clone: an emitted-but-deleted clone selects
+    // nothing ("a gate must assert its subject was live").
+    if fast_clone_call_free && crate::opt_report::enabled() {
+        let (name, local_id) = match matched.element_binding {
+            Some(id) => (
+                ctx.local_id_to_name
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("<local {id}>")),
+                Some(id),
+            ),
+            None => (
+                ctx.local_id_to_name
+                    .get(&matched.array_id)
+                    .map(|n| format!("elements of `{n}`"))
+                    .unwrap_or_else(|| format!("elements of <local {}>", matched.array_id)),
+                None,
+            ),
+        };
+        crate::opt_report::select(
+            crate::opt_report::Position::Local,
+            &name,
+            local_id,
+            crate::opt_report::Analysis::PtrShape,
+            "Ptr<Shape>",
+            1,
+            Some(format!(
+                "element-shape loop clone (runtime-guarded): class {}, {} tracked field(s); \
+                 element reads in this loop lower to offset loads behind the preheader guard",
+                matched.class_name,
+                matched.fields.len()
+            )),
+        );
     }
 
     ctx.current_block = slow_pre_idx;
