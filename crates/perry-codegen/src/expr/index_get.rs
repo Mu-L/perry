@@ -31,12 +31,13 @@ use crate::type_analysis::{is_array_expr, is_numeric_expr, is_string_expr, recei
 use crate::types::{DOUBLE, I1, I16, I32, I64, I8};
 
 use super::{
-    array_kind_fact, buffer_access_materialization_reason, emit_typed_feedback_register_site,
-    expr_has_numeric_pointer_free_array_layout, int_range_expr, lower_buffer_load, lower_expr,
-    lower_expr_as_i32, lower_typed_array_load, materialize_js_value, raw_f64_layout_fact,
-    try_lower_flat_const_index_get, typed_feedback_emission_enabled, unbox_str_handle,
-    unbox_to_i64, BufferAccessSpec, FnCtx, PackedF64LoopFact, TypedFeedbackContract,
-    TypedFeedbackKind,
+    array_kind_fact, attach_buffer_view_pointer_state_for_expr,
+    buffer_access_materialization_reason, emit_typed_feedback_register_site,
+    expr_has_numeric_pointer_free_array_layout, int_range_expr, invalidate_buffer_view_pointer,
+    lower_buffer_load, lower_expr, lower_expr_as_i32, lower_typed_array_load, materialize_js_value,
+    raw_f64_layout_fact, try_lower_flat_const_index_get, typed_feedback_emission_enabled,
+    unbox_str_handle, unbox_to_i64, BufferAccessSpec, FnCtx, PackedF64LoopFact,
+    TypedFeedbackContract, TypedFeedbackKind,
 };
 
 mod guarded_array;
@@ -215,6 +216,40 @@ fn numeric_index_needs_runtime_key(ctx: &FnCtx<'_>, object: &Expr, index: &Expr)
 fn typed_array_index_needs_runtime_key(ctx: &FnCtx<'_>, object: &Expr, index: &Expr) -> bool {
     !numeric_index_has_integer_array_index_proof(ctx, index)
         && !numeric_index_has_loop_array_index_proof(ctx, object, index)
+}
+
+fn is_proven_canonical_numeric_string_literal(key: &[u8]) -> bool {
+    if matches!(key, b"-0" | b"NaN" | b"Infinity" | b"-Infinity") {
+        return true;
+    }
+
+    let digits = key.strip_prefix(b"-").unwrap_or(key);
+    if digits.is_empty()
+        || (digits.len() > 1 && digits[0] == b'0')
+        || !digits.iter().all(u8::is_ascii_digit)
+    {
+        return false;
+    }
+
+    // Decimal integers through Number.MAX_SAFE_INTEGER are exact, and this
+    // range is below the threshold where JS Number#toString switches to
+    // exponent notation. Their source spelling therefore proves
+    // CanonicalNumericIndexString without invoking runtime conversion.
+    digits
+        .iter()
+        .try_fold(0_u64, |value, digit| {
+            value.checked_mul(10)?.checked_add(u64::from(digit - b'0'))
+        })
+        .is_some_and(|value| value <= 9_007_199_254_740_991)
+}
+
+fn runtime_key_may_expose_typed_array_backing_buffer(index: &Expr) -> bool {
+    match index {
+        Expr::String(key) => !is_proven_canonical_numeric_string_literal(key.as_bytes()),
+        Expr::WtfString(key) => !is_proven_canonical_numeric_string_literal(key),
+        Expr::Integer(_) | Expr::Number(_) => false,
+        _ => true,
+    }
 }
 
 fn lower_array_index_get_via_runtime_key(
@@ -825,6 +860,17 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     return Ok(v);
                 }
                 if typed_array_index_needs_runtime_key(ctx, object.as_ref(), index.as_ref()) {
+                    if runtime_key_may_expose_typed_array_backing_buffer(index) {
+                        if let Expr::LocalGet(id) = object.as_ref() {
+                            if ctx.buffer_view_slots.contains_key(id) {
+                                invalidate_buffer_view_pointer(
+                                    ctx,
+                                    *id,
+                                    MaterializationReason::MutableAlias,
+                                );
+                            }
+                        }
+                    }
                     let arr_box = lower_expr(ctx, object)?;
                     let key_box = lower_expr(ctx, index)?;
                     let blk = ctx.block();
@@ -849,6 +895,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         false,
                         vec!["typed_array_fallback=untracked_or_unproven".to_string()],
                     );
+                    attach_buffer_view_pointer_state_for_expr(ctx, object);
                     return Ok(result);
                 }
 
@@ -893,6 +940,7 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     false,
                     vec!["typed_array_fallback=untracked_or_unproven".to_string()],
                 );
+                attach_buffer_view_pointer_state_for_expr(ctx, object);
                 return Ok(result);
             }
             if is_uint8array_receiver(ctx, object) && is_numeric_expr(ctx, index) {
