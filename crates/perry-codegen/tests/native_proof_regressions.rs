@@ -11710,7 +11710,9 @@ fn typed_f64_receiver_method_clone_raw_loads_after_composed_guards() {
             && typed_ir.contains("getelementptr i8, ptr")
             && typed_ir.matches("load double").count() >= 2
             && typed_ir.contains(" fadd ")
-            && typed_ir.contains(" fmul "),
+            && typed_ir.contains(" fmul ")
+            && !typed_ir.contains("js_number_coerce")
+            && !typed_ir.contains("js_dynamic_string_or_number_add"),
         "typed receiver clone should raw-load receiver fields and stay in f64 SSA:\n{typed_ir}"
     );
     let method_guard = caller_ir
@@ -11741,34 +11743,79 @@ fn typed_f64_receiver_method_clone_raw_loads_after_composed_guards() {
     //      offsets but must NOT assume the slots hold canonical raw f64
     //
     // What makes (3) sound is not which symbol it is, it is that the callee
-    // coerces what it loads. `$pshape` does: it emits `inttoptr` +
-    // `getelementptr` + `load double` — the shape guarantees the OFFSETS — and
-    // then routes every loaded slot through `js_number_coerce`, which is
-    // exactly the right handling for a slot that may hold a NaN-boxed value.
-    // `$generic` is also acceptable here; what must never appear on this edge
-    // is `$typed_f64_recv`, whose whole premise is the guard that just failed.
+    // preserves coercion semantics after loading. `$pshape` may use
+    // `inttoptr` + `getelementptr` + `load double` because the shape guarantees
+    // the OFFSETS, but it must tag-dispatch the `+` and then ToNumber that
+    // possibly boxed result before the following multiply. `$generic` is also
+    // acceptable here; what must never appear on this edge is
+    // `$typed_f64_recv`, whose whole premise is the guard that just failed.
+    let field_guard_branch = caller_ir[field_guard..]
+        .lines()
+        .find(|line| line.trim_start().starts_with("br i1 "))
+        .unwrap_or_else(|| panic!("field guards should feed a conditional branch:\n{caller_ir}"));
+    let mut field_guard_successors = field_guard_branch
+        .split("label %")
+        .skip(1)
+        .map(|part| part.split([',', ' ']).next().unwrap());
+    let success_label = field_guard_successors.next().unwrap_or_else(|| {
+        panic!("field-guard branch should have a success edge: {field_guard_branch}")
+    });
+    let failure_label = field_guard_successors.next().unwrap_or_else(|| {
+        panic!("field-guard branch should have a failure edge: {field_guard_branch}")
+    });
+    let basic_block = |label: &str| {
+        let marker = format!("\n{label}:\n");
+        let start = caller_ir
+            .find(&marker)
+            .unwrap_or_else(|| panic!("basic block `{label}` not found:\n{caller_ir}"))
+            + marker.len();
+        let rest = &caller_ir[start..];
+        &rest[..rest.find("\n\n").unwrap_or(rest.len())]
+    };
+    let success_block = basic_block(success_label);
+    let failure_block = basic_block(failure_label);
+    assert!(
+        success_block.contains(&format!("call double @{typed}(i64 ")),
+        "the raw-f64 field-guard success edge must call the raw-f64 receiver clone:\n\
+         {success_block}"
+    );
+    assert!(
+        !failure_block.contains(&format!("call double @{typed}(")),
+        "the raw-f64 field-guard failure edge must not call the raw-f64 receiver clone:\n\
+         {failure_block}"
+    );
     let failure_edge_callee = [generic_body, pshape_body]
         .into_iter()
-        .find(|sym| caller_ir.contains(&format!("call double @{sym}(")))
+        .find(|sym| failure_block.contains(&format!("call double @{sym}(")))
         .unwrap_or_else(|| {
             panic!(
                 "raw-f64 field guard failure must reach a clone that does not \
-                 assume raw-f64 slots (`$generic` or `$pshape`):\n{caller_ir}"
+                 assume raw-f64 slots (`$generic` or `$pshape`):\n{failure_block}"
             )
         });
-    assert!(
-        !caller_ir.contains(&format!("call double @{typed}(double ")),
-        "the guard-failure edge must not reach the raw-f64 receiver clone \
-         (that clone is only valid when the guard PASSED):\n{caller_ir}"
-    );
     if failure_edge_callee == pshape_body {
         let pshape_ir = defined_function_ir_section(&ir, pshape_body);
+        let dynamic_add = pshape_ir
+            .find("call double @js_dynamic_string_or_number_add(")
+            .unwrap_or_else(|| {
+                panic!("the Ptr<Shape> clone must tag-dispatch declared-only `+`:\n{pshape_ir}")
+            });
+        let result_coerce = pshape_ir
+            .find("call double @js_number_coerce(")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the Ptr<Shape> clone must ToNumber the possibly boxed `+` result:\n\
+                     {pshape_ir}"
+                )
+            });
+        let multiply = pshape_ir
+            .find(" fmul ")
+            .unwrap_or_else(|| panic!("expected score's multiply in `$pshape`:\n{pshape_ir}"));
         assert!(
-            pshape_ir.contains("call double @js_number_coerce("),
-            "the Ptr<Shape> clone reached on raw-f64 guard FAILURE must coerce \
-             every slot it loads — without that it is the typed clone under \
-             another name, and a receiver whose fields are not raw f64 would \
-             take raw loads anyway:\n{pshape_ir}"
+            dynamic_add < result_coerce && result_coerce < multiply,
+            "the Ptr<Shape> clone reached on raw-f64 guard FAILURE must \
+             ToNumber the possibly boxed `+` result before multiplying it:\n\
+             {pshape_ir}"
         );
     }
     assert!(
