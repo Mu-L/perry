@@ -394,6 +394,19 @@ pub(crate) fn visit_object_static_prototype_slot_mut(
     if owner == 0 {
         return;
     }
+    // The residual registry is EMPTY until a non-meta-capable owner records a
+    // prototype, and the latch is stored (`Release`) *before* that insert, so
+    // a `false` read proves there is nothing here to visit. Its siblings
+    // (`object_static_prototype`, `object_static_prototype_owner_moved`,
+    // `prune_dead_object_prototype_owners`) already gate on it; THIS one is
+    // the collector's per-object rewrite hook, so without the gate every
+    // traced object took a process-global `Mutex<HashMap>` and paid a SipHash
+    // probe against an empty map. Measured on `gc-handoff/bench/retain.ts`:
+    // `pthread_mutex_lock` and `RandomState::hash_one` were both visible under
+    // the mark drain in a single-threaded profile.
+    if !OBJECT_PROTOTYPES_NONEMPTY.load(Ordering::Acquire) {
+        return;
+    }
     // Take the entry OUT and run the visit with the lock RELEASED: a
     // copying-minor rewrite visitor can move the prototype object, and
     // move fixup re-enters `object_static_prototype_owner_moved`, which
@@ -619,5 +632,50 @@ mod latch_drain_tests_7737 {
              every evacuated object keeps paying the mutex + SipHash lookup \
              for the rest of the process"
         );
+    }
+
+    /// The collector's per-object rewrite hook now gates on the same latch.
+    ///
+    /// Both halves are asserted, because only the pair is a fix: a hook that
+    /// skips an EMPTY registry is the optimisation, and a hook that still
+    /// reaches a RECORDED entry is the thing the optimisation must not break.
+    /// Without the second assertion, `return;` at the top of the function
+    /// would also pass.
+    #[test]
+    fn the_gc_visit_hook_skips_an_empty_registry_and_still_reaches_a_recorded_one() {
+        let _lock = crate::gc::global_side_table_test_lock();
+        prune_dead_object_prototype_owners(&|_| true);
+
+        // A REAL old-gen allocation, not a synthetic address: on the armed
+        // path the visitor re-reads the owner's `GcHeader` to re-key a
+        // self-referential prototype, so a made-up owner segfaults there. (The
+        // #7737 test above never calls the visitor, which is why it can use
+        // one.)
+        let owner = crate::arena::arena_alloc_gc_old(64, 8, crate::gc::GC_TYPE_OBJECT) as usize;
+        let proto_bits: u64 = 0x7FFC_0000_0000_0001;
+
+        let mut visits = 0usize;
+        visit_object_static_prototype_slot_mut(owner, |_| visits += 1);
+        assert_eq!(
+            visits, 0,
+            "an empty registry must be answered by the latch, not by a \
+             process-global mutex plus a SipHash probe — this hook runs once \
+             per TRACED object"
+        );
+
+        if let Ok(mut map) = get_object_prototypes().lock() {
+            OBJECT_PROTOTYPES_NONEMPTY.store(true, Ordering::Release);
+            map.insert(owner, proto_bits);
+        }
+        let mut seen = 0u64;
+        let mut visits = 0usize;
+        visit_object_static_prototype_slot_mut(owner, |slot| {
+            visits += 1;
+            seen = unsafe { *slot };
+        });
+        assert_eq!(visits, 1, "a recorded prototype slot must still be visited");
+        assert_eq!(seen, proto_bits);
+
+        prune_dead_object_prototype_owners(&|o| o == owner);
     }
 }
