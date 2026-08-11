@@ -104,6 +104,17 @@ pub(crate) struct UpdateConfig {
     /// What Enter means at the `prompt` mode question. Default false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) prompt_default: Option<bool>,
+    /// Which document to read to learn the latest version:
+    /// `gh-releases`, `npm`, `gh-registry` or `custom`. Unset walks the
+    /// historical ladder. See `release_source`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<String>,
+    /// Package name for the npm-shaped sources. Defaults to Perry's own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) package: Option<String>,
+    /// Registry base URL for the npm-shaped sources.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) registry: Option<String>,
     /// Keys this build does not know about.
     ///
     /// Without this, a `[update]` key written by a NEWER Perry — or by hand,

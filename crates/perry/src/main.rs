@@ -7,6 +7,7 @@ mod compat_reports;
 mod install_channel;
 #[cfg(test)]
 mod panic_profile_contract;
+mod release_source;
 mod shadow_layout_contract;
 mod telemetry;
 #[cfg(test)]

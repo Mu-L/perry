@@ -15,8 +15,8 @@ use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-const HUB_URL: &str = "https://hub.perryts.com/api/v1/version/latest";
-const GITHUB_URL: &str = "https://api.github.com/repos/PerryTS/perry/releases/latest";
+pub(crate) const HUB_URL: &str = "https://hub.perryts.com/api/v1/version/latest";
+pub(crate) const GITHUB_URL: &str = "https://api.github.com/repos/PerryTS/perry/releases/latest";
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -327,42 +327,6 @@ pub fn compare_versions(a: &str, b: &str) -> Result<Ordering> {
     Ok(a.cmp_precedence(&b))
 }
 
-fn get_update_servers() -> Vec<String> {
-    let mut servers = Vec::new();
-
-    // 1. Environment variable (highest priority)
-    if let Ok(url) = std::env::var("PERRY_UPDATE_SERVER") {
-        if !url.is_empty() {
-            servers.push(url);
-        }
-    }
-
-    // 2. Config file
-    if servers.is_empty() {
-        if let Some(url) = load_config_update_server() {
-            servers.push(url);
-        }
-    }
-
-    // 3. Perry Hub
-    servers.push(HUB_URL.to_string());
-
-    // 4. GitHub API
-    servers.push(GITHUB_URL.to_string());
-
-    servers
-}
-
-/// The configured update server, read through the SHARED config loader.
-///
-/// This used to parse `~/.perry/config.toml` again into a private pair of
-/// structs. That is what let `[update]` be silently erased: the real
-/// `PerryConfig` had no field for it, so every `save_config` reconstructed the
-/// file without it and threw the section away.
-fn load_config_update_server() -> Option<String> {
-    crate::commands::publish::load_config().update?.server
-}
-
 fn fetch_latest_version() -> Result<UpdateCache> {
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
@@ -371,9 +335,59 @@ fn fetch_latest_version() -> Result<UpdateCache> {
         .build()
         .context("Failed to create HTTP client")?;
 
-    let servers = get_update_servers();
     let mut last_err = None;
 
+    // A configured source answers on its own. Nothing falls back to the ladder
+    // after it: a user who said "ask npm" and got an error wants to hear that,
+    // not a version from somewhere they did not name.
+    if let Some(source) = crate::release_source::resolve() {
+        let (url, headers) = source.request()?;
+        let mut request = client.get(&url);
+        for (name, value) in &headers {
+            request = request.header(*name, value);
+        }
+        let response = request
+            .send()
+            .with_context(|| format!("{} check failed ({url})", source.label()))?;
+        if !response.status().is_success() {
+            bail!(
+                "{} check failed: HTTP {} from {url}",
+                source.label(),
+                response.status()
+            );
+        }
+        let body = response.text().context("update source returned no body")?;
+        let probe = source.parse(&body)?;
+        parse_version(&probe.latest_version).with_context(|| {
+            format!(
+                "{} returned an invalid version: {}",
+                source.label(),
+                probe.latest_version
+            )
+        })?;
+        // Same discipline as the fallback ladder below: take the lock, then
+        // re-read the notice state. Reading it before the request would let a
+        // notice recorded while the request was in flight be overwritten with a
+        // minutes-old value, and telling the user twice about one release is the
+        // exact thing the throttle exists to prevent. Both notice fields carry
+        // forward — dropping `last_notified_version` reset the version-keyed
+        // throttle on every refresh.
+        let _guard = lock_cache();
+        let prior = load_cache();
+        let cache = UpdateCache {
+            last_check: now_rfc3339(),
+            latest_version: probe.latest_version,
+            release_url: probe.release_url,
+            last_notification: prior.as_ref().and_then(|c| c.last_notification.clone()),
+            last_notified_version: prior
+                .as_ref()
+                .and_then(|c| c.last_notified_version.clone()),
+        };
+        save_cache(&cache);
+        return Ok(cache);
+    }
+
+    let servers = crate::release_source::release_info_servers();
     for url in &servers {
         match client.get(url).send() {
             Ok(resp) if resp.status().is_success() => match resp.json::<ReleaseInfo>() {
@@ -772,7 +786,10 @@ pub fn perform_self_update(output: UpdateOutput) -> Result<()> {
         .build()?;
     let mut release_info = None;
     let mut last_err = None;
-    let servers = get_update_servers();
+    // The ARTIFACT ladder, deliberately not the check source: this is where
+    // the signed `.update.json` manifest lives, and no configured check source
+    // may redirect it. See `release_source`'s module docs.
+    let servers = crate::release_source::release_info_servers();
 
     for url in &servers {
         match client.get(url).send() {
