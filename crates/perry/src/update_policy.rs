@@ -683,7 +683,6 @@ mod teardown_tests {
         }
     }
 
-
     /// An interactive terminal, a successful command, an unmanaged install
     /// with a writable directory — the only shape in which anything installs.
     fn ideal() -> TeardownEnv {

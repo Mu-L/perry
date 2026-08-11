@@ -407,8 +407,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let kept = "license_key = \"keep-me\"\n";
             std::fs::write(&path, kept).expect("write");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
-                .expect("chmod");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
             // Root ignores the mode bits, so there is nothing to prove when the
             // suite runs as root. Skip in that case rather than fail.
             let still_readable = std::fs::read_to_string(&path).is_ok();
@@ -448,7 +447,9 @@ mod tests {
         })
         .expect("a fresh config must be writable");
         assert!(
-            std::fs::read_to_string(&path).expect("read").contains("mode"),
+            std::fs::read_to_string(&path)
+                .expect("read")
+                .contains("mode"),
             "the setting was not persisted"
         );
 

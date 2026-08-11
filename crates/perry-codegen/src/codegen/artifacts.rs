@@ -1439,8 +1439,7 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
     // same extern declaration. Without it the module references a global it
     // never declared and LLVM refuses to parse the IR — which is a good way for
     // this to fail, since it fails at build time and names the missing global.
-    let mut nested_prefixes: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
+    let mut nested_prefixes: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for key in &cross_module.namespace_member_nested {
         if let Some(prefix) = cross_module.namespace_member_prefixes.get(key) {
             if prefix != module_prefix.as_str() {
