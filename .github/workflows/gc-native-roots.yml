@@ -119,11 +119,24 @@
 #                 objects copied, and the whole step passes. The collector was
 #                 never the problem.
 #
-#   ubuntu-24.04-arm  REAL DEFECT, filed as #7984. `PERRY_STACKMAP_WALKER=verify`
-#                 caught the fast fp-chain walker and the unwinder resolving the
-#                 same root to addresses 96 bytes apart. This arm is red because
-#                 it found the bug it was built to find; it must STAY red until
-#                 #7984 is fixed. Do not skip it.
+#   ubuntu-24.04-arm  REAL DEFECT, filed as #7984 and FIXED (#7997).
+#                 `PERRY_STACKMAP_WALKER=verify` caught the fast fp-chain
+#                 walker and the unwinder resolving the same root 96 bytes
+#                 apart, and the fast walker — the one that runs when `verify`
+#                 is off — was the wrong one. Two blind spots in
+#                 `fp_to_sp_offset`, both only reachable with SVE on, which is
+#                 what `-mcpu=native` turns on for a Neoverse-class core and
+#                 nothing on macOS or x86-64 ever does: a callee-save store
+#                 ended the prologue's stack-adjustment run, and
+#                 `addvl sp, sp, #-N` was not decoded at all. The 96 was never
+#                 a constant — it is that frame's missed tail, and it scales
+#                 with the vector length (208 at VL = 64 B).
+#
+#                 This arm should now be GREEN. If it goes red again, read the
+#                 report `verify` prints before assuming a regression: it names
+#                 the frame, the base register, both resolved bases and the
+#                 prologue words, which is enough to say which walker is wrong
+#                 without a second run.
 #
 #   windows-latest    REAL DEFECT, filed as #7985 (`perry.exe` cannot link
 #                 against the official LLVM 22 release: /MT-vs-/MD CRT mismatch,
@@ -133,11 +146,11 @@
 #                 `D:\a\_temp` as a remote host — was a workflow bug and is
 #                 fixed here with `--force-local`.
 #
-# So: after #7970 the macOS and ubuntu-latest arms should pass and the other two
-# should remain red on their filed defects. This workflow is therefore NOT a
-# promotion candidate yet — promoting it while #7984/#7985 are open would block
-# every PR. Promote only once all four arms are green, and per CLAUDE.md, run it
-# green once BEFORE adding it to branch protection.
+# So: after #7970 and #7997 three of the four arms should pass and only
+# windows-latest should remain red, on #7985. This workflow is therefore still
+# NOT a promotion candidate — promoting it while #7985 is open would block every
+# PR. Promote only once all four arms are green, and per CLAUDE.md, run it green
+# once BEFORE adding it to branch protection.
 name: gc-native-roots
 on:
   # Must run where it can actually gate something. Branch-scoped triggers were
@@ -262,6 +275,42 @@ jobs:
         run: |
           export RUSTFLAGS="-C force-frame-pointers=yes -C force-unwind-tables=yes"
           cargo build --profile perry-dev -p perry -p perry-runtime-static -p perry-stdlib-static
+
+      # The two aarch64 walkers, over a frame this repository wrote, on the host
+      # that has to walk it.
+      #
+      # Until this step, NOTHING `cargo test` runs ever called `fp_chain::visit`
+      # or `unwind::visit` — their only exercise anywhere was `verify` mode in
+      # the step further down, inside a workflow that has never had a successful
+      # run on any branch (#7970). The unit tests cover the decoder and the
+      # matcher; the step that turns a `(register, offset)` pair into a stack
+      # address had none, which is why #7984 could only ever be found by
+      # compiling TypeScript and collecting.
+      #
+      # This asks the same question in seconds and without a compiler: given a
+      # frame whose layout is known — the aarch64-ELF one, where LLVM puts the
+      # `x29,x30` pair below the other callee-saves, and the Mach-O one, where
+      # it sits at the top — do both walkers land on the word the record names?
+      # It runs BEFORE the probe matrix so a walker defect is reported as a
+      # walker defect rather than as an oracle diff twenty minutes later.
+      - name: Walker agreement (aarch64 hosts)
+        if: ${{ !cancelled() && matrix.arch == 'aarch64' && runner.os != 'Windows' }}
+        run: |
+          set -euo pipefail
+          export RUSTFLAGS="-C force-frame-pointers=yes -C force-unwind-tables=yes"
+          cargo test --profile perry-dev -p perry-runtime --lib gc::roots::stack_maps \
+            -- --test-threads=1 | tee /tmp/walker-agreement.log
+          # `--lib <filter>` is a substring match, so a rename makes it select
+          # nothing and `cargo test` still exits 0 having run zero tests — a
+          # gate that cannot fail. Require each test by name, including the
+          # sabotage arm that proves the sentinel check discriminates.
+          for name in both_walkers_resolve_an_sp_root_in_an_elf_shaped_frame \
+                      both_walkers_resolve_an_sp_root_in_a_darwin_shaped_frame \
+                      a_wrong_frame_offset_is_caught; do
+            grep -q "walker_agreement::$name ... ok" /tmp/walker-agreement.log \
+              || { echo "::error::$name did not run — the filter matched nothing"; exit 1; }
+          done
+
       - name: Probe matrix, RS4GC mode, forced evacuation
         if: ${{ !cancelled() }}
         run: |
@@ -515,7 +564,7 @@ jobs:
                 "/tmp/rs4gc-$name" > "/tmp/walker-$name-$mode.out" \
                                   2> "/tmp/walker-$name-$mode.err" \
                 || { echo "::error::$name crashed under PERRY_STACKMAP_WALKER=$mode"; \
-                     tail -20 "/tmp/walker-$name-$mode.err"; exit 1; }
+                     tail -120 "/tmp/walker-$name-$mode.err"; exit 1; }
               diff "/tmp/rs4gc-$name.oracle" "/tmp/walker-$name-$mode.out" \
                 || { echo "::error::$name diverged from the pinned oracle under PERRY_STACKMAP_WALKER=$mode"; exit 1; }
               checked=$((checked+1))

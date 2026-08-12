@@ -179,6 +179,41 @@ fn walker_mode() -> WalkerMode {
     })
 }
 
+/// One root as a walker resolved it, carrying the provenance that says WHY.
+///
+/// The walkers used to hand the collector a bare `MutableRootSlot`, which is
+/// all the collector needs and exactly nothing of what a disagreement between
+/// two walkers is about. When `PERRY_STACKMAP_WALKER=verify` caught the
+/// aarch64-ELF fp-chain walk and the unwinder resolving one root 96 bytes
+/// apart (#7984), the panic could say "1 slot versus 1 slot" and print two
+/// integers — from which neither the frame, the base register, nor the frame
+/// whose base was used could be recovered. Every walker now reports where the
+/// address came from, so `verify` names the disagreement instead of posing it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ResolvedRoot {
+    /// Address of the slot: `base` displaced by the record's frame offset.
+    pub(super) address: usize,
+    /// The frame's return address — what `match_records` was keyed on.
+    pub(super) ip: usize,
+    /// Start of the function the matched record belongs to.
+    pub(super) function_address: usize,
+    /// The record's base register (29 = FP, 31 = SP on aarch64).
+    pub(super) dwarf_reg: u16,
+    /// The record's frame offset from that base.
+    pub(super) offset: i32,
+    /// The base the walker resolved that register to for this frame.
+    pub(super) base: usize,
+}
+
+impl ResolvedRoot {
+    fn slot(self) -> MutableRootSlot {
+        MutableRootSlot {
+            kind: MutableRootSlotKind::NativeStack,
+            ptr: self.address as *mut u64,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(in crate::gc) struct NativeStackWalkStats {
     pub(in crate::gc) walks: usize,
@@ -364,11 +399,53 @@ fn fp_to_sp_offset(function_address: usize) -> Option<usize> {
                     fp_offset = Some(offset + immediate_of(word));
                     continue;
                 }
-                // The prologue's stack adjustments are contiguous; the first
-                // instruction after them that is not a `sub sp` ends the run.
-                // Anything later that touches sp is a body operation (a dynamic
-                // alloca, a call-argument area) which the stack map's own
-                // offsets already account for.
+                // #7984: an SVE stack adjustment scales by the RUNTIME vector
+                // length, which is nowhere in the instruction. There is no
+                // correct number to return, so return none of one — the
+                // caller falls back to the platform unwinder, which reads the
+                // frame's DWARF CFI and does not need VG for an fp-based
+                // frame.
+                //
+                // This is not hypothetical and it is not rare. Perry tunes a
+                // host build with `-mcpu=native`; on any Neoverse-class core
+                // that turns SVE on, and LLVM then emits the module body's
+                // prologue as (measured on `01_nursery_churn`, aarch64 Linux,
+                // `-mcpu=neoverse-n2`):
+                //
+                //     add   x29, sp, #0x20     <- fp established here
+                //     stp   x28, x27, [sp, #48]
+                //     ... four more callee-save pairs ...
+                //     sub   sp, sp, #0x50      <- 80 bytes
+                //     addvl sp, sp, #-2        <- and 2 x VL more
+                //
+                // The same probe built `-mcpu=neoverse-n1` has neither the
+                // interleaved stores nor the `addvl`, which is why this was an
+                // ARM-Linux-runner-only failure that no macOS arm could see.
+                if writes_sp_by_vector_length(word) {
+                    // The multiplier is in the instruction; the unit is not.
+                    // Read it once from the kernel — `?` fails the whole
+                    // decode where it cannot be read, because half a frame
+                    // size is a wrong answer, not a partial one.
+                    fp_offset = Some(offset + sve_sp_allocation_bytes(word)?);
+                    continue;
+                }
+                // A store INTO the frame does not move sp, so it cannot end
+                // the run of stack adjustments — and LLVM interleaves exactly
+                // these between the frame-pointer setup and the local-area
+                // allocation in the shape above. Treating one as the end of
+                // the prologue is what made the decoder report 0x20 for a
+                // frame whose body SP is 144 bytes below the frame pointer,
+                // placing every SP-relative root in it 112 bytes too high.
+                if is_frame_store_through_sp(word) {
+                    continue;
+                }
+                // Anything else ends the prologue. Something later that
+                // touches sp is a body operation (a dynamic alloca, a
+                // call-argument area) which the stack map's own offsets
+                // already account for — and a frame that needs a base pointer
+                // for either reason records its roots against x19, which
+                // `chain_walkable` refuses for the whole image, so this walker
+                // never sees one.
                 break;
             }
         }
@@ -378,6 +455,118 @@ fn fp_to_sp_offset(function_address: usize) -> Option<usize> {
         }
     }
     fp_offset
+}
+
+/// `stp`/`str` with SP as the base register and no writeback.
+///
+/// These are the callee-save spills LLVM emits, and they do not modify sp — so
+/// one appearing after the frame-pointer setup says nothing about whether the
+/// prologue's stack adjustments are finished. Enumerated rather than inferred:
+/// an instruction this does not recognise ends the run, which is the safe
+/// direction. Every opcode below was read out of a real aarch64-Linux binary
+/// (`objdump -d`, `01_nursery_churn` built `-mcpu=neoverse-n2`), not from
+/// memory.
+#[cfg(target_arch = "aarch64")]
+fn is_frame_store_through_sp(word: u32) -> bool {
+    // Base register, bits [9:5]. 31 is SP in a load/store base position (it is
+    // never XZR there), so no ambiguity to resolve.
+    if (word >> 5) & 0x1F != u32::from(DWARF_REG_SP_AARCH64) {
+        return false;
+    }
+    matches!(
+        word & 0xFFC0_0000,
+        0xA900_0000     // stp  Xt1, Xt2, [sp, #imm]   (measured: a9036ffc)
+        | 0x6D00_0000   // stp  Dt1, Dt2, [sp, #imm]   (measured: 6d0123e9)
+        | 0xAD00_0000   // stp  Qt1, Qt2, [sp, #imm]
+        | 0xF900_0000   // str  Xt,       [sp, #imm]
+        | 0xFD00_0000   // str  Dt,       [sp, #imm]
+        | 0x3D80_0000 // str  Qt,       [sp, #imm]
+    )
+}
+
+/// `addvl`/`addpl` writing SP — an adjustment in units of the runtime SVE
+/// vector length.
+///
+/// The instruction carries a multiplier, not a byte count, so the frame's real
+/// size is unknowable from the text. `fp_to_sp_offset` fails closed on one
+/// rather than returning the unscaled figure.
+///
+/// Encoding, verified against `043f57df` = `addvl sp, sp, #-2` in a real
+/// binary: bits [31:24] `0000_0100`, [23:21] `001`, [20:16] Rn, [15:11] `01010`
+/// (`addvl`) or `01011` (`addpl`), [10:5] imm6, [4:0] Rd.
+#[cfg(target_arch = "aarch64")]
+fn writes_sp_by_vector_length(word: u32) -> bool {
+    word & 0x1F == u32::from(DWARF_REG_SP_AARCH64)
+        && matches!(word & SVE_ADD_OPCODE_MASK, SVE_ADDVL | SVE_ADDPL)
+}
+
+#[cfg(target_arch = "aarch64")]
+const SVE_ADD_OPCODE_MASK: u32 = 0xFFE0_F800;
+#[cfg(target_arch = "aarch64")]
+const SVE_ADDVL: u32 = 0x0420_5000;
+#[cfg(target_arch = "aarch64")]
+const SVE_ADDPL: u32 = 0x0420_5800;
+
+/// How many bytes an `addvl`/`addpl` writing SP takes OFF the stack.
+///
+/// `addvl Rd, Rn, #imm6` is `Rd = Rn + imm6 * VL`, where VL is the vector
+/// length in bytes; `addpl` uses an eighth of it (the predicate length). A
+/// prologue allocation is a NEGATIVE multiplier, so a non-negative one is not
+/// an allocation and is refused rather than guessed at.
+///
+/// `None` — vector length unavailable, or not an allocation — fails the whole
+/// decode, which puts the frame on the platform unwinder. Half a frame size is
+/// a wrong answer, not a partial one.
+#[cfg(target_arch = "aarch64")]
+fn sve_sp_allocation_bytes(word: u32) -> Option<usize> {
+    // imm6, bits [10:5], signed.
+    let raw = ((word >> 5) & 0x3F) as i32;
+    let multiplier = if raw & 0x20 != 0 { raw - 0x40 } else { raw };
+    let allocation = usize::try_from(-multiplier).ok().filter(|n| *n > 0)?;
+    let vector_length = sve_vector_length_bytes()?;
+    match word & SVE_ADD_OPCODE_MASK {
+        SVE_ADDVL => allocation.checked_mul(vector_length),
+        // `addpl`'s unit is VL/8, and a vector length is always a multiple of
+        // 16 bytes, so the division is exact.
+        SVE_ADDPL => allocation.checked_mul(vector_length / 8),
+        _ => None,
+    }
+}
+
+/// The calling thread's SVE vector length in bytes.
+///
+/// Read from the kernel rather than executed: `rdvl` would be the direct way
+/// and it faults on a core without SVE, which is most of them — including
+/// every Apple one, where this returns `None` and any `addvl` in a decoded
+/// prologue therefore fails closed. `prctl(PR_SVE_GET_VL)` costs one syscall,
+/// answers on a thread that has never touched SVE, and is cached for the
+/// process because nothing in Perry calls `PR_SVE_SET_VL`.
+///
+/// The walking thread is the right thread to ask: the prologue whose `addvl`
+/// is being decoded executed on it, with this same length.
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+fn sve_vector_length_bytes() -> Option<usize> {
+    static VECTOR_LENGTH: OnceLock<Option<usize>> = OnceLock::new();
+    *VECTOR_LENGTH.get_or_init(|| {
+        // <linux/prctl.h>
+        const PR_SVE_GET_VL: i32 = 51;
+        const PR_SVE_VL_LEN_MASK: i32 = 0xffff;
+        unsafe extern "C" {
+            fn prctl(option: i32, ...) -> i32;
+        }
+        let raw = unsafe { prctl(PR_SVE_GET_VL) };
+        // Negative is -1/errno: no SVE, or a kernel without the interface. A
+        // zero length would be nonsense; refuse it rather than scale by it.
+        (raw > 0).then(|| (raw & PR_SVE_VL_LEN_MASK) as usize)
+    })
+}
+
+#[cfg(all(target_arch = "aarch64", not(target_os = "linux")))]
+fn sve_vector_length_bytes() -> Option<usize> {
+    // No non-Linux aarch64 target Perry supports implements SVE, and neither
+    // backend for them emits `addvl`. Fail closed if one ever does, rather
+    // than invent a length.
+    None
 }
 
 #[cfg(not(target_arch = "aarch64"))]
@@ -461,59 +650,21 @@ pub(super) fn visit_stack_map_root_slots(
         return NativeStackWalkStats::default();
     }
     match walker_mode() {
-        WalkerMode::Unwind => unwind::visit(index, visit),
+        WalkerMode::Unwind => unwind::visit(index, &mut |root: ResolvedRoot| visit(root.slot())),
         WalkerMode::Fast => {
             if index.chain_walkable {
-                if let Some(stats) = fp_chain::visit(index, visit) {
+                if let Some(stats) =
+                    fp_chain::visit(index, &mut |root: ResolvedRoot| visit(root.slot()))
+                {
                     return stats;
                 }
             }
-            let mut stats = unwind::visit(index, visit);
+            let mut stats = unwind::visit(index, &mut |root: ResolvedRoot| visit(root.slot()));
             stats.fallback_walks = 1;
             stats
         }
-        WalkerMode::Verify => verify_visit(index, visit),
+        WalkerMode::Verify => verify::visit(index, visit),
     }
-}
-
-/// Debug-only cross-check: the fast walk reads slot addresses without
-/// mutating, then the unwinder performs the real visitation while recording
-/// what it reached. Any set difference is a missed or invented frame and
-/// panics immediately — this is the liveness gate for the fast walker itself.
-fn verify_visit(
-    index: &StackMapIndex,
-    visit: &mut impl FnMut(MutableRootSlot),
-) -> NativeStackWalkStats {
-    let mut fast_addresses: Vec<usize> = Vec::new();
-    let fast_stats = fp_chain::visit(index, &mut |slot: MutableRootSlot| {
-        fast_addresses.push(slot.ptr as usize);
-    });
-    let Some(fast_stats) = fast_stats else {
-        panic!(
-            "PERRY_STACKMAP_WALKER=verify: fast walk unavailable \
-             (chain_walkable={}, anomaly or unsupported target)",
-            index.chain_walkable
-        );
-    };
-    let mut unwind_addresses: Vec<usize> = Vec::new();
-    let mut stats = unwind::visit(index, &mut |slot: MutableRootSlot| {
-        unwind_addresses.push(slot.ptr as usize);
-        visit(slot);
-    });
-    fast_addresses.sort_unstable();
-    fast_addresses.dedup();
-    unwind_addresses.sort_unstable();
-    unwind_addresses.dedup();
-    assert_eq!(
-        fast_addresses,
-        unwind_addresses,
-        "PERRY_STACKMAP_WALKER=verify: fast walk visited {} unique slots, \
-         unwinder visited {}",
-        fast_addresses.len(),
-        unwind_addresses.len()
-    );
-    stats.fp_walks = fast_stats.fp_walks;
-    stats
 }
 
 /// Decode every concatenated compact map in the section.
@@ -1009,7 +1160,7 @@ mod unwind {
         stats: NativeStackWalkStats,
     }
 
-    pub(super) fn visit<F: FnMut(MutableRootSlot)>(
+    pub(super) fn visit<F: FnMut(ResolvedRoot)>(
         index: &StackMapIndex,
         visit: &mut F,
     ) -> NativeStackWalkStats {
@@ -1030,7 +1181,7 @@ mod unwind {
         state.stats
     }
 
-    unsafe extern "C" fn walk_frame<F: FnMut(MutableRootSlot)>(
+    unsafe extern "C" fn walk_frame<F: FnMut(ResolvedRoot)>(
         context: *mut UnwindContext,
         argument: *mut c_void,
     ) -> i32 {
@@ -1084,9 +1235,13 @@ mod unwind {
                 if address == 0 || address & (std::mem::align_of::<u64>() - 1) != 0 {
                     continue;
                 }
-                (state.visit)(MutableRootSlot {
-                    kind: MutableRootSlotKind::NativeStack,
-                    ptr: address as *mut u64,
+                (state.visit)(ResolvedRoot {
+                    address,
+                    ip,
+                    function_address: record.function_address,
+                    dwarf_reg: location.dwarf_reg,
+                    offset: location.offset,
+                    base,
                 });
             }
         }
@@ -1216,7 +1371,7 @@ mod unwind {
         (low != 0 && low < high).then_some((low, high))
     }
 
-    pub(super) fn visit<F: FnMut(MutableRootSlot)>(
+    pub(super) fn visit<F: FnMut(ResolvedRoot)>(
         index: &StackMapIndex,
         visit: &mut F,
     ) -> NativeStackWalkStats {
@@ -1257,9 +1412,13 @@ mod unwind {
                         {
                             return stats;
                         }
-                        visit(MutableRootSlot {
-                            kind: MutableRootSlotKind::NativeStack,
-                            ptr: address as *mut u64,
+                        visit(ResolvedRoot {
+                            address,
+                            ip: context.rip as usize,
+                            function_address: record.function_address,
+                            dwarf_reg: location.dwarf_reg,
+                            offset: location.offset,
+                            base,
                         });
                     }
                 }
@@ -1320,7 +1479,7 @@ mod unwind {
 
     pub(super) fn visit(
         _index: &StackMapIndex,
-        _visit: &mut impl FnMut(MutableRootSlot),
+        _visit: &mut impl FnMut(ResolvedRoot),
     ) -> NativeStackWalkStats {
         NativeStackWalkStats::default()
     }
@@ -1401,7 +1560,7 @@ mod fp_chain {
         (addr as usize).saturating_add(size)
     }
 
-    pub(super) fn visit<F: FnMut(MutableRootSlot)>(
+    pub(super) fn visit<F: FnMut(ResolvedRoot)>(
         index: &StackMapIndex,
         visit: &mut F,
     ) -> Option<NativeStackWalkStats> {
@@ -1483,9 +1642,13 @@ mod fp_chain {
                                 {
                                     continue;
                                 }
-                                visit(MutableRootSlot {
-                                    kind: MutableRootSlotKind::NativeStack,
-                                    ptr: address as *mut u64,
+                                visit(ResolvedRoot {
+                                    address,
+                                    ip: return_address,
+                                    function_address: record.function_address,
+                                    dwarf_reg: location.dwarf_reg,
+                                    offset: location.offset,
+                                    base,
                                 });
                             }
                         }
@@ -1510,11 +1673,16 @@ mod fp_chain {
 
     pub(super) fn visit(
         _index: &StackMapIndex,
-        _visit: &mut impl FnMut(MutableRootSlot),
+        _visit: &mut impl FnMut(ResolvedRoot),
     ) -> Option<NativeStackWalkStats> {
         None
     }
 }
+
+// `verify` mode, and the report it prints when the two walkers disagree. Its
+// own file because this one is close to the 2000-line cap.
+#[path = "stack_maps_verify.rs"]
+mod verify;
 
 // The contract the Itanium fallback rests on, asserted against a real walk
 // rather than against DWARF's definition of a CFA — the two disagree, and
@@ -1529,466 +1697,16 @@ mod fp_chain {
 mod unwind_contract;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "stack_maps_decode_tests.rs"]
+mod decode_tests;
 
-    fn push_varint(out: &mut Vec<u8>, mut value: u64) {
-        while value >= 0x80 {
-            out.push((value as u8 & 0x7F) | 0x80);
-            value >>= 7;
-        }
-        out.push(value as u8);
-    }
-
-    fn zigzag(value: i32) -> u64 {
-        ((value << 1) ^ (value >> 31)) as u32 as u64
-    }
-
-    /// Build one compact blob, mirroring `perry-codegen/src/gc_map.rs`.
-    /// `records` is `(instruction_offset, roots)`, roots as `(dwarf_reg, offset)`;
-    /// an empty root slice with `repeat` set encodes the repeat flag.
-    fn one_map(function: u64, records: &[(u32, Vec<(u16, i32)>, bool)]) -> Vec<u8> {
-        let mut offsets = Vec::new();
-        let mut stream = Vec::new();
-        for (instruction_offset, roots, repeat) in records {
-            offsets.extend_from_slice(&instruction_offset.to_le_bytes());
-            if *repeat {
-                push_varint(&mut stream, 1);
-                continue;
-            }
-            push_varint(&mut stream, (roots.len() as u64) << 1);
-            let mut last: Option<i32> = None;
-            for (reg, offset) in roots {
-                let tag = match *reg {
-                    DWARF_REG_FP_AARCH64 => 0u64,
-                    DWARF_REG_SP_AARCH64 => 1,
-                    _ => 2,
-                };
-                let delta = match last {
-                    None => *offset,
-                    Some(previous) => offset.wrapping_sub(previous),
-                };
-                push_varint(&mut stream, (zigzag(delta) << 2) | tag);
-                if tag == 2 {
-                    push_varint(&mut stream, u64::from(*reg));
-                }
-                last = Some(*offset);
-            }
-        }
-
-        // Build for THIS host's pointer width, mirroring the emitter: the
-        // decoder rejects a blob whose recorded width disagrees with its own.
-        let ptr64 = std::mem::size_of::<usize>() == 8;
-        let entry = if ptr64 { 16 } else { 12 };
-        let total_len = 16 + entry + offsets.len() + stream.len();
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(GC_MAP_MAGIC);
-        bytes.push(GC_MAP_VERSION);
-        bytes.push(0);
-        bytes.extend_from_slice(&u16::from(ptr64).to_le_bytes());
-        bytes.extend_from_slice(&1u32.to_le_bytes());
-        bytes.extend_from_slice(&(total_len as u32).to_le_bytes());
-        if ptr64 {
-            bytes.extend_from_slice(&function.to_le_bytes());
-        } else {
-            bytes.extend_from_slice(&(function as u32).to_le_bytes());
-        }
-        bytes.extend_from_slice(&32u32.to_le_bytes());
-        bytes.extend_from_slice(&(records.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&offsets);
-        bytes.extend_from_slice(&stream);
-        while bytes.len() % 8 != 0 {
-            bytes.push(0);
-        }
-        bytes
-    }
-
-    fn simple(function: u64, offset: u32, frame_offset: i32) -> Vec<u8> {
-        one_map(function, &[(offset, vec![(29, frame_offset)], false)])
-    }
-
-    #[test]
-    fn decodes_frame_location() {
-        let bytes = simple(0x1000, 0x10, -8);
-        let (records, roots) = parse_gc_map(&bytes).expect("valid map");
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].pc, 0x1010);
-        assert_eq!(records[0].function_address, 0x1000);
-        assert_eq!(records[0].stack_size, 32);
-        assert_eq!(
-            roots,
-            vec![StackMapLocation {
-                dwarf_reg: 29,
-                offset: -8,
-            }]
-        );
-    }
-
-    #[test]
-    fn decodes_linker_concatenated_input_sections() {
-        let mut bytes = simple(0x1000, 0x10, -8);
-        bytes.extend_from_slice(&simple(0x2000, 0x20, -16));
-        let (records, _) = parse_gc_map(&bytes).expect("concatenated maps");
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].pc, 0x1010);
-        assert_eq!(records[1].pc, 0x2020);
-    }
-
-    #[test]
-    fn repeated_live_sets_share_one_copy() {
-        // Three safepoints, the last two repeating the first's live set: the
-        // whole point of the format, and the reason the in-memory index does
-        // not hold 154k duplicated entries on a real application.
-        let bytes = one_map(
-            0x1000,
-            &[
-                (0x10, vec![(29, -8), (29, -16)], false),
-                (0x20, vec![], true),
-                (0x30, vec![], true),
-            ],
-        );
-        let (records, roots) = parse_gc_map(&bytes).expect("valid map");
-        assert_eq!(records.len(), 3);
-        assert_eq!(roots.len(), 2, "the repeats must not append new roots");
-        for record in &records {
-            assert_eq!(record.roots_start, 0);
-            assert_eq!(record.roots_len, 2);
-        }
-    }
-
-    #[test]
-    fn decodes_negative_and_ascending_root_offsets() {
-        let bytes = one_map(0x1000, &[(0, vec![(29, -64), (29, -8), (31, 24)], false)]);
-        let (_, roots) = parse_gc_map(&bytes).expect("valid map");
-        assert_eq!(
-            roots,
-            vec![
-                StackMapLocation {
-                    dwarf_reg: 29,
-                    offset: -64
-                },
-                StackMapLocation {
-                    dwarf_reg: 29,
-                    offset: -8
-                },
-                StackMapLocation {
-                    dwarf_reg: 31,
-                    offset: 24
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn decodes_an_explicit_base_register() {
-        // LLVM uses x19 as a frame base pointer in functions with dynamic
-        // stack allocation — 66 root slots in one real module. A single FP/SP
-        // bit cannot express that, which is what forced the 2-bit base tag.
-        let bytes = one_map(0x1000, &[(0x10, vec![(19, -40), (29, -8)], false)]);
-        let (_, roots) = parse_gc_map(&bytes).expect("valid map");
-        assert_eq!(
-            roots,
-            vec![
-                StackMapLocation {
-                    dwarf_reg: 19,
-                    offset: -40
-                },
-                StackMapLocation {
-                    dwarf_reg: 29,
-                    offset: -8
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn an_explicit_base_register_disables_the_fast_walk() {
-        // The x29-chain walker can only recover FP and SP; anything else must
-        // fall back to the platform unwinder, which can.
-        let index = index_records(
-            vec![StackMapRecord {
-                pc: 0x1000,
-                function_address: 0x1000,
-                stack_size: 64,
-                roots_start: 0,
-                roots_len: 1,
-            }],
-            vec![StackMapLocation {
-                dwarf_reg: 19,
-                offset: -40,
-            }],
-        );
-        assert!(!index.chain_walkable);
-    }
-
-    #[test]
-    fn rejects_a_blob_built_for_the_other_pointer_width() {
-        // The header records the width the emitter used. A blob claiming the
-        // other width would have every function address misread, so it must be
-        // refused rather than decoded — watchOS `arm64_32` is ILP32 while every
-        // other supported target is LP64.
-        let mut bytes = simple(0x1000, 0x10, -8);
-        let flags = u16::from_le_bytes([bytes[6], bytes[7]]);
-        bytes[6..8].copy_from_slice(&(flags ^ 1).to_le_bytes());
-        assert!(
-            parse_gc_map(&bytes).is_none(),
-            "a map built for the other pointer width must be refused"
-        );
-    }
-
-    #[test]
-    fn rejects_a_blob_whose_length_cannot_advance_the_cursor() {
-        // `total_len` comes straight from the header. A zero (or too-small)
-        // value leaves `base` where it was, and because the magic still
-        // matches there the resync path never runs — the loop spins forever
-        // inside `OnceLock::get_or_init`, hanging the process at the first
-        // collection instead of failing closed.
-        let mut bytes = simple(0x1000, 0x10, -8);
-        bytes[12..16].copy_from_slice(&0u32.to_le_bytes());
-        assert!(
-            parse_gc_map(&bytes).is_none(),
-            "a blob that cannot advance the cursor must be rejected, not looped on"
-        );
-
-        // Long enough to look plausible, still short of header + function table.
-        let mut bytes = simple(0x1000, 0x10, -8);
-        bytes[12..16].copy_from_slice(&20u32.to_le_bytes());
-        assert!(parse_gc_map(&bytes).is_none());
-    }
-
-    #[test]
-    fn rejects_a_truncated_function_table() {
-        // The record counts size the fixed-width offset array; a short read
-        // there must not be rounded down to zero, or every later varint is
-        // decoded from the wrong offset.
-        let bytes = simple(0x1000, 0x10, -8);
-        let truncated = &bytes[..20];
-        assert!(parse_gc_map(truncated).is_none());
-    }
-
-    #[test]
-    fn rejects_truncated_or_wrong_version_sections() {
-        assert!(parse_gc_map(&[]).is_none() || parse_gc_map(&[]).unwrap().0.is_empty());
-        let mut bytes = simple(0x1000, 0x10, -8);
-        bytes[4] = GC_MAP_VERSION + 1;
-        assert!(
-            parse_gc_map(&bytes).is_none(),
-            "an unknown version must not be guessed at"
-        );
-        // A total_len that runs past the section must fail rather than read on.
-        let mut bytes = simple(0x1000, 0x10, -8);
-        let len = bytes.len();
-        bytes[12..16].copy_from_slice(&((len as u32) + 64).to_le_bytes());
-        assert!(parse_gc_map(&bytes).is_none());
-    }
-
-    #[test]
-    fn chain_walkable_index_accepts_fp_and_sp_locations_only() {
-        let rec = |pc: usize| StackMapRecord {
-            pc,
-            function_address: pc,
-            stack_size: 160,
-            roots_start: 0,
-            roots_len: 1,
-        };
-        // FP and SP are both walkable: SP resolves per frame by decoding the
-        // owning function's prologue (#7173).
-        let walkable = index_records(
-            vec![rec(0x1000), rec(0x2000)],
-            vec![
-                StackMapLocation {
-                    dwarf_reg: DWARF_REG_FP_AARCH64,
-                    offset: -8,
-                },
-                StackMapLocation {
-                    dwarf_reg: DWARF_REG_SP_AARCH64,
-                    offset: -8,
-                },
-            ],
-        );
-        assert!(walkable.chain_walkable);
-        assert_eq!(walkable.min_pc, 0x1000);
-        assert_eq!(walkable.max_pc, 0x2000);
-        // Any other register disqualifies the whole image.
-        assert!(
-            !index_records(
-                vec![rec(0x1000)],
-                vec![StackMapLocation {
-                    dwarf_reg: 1,
-                    offset: -8
-                }],
-            )
-            .chain_walkable,
-            "a non-FP/SP register must disable the fast walk"
-        );
-    }
-
-    #[test]
-    fn rejects_a_record_from_an_adjacent_function() {
-        // A safepoint at the end of A must not be matched for an `ip` early in
-        // B just because it falls inside the +-16 window: the walker would use
-        // A's frame offsets against B's frame.
-        let index = index_records(
-            vec![
-                StackMapRecord {
-                    pc: 0x1ffc,
-                    function_address: 0x1000,
-                    stack_size: 32,
-                    roots_start: 0,
-                    roots_len: 1,
-                },
-                StackMapRecord {
-                    pc: 0x2040,
-                    function_address: 0x2000,
-                    stack_size: 32,
-                    roots_start: 0,
-                    roots_len: 1,
-                },
-            ],
-            vec![StackMapLocation {
-                dwarf_reg: 29,
-                offset: -8,
-            }],
-        );
-        // 0x2004 is 8 bytes past A's last safepoint but lives in B.
-        assert!(
-            index.match_records(0x2004).is_empty(),
-            "a record from the previous function must not match"
-        );
-        // A same-function near-match is still accepted — requiring an exact pc
-        // would drop it, and the measured suite has one.
-        assert_eq!(index.match_records(0x2038).len(), 1);
-    }
-
-    #[test]
-    fn matches_plain_maps_before_and_statepoints_after_unwinder_ips() {
-        let rec = |pc: usize| StackMapRecord {
-            pc,
-            function_address: pc,
-            stack_size: 32,
-            roots_start: 0,
-            roots_len: 0,
-        };
-        let maps = vec![rec(0x1000), rec(0x1020)];
-        assert_eq!(closest_record_pc(&maps, 0x1004), Some(0x1000));
-        assert_eq!(closest_record_pc(&maps, 0x101c), Some(0x1020));
-        assert_eq!(closest_record_pc(&maps, 0x1020), Some(0x1020));
-    }
-}
-
-#[cfg(all(test, target_arch = "aarch64"))]
-mod fp_offset_trailing_sub_tests {
-    use super::fp_to_sp_offset;
-
-    /// Assemble a prologue into executable-ish memory and decode it. The
-    /// decoder only reads words, so a plain aligned buffer is enough.
-    fn decode(words: &[u32]) -> Option<usize> {
-        let buf = words.to_vec().into_boxed_slice();
-        let addr = buf.as_ptr() as usize;
-        let out = fp_to_sp_offset(addr);
-        drop(buf);
-        out
-    }
-
-    const ADD_X29_SP_0X90: u32 = 0x9102_43FD; // add x29, sp, #0x90
-    const SUB_SP_SP_0X170: u32 = 0xD105_C3FF; // sub sp, sp, #0x170
-    const RET: u32 = 0xD65F_03C0;
-    const NOP: u32 = 0xD503_201F;
-
-    // The three prologue words #7394 was measured on, read out of
-    // `perry_fn_test_gap_gc_call_argument_rooting_ts__run` at +0x20:
-    //
-    //     9101c3fd   add x29, sp, #0x70
-    //     d14007ff   sub sp, sp, #0x1, lsl #12
-    //     d12103ff   sub sp, sp, #0x840
-    const ADD_X29_SP_0X70: u32 = 0x9101_C3FD;
-    const SUB_SP_SP_1_LSL12: u32 = 0xD140_07FF;
-    const SUB_SP_SP_0X840: u32 = 0xD121_03FF;
-    const ADD_X29_SP_2_LSL12: u32 = 0x9140_0BFD; // add x29, sp, #0x2, lsl #12
-
-    /// #7328: `add x29, sp, #imm` is not always the last stack adjustment.
-    /// LLVM emits a further `sub sp, sp, #N` after establishing the frame
-    /// pointer, and reading only the `add` left the fast walker N bytes high
-    /// on every slot in that frame — a silent wrong answer, since the walker
-    /// then enumerated addresses the collector treated as roots.
-    #[test]
-    fn a_sub_after_the_fp_setup_is_included() {
-        assert_eq!(
-            decode(&[ADD_X29_SP_0X90, SUB_SP_SP_0X170, NOP, RET]),
-            Some(0x90 + 0x170),
-            "the trailing `sub sp, sp, #0x170` must be added to the fp offset"
-        );
-    }
-
-    /// The common shape — fp established last — must be unchanged.
-    #[test]
-    fn a_prologue_with_no_trailing_sub_is_unchanged() {
-        assert_eq!(decode(&[ADD_X29_SP_0X90, NOP, RET]), Some(0x90));
-    }
-
-    /// Only a contiguous run of `sub sp` immediately after the `add` counts.
-    /// A later `sub sp` is a body operation (dynamic alloca, call-argument
-    /// area) already accounted for by the stack map's own slot offsets.
-    #[test]
-    fn a_sub_after_the_prologue_run_is_not_counted() {
-        assert_eq!(
-            decode(&[ADD_X29_SP_0X90, NOP, SUB_SP_SP_0X170, RET]),
-            Some(0x90),
-            "a `sub sp` separated from the prologue run must not be folded in"
-        );
-    }
-
-    /// A leaf that never sets up fp still fails closed, so the caller falls
-    /// back to the platform unwinder rather than inventing an offset.
-    #[test]
-    fn a_leaf_without_fp_setup_still_fails_closed() {
-        assert_eq!(decode(&[NOP, RET]), None);
-    }
-
-    /// #7394: a trailing `sub sp, sp, #imm, lsl #12` must contribute
-    /// `imm << 12`. #7328's decoder masked the `sh` bit into the opcode
-    /// comparison, so a shifted `sub` did not match at all.
-    #[test]
-    fn a_shifted_trailing_sub_is_included() {
-        assert_eq!(
-            decode(&[ADD_X29_SP_0X70, SUB_SP_SP_1_LSL12, NOP, RET]),
-            Some(0x70 + 0x1000),
-            "`sub sp, sp, #0x1, lsl #12` must contribute 4096, not 1"
-        );
-    }
-
-    /// The measured shape. The shifted `sub` is not the last one, so failing
-    /// to match it also **ended the accumulation run** and dropped the
-    /// `sub sp, sp, #0x840` behind it: the decoder reported 0x70 for a frame
-    /// whose body SP is 0x18B0 below the frame pointer, and the walker
-    /// enumerated — and the collector wrote through — addresses 6208 bytes
-    /// off. That is CLAUDE.md's fourth gate-failure mode: a live walker
-    /// visiting the wrong stack.
-    #[test]
-    fn a_shifted_sub_does_not_end_the_accumulation_run() {
-        assert_eq!(
-            decode(&[
-                ADD_X29_SP_0X70,
-                SUB_SP_SP_1_LSL12,
-                SUB_SP_SP_0X840,
-                NOP,
-                RET
-            ]),
-            Some(0x70 + 0x1000 + 0x840),
-            "every `sub sp` in the contiguous prologue run must be folded in"
-        );
-    }
-
-    /// The `sh` bit is decoded on the `add` that establishes the frame
-    /// pointer too — the same masking bug applied there, where it would have
-    /// made the decoder skip the fp setup entirely and report a later
-    /// instruction's offset (or `None`).
-    #[test]
-    fn a_shifted_fp_setup_is_decoded() {
-        assert_eq!(
-            decode(&[ADD_X29_SP_2_LSL12, NOP, RET]),
-            Some(0x2000),
-            "`add x29, sp, #0x2, lsl #12` establishes fp 8192 above sp"
-        );
-    }
-}
+// The only test anywhere that runs BOTH aarch64 walkers over a frame whose
+// layout is known, and requires each to land on the word the record names.
+// Same platform set as `fp_chain` itself.
+#[cfg(all(
+    test,
+    any(target_vendor = "apple", target_os = "linux"),
+    target_arch = "aarch64"
+))]
+#[path = "stack_maps_walker_agreement.rs"]
+mod walker_agreement;
