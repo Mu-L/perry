@@ -373,55 +373,6 @@ impl CopyingNurseryPreflight {
     }
 }
 
-#[derive(Default)]
-pub(super) struct StickyRememberedSet {
-    pub(super) old_pages: crate::fast_hash::PtrHashSet<usize>,
-    pub(super) external_pages: Vec<(usize, usize)>,
-}
-
-impl StickyRememberedSet {
-    pub(super) fn remember_slot(
-        &mut self,
-        parent_header: *mut GcHeader,
-        slot: *mut u64,
-        external: bool,
-    ) {
-        if parent_header.is_null() || slot.is_null() {
-            return;
-        }
-        let page = crate::arena::generation_page_for_addr(slot as usize);
-        if external {
-            // #7538: an owner's external buffer can contribute thousands of
-            // slots (a lazy JSON array's sparse element cache is one 8-byte
-            // slot per element), and they are visited in address order — so
-            // one adjacent-duplicate check collapses a whole page's worth of
-            // pushes into a single entry. `restore` dedupes again inside
-            // `mark_dirty_external_slot_page`; this keeps the intermediate
-            // Vec from growing with the element count.
-            let entry = (parent_header as usize, page);
-            if self.external_pages.last() != Some(&entry) {
-                self.external_pages.push(entry);
-            }
-        } else {
-            self.old_pages.insert(page);
-        }
-    }
-
-    pub(super) fn restore(&self) {
-        for &page in &self.old_pages {
-            mark_dirty_old_page(page);
-        }
-        for &(header, page) in &self.external_pages {
-            mark_dirty_external_slot_page(header, page);
-        }
-    }
-
-    pub(super) fn extend(&mut self, other: StickyRememberedSet) {
-        self.old_pages.extend(other.old_pages);
-        self.external_pages.extend(other.external_pages);
-    }
-}
-
 pub(super) struct CopyingNurseryCollector {
     pub(super) ptrs: CopyingPointerSet,
     pub(super) worklist: Vec<*mut GcHeader>,
@@ -1360,12 +1311,13 @@ pub(super) fn gc_collect_minor_copying_fast_path(
     gc_collect_minor_copying_fast_path_with_eligibility(trace, start, eligibility, trigger_kind)
 }
 
-pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
+pub(super) fn run_copied_minor_attempt(
     trace: &mut Option<GcCycleTrace>,
     start: Instant,
     eligibility: CopiedMinorEligibility,
     _trigger_kind: GcTriggerKind,
-) -> Option<CopiedMinorFastPathOutcome> {
+    may_speculate: bool,
+) -> CopiedMinorAttempt {
     if let Some(trace) = trace.as_mut() {
         trace.copying_nursery = eligibility.trace_stats();
         trace.legacy_copy_only_scanner_pinned = eligibility.legacy_root_stats;
@@ -1396,7 +1348,7 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
         );
     }
     if !eligibility.eligible {
-        return None;
+        return CopiedMinorAttempt::Done(None);
     }
     let preflight_skipped = eligibility.preflight_skipped;
     let malloc_sweep_due = eligibility.malloc_sweep_due;
@@ -1416,8 +1368,18 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
     // preflight above ran against the pre-retag labels, which is correct — it
     // answers "may this cycle move objects at all", a question the retag does
     // not change.
-    let promotion = if super::should_promote_young_in_place() {
-        crate::arena::retag_young_for_in_place_promotion()
+    // #7937: the FIRST copying minor has no previous cycle to read, so the
+    // steady-state policy above always declines. It may instead ATTEMPT the
+    // promotion and decide from its own trace — see
+    // `should_attempt_first_cycle_promotion` for why, and for why both extra
+    // preconditions here are about making the ROLLBACK's obligations provably
+    // empty rather than about liveness.
+    let speculate_first_cycle = may_speculate
+        && ptrs.malloc_registry_empty_at_start
+        && untraced_promotion_instrument_veto().is_none()
+        && super::should_attempt_first_cycle_promotion();
+    let promotion = if super::should_promote_young_in_place() || speculate_first_cycle {
+        crate::arena::retag_young_for_in_place_promotion(speculate_first_cycle)
     } else {
         crate::arena::InPlacePromotion::default()
     };
@@ -1430,6 +1392,11 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
     collector.stats.malloc_sweep_due = malloc_sweep_due;
     collector.stats.preflight_skipped = preflight_skipped;
     collector.stats.in_place_promotion = promoting_in_place;
+    // `may_speculate` is false on exactly one path: the retry the wrapper runs
+    // after a rollback. So this pair is exact without threading extra state
+    // through, and it survives the retry overwriting the trace.
+    collector.stats.first_cycle_promotion_attempted = speculate_first_cycle || !may_speculate;
+    collector.stats.first_cycle_promotion_rolled_back = !may_speculate;
     collector.stats.in_place_promoted_blocks = promotion.block_count();
     // See `CopyingNurseryCollector::skip_remembering` for the proof.
     collector.skip_remembering =
@@ -1649,6 +1616,28 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
     }
     trace_phase_record(trace, "copying_nursery", phase_start);
 
+    // #7937: the attempt's own trace has finished, so the ratio it was missing
+    // now exists. Nothing has been handed to old-gen yet, so rolling back
+    // restores the pre-cycle state, and the list is exactly two long: the retag
+    // (the only physical commitment) and the marks. Everything else the attempt
+    // did is a PROVABLE no-op on a promoting cycle — after the retag no address
+    // classifies as `Nursery`, so `move_young` is unreachable and every root
+    // and slot rewrite is a no-op, and `skip_remembering` (a precondition of
+    // attempting) means no remembered-set entry was created or consumed.
+    // `remembered_set_clear()` and the from-space reset are both below here.
+    if speculate_first_cycle && promoting_in_place {
+        let holds_up =
+            super::first_cycle_promotion_holds_up(from_space_bytes, collector.live_from_bytes);
+        super::note_first_cycle_promotion(!holds_up);
+        if !holds_up {
+            unsafe {
+                collector.clear_marks();
+            }
+            crate::arena::undo_in_place_promotion_retag(&promotion);
+            return CopiedMinorAttempt::RolledBack;
+        }
+    }
+
     // Weak semantics for the copied-minor fast path. This path bypasses
     // cycle.rs's `WeakProcessing` subphase entirely, so before this block
     // existed NOTHING here tombstoned dead weak targets — and the scan
@@ -1761,6 +1750,8 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
         .bytes
         .saturating_sub(promotion_stats.live_bytes);
     collector.stats.in_place_sparse_blocks = promotion_stats.sparse_blocks;
+    collector.stats.in_place_dead_blocks = promotion_stats.dead_blocks;
+    collector.stats.in_place_dead_block_bytes = promotion_stats.dead_block_bytes;
     if let Some(trace) = trace.as_mut() {
         trace.old_pages = crate::arena::old_page_summary();
     }
@@ -1958,10 +1949,10 @@ pub(super) fn gc_collect_minor_copying_fast_path_with_eligibility(
         );
     }
     super::scanner_profile::report_and_reset("copying_minor");
-    Some(CopiedMinorFastPathOutcome {
+    CopiedMinorAttempt::Done(Some(CopiedMinorFastPathOutcome {
         freed_bytes,
         malloc_swept: malloc_sweep_due,
-    })
+    }))
 }
 
 fn finalize_dead_copied_minor_from_space_side_allocations() {
