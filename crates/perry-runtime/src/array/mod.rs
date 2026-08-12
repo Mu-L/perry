@@ -145,7 +145,7 @@ pub(crate) use self::prototype_addr::{
 };
 #[cfg(test)]
 pub(crate) use self::prototype_addr::{
-    test_memoized_prototype_addr, test_prototype_addr_cache_wiring,
+    test_memoized_prototype_addr, test_prototype_addr_cache_wiring, test_prototype_addr_cell_count,
     test_rewrite_prototype_addr_slot,
 };
 pub(crate) use self::sort::object_prototype_has_index_prop;
