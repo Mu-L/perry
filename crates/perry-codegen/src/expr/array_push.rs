@@ -74,6 +74,31 @@ use super::{
     TypedFeedbackContract, TypedFeedbackKind,
 };
 
+/// Metadata may admit the #7839 append tier because that tier tests the live
+/// result bits before doing GC bookkeeping. A lying numeric operand makes JS
+/// `+` produce a heap value; the pointer test then takes the note/addref/
+/// barrier arm, so the annotation selects a checked lowering, not an answer.
+fn guarded_numeric_add_push_candidate(ctx: &FnCtx<'_>, value: &Expr) -> bool {
+    if is_numeric_expr(ctx, value) {
+        return true;
+    }
+    match value {
+        Expr::LocalGet(id) => matches!(
+            ctx.local_type_hint(id),
+            Some(perry_hir::types::Type::Number | perry_hir::types::Type::Int32)
+        ),
+        Expr::Binary {
+            op: perry_hir::BinaryOp::Add,
+            left,
+            right,
+        } => {
+            guarded_numeric_add_push_candidate(ctx, left)
+                && guarded_numeric_add_push_candidate(ctx, right)
+        }
+        _ => false,
+    }
+}
+
 /// The expression's result: the new length per ES2024 `Array.prototype.push`.
 ///
 /// `js_array_length` is NOT a field read — it resolves Proxy arrays through
@@ -557,7 +582,8 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, value_discarded: bool) -> 
                 layout_note_needed
             };
             let write_barrier_needed = array_store_needs_write_barrier(ctx, value);
-            let value_is_numeric = is_numeric_expr(ctx, value);
+            let value_is_statically_numeric = is_numeric_expr(ctx, value);
+            let value_is_numeric = guarded_numeric_add_push_candidate(ctx, value);
             let require_numeric_layout =
                 value_is_numeric && expr_has_numeric_pointer_free_array_layout(ctx, &array_expr);
             // #7839 — the inline append's three GC-bookkeeping calls behind ONE
@@ -603,8 +629,16 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, value_discarded: bool) -> 
             // numeric values (e.g. a read fallback's INT32-boxed bits) keep
             // the runtime-guarded tier: stored verbatim they would corrupt
             // the dense raw-f64 invariant.
-            let keep_guarded_numeric_push = super::typed_feedback_emission_enabled()
-                || !crate::type_analysis::expr_produces_canonical_raw_f64(ctx, value);
+            // Metadata-selected `+` is only a guarded candidate: a declared
+            // number may hold a string, boolean, or any other JS value. Keep
+            // that shape on the runtime numeric guard even when feedback
+            // emission is disabled. A guard miss reaches `js_array_push_f64`,
+            // which performs the generic store and revokes raw-f64 layout for
+            // every non-number (including non-pointer tags).
+            let inline_value_shape =
+                crate::type_analysis::expr_produces_canonical_raw_f64(ctx, value);
+            let keep_guarded_numeric_push =
+                super::typed_feedback_emission_enabled() || !inline_value_shape;
             if require_numeric_layout
                 && keep_guarded_numeric_push
                 && !ctx.boxed_vars.contains(array_id)
@@ -1013,7 +1047,13 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, value_discarded: bool) -> 
                     // #7469: provably dead under `declared_all_pointer` — the
                     // `nofwd` admission test proved both raw-f64 bits already
                     // clear, and clearing them is this call's only effect.
-                    if !value_is_numeric && !declared_all_pointer {
+                    // A metadata-only numeric candidate has not established
+                    // the live value's kind. If this generic inline tier is
+                    // used (for an array without a static raw-f64 fact), let
+                    // the runtime note inspect every stored tag and revoke a
+                    // dynamically active numeric layout on strings, booleans,
+                    // undefined, and all other non-number values.
+                    if !value_is_statically_numeric && !declared_all_pointer {
                         let value_bits = barrier_value_bits
                             .clone()
                             .or(value_bits)
