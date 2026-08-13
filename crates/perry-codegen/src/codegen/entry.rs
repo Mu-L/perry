@@ -461,18 +461,14 @@ pub(super) fn compile_module_entry(
         // `.next/server/**` module path now (before `main` borrows `llmod`); the
         // registration calls go in the block below. `(string_const_name,
         // byte_len, sanitized_prefix)`.
-        let nextjs_path_inits: Vec<(String, usize, String)> = if is_dylib {
-            Vec::new()
-        } else {
-            cross_module
-                .nextjs_path_init_modules
-                .iter()
-                .map(|(path, prefix)| {
-                    let (cn, len) = llmod.add_string_constant(path);
-                    (cn, len, prefix.clone())
-                })
-                .collect()
-        };
+        let nextjs_path_inits: Vec<(String, usize, String)> = cross_module
+            .nextjs_path_init_modules
+            .iter()
+            .map(|(path, prefix)| {
+                let (cn, len) = llmod.add_string_constant(path);
+                (cn, len, prefix.clone())
+            })
+            .collect();
         let main = if is_dylib {
             llmod.define_function("perry_module_init", VOID, vec![])
         } else {
@@ -1275,7 +1271,18 @@ pub(super) fn compile_module_entry(
                     }
                     blk.call_void(&format!("{}__init", dep_prefix), &[]);
                 }
-                blk.call_void(&init_body_name, &[]);
+                // Run each module body behind a native exception boundary.
+                // A CommonJS wrapper publishes partial exports at the top of
+                // this body; if an exception escapes before final publication,
+                // the runtime caches that exact failure and wakes path-module
+                // waiters before rethrowing. Keeping the boundary here avoids
+                // adding a JavaScript `try` block that would change top-level
+                // `let`/`const`/`class` scope in flat CJS emission.
+                let init_body_addr = format!("ptrtoint (ptr @{} to i64)", init_body_name);
+                blk.call_void(
+                    "js_run_module_init_catching",
+                    &[(I64, init_body_addr.as_str())],
+                );
                 blk.ret_void();
             }
         }
