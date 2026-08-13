@@ -740,6 +740,19 @@ test_gap_gc_class_field_receiver_rooting
 test_gap_gc_index_set_bounded_globalthis_ta_rooting
 test_gap_gc_namespace_and_computed_dispatch_rooting
 
+# #7949 (PR #7962): Rust-side containers retained raw JS values across
+# allocating callbacks and property operations. These two witnesses shipped
+# with that fix but were never registered, leaving their moving-GC coverage
+# dark and the registration lint red on main.
+test_gap_gc_container_value_rooting
+test_gap_gc_define_properties_key_rooting
+
+# #7979: comparison operands are lowered left-to-right, so the first call
+# result must remain rooted while an allocating second call runs. This is the
+# #7963 defineProperty witness restored to its natural inline verdict shape;
+# retired-from-space protection made the pre-fix js_eq stale read fault.
+test_gap_gc_define_property_descriptor_rooting
+
 # #7766 (PR #7778): the element-binding clone through a function boundary.
 # Lying callers force the slow path while the honest arm's clone reads raw
 # f64 slots off relocatable objects — live on the evacuating arms (9 copying
