@@ -788,7 +788,13 @@ fn match_packed_f64_range_loop(
         // read-only DENSE mode: several scalar statements, masked
         // statically-windowed indices, no stores, no side exits.
         accesses.clear();
-        if !packed_f64_range_loop_dense_body_collect(body, counter_id, bound_local, &mut accesses) {
+        if !packed_f64_range_loop_dense_body_collect(
+            ctx,
+            body,
+            counter_id,
+            bound_local,
+            &mut accesses,
+        ) {
             return None;
         }
         true
@@ -1060,6 +1066,7 @@ fn packed_f64_range_loop_store_collect(
 /// have no side exits, multi-statement bodies are safe: an iteration either
 /// runs entirely in the fast copy or entirely in the slow copy.
 fn packed_f64_range_loop_dense_body_collect(
+    ctx: &FnCtx<'_>,
     body: &[Stmt],
     counter_id: u32,
     bound_local: Option<u32>,
@@ -1074,7 +1081,9 @@ fn packed_f64_range_loop_dense_body_collect(
                 init: Some(init),
                 ..
             } => {
-                if !packed_f64_range_loop_pure_expr_collect(init, counter_id, true, accesses) {
+                if !masked_window_expression_is_non_collecting(ctx, init)
+                    || !packed_f64_range_loop_pure_expr_collect(init, counter_id, true, accesses)
+                {
                     return false;
                 }
                 written.insert(*id);
@@ -1086,19 +1095,26 @@ fn packed_f64_range_loop_dense_body_collect(
                 if *id == counter_id || Some(*id) == bound_local {
                     return false;
                 }
-                if !packed_f64_range_loop_pure_expr_collect(value, counter_id, true, accesses) {
+                if !masked_window_expression_is_non_collecting(ctx, value)
+                    || !packed_f64_range_loop_pure_expr_collect(value, counter_id, true, accesses)
+                {
                     return false;
                 }
                 written.insert(*id);
             }
-            Stmt::Expr(Expr::Update { id, .. }) => {
+            Stmt::Expr(expr @ Expr::Update { id, .. }) => {
                 if *id == counter_id || Some(*id) == bound_local {
+                    return false;
+                }
+                if !masked_window_expression_is_non_collecting(ctx, expr) {
                     return false;
                 }
                 written.insert(*id);
             }
             Stmt::Expr(expr) => {
-                if !packed_f64_range_loop_pure_expr_collect(expr, counter_id, true, accesses) {
+                if !masked_window_expression_is_non_collecting(ctx, expr)
+                    || !packed_f64_range_loop_pure_expr_collect(expr, counter_id, true, accesses)
+                {
                     return false;
                 }
             }
@@ -1108,6 +1124,159 @@ fn packed_f64_range_loop_dense_body_collect(
     !accesses.is_empty()
         && accesses.values().all(|access| !access.written)
         && accesses.keys().all(|arr_id| !written.contains(arr_id))
+}
+
+/// Prove that an expression lowered while masked-window facts are active cannot
+/// collect. The structural matcher knows each admitted `IndexGet` becomes a
+/// guarded numeric load, so the proof treats its RESULT as an inert number but
+/// still checks its INDEX expression recursively: a bounded shape such as
+/// `(+key) & 7` can invoke user coercion when `key` is `any`.
+///
+/// Checking the WHOLE operator tree matters as much as checking indexes. In
+/// `ta[0] + (+key) + ta[1]`, the tier's hoisted backing pointer crosses the
+/// middle coercion before the second load. Merely proving both indexes inert
+/// leaves that broader window open.
+pub(super) fn masked_window_expression_is_non_collecting(
+    ctx: &FnCtx<'_>,
+    expr: &perry_hir::Expr,
+) -> bool {
+    masked_window_expression_proof(ctx, expr).is_some()
+}
+
+/// Facts about a value whose evaluation has also been proved non-collecting.
+/// `inert` means coercing the result cannot dispatch user code; `numeric` is
+/// the stronger fact needed to distinguish numeric `+` from concatenation.
+#[derive(Clone, Copy)]
+struct MaskedWindowExpressionProof {
+    inert: bool,
+    numeric: bool,
+}
+
+/// Prove the collection behavior of the whole expression while computing the
+/// two result facts its parents need. This is deliberately an allowlist:
+/// `None` is the conservative answer for forms the masked structural walkers
+/// do not admit.
+fn masked_window_expression_proof(
+    ctx: &FnCtx<'_>,
+    expr: &perry_hir::Expr,
+) -> Option<MaskedWindowExpressionProof> {
+    use perry_hir::{BinaryOp, CompareOp, Expr, UnaryOp};
+    let proof = |inert, numeric| MaskedWindowExpressionProof { inert, numeric };
+    match expr {
+        // The structural matcher separately proves this is a tracked masked
+        // read. Under its active fact the access itself is a guarded numeric
+        // load, but evaluating the index must still pass this same whole-tree
+        // proof before that fact may be installed.
+        Expr::IndexGet { object, index } => {
+            if !matches!(object.as_ref(), Expr::LocalGet(_)) {
+                return None;
+            }
+            masked_window_expression_proof(ctx, index)?;
+            Some(proof(true, true))
+        }
+        Expr::Number(_) | Expr::Integer(_) => Some(proof(true, true)),
+        Expr::Bool(_) | Expr::Null | Expr::Undefined => Some(proof(true, false)),
+        Expr::LocalGet(_) => {
+            let inert = crate::rooting::expr_is_inert_primitive(ctx, expr);
+            Some(proof(
+                inert,
+                inert && crate::type_analysis::is_numeric_expr(ctx, expr),
+            ))
+        }
+        // `++` / `--` execute ToNumeric before mutating their local. The
+        // shared inert predicate admits only a non-pointer primitive local;
+        // an `any` target can dispatch valueOf/Symbol.toPrimitive and collect.
+        Expr::Update { .. } => {
+            crate::rooting::expr_is_inert_primitive(ctx, expr).then(|| proof(true, true))
+        }
+        Expr::Binary { op, left, right } => {
+            let left = masked_window_expression_proof(ctx, left)?;
+            let right = masked_window_expression_proof(ctx, right)?;
+            if matches!(op, BinaryOp::Add) {
+                if !left.numeric || !right.numeric {
+                    return None;
+                }
+            } else if !left.inert || !right.inert {
+                return None;
+            }
+            Some(proof(true, true))
+        }
+        Expr::Compare { op, left, right } => {
+            let left = masked_window_expression_proof(ctx, left)?;
+            let right = masked_window_expression_proof(ctx, right)?;
+            if !matches!(op, CompareOp::Eq | CompareOp::Ne) && (!left.inert || !right.inert) {
+                return None;
+            }
+            Some(proof(true, false))
+        }
+        Expr::Unary { op, operand } => {
+            let operand = masked_window_expression_proof(ctx, operand)?;
+            if !matches!(op, UnaryOp::Not) && !operand.inert {
+                return None;
+            }
+            Some(proof(true, !matches!(op, UnaryOp::Not)))
+        }
+        Expr::Logical { left, right, .. } => {
+            let left = masked_window_expression_proof(ctx, left)?;
+            let right = masked_window_expression_proof(ctx, right)?;
+            Some(proof(
+                left.inert && right.inert,
+                left.numeric && right.numeric,
+            ))
+        }
+        Expr::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            masked_window_expression_proof(ctx, condition)?;
+            let then_expr = masked_window_expression_proof(ctx, then_expr)?;
+            let else_expr = masked_window_expression_proof(ctx, else_expr)?;
+            Some(proof(
+                then_expr.inert && else_expr.inert,
+                then_expr.numeric && else_expr.numeric,
+            ))
+        }
+        Expr::Void(value) | Expr::TypeOf(value) | Expr::BooleanCoerce(value) => {
+            masked_window_expression_proof(ctx, value)?;
+            Some(proof(true, false))
+        }
+        Expr::NumberCoerce(value) => {
+            let value = masked_window_expression_proof(ctx, value)?;
+            value.inert.then(|| proof(true, true))
+        }
+        Expr::MathImul(left, right) | Expr::MathPow(left, right) => {
+            for value in [left.as_ref(), right.as_ref()] {
+                if !masked_window_expression_proof(ctx, value)?.inert {
+                    return None;
+                }
+            }
+            Some(proof(true, true))
+        }
+        Expr::MathMin(values) | Expr::MathMax(values) => {
+            for value in values {
+                if !masked_window_expression_proof(ctx, value)?.inert {
+                    return None;
+                }
+            }
+            Some(proof(true, true))
+        }
+        Expr::MathAbs(value)
+        | Expr::MathSqrt(value)
+        | Expr::MathFloor(value)
+        | Expr::MathCeil(value)
+        | Expr::MathRound(value)
+        | Expr::MathTrunc(value)
+        | Expr::MathSign(value)
+        | Expr::MathF16round(value) => {
+            let value = masked_window_expression_proof(ctx, value)?;
+            if !value.inert {
+                return None;
+            }
+            Some(proof(true, true))
+        }
+        _ => None,
+    }
 }
 
 /// Effect-free expression walk: tracked `a[i ± c]` reads, locals, literals and
