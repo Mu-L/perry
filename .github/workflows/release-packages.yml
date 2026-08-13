@@ -296,6 +296,9 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: perry-windows-x86_64
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            artifact: perry-windows-aarch64
 
     runs-on: ${{ matrix.os }}
     env:
@@ -609,22 +612,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # #4823 (option 1): the Android UI backend so a WinGet/Scoop-installed
           # perry can link `perry/ui` apps for android without a source tree.
-          # Best-effort: aws-lc-rs cross-from-Windows can be finicky; a failure
-          # here must not sink the whole release, because the npm path backfills
-          # libperry_ui_android.a from the ubuntu `perry-cross-*` bundle and the
-          # zip still ships runtime+stdlib. The UI staging below is guarded on
-          # the lib actually existing.
+          # This is mandatory for every Windows archive: matrix legs package
+          # independently, so another leg cannot backfill a missing library.
           # Mirrors the ubuntu cross-bundle leg: `--profile dist` build for the
           # staticlib (UI crates are already staticlib — no -static wrapper); the
           # global-dynamic TLS rustflag only matters at the consumer's final
           # cdylib link, not here.
-          # A native non-zero exit isn't a terminating error in pwsh, so guard
-          # on $LASTEXITCODE explicitly and reset it so the step stays green.
           cargo build --profile dist --target aarch64-linux-android -p perry-ui-android
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "perry-ui-android android cross-build failed (exit $LASTEXITCODE) — zip will omit the UI lib; npm backfills it from perry-cross-aarch64-linux-android."
-            $global:LASTEXITCODE = 0
-          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # #4856 — defense in depth behind the cache eviction above: assert
       # every runtime archive this leg built (host triple + any Apple/
@@ -770,7 +765,7 @@ jobs:
               $signtool = $signtoolCommand.Source
             } else {
               $kitsBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
-              $signtool = Get-ChildItem "$kitsBin\*\x64\signtool.exe" |
+              $signtool = Get-ChildItem "$kitsBin\*\arm64\signtool.exe", "$kitsBin\*\x64\signtool.exe" |
                 Sort-Object { [version]$_.Directory.Parent.Name } -Descending |
                 Select-Object -First 1 -ExpandProperty FullName
             }
@@ -817,14 +812,14 @@ jobs:
           # subdir lives alongside `perry.exe`.
           $androidLibDir = "staging/aarch64-linux-android/release"
           New-Item -ItemType Directory -Force -Path $androidLibDir | Out-Null
-          # #4823: libperry_ui_android.a is best-effort (the cross-build above
-          # may have skipped it) — Test-Path guards it just like the others.
           $androidLibs = @("libperry_runtime.a", "libperry_stdlib.a", "libperry_ui_android.a")
           foreach ($lib in $androidLibs) {
             $src = "target/aarch64-linux-android/dist/$lib"
-            if (Test-Path $src) {
-              Copy-Item $src $androidLibDir
+            if (-not (Test-Path -LiteralPath $src -PathType Leaf)) {
+              Write-Error "Required Android library missing from ${{ matrix.artifact }}: $src"
+              exit 1
             }
+            Copy-Item $src $androidLibDir
           }
           Compress-Archive -Path staging/* -DestinationPath "${{ matrix.artifact }}.zip"
 
@@ -1066,12 +1061,15 @@ jobs:
             ui_lib: libperry_ui_android.a
             tier3: false
           # --- Windows MSVC (native runner) ---------------------------------
-          # Only x86_64 today. perry's compile.rs maps `--target windows`
-          # to `x86_64-pc-windows-msvc` (compile.rs:1009); ARM64 Windows
-          # support is a separate follow-up — re-add `aarch64-pc-windows-msvc`
-          # here once the CLI knows about it.
+          # Both native Windows architectures use their matching hosted runner
+          # so Rust, LLVM, MSVC, and the packaged executable all agree.
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            ui_crate: perry-ui-windows
+            ui_lib: perry_ui_windows.lib
+            tier3: false
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
             ui_crate: perry-ui-windows
             ui_lib: perry_ui_windows.lib
             tier3: false
@@ -1999,9 +1997,9 @@ jobs:
           echo "Hub response: ${RESPONSE}"
 
   # ---------------------------------------------------------------------------
-  # Publish npm packages (@perryts/perry + 7 per-platform packages)
+  # Publish npm packages (@perryts/perry + 8 per-platform packages)
   #
-  # Uses OIDC / Trusted Publishers (no long-lived NPM_TOKEN). Each of the 8
+  # Uses OIDC / Trusted Publishers (no long-lived NPM_TOKEN). Each of the 9
   # package names must be registered on npmjs.com with this repo + workflow
   # as a Trusted Publisher. See npm/README.md for the one-time setup.
   # ---------------------------------------------------------------------------
