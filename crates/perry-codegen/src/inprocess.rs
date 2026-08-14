@@ -38,7 +38,16 @@ use inkwell::OptimizationLevel;
 /// passing against a pipeline production had stopped using. `mem2reg` is not
 /// incidental company: RS4GC tracks `addrspace(1)` **SSA values**, not memory,
 /// so a root alloca that survives promotion is a root the collector never sees.
-pub(crate) const STATEPOINT_REWRITE_PASSES: &str = "function(mem2reg),rewrite-statepoints-for-gc";
+// SCCP—not InstCombine—is before RS4GC deliberately (#8065). Native C-API construction
+// folds constants as instructions are built, while whole-module text parsing
+// retains the equivalent instruction graph. If RS4GC sees those two shapes
+// before canonicalization, their live-root ordering can differ and reach both
+// machine code and the compact GC map. The ordinary optimization pipeline is
+// too late: statepoints and relocations have already been assigned by then.
+// The narrower SCCP preserves dynamic pointer round trips which InstCombine
+// can erase, so the positive live-root witness remains visible to RS4GC.
+pub(crate) const STATEPOINT_REWRITE_PASSES: &str =
+    "function(mem2reg,sccp),rewrite-statepoints-for-gc";
 
 /// Test seam (#7502): parse `ll_text`, run [`STATEPOINT_REWRITE_PASSES`] for
 /// `effective_target`, and return the rewritten IR.
@@ -54,6 +63,21 @@ pub(crate) fn statepoint_rewritten_ir(
     ll_text: &str,
     effective_target: &str,
     module_name: &str,
+) -> Result<String> {
+    statepoint_rewritten_ir_with_passes(
+        ll_text,
+        effective_target,
+        module_name,
+        STATEPOINT_REWRITE_PASSES,
+    )
+}
+
+#[cfg(test)]
+fn statepoint_rewritten_ir_with_passes(
+    ll_text: &str,
+    effective_target: &str,
+    module_name: &str,
+    passes: &str,
 ) -> Result<String> {
     global_init(&[]);
     let context = Context::create();
@@ -77,8 +101,8 @@ pub(crate) fn statepoint_rewritten_ir(
         .verify()
         .map_err(|e| anyhow!("LLVM verifier rejected pre-statepoint module:\n{}", e))?;
     module
-        .run_passes(STATEPOINT_REWRITE_PASSES, &tm, PassBuilderOptions::create())
-        .map_err(|e| anyhow!("`{STATEPOINT_REWRITE_PASSES}` failed:\n{}", e))?;
+        .run_passes(passes, &tm, PassBuilderOptions::create())
+        .map_err(|e| anyhow!("`{passes}` failed:\n{}", e))?;
     module
         .verify()
         .map_err(|e| anyhow!("LLVM verifier rejected the statepoint module:\n{}", e))?;
@@ -411,6 +435,125 @@ fn optimize_and_emit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn constant_fold_order_fixture(folded: bool) -> String {
+        let mut ir = String::from(
+            "declare i64 @may_collect()\n\ndefine i64 @f(i64 %d0, i64 %d1, i64 %d2, i64 %d3, i64 %d4, i64 %d5, i64 %d6, i64 %d7) gc \"statepoint-example\" {\nentry:\n",
+        );
+        for i in 0..8 {
+            ir.push_str(&format!("  %cslot{i} = alloca ptr addrspace(1)\n"));
+            if folded {
+                ir.push_str(&format!(
+                    "  store ptr addrspace(1) inttoptr (i64 9222246136947933185 to ptr addrspace(1)), ptr %cslot{i}\n"
+                ));
+            } else {
+                ir.push_str(&format!(
+                    "  %cb{i} = bitcast double 0x7FFC000000000001 to i64\n  %cp{i} = inttoptr i64 %cb{i} to ptr addrspace(1)\n  store ptr addrspace(1) %cp{i}, ptr %cslot{i}\n"
+                ));
+            }
+        }
+        for i in 0..8 {
+            ir.push_str(&format!(
+                "  %dslot{i} = alloca ptr addrspace(1)\n  %dp{i} = inttoptr i64 %d{i} to ptr addrspace(1)\n  store ptr addrspace(1) %dp{i}, ptr %dslot{i}\n"
+            ));
+        }
+        ir.push_str("  %sp = call i64 @may_collect()\n");
+        for i in 0..8 {
+            ir.push_str(&format!(
+                "  %after{i} = load ptr addrspace(1), ptr %dslot{i}\n  %bits{i} = ptrtoint ptr addrspace(1) %after{i} to i64\n"
+            ));
+        }
+        for i in 0..8 {
+            ir.push_str(&format!(
+                "  %cafter{i} = load ptr addrspace(1), ptr %cslot{i}\n  %cbits{i} = ptrtoint ptr addrspace(1) %cafter{i} to i64\n"
+            ));
+        }
+        ir.push_str("  %x1 = xor i64 %bits0, %bits1\n");
+        for i in 2..8 {
+            ir.push_str(&format!("  %x{i} = xor i64 %x{}, %bits{i}\n", i - 1));
+        }
+        ir.push_str("  %y0 = xor i64 %x7, %cbits0\n");
+        for i in 1..8 {
+            ir.push_str(&format!("  %y{i} = xor i64 %y{}, %cbits{i}\n", i - 1));
+        }
+        ir.push_str("  ret i64 %y7\n}\n");
+        ir
+    }
+
+    #[test]
+    fn rs4gc_canonicalizes_construction_time_folds_before_root_liveness() {
+        let _native = crate::codegen::helpers::NativeRootsPin::native();
+        let target = crate::codegen::default_target_triple();
+        let text_ir = constant_fold_order_fixture(false);
+        let folded_ir = constant_fold_order_fixture(true);
+
+        for (label, ir) in [("text", &text_ir), ("folded", &folded_ir)] {
+            let rewritten = statepoint_rewritten_ir(ir, &target, label)
+                .unwrap_or_else(|e| panic!("{label} fixture must run RS4GC: {e:#}"));
+            assert!(
+                !rewritten.contains("%cb0 = bitcast"),
+                "{label} fixture reached RS4GC before construction-time folds converged:\n{rewritten}"
+            );
+            let live_bundle = rewritten
+                .lines()
+                .find(|line| line.contains("\"gc-live\""))
+                .unwrap_or_else(|| panic!("{label} fixture lost every dynamic root:\n{rewritten}"));
+            assert!(
+                live_bundle.contains("%dp0"),
+                "{label} fixture lost every dynamic root:\n{rewritten}"
+            );
+            assert!(
+                rewritten.contains("gc.relocate"),
+                "{label} fixture did not relocate a dynamic root:\n{rewritten}"
+            );
+        }
+
+        let emit = |ir: &str, name: &str| {
+            let context = Context::create();
+            let module = parse_ir_text(&context, ir, name).expect("fixture parses");
+            optimize_and_emit_module(&module, &target, &["-O3".into(), "-S".into()])
+                .expect("fixture emits assembly")
+        };
+        let text = emit(&text_ir, "constant_fold_text");
+        let folded = emit(&folded_ir, "constant_fold_native");
+        assert_eq!(
+            text, folded,
+            "construction-time constant folding must converge before RS4GC assigns root liveness"
+        );
+
+        const PRE_FIX_PASSES: &str = "function(mem2reg),rewrite-statepoints-for-gc";
+        let pre_fix_emit = |ir: &str, name: &str| {
+            let rewritten = statepoint_rewritten_ir_with_passes(
+                ir,
+                &target,
+                &format!("{name}_rewrite"),
+                PRE_FIX_PASSES,
+            )
+            .expect("pre-fix pipeline rewrites fixture");
+            let context = Context::create();
+            let module =
+                parse_ir_text(&context, &rewritten, name).expect("rewritten fixture parses");
+            let _shadow = crate::codegen::helpers::NativeRootsPin::shadow();
+            (
+                rewritten,
+                optimize_and_emit_module(&module, &target, &["-O3".into(), "-S".into()])
+                    .expect("rewritten fixture emits assembly"),
+            )
+        };
+        let (pre_fix_text_ir, pre_fix_text) = pre_fix_emit(&text_ir, "pre_fix_text");
+        let (_, pre_fix_folded) = pre_fix_emit(&folded_ir, "pre_fix_native");
+        assert!(
+            pre_fix_text_ir
+                .lines()
+                .find(|line| line.contains("\"gc-live\""))
+                .is_some_and(|line| line.contains("%cp0")),
+            "negative control must keep a constant-derived text root live across the safepoint:\n{pre_fix_text_ir}"
+        );
+        assert_ne!(
+            pre_fix_text, pre_fix_folded,
+            "fixture must fail byte equality under the pre-#8065 pass order"
+        );
+    }
 
     /// Layer-2 readiness (#7174, engine-plan layer 0 -> 2): the in-process
     /// pipeline can schedule `RewriteStatepointsForGC` at the pinned LLVM —
