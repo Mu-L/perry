@@ -33,8 +33,13 @@ def rust_sources() -> dict[str, str]:
     }
 
 
-def strip_rust_comments_and_literals(source: str) -> str:
-    """Blank comments/string literals while preserving code and newlines."""
+def _rust_without_comments_and_literals(source: str, preserve_offsets: bool) -> str:
+    """Blank comments/literals, optionally preserving every source offset."""
+
+    def blank_span(span: str) -> str:
+        if preserve_offsets:
+            return "".join("\n" if char == "\n" else " " for char in span)
+        return " " + "\n" * span.count("\n")
 
     chunks: list[str] = []
     pos = 0
@@ -45,11 +50,11 @@ def strip_rust_comments_and_literals(source: str) -> str:
         if lexeme == "//":
             newline = source.find("\n", end)
             if newline < 0:
-                chunks.append(" ")
-                pos = len(source)
-                break
-            chunks.append("\n")
-            pos = newline + 1
+                end = len(source)
+            else:
+                end = newline + 1
+            chunks.append(blank_span(source[match.start() : end]))
+            pos = end
             continue
         if lexeme == "/*":
             depth = 1
@@ -69,10 +74,22 @@ def strip_rust_comments_and_literals(source: str) -> str:
             else:
                 tail = QUOTED_STRING_TAIL.match(source, end)
                 end = len(source) if tail is None else tail.end()
-        chunks.append(" " + "\n" * source[match.start() : end].count("\n"))
+        chunks.append(blank_span(source[match.start() : end]))
         pos = end
     chunks.append(source[pos:])
     return "".join(chunks)
+
+
+def strip_rust_comments_and_literals(source: str) -> str:
+    """Blank comments/string literals while preserving code and newlines."""
+
+    return _rust_without_comments_and_literals(source, preserve_offsets=False)
+
+
+def blank_rust_comments_and_literals(source: str) -> str:
+    """Blank comments/literals while preserving every source-string offset."""
+
+    return _rust_without_comments_and_literals(source, preserve_offsets=True)
 
 
 def stripped_sources(sources: dict[str, str]) -> dict[str, str]:
@@ -90,6 +107,15 @@ def run_literal_lexer_selftest() -> None:
     clean = strip_rust_comments_and_literals(fixture)
     if len(re.findall(r"\.\s*keys_array\b", clean)) != 1:
         raise CensusError("literal lexer swallowed a real member between quote-char literals")
+    brace_fixture = '''fn brace_fixture() {
+        let string_brace = "}";
+        let char_brace = '{';
+        // } must not close the function
+        let live_after_literal_braces = 1;
+    }
+    '''
+    if "live_after_literal_braces" not in function_body(brace_fixture, "brace_fixture"):
+        raise CensusError("raw function-body extraction counted literal/comment braces")
 
 
 def normalize_line(line: str) -> str:
@@ -154,17 +180,18 @@ def observed_census(sources: dict[str, str]) -> dict[str, object]:
 
 
 def function_body(source: str, name: str) -> str:
-    match = re.search(rf"\bfn\s+{re.escape(name)}\b", source)
+    blanked = blank_rust_comments_and_literals(source)
+    match = re.search(rf"\bfn\s+{re.escape(name)}\b", blanked)
     if not match:
         raise CensusError(f"missing function body: {name}")
-    start = source.find("{", match.end())
+    start = blanked.find("{", match.end())
     if start < 0:
         raise CensusError(f"missing opening brace: {name}")
     depth = 0
-    for i in range(start, len(source)):
-        if source[i] == "{":
+    for i in range(start, len(blanked)):
+        if blanked[i] == "{":
             depth += 1
-        elif source[i] == "}":
+        elif blanked[i] == "}":
             depth -= 1
             if depth == 0:
                 return source[start + 1 : i]
@@ -190,6 +217,18 @@ def assert_authority_surfaces(sources: dict[str, str]) -> None:
         "crates/perry-codegen/src/lower_call/new_alloc.rs",
         "crates/perry-runtime/src/gc/layout_slot_visit.rs",
         "crates/perry-runtime/src/object/field_set_by_name/tail.rs",
+        "crates/perry-runtime/src/typed_feedback/guards.rs",
+        "crates/perry-runtime/src/object/native_call_method.rs",
+        "crates/perry-runtime/src/object/exotic_expando.rs",
+        "crates/perry-runtime/src/object/field_get_set/get_field_by_name_tail.rs",
+        "crates/perry-runtime/src/object/field_get_set/ic_miss.rs",
+        "crates/perry-runtime/src/proxy/put_value.rs",
+        "crates/perry-runtime/src/gc/types.rs",
+        "crates/perry-runtime/src/regex.rs",
+        "crates/perry-codegen/src/expr/class_field_inline_guard.rs",
+        "crates/perry-codegen/src/expr/element_shape_guard.rs",
+        "crates/perry-codegen/src/expr/property_get/generic_dispatch.rs",
+        "crates/perry-codegen/src/expr/proxy_reflect.rs",
     )
     missing = [path for path in authority_paths if path not in sources]
     if missing:
@@ -204,11 +243,47 @@ def assert_authority_surfaces(sources: dict[str, str]) -> None:
     transition_tail = clean[
         "crates/perry-runtime/src/object/field_set_by_name/tail.rs"
     ]
+    typed_guards = clean["crates/perry-runtime/src/typed_feedback/guards.rs"]
+    native_call_method = clean[
+        "crates/perry-runtime/src/object/native_call_method.rs"
+    ]
+    exotic_expando = clean["crates/perry-runtime/src/object/exotic_expando.rs"]
+    get_field_tail = clean[
+        "crates/perry-runtime/src/object/field_get_set/get_field_by_name_tail.rs"
+    ]
+    ic_miss = clean["crates/perry-runtime/src/object/field_get_set/ic_miss.rs"]
+    put_value = clean["crates/perry-runtime/src/proxy/put_value.rs"]
+    gc_types = clean["crates/perry-runtime/src/gc/types.rs"]
+    regex_runtime = clean["crates/perry-runtime/src/regex.rs"]
+    class_guard = clean[
+        "crates/perry-codegen/src/expr/class_field_inline_guard.rs"
+    ]
+    element_guard = clean[
+        "crates/perry-codegen/src/expr/element_shape_guard.rs"
+    ]
+    generic_pic = clean[
+        "crates/perry-codegen/src/expr/property_get/generic_dispatch.rs"
+    ]
+    write_pics = clean["crates/perry-codegen/src/expr/proxy_reflect.rs"]
+    # Emitted ObjectHeader offsets and fail-closed constants are represented as
+    # Rust string literals, so inspect raw function bodies for these checks.
+    raw_class_guard = sources[
+        "crates/perry-codegen/src/expr/class_field_inline_guard.rs"
+    ]
+    raw_element_guard = sources[
+        "crates/perry-codegen/src/expr/element_shape_guard.rs"
+    ]
+    raw_generic_pic = sources[
+        "crates/perry-codegen/src/expr/property_get/generic_dispatch.rs"
+    ]
+    raw_write_pics = sources["crates/perry-codegen/src/expr/proxy_reflect.rs"]
 
     for pattern, label in (
         (r"descriptors\s*:\s*HashMap\s*<\s*u32\s*,\s*ShapeDescriptor", "by-id descriptor table"),
         (r"logical_key_count\s*:\s*u32", "exact logical-key fact"),
         (r"live_inline_slot_count\s*:\s*u32", "exact live-slot fact"),
+        (r"semantic_generation\s*:\s*u64", "semantic transition fact"),
+        (r"object_kind\s*:\s*ShapeObjectKind", "authoritative receiver-kind fact"),
         (r"\bfn\s+shape_descriptor_by_id\b", "by-id lookup"),
         (r"\bfn\s+debug_assert_object_shape_parity\b", "parity assertion"),
         (r"\bfn\s+synchronize_live_object_shape_descriptor_after_header_visit\b", "live-object descriptor mirror"),
@@ -218,9 +293,15 @@ def assert_authority_surfaces(sources: dict[str, str]) -> None:
 
     allocator = function_body(shapes, "alloc_shape_id_from")
     require_code(allocator, r"\bcompare_exchange_weak\s*\(", "exhaustion park")
-    if re.search(r"\bfetch_add\s*\(|\bprocess\s*::\s*(?:abort|exit)\s*\(", allocator):
-        raise CensusError("ShapeId exhaustion is wrapping or unrecoverable")
-    require_code(shapes, r"\.unwrap_or\s*\(\s*0\s*\)", "recoverable exhaustion fallback")
+    if re.search(r"\bfetch_add\s*\(", allocator):
+        raise CensusError("ShapeId allocator wraps instead of parking")
+    require_code(shapes, r"\bfn\s+shape_id_exhausted_abort\b", "exhaustion fail-stop")
+    public_ensure = function_body(shapes, "shape_id_for_keys_ensure")
+    require_code(
+        public_ensure,
+        r"publish_shape_result\s*\(",
+        "typed shape-mint errors fail stop",
+    )
 
     scanner = function_body(shapes, "scan_shape_table_rekey_mut")
     require_code(scanner, r"\bvisit_metadata_usize_slot\s*\(", "weak metadata rewrite")
@@ -250,28 +331,30 @@ def assert_authority_surfaces(sources: dict[str, str]) -> None:
         "descriptor fact capture exact array type",
     )
 
-    ensure = function_body(shapes, "shape_descriptor_ensure")
+    ensure = function_body(shapes, "shape_descriptor_ensure_with_generation")
     assert_before(
         ensure,
         "inner.descriptors.insert",
-        "inner.ids_by_facts.insert",
+        "inner.ids_by_facts.entry",
         "by-id descriptor before reverse accelerator",
     )
-    sync = function_body(shapes, "synchronize_object_shape_descriptor")
+    sync = function_body(shapes, "synchronize_object_shape_descriptor_from")
     assert_before(
         sync,
         "shape_descriptor_ensure",
         "(*obj).parent_class_id = id",
         "descriptor before ObjectHeader ShapeId",
     )
-    retirement = function_body(shapes, "retire_key_count_versions")
+    retirement = function_body(shapes, "retain_key_count_versions")
     require_code(
         retirement,
         r"ids_by_keys\s*\.\s*remove\s*\(\s*&keys\s*\)",
-        "keys-scoped descriptor retirement index",
+        "keys-scoped descriptor lineage index",
     )
     if re.search(r"descriptors\s*\.\s*(?:iter|values|keys)\s*\(", retirement):
-        raise CensusError("shape descriptor retirement scans the global descriptor table")
+        raise CensusError("shape descriptor lineage repair scans the global descriptor table")
+    if "descriptors.remove" in retirement:
+        raise CensusError("live-key lineage repair eagerly deletes published descriptors")
     for name in ("shape_keys_grown", "shape_drop"):
         if "descriptors.remove" in function_body(shapes, name):
             raise CensusError(f"{name} eagerly deletes a sibling descriptor")
@@ -291,6 +374,136 @@ def assert_authority_surfaces(sources: dict[str, str]) -> None:
         "set_object_live_slot_count",
         "runtime_store_jsvalue_slot",
         "transition-cache count before value",
+    )
+
+    # Runtime guard contracts may consume ShapeId/descriptor facts, never the
+    # compatibility ObjectHeader mirrors or a keys-pointer token.
+    for name in (
+        "method_direct_call_contract",
+        "class_field_get_contract",
+        "class_field_fast_contract",
+        "class_field_set_contract",
+    ):
+        body = function_body(typed_guards, name)
+        if re.search(r"expected_keys|\(\s*\*\s*obj\s*\)\s*\.\s*(?:keys_array|field_count|object_type)\b", body):
+            raise CensusError(f"{name} reintroduced a legacy header guard fact")
+        require_code(
+            body,
+            r"object_shape(?:_(?:id|descriptor))?\s*\(",
+            f"{name} ShapeId authority",
+        )
+
+    for name in ("class_vtable_fast_guard", "js_native_call_method"):
+        body = function_body(native_call_method, name)
+        if re.search(
+            r"\(\s*\*\s*obj\s*\)\s*\.\s*(?:keys_array|field_count|object_type)\b|js_array_length\s*\(\s*keys\s*\)",
+            body,
+        ):
+            raise CensusError(f"{name} reintroduced a legacy method guard fact")
+        require_code(
+            body,
+            r"object_shape_descriptor\s*\(",
+            f"{name} ShapeId descriptor authority",
+        )
+        require_code(
+            body,
+            r"logical_key_count\b",
+            f"{name} exact logical key count",
+        )
+
+    # RegExp identity lives in the GcHeader kind. No ObjectHeader payload word
+    # or registry/magic conjunction may decide these ordinary-object forks.
+    for name in ("object_is_regular", "object_is_shaped"):
+        body = function_body(object_mod, name)
+        require_code(body, r"obj_type\s*==\s*crate::gc::GC_TYPE_OBJECT", f"{name} GC kind")
+        if re.search(r"regex_header_has_magic|object_type", body):
+            raise CensusError(f"{name} reintroduced an old payload discriminator")
+    regexp_alloc = function_body(regex_runtime, "js_regexp_new")
+    require_code(
+        regexp_alloc,
+        r"gc_malloc\s*\([^;]*crate::gc::GC_TYPE_REGEXP",
+        "RegExp dedicated GC birth kind",
+    )
+    expando_kind = function_body(exotic_expando, "exotic_expando_kind")
+    require_code(
+        expando_kind,
+        r"crate::gc::GC_TYPE_REGEXP\s*=>\s*Some\s*\(\s*ExoticKind::RegExp",
+        "RegExp expando dedicated kind",
+    )
+    regexp_get = function_body(get_field_tail, "get_field_by_name_object_tail")
+    require_code(
+        regexp_get,
+        r"gc_type\s*==\s*crate::gc::GC_TYPE_REGEXP",
+        "RegExp property dispatch dedicated kind",
+    )
+    if re.search(
+        r"GC_TYPE_OBJECT[^{};]*is_regex_pointer|is_regex_pointer[^{};]*GC_TYPE_OBJECT",
+        expando_kind + regexp_get,
+    ):
+        raise CensusError("RegExp dispatch reintroduced the former object-kind probe")
+
+    read_miss = function_body(ic_miss, "js_object_get_field_ic_miss")
+    for body, label in (
+        (read_miss, "read PIC miss"),
+        (function_body(put_value, "js_put_value_set_ic_miss"), "static write PIC miss"),
+        (function_body(put_value, "dyn_ic_try_store"), "dynamic write PIC hit"),
+        (function_body(put_value, "js_put_value_set_dyn_ic_miss"), "dynamic write PIC miss"),
+    ):
+        if re.search(r"else\s*\{\s*(?:keys|\(\s*\*\s*obj\s*\)\.keys_array)\s+as\s+u64", body):
+            raise CensusError(f"{label} reintroduced a keys-pointer token")
+
+    # Emitted guards must not read the three payload offsets #8047 will remove.
+    for source, names in (
+        (raw_class_guard, (
+            "emit_class_field_loop_preheader_check",
+            "emit_proven_shape_recheck",
+            "emit_class_field_inline_precheck",
+        )),
+        (raw_element_guard, ("emit_element_shape_field_load",)),
+    ):
+        for name in names:
+            body = function_body(source, name)
+            if re.search(r"expected_keys|add\s*\([^\n]*\"(?:0|12|16)\"", body):
+                raise CensusError(f"{name} emits a removed ObjectHeader fact")
+
+    generic_body = function_body(raw_generic_pic, "lower_generic_property_get")
+    if re.search(r"add\s*\(\s*I64\s*,\s*&obj_handle\s*,\s*\"(?:12|16)\"", generic_body):
+        raise CensusError("generic read PIC emits a removed ObjectHeader fact")
+    require_code(
+        generic_body,
+        r"select\s*\(\s*I1\s*,\s*&is_stamp\s*,\s*I64\s*,\s*&id_token\s*,\s*\"0\"\s*\)",
+        "generic read PIC invalid-id fail-closed token",
+    )
+    for name in ("lower_put_value_static_write_ic", "lower_put_value_dyn_ic_inline"):
+        body = function_body(raw_write_pics, name)
+        if re.search(r"add\s*\(\s*I64\s*,\s*&(safe_target|t_handle)\s*,\s*\"(?:12|16)\"", body):
+            raise CensusError(f"{name} emits a removed ObjectHeader fact")
+
+    require_code(gc_types, r"GC_TYPE_REGEXP\s*:\s*u8", "RegExp external discriminator")
+    regexp_info_match = re.search(
+        r"gc_type_info_entry\(\s*GC_TYPE_REGEXP\b[\s\S]*?\n\s*\)\s*\)",
+        gc_types,
+    )
+    if not regexp_info_match:
+        raise CensusError("shape descriptor authority surface missing: RegExp type metadata")
+    regexp_info = regexp_info_match.group(0)
+    require_code(
+        regexp_info,
+        r"GcMoveHookKind::RegExpSideTables",
+        "RegExp address-owned relocation hook",
+    )
+    require_code(
+        regexp_info,
+        r"GcFinalizeHookKind::RegExpSideTables",
+        "RegExp malloc-finalize side-table hook",
+    )
+    if "OBJ_FLAG_CLASS_OBJECT" in gc_types + class_guard + element_guard + write_pics:
+        raise CensusError("class kind reintroduced a GcHeader layout-bit alias")
+    class_probe = function_body(object_mod, "object_is_regular")
+    require_code(
+        class_probe,
+        r"ShapeObjectKind::Ordinary",
+        "ordinary-object descriptor kind authority",
     )
 
 
@@ -367,11 +580,11 @@ def run_sabotage_selftests(sources: dict[str, str], baseline: dict[str, object])
     inverted_publication = dict(sources)
     path = "crates/perry-runtime/src/object/shapes.rs"
     publication_body = function_body(
-        inverted_publication[path], "synchronize_object_shape_descriptor"
+        inverted_publication[path], "synchronize_object_shape_descriptor_from"
     )
     inverted_body = swap_once(
         publication_body,
-        "shape_descriptor_ensure(keys, key_count, (*obj).field_count)",
+        "shape_descriptor_ensure_with_generation(",
         "(*obj).parent_class_id = id",
     )
     inverted_publication[path] = inverted_publication[path].replace(
@@ -385,7 +598,7 @@ def run_sabotage_selftests(sources: dict[str, str], baseline: dict[str, object])
     unscoped_retirement = dict(sources)
     path = "crates/perry-runtime/src/object/shapes.rs"
     retirement_body = function_body(
-        unscoped_retirement[path], "retire_key_count_versions"
+        unscoped_retirement[path], "retain_key_count_versions"
     )
     unscoped_body, substitutions = re.subn(
         r"ids_by_keys\s*\.\s*remove\s*\(\s*&keys\s*\)",
@@ -401,6 +614,22 @@ def run_sabotage_selftests(sources: dict[str, str], baseline: dict[str, object])
     expect_rejected(
         "descriptor retirement without keys index",
         lambda: assert_authority_surfaces(unscoped_retirement),
+    )
+
+    legacy_ir = dict(sources)
+    path = "crates/perry-codegen/src/expr/property_get/generic_dispatch.rs"
+    legacy_body, substitutions = re.subn(
+        r'add\(I64, &obj_handle, "8"\)',
+        'add(I64, &obj_handle, "16")',
+        legacy_ir[path],
+        count=1,
+    )
+    if substitutions != 1:
+        raise CensusError("legacy emitted-offset sabotage fixture missing")
+    legacy_ir[path] = legacy_body
+    expect_rejected(
+        "legacy keys-header offset in emitted PIC",
+        lambda: assert_authority_surfaces(legacy_ir),
     )
 
     stale_summary = json.loads(json.dumps(baseline))
