@@ -238,6 +238,11 @@ pub(crate) struct FnCtx<'a> {
     /// initializer. Unlike `local_types`, this map never receives a declared
     /// annotation or a type inferred from one.
     pub proven_local_types: std::collections::HashMap<u32, HirType>,
+    /// Immutable CSE/local aliases of a property read from another local,
+    /// recorded as `alias_id -> (owner_id, property)`. Guarded discriminant
+    /// narrowing uses this only after proving the owner at runtime; the alias
+    /// itself contributes no type evidence.
+    pub guarded_discriminant_aliases: std::collections::HashMap<u32, (u32, String)>,
     /// Module-global proofs used only by cross-thread admission. These are
     /// collected from structural initializers with module-wide write
     /// invalidation; ordinary local type predicates do not consult them.
@@ -1029,6 +1034,10 @@ pub(crate) struct FnCtx<'a> {
     /// dispatch statically-proven sites to the raw-ABI symbol.
     pub spec_abi_functions: &'a std::collections::HashMap<u32, crate::codegen::SpecFnPlan>,
 
+    /// Constructively verified return facts for specialized module functions.
+    /// Consumed only when the current call's arguments prove the same plan.
+    pub spec_return_proofs: &'a std::collections::HashMap<u32, HirType>,
+
     /// Phase 2 pre-pass output (`collectors/spec_abi_sites.rs`): LocalIds
     /// proven to permanently hold one specific non-view typed array. A call
     /// arg `LocalGet(id)` matches a `TaPtr` slot only when `id` is here AND in
@@ -1801,6 +1810,21 @@ impl<'a> FnCtx<'a> {
     /// an allowlist rationale fails CI.
     pub(crate) fn local_type_hint(&self, id: &u32) -> Option<&HirType> {
         self.local_types.get(id)
+    }
+
+    /// Snapshot a binding's runtime-derived proof so a branch-scoped narrowing
+    /// can be undone EXACTLY.
+    ///
+    /// This is restore bookkeeping, not evidence: the value is only ever
+    /// written back into `proven_local_types`, never consumed as a type fact,
+    /// so it deliberately does not go through `stable_local_type_proof`. That
+    /// accessor answers `None` for a reassigned binding, which as a *snapshot*
+    /// would silently DROP the entry on restore instead of restoring it — a
+    /// narrowing that outlives its branch, which is the wrong-code shape this
+    /// module exists to prevent. Inventoried by
+    /// `scripts/local_binding_type_audit.py` like the other two accessors.
+    pub(crate) fn snapshot_guarded_proof(&self, id: &u32) -> Option<HirType> {
+        self.proven_local_types.get(id).cloned()
     }
 
     pub(crate) fn has_imported_extern_binding(&self, name: &str) -> bool {
