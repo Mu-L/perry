@@ -115,8 +115,18 @@ fn bound_native_method_length(name: &str) -> Option<u32> {
 }
 
 #[no_mangle]
-pub extern "C" fn js_vm_create_context(sandbox: f64) -> f64 {
-    crate::node_vm::create_context(sandbox)
+pub extern "C" fn js_vm_create_context(sandbox: f64, options: f64) -> f64 {
+    crate::node_vm::create_context(sandbox, options)
+}
+
+#[no_mangle]
+pub extern "C" fn js_vm_create_script_branded(code: f64, options: f64) -> f64 {
+    crate::node_vm::dispatch_vm_method(
+        "createScript",
+        code,
+        options,
+        f64::from_bits(crate::value::TAG_UNDEFINED),
+    )
 }
 
 pub fn scan_native_callable_export_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {

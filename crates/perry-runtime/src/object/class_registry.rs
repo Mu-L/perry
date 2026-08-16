@@ -48,6 +48,7 @@ mod prototype_methods;
 pub(crate) mod prototype_objects;
 mod registration;
 mod state;
+mod vm_brand;
 
 // ── state.rs ────────────────────────────────────────────────────────────────
 pub(crate) use state::{
@@ -109,7 +110,7 @@ pub use prototype_methods::{
     js_register_function_prototype_method, js_register_prototype_method, CLASS_PROTOTYPE_METHODS,
 };
 
-// ── construct.rs ────────────────────────────────────────────────────────────
+// ── construct.rs / vm_brand.rs ──────────────────────────────────────────────
 pub(crate) use construct::{
     extends_target_must_throw, function_would_have_own_prototype, is_callable_function_value,
     js_value_is_constructor, lookup_prototype_method, nm_ctor_child_process, nm_ctor_cluster,
@@ -121,6 +122,7 @@ pub use construct::{
     js_new_function_construct_apply, js_new_function_construct_with_new_target,
     js_new_target_value,
 };
+pub(crate) use vm_brand::brand_vm_script_instance;
 
 // ── gc_roots.rs ─────────────────────────────────────────────────────────────
 pub(crate) use gc_roots::{
