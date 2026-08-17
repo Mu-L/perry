@@ -879,11 +879,9 @@ fn make_instance_result(module: *mut c_void, inst: *mut c_void, imports: f64) ->
 
     let result = scope.root_raw_mut_ptr(crate::object::js_object_alloc(0, 0));
     let module_value = scope.root_nanbox_f64(make_module_object(module));
-    let result_ptr = object_set(
-        result.get_raw_mut_ptr::<crate::object::ObjectHeader>(),
-        b"module",
-        module_value.get_nanbox_f64(),
-    );
+    let result_ptr = result.with_mut_ptr(|r: *mut crate::object::ObjectHeader| {
+        object_set(r, b"module", module_value.get_nanbox_f64())
+    });
     result.set_raw_mut_ptr(result_ptr);
     let result_ptr = object_set(
         result.get_raw_mut_ptr::<crate::object::ObjectHeader>(),
@@ -891,7 +889,7 @@ fn make_instance_result(module: *mut c_void, inst: *mut c_void, imports: f64) ->
         object_value(instance.get_raw_mut_ptr::<crate::object::ObjectHeader>()),
     );
     result.set_raw_mut_ptr(result_ptr);
-    object_value(result.get_raw_mut_ptr::<crate::object::ObjectHeader>())
+    result.with_mut_ptr(|r: *mut crate::object::ObjectHeader| object_value(r))
 }
 
 /// `WebAssembly.instantiate(bytes, imports?)` returns the standard instance
