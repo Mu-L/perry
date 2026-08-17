@@ -425,6 +425,20 @@ pub(crate) fn is_numeric_expr(ctx: &FnCtx<'_>, e: &Expr) -> bool {
             let Expr::LocalGet(arr_id) = object.as_ref() else {
                 return false;
             };
+            if ctx.native_facts.num_array_local(*arr_id).is_some() {
+                return true;
+            }
+            // #8225: tracked BufferViewSlots come from compiler-owned
+            // Buffer/typed-array constructors (including NativeArena views),
+            // and every representable element kind is numeric. This runtime
+            // fact is stronger than the erasable declaration consulted below.
+            if ctx
+                .buffer_view_slots
+                .get(arr_id)
+                .is_some_and(|view| view.elem.is_number_valued())
+            {
+                return true;
+            }
             match ctx.stable_local_type_proof(arr_id) {
                 Some(HirType::Array(elem)) => {
                     matches!(**elem, HirType::Number | HirType::Int32)

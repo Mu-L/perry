@@ -1439,7 +1439,13 @@ equals = "width_aware_buffer_kernels:38314632556\n"
 detail = "width-aware buffer and typed-array semantic checksum"
 
 [workloads.width_aware_buffer_kernels.native_rep_checks]
-allow_materialization_reasons = ["function_abi", "runtime_api", "unknown_alias", "unknown_bounds"]
+allow_materialization_reasons = [
+  "function_abi",
+  "runtime_api",
+  "unknown_alias",
+  "unknown_bounds",
+  "unknown_call_escape",
+]
 
 [[workloads.width_aware_buffer_kernels.native_rep_checks.require_records]]
 name = "buffer_read_u32_be"
@@ -1523,14 +1529,14 @@ notes_contains = "typed_array_fallback=untracked_or_unproven"
 min = 2
 
 [[workloads.width_aware_buffer_kernels.native_rep_checks.require_records]]
-name = "typed_array_bounds_get_fallback"
+name = "typed_array_unproven_get_fallback"
 source_function = "typedArrayHazards"
 expr_kind = "TypedArrayGet"
 consumer = "TypedArrayGet.slow_path"
 native_rep_name = "js_value"
 access_mode = "dynamic_fallback"
 bounds_state = "unknown"
-materialization_reason = "unknown_bounds"
+materialization_reason = "unknown_call_escape"
 notes_contains = "typed_array_fallback=untracked_or_unproven"
 
 [[workloads.width_aware_buffer_kernels.native_rep_checks.require_records]]
@@ -1544,17 +1550,6 @@ bounds_state = "unknown"
 materialization_reason = "unknown_alias"
 notes_contains = "typed_array_fallback=untracked_or_unproven"
 min = 2
-
-[[workloads.width_aware_buffer_kernels.native_rep_checks.require_records]]
-name = "typed_array_bounds_set_fallback"
-source_function = "typedArrayHazards"
-expr_kind = "TypedArraySet"
-consumer = "TypedArraySet.slow_path"
-native_rep_name = "js_value"
-access_mode = "dynamic_fallback"
-bounds_state = "unknown"
-materialization_reason = "unknown_bounds"
-notes_contains = "typed_array_fallback=untracked_or_unproven"
 
 [workloads.native_owned_typed_views]
 source = "benchmarks/compiler_output/fixtures/native_owned_typed_views.ts"
@@ -1892,9 +1887,26 @@ kind = "native_abi_packet_typed"
 allow_hot_loop_conversions = true
 allow_dynamic_property_runtime = true
 allowed_hot_loop_runtime_calls = [
+  "js_dynamic_string_or_number_add",
+  "js_number_coerce",
   "js_shadow_frame_push",
   "js_shadow_slot_bind",
 ]
+
+# #8094's public trampoline contains a guarded specialized clone and the
+# semantics-preserving generic fallback. LLVM may inline both into the public
+# symbol, so the global hot-loop census legitimately sees dynamic helpers from
+# the fallback. Pin the actual optimization contract on the pre-opt clone: its
+# successful-guard body must remain free of those helpers (#8225).
+[[workloads.native_abi_packet_typed.ir_checks]]
+name = "packet_typed_specialized_clone_has_no_dynamic_numeric_helpers"
+section = "llvm_before"
+function_contains = "$spec_"
+regex_none = [
+  "call double @js_dynamic_string_or_number_add",
+  "call double @js_number_coerce",
+]
+detail = "the guarded typed-packet clone keeps numeric additions native while the generic fallback preserves erased-annotation semantics"
 
 [workloads.native_abi_packet_typed.vectorization]
 min_vectorized_loops = 0
