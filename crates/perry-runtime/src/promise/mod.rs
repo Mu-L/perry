@@ -691,12 +691,19 @@ pub(crate) struct AsyncStepGuard {
 pub(crate) const ASYNC_STEP_REENTRY_BOUND: u32 = 10_000;
 
 pub(crate) fn enqueue_queue_microtask(callback: i64) {
-    let context = capture_context();
-    let ids = crate::async_hooks::init_resource(
-        "Microtask",
-        f64::from_bits(crate::value::TAG_UNDEFINED),
-        false,
-    );
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let callback_handle =
+        scope.root_raw_const_ptr(callback as *const crate::closure::ClosureHeader);
+    let resource = crate::object::js_object_alloc(0, 0);
+    let resource_handle = scope.root_raw_mut_ptr(resource);
+    let mut context = capture_context();
+    let context_roots = crate::async_context::root_snapshot(&scope, &context);
+    let resource_value = resource_handle
+        .with_mut_ptr::<u8, _>(|resource| crate::value::js_nanbox_pointer(resource as i64));
+    let (ids, callback) = callback_handle.across_const::<crate::closure::ClosureHeader, _>(|| {
+        crate::async_hooks::init_resource("Microtask", resource_value, true)
+    });
+    crate::async_context::refresh_snapshot_from_roots(&mut context, &context_roots);
     TASK_QUEUE.with(|q| {
         q.borrow_mut().push_back(Task::Microtask {
             callback: callback as ClosurePtr,

@@ -78,6 +78,15 @@ struct HookCallbacks {
     promise_resolve: *const ClosureHeader,
 }
 
+#[derive(Clone, Copy)]
+enum HookPhase {
+    Init,
+    Before,
+    After,
+    Destroy,
+    PromiseResolve,
+}
+
 unsafe impl Send for HookCallbacks {}
 unsafe impl Sync for HookCallbacks {}
 
@@ -98,6 +107,16 @@ impl HookCallbacks {
             || !self.after.is_null()
             || !self.destroy.is_null()
             || !self.promise_resolve.is_null()
+    }
+
+    fn for_phase(&self, phase: HookPhase) -> *const ClosureHeader {
+        match phase {
+            HookPhase::Init => self.init,
+            HookPhase::Before => self.before,
+            HookPhase::After => self.after,
+            HookPhase::Destroy => self.destroy,
+            HookPhase::PromiseResolve => self.promise_resolve,
+        }
     }
 }
 
@@ -134,6 +153,14 @@ per_test_global! {
 static ASYNC_RESOURCE_HANDLES: LazyLock<Mutex<HashSet<i64>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 static ASYNC_RESOURCE_HANDLE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Live `AsyncHook` handles, for the same dynamic-receiver reason as
+/// `ASYNC_RESOURCE_HANDLES`. A helper that returns
+/// `createHook(options).enable()` erases the static `AsyncHook` class before
+/// its caller later invokes `disable()`.
+static ASYNC_HOOK_HANDLES: LazyLock<Mutex<HashSet<i64>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+static ASYNC_HOOK_HANDLE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static EXECUTION_STACK: RefCell<Vec<(u64, u64)>> = const { RefCell::new(Vec::new()) };
@@ -393,7 +420,27 @@ pub extern "C" fn js_async_hooks_create_hook(options: f64) -> i64 {
         callbacks,
         enabled: false,
     });
-    Box::into_raw(Box::new(AsyncHookHandle { index })) as i64
+    let handle = Box::into_raw(Box::new(AsyncHookHandle { index })) as i64;
+    ASYNC_HOOK_HANDLES.lock().unwrap().insert(handle);
+    ASYNC_HOOK_HANDLE_COUNT.fetch_add(1, Ordering::Relaxed);
+    handle
+}
+
+/// Dynamic method dispatch for `AsyncHook` values whose static class was lost
+/// through a helper return or `any`-typed binding.
+pub fn try_async_hook_method_dispatch(handle: i64, method_name: &str) -> Option<f64> {
+    if ASYNC_HOOK_HANDLE_COUNT.load(Ordering::Relaxed) == 0
+        || !matches!(method_name, "enable" | "disable")
+        || !ASYNC_HOOK_HANDLES.lock().unwrap().contains(&handle)
+    {
+        return None;
+    }
+    let result = match method_name {
+        "enable" => js_async_hook_enable(handle),
+        "disable" => js_async_hook_disable(handle),
+        _ => unreachable!("gated above"),
+    };
+    Some(crate::value::js_nanbox_pointer(result))
 }
 
 #[no_mangle]
@@ -441,7 +488,7 @@ fn enabled_callbacks() -> Vec<HookCallbacks> {
         .collect()
 }
 
-fn with_hook_callbacks(mut f: impl FnMut(HookCallbacks)) {
+fn with_hook_callbacks(phase: HookPhase, mut f: impl FnMut(*const ClosureHeader)) {
     if !hooks_active() {
         return;
     }
@@ -450,8 +497,27 @@ fn with_hook_callbacks(mut f: impl FnMut(HookCallbacks)) {
             return;
         }
         guard.set(true);
-        for callbacks in enabled_callbacks() {
-            f(callbacks);
+        let callbacks = enabled_callbacks();
+
+        // Hook membership is snapshotted once per lifecycle phase: disabling
+        // a hook from another hook callback must not remove it from the phase
+        // already in progress, and enabling one must not add it. The callback
+        // pointers in that snapshot still have to remain moving-GC roots,
+        // though. A callback can allocate arbitrary JS objects; previously the
+        // first hook could therefore evacuate the remaining hooks while their
+        // copied raw pointers stayed in this Rust Vec. Dispatching the next
+        // stale pointer caused the multi-hook #6764 fixtures to segfault.
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let rooted: Vec<_> = callbacks
+            .iter()
+            .map(|callbacks| scope.root_raw_const_ptr(callbacks.for_phase(phase)))
+            .collect();
+        for callback in rooted {
+            callback.with_const_ptr::<ClosureHeader, _>(|callback| {
+                if !callback.is_null() {
+                    f(callback);
+                }
+            });
         }
         guard.set(false);
     });
@@ -503,17 +569,14 @@ fn emit_init(async_id: u64, type_name: &str, trigger_async_id: u64, resource: f6
     let resource_handle = scope.root_nanbox_f64(resource);
     let type_ptr = js_string_from_bytes(type_name.as_ptr(), type_name.len() as u32);
     let type_value_handle = scope.root_nanbox_f64(box_string(type_ptr as *const u8));
-    with_hook_callbacks(|callbacks| {
-        if !callbacks.init.is_null() {
-            let callback_handle = scope.root_raw_const_ptr(callbacks.init);
-            js_closure_call4(
-                callback_handle.get_raw_const_ptr(),
-                async_id as f64,
-                type_value_handle.get_nanbox_f64(),
-                async_id_to_js_number(trigger_async_id),
-                resource_handle.get_nanbox_f64(),
-            );
-        }
+    with_hook_callbacks(HookPhase::Init, |callback| {
+        js_closure_call4(
+            callback,
+            async_id as f64,
+            type_value_handle.get_nanbox_f64(),
+            async_id_to_js_number(trigger_async_id),
+            resource_handle.get_nanbox_f64(),
+        );
     });
 }
 
@@ -528,12 +591,8 @@ pub fn before(async_id: u64, trigger_async_id: u64) {
     });
     CURRENT_EXECUTION_ID.with(|c| c.set(async_id));
     CURRENT_TRIGGER_ID.with(|c| c.set(trigger_async_id));
-    let scope = crate::gc::RuntimeHandleScope::new();
-    with_hook_callbacks(|callbacks| {
-        if !callbacks.before.is_null() {
-            let callback_handle = scope.root_raw_const_ptr(callbacks.before);
-            js_closure_call1(callback_handle.get_raw_const_ptr(), async_id as f64);
-        }
+    with_hook_callbacks(HookPhase::Before, |callback| {
+        js_closure_call1(callback, async_id as f64);
     });
 }
 
@@ -541,12 +600,8 @@ pub fn after(async_id: u64) {
     if async_id == 0 {
         return;
     }
-    let scope = crate::gc::RuntimeHandleScope::new();
-    with_hook_callbacks(|callbacks| {
-        if !callbacks.after.is_null() {
-            let callback_handle = scope.root_raw_const_ptr(callbacks.after);
-            js_closure_call1(callback_handle.get_raw_const_ptr(), async_id as f64);
-        }
+    with_hook_callbacks(HookPhase::After, |callback| {
+        js_closure_call1(callback, async_id as f64);
     });
     let prev = EXECUTION_STACK
         .with(|stack| stack.borrow_mut().pop())
@@ -571,12 +626,8 @@ pub fn promise_resolve(async_id: u64) {
     if async_id == 0 {
         return;
     }
-    let scope = crate::gc::RuntimeHandleScope::new();
-    with_hook_callbacks(|callbacks| {
-        if !callbacks.promise_resolve.is_null() {
-            let callback_handle = scope.root_raw_const_ptr(callbacks.promise_resolve);
-            js_closure_call1(callback_handle.get_raw_const_ptr(), async_id as f64);
-        }
+    with_hook_callbacks(HookPhase::PromiseResolve, |callback| {
+        js_closure_call1(callback, async_id as f64);
     });
 }
 
@@ -598,12 +649,8 @@ pub fn destroy(async_id: u64) {
     if !should_emit {
         return;
     }
-    let scope = crate::gc::RuntimeHandleScope::new();
-    with_hook_callbacks(|callbacks| {
-        if !callbacks.destroy.is_null() {
-            let callback_handle = scope.root_raw_const_ptr(callbacks.destroy);
-            js_closure_call1(callback_handle.get_raw_const_ptr(), async_id as f64);
-        }
+    with_hook_callbacks(HookPhase::Destroy, |callback| {
+        js_closure_call1(callback, async_id as f64);
     });
     RESOURCES.lock().unwrap().remove(&async_id);
 }
