@@ -14,6 +14,14 @@
 //!
 //! Literal-source forms must keep working: those are const-folded and compiled AOT.
 
+//! #8479: this suite is the counterpart canary to `bun_ffi_stage1`. #8416 made
+//! the deferred error here survive on Linux by marking `js_closure_call1` /
+//! `js_native_call_value` `extern "C-unwind"` — which, in a `panic=abort`
+//! runtime whose JS throws are raw Itanium unwinds, installs an RFC-2945
+//! abort guard on a frame the throw must pass THROUGH, and that is what broke
+//! `tier1_every_ffi_type_against_test_dylib`. Those conversions were undone;
+//! keep this file in the diff of any change to that path so `e2e-scoped`
+//! actually runs the suite (it skips silently, and reports green, otherwise).
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Once;
@@ -29,11 +37,19 @@ fn workspace_root() -> PathBuf {
         .expect("canonicalize workspace root")
 }
 
-fn target_debug_dir() -> PathBuf {
+/// #8479: `release`, not `debug`. `panic` is a PROFILE-level setting and only
+/// `release`/`dist`/`perry-dev` set `panic = "abort"`. A debug archive is
+/// `panic = "unwind"`, and under that strategy rustc plants an RFC-2945
+/// abort-on-unwind guard in every `extern "C"` helper — which a JS throw
+/// crossing that helper trips ("panic in a function that cannot unwind").
+/// Perry never ships such a runtime, so linking one here tested unwind
+/// semantics that do not exist in production and made this test and
+/// `bun_ffi_stage1`'s use-after-close case mutually unsatisfiable.
+fn target_runtime_dir() -> PathBuf {
     std::env::var_os("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| workspace_root().join("target"))
-        .join("debug")
+        .join("release")
 }
 
 /// Build `libperry_{runtime,stdlib}.a` once so the compiled binaries can link.
@@ -47,6 +63,9 @@ fn ensure_runtime_archive() {
         let build = Command::new(cargo)
             .current_dir(workspace_root())
             .arg("build")
+            // #8479: must match `target_runtime_dir()` — a debug archive has
+            // the wrong panic strategy (see that function's comment).
+            .arg("--release")
             .arg("-p")
             .arg("perry-runtime-static")
             .arg("-p")
@@ -64,7 +83,7 @@ fn ensure_runtime_archive() {
 
 fn runtime_dir() -> PathBuf {
     ensure_runtime_archive();
-    target_debug_dir()
+    target_runtime_dir()
 }
 
 /// Literal-source `Function` / `Function.apply` / `Function.call` are const-folded and
