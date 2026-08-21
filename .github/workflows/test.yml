@@ -227,6 +227,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 'nightly-2026-08-20'
           components: rustfmt, clippy
       - uses: ./.github/actions/setup-llvm22
 
@@ -735,6 +736,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 'nightly-2026-08-20'
           components: clippy
       - uses: ./.github/actions/setup-llvm22
 
@@ -822,6 +824,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 'nightly-2026-08-20'
       - uses: ./.github/actions/setup-llvm22
 
       - name: Install sccache
@@ -934,6 +938,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 'nightly-2026-08-20'
       - uses: ./.github/actions/setup-llvm22
 
       - name: Install sccache
@@ -1255,6 +1261,8 @@ jobs:
       - name: Install Rust toolchain
         if: steps.scope.outputs.rust_work == 'true'
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 'nightly-2026-08-20'
       - uses: ./.github/actions/setup-llvm22
         if: steps.scope.outputs.rust_work == 'true'
 
@@ -1441,6 +1449,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 'nightly-2026-08-20'
       - uses: ./.github/actions/setup-llvm22
 
       - name: Setup Node.js
@@ -1544,6 +1554,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 'nightly-2026-08-20'
       - uses: ./.github/actions/setup-llvm22
 
       - name: Set up ARM64 MSVC environment
@@ -1654,6 +1666,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 'nightly-2026-08-20'
       - uses: ./.github/actions/setup-llvm22
 
       - uses: Swatinem/rust-cache@v2
@@ -1773,6 +1787,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 'nightly-2026-08-20'
       - uses: ./.github/actions/setup-llvm22
 
       - name: Install sccache
@@ -1969,6 +1985,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 'nightly-2026-08-20'
       - uses: ./.github/actions/setup-llvm22
 
       - name: Install sccache
@@ -2141,6 +2159,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 'nightly-2026-08-20'
       - uses: ./.github/actions/setup-llvm22
 
       - name: Install sccache
@@ -2257,6 +2277,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 'nightly-2026-08-20'
       - uses: ./.github/actions/setup-llvm22
 
       - uses: Swatinem/rust-cache@v2
@@ -2372,6 +2394,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 'nightly-2026-08-20'
       - uses: ./.github/actions/setup-llvm22
       - uses: Swatinem/rust-cache@v2
         with:
@@ -2533,6 +2557,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 'nightly-2026-08-20'
       - uses: ./.github/actions/setup-llvm22
 
       - uses: Swatinem/rust-cache@v2
@@ -2923,6 +2949,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 'nightly-2026-08-20'
       - uses: ./.github/actions/setup-llvm22
 
       - uses: Swatinem/rust-cache@v2
@@ -2985,6 +3013,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 'nightly-2026-08-20'
       - uses: ./.github/actions/setup-llvm22
 
       - uses: Swatinem/rust-cache@v2
@@ -3052,6 +3082,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 'nightly-2026-08-20'
       - uses: ./.github/actions/setup-llvm22
 
       - uses: Swatinem/rust-cache@v2
@@ -3106,6 +3138,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 'nightly-2026-08-20'
       - uses: ./.github/actions/setup-llvm22
 
       - uses: Swatinem/rust-cache@v2
@@ -3275,6 +3309,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 'nightly-2026-08-20'
       - uses: ./.github/actions/setup-llvm22
 
       - name: Set up MSVC environment (Windows)
@@ -3430,6 +3466,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 'nightly-2026-08-20'
       - uses: ./.github/actions/setup-llvm22
 
       - uses: Swatinem/rust-cache@v2
