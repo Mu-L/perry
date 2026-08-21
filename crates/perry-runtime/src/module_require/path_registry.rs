@@ -118,10 +118,6 @@ impl PathModuleState {
 pub(super) struct PathModuleRegistry {
     state: std::sync::Mutex<PathModuleState>,
     ready: std::sync::Condvar,
-    /// Perry heaps and mutable-root scanners are thread-local. The provider
-    /// registry is process-global for app-dylib symbol resolution, but its JS
-    /// values must remain confined to the one runtime thread that owns them.
-    runtime_owner: std::sync::OnceLock<std::thread::ThreadId>,
 }
 
 impl Default for PathModuleRegistry {
@@ -129,7 +125,6 @@ impl Default for PathModuleRegistry {
         Self {
             state: std::sync::Mutex::new(PathModuleState::default()),
             ready: std::sync::Condvar::new(),
-            runtime_owner: std::sync::OnceLock::new(),
         }
     }
 }
@@ -141,21 +136,19 @@ impl PathModuleRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    pub(super) fn bind_runtime_owner(&self) -> bool {
-        let current = std::thread::current().id();
-        self.runtime_owner.get_or_init(|| current) == &current
-    }
-
-    pub(super) fn is_runtime_owner(&self) -> bool {
-        self.runtime_owner
-            .get()
-            .is_some_and(|owner| *owner == std::thread::current().id())
-    }
-
     /// Register one canonical path -> initializer mapping. The same mapping is
     /// idempotent. A second address for the same canonical file is rejected so
     /// an alias can never create a second logical module initialization.
     pub(super) fn register_init(&self, key: String, init_addr: usize) -> bool {
+        // The address is a property of the PROGRAM, not of any heap: codegen
+        // emits one `<prefix>__init` per canonical path and registers it once,
+        // on whichever thread runs module init first. Every later heap needs
+        // that same address to be able to initialize the module for itself, so
+        // it lives in a process-global map. It is a code pointer, never a JS
+        // value, so no collector has any interest in it.
+        if !register_init_addr(&key, init_addr) {
+            return false;
+        }
         let mut state = self.lock();
         let entry = state.entries.entry(key).or_insert_with(|| PathModuleEntry {
             init_addr: None,
@@ -163,10 +156,30 @@ impl PathModuleRegistry {
             status: PathModuleStatus::Registered,
             active_claim: None,
         });
-        if let Some(existing) = entry.init_addr {
-            return existing == init_addr;
-        }
         entry.init_addr = Some(init_addr);
+        true
+    }
+
+    /// Adopt the program-wide initializer for `key` into THIS heap's table.
+    /// A heap that has never required the path has no entry for it, but the
+    /// initializer exists process-wide; without this a second heap silently
+    /// resolves the module to an empty `module.exports`.
+    fn adopt_registered_init(&self, state: &mut PathModuleState, key: &str) -> bool {
+        if state.entries.contains_key(key) {
+            return true;
+        }
+        let Some(init_addr) = lookup_init_addr(key) else {
+            return false;
+        };
+        state.entries.insert(
+            key.to_string(),
+            PathModuleEntry {
+                init_addr: Some(init_addr),
+                exports: None,
+                status: PathModuleStatus::Registered,
+                active_claim: None,
+            },
+        );
         true
     }
 
@@ -370,6 +383,9 @@ impl PathModuleRegistry {
         let current = std::thread::current().id();
         let init_addr = loop {
             let mut state = self.lock();
+            if !self.adopt_registered_init(&mut state, key) {
+                return Ok(None);
+            }
             let Some(entry) = state.entries.get_mut(key) else {
                 return Ok(None);
             };
@@ -514,8 +530,80 @@ impl PathModuleRegistry {
     }
 }
 
-pub(super) static MODULE_PATH_REGISTRY: std::sync::LazyLock<PathModuleRegistry> =
-    std::sync::LazyLock::new(PathModuleRegistry::default);
+crate::perry_thread_local! {
+    /// Canonical path -> generated initializer address, per-heap like the
+    /// export table beside it. Holds only code addresses, so unlike that table
+    /// it is not a GC root and needs no scanner.
+    ///
+    /// An initializer address looks like a property of the program, and within
+    /// ONE program it is — but a host that loads several application libraries
+    /// into one process gets a separate copy of each module per library, at its
+    /// own code address, under the SAME baked canonical path. A process-wide
+    /// map then sees "same path, different address", refuses the second
+    /// library's registration as a duplicate, and that application's modules
+    /// never initialize. Measured: two Next apps in one Coop process, 115
+    /// rejections, the second app serving 500 while the first served 200.
+    ///
+    /// Every heap registers its own initializers as its library runs
+    /// `perry_module_init` on its own thread, so per-heap loses nothing.
+    ///
+    /// These are rustdoc rather than plain `//` because `perry_thread_local!`
+    /// passes `#[$attr]` through onto the static it emits. A `///` placed
+    /// BEFORE the macro invocation instead attaches to nothing, and `-D
+    /// warnings` (a required PR gate) then rejects the build.
+    static PATH_MODULE_INIT_ADDRS: std::cell::RefCell<
+        std::collections::HashMap<String, usize>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn with_init_addrs<R>(f: impl FnOnce(&mut std::collections::HashMap<String, usize>) -> R) -> R {
+    PATH_MODULE_INIT_ADDRS.with(|addrs| f(&mut addrs.borrow_mut()))
+}
+
+/// Idempotent. A second, DIFFERENT address for one canonical path is rejected
+/// so an alias can never create a second logical module initialization.
+fn register_init_addr(key: &str, init_addr: usize) -> bool {
+    with_init_addrs(|addrs| match addrs.entry(key.to_string()) {
+        std::collections::hash_map::Entry::Occupied(slot) => *slot.get() == init_addr,
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(init_addr);
+            true
+        }
+    })
+}
+
+fn lookup_init_addr(key: &str) -> Option<usize> {
+    with_init_addrs(|addrs| addrs.get(key).copied())
+}
+
+crate::perry_thread_local! {
+    /// Per-heap, not per-process. `PathModuleEntry::exports` holds NaN-boxed
+    /// pointers into the arena of the thread that produced them, and both the
+    /// arena and the mutable-root scanners are thread-local — so a
+    /// process-global table would hand one heap's pointer to another heap's
+    /// collector. One table per runtime thread keeps every entry's referent in
+    /// the same heap as the scanner that rewrites it, which is what lets a
+    /// single process host more than one Perry application.
+    ///
+    /// Keyed by THREAD, not by [`crate::agent::AgentId`], even though #6294
+    /// established agent tagging for the cross-thread queues. The two are
+    /// keyed differently on purpose:
+    ///
+    /// - An agent tags *queued work* so a drain can tell whose pointers it may
+    ///   touch. A thread with no agent of its own resolves to `PRIMARY_AGENT`
+    ///   because it is a pump acting for the primary heap.
+    /// - This table instead holds pointers into an *arena*, and the arena is
+    ///   itself a `thread_local!` (`thread.rs`). Thread is therefore exactly
+    ///   the domain those pointers live and die in.
+    ///
+    /// The distinction is load-bearing for embedders: a Coop app thread is a
+    /// plain `std::thread::spawn`, not a `perry/thread` worker, so it never
+    /// calls `enter_worker_agent()` and every such thread resolves to
+    /// `PRIMARY_AGENT`. Agent-keying would hand all of a host's apps one
+    /// shared table — the bug this replaced, minus the guard that used to make
+    /// it loud.
+    pub(super) static MODULE_PATH_REGISTRY: PathModuleRegistry = PathModuleRegistry::default();
+}
 
 #[cfg(test)]
 mod path_module_registry_tests {
@@ -877,18 +965,78 @@ mod path_module_registry_tests {
         );
     }
 
+    /// Each runtime thread owns its own table. An entry published on one
+    /// thread must be invisible to another: `exports` is a NaN-boxed pointer
+    /// into the publishing thread's arena, and only that thread's scanner
+    /// rewrites it. This is what lets one process host several Perry apps.
     #[test]
-    fn provider_registry_binds_to_one_runtime_thread() {
-        let registry = Arc::new(PathModuleRegistry::default());
-        assert!(registry.bind_runtime_owner());
-        assert!(registry.is_runtime_owner());
-        let worker_registry = Arc::clone(&registry);
-        assert!(
-            !std::thread::spawn(move || worker_registry.bind_runtime_owner())
-                .join()
-                .unwrap()
+    fn path_registry_is_per_heap_not_per_process() {
+        const KEY: &str = "/per-heap-isolation-fixture.js";
+        MODULE_PATH_REGISTRY.with(|registry| {
+            assert!(registry.register_final_exports(KEY.into(), 0xD1));
+            assert_eq!(registry.published_exports(KEY), Some(0xD1));
+        });
+
+        let seen_by_second_heap = std::thread::spawn(|| {
+            MODULE_PATH_REGISTRY.with(|registry| registry.published_exports(KEY))
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            seen_by_second_heap, None,
+            "a second heap must not observe the first heap's exports pointer"
         );
-        assert!(registry.is_runtime_owner());
+
+        // The publishing thread still sees its own entry: isolation, not loss.
+        MODULE_PATH_REGISTRY.with(|registry| {
+            assert_eq!(registry.published_exports(KEY), Some(0xD1));
+            registry.remove_for_test(KEY);
+        });
+    }
+
+    /// The Coop shape: many apps in one process load the SAME module path.
+    /// Each heap must run its own initializer and get its own exports, with
+    /// no thread refused and no initializer skipped as already-done.
+    #[test]
+    fn every_heap_runs_its_own_initializer_for_the_same_path() {
+        const KEY: &str = "/shared-bundle-path.js";
+        fn init_on_this_heap(marker: u64) -> Option<u64> {
+            // Seeds only the process-wide ADDRESS, never an entry, so the
+            // require below has to reach `adopt_registered_init` — the path a
+            // second heap actually takes. Calling `register_init` here instead
+            // would insert the entry directly and skip the very code under
+            // test; an earlier version of this test did exactly that and so
+            // could not see that a second heap had no initializer to run.
+            //
+            // Seeding per thread is a TEST-BUILD requirement, not a
+            // production one: `per_test_global!` expands to a per-thread
+            // instance under `cfg(test)`, whereas the shipped static is one
+            // process-wide map that codegen fills once at startup.
+            assert!(register_init_addr(KEY, 0x2000));
+            MODULE_PATH_REGISTRY.with(|registry| {
+                let ran = std::cell::Cell::new(false);
+                let outcome = registry.require_with(KEY, &|_addr| {
+                    ran.set(true);
+                    assert!(registry.register_final_exports(KEY.into(), marker));
+                    Ok(())
+                });
+                assert!(ran.get(), "this heap's initializer must actually run");
+                outcome.expect("no heap may be refused ownership")
+            })
+        }
+
+        let first = init_on_this_heap(0xA1);
+        let second = std::thread::spawn(|| init_on_this_heap(0xB2))
+            .join()
+            .unwrap();
+
+        assert_eq!(first, Some(0xA1));
+        assert_eq!(
+            second,
+            Some(0xB2),
+            "the second heap got the first heap's value"
+        );
+        MODULE_PATH_REGISTRY.with(|registry| registry.remove_for_test(KEY));
     }
 
     #[test]
