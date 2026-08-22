@@ -320,10 +320,10 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                 // `catchTag`-style dispatch. Bind the declared name to a
                 // `ClassExprFresh` value (the #1772/#1787 machinery class
                 // EXPRESSIONS already use) so each evaluation carries its own
-                // captured environment on its own heap class object. Scoped
-                // to capture-only classes: one with static state keeps the
-                // shared-template path, whose interleaved static-init
-                // statements below target the template by name. Prototype
+                // captured environment on its own heap class object. Capturing
+                // classes with public static state retain the shared-template
+                // path for now, but private elements always require a fresh
+                // evaluation — including private static state. Prototype
                 // identity is still shared per template — the remaining gap
                 // tracked on #6465.
                 let has_static_state = !class.static_fields.is_empty()
@@ -331,7 +331,37 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                         .static_methods
                         .iter()
                         .any(|m| m.name.starts_with("__perry_static_init_"));
-                let fresh_binding = !captured_exprs.is_empty() && !has_static_state;
+                let has_private_elements = class.has_private_elements();
+                let fresh_binding =
+                    has_private_elements || (!captured_exprs.is_empty() && !has_static_state);
+                let named_statics: Vec<(String, Expr)> = if fresh_binding {
+                    class
+                        .static_fields
+                        .iter()
+                        .filter_map(
+                            |field| match (field.key_expr.as_ref(), field.init.as_ref()) {
+                                (None, Some(value)) => Some((field.name.clone(), value.clone())),
+                                _ => None,
+                            },
+                        )
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let symbol_statics: Vec<(Expr, Expr)> = if fresh_binding {
+                    class
+                        .static_fields
+                        .iter()
+                        .filter_map(
+                            |field| match (field.key_expr.as_ref(), field.init.as_ref()) {
+                                (Some(key), Some(value)) => Some((key.clone(), value.clone())),
+                                _ => None,
+                            },
+                        )
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 // Static field initializers + static blocks for a
                 // function-nested class. The module-level path
                 // (`lower/stmt.rs`) emits these into `module.init`; here they
@@ -342,22 +372,22 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                 // classes initialized. Interleaved in source order (see
                 // `build_interleaved_static_init_stmts`), with lexical `this`
                 // in field initializers bound to the class ref.
-                result.extend(crate::lower_decl::build_interleaved_static_init_stmts(
-                    &class_decl.class.body,
-                    &class.name,
-                    &class.static_fields,
-                    &class.static_methods,
-                ));
+                if !fresh_binding {
+                    result.extend(crate::lower_decl::build_interleaved_static_init_stmts(
+                        &class_decl.class.body,
+                        &class.name,
+                        &class.static_fields,
+                        &class.static_methods,
+                    ));
+                }
                 let template_name = class.name.clone();
                 ctx.pending_classes.push(class);
-                // #6465 (see `fresh_binding` above): bind the declared name to
-                // a per-evaluation heap class object. The local shadows the
-                // class-registry fallback for every in-scope read — including
-                // the factory's `return C` — so the escaped value carries THIS
-                // evaluation's captures instead of the registry's last-wins
-                // snapshot. `new C()` sites that statically resolve the
-                // template still pass the live captures as trailing args, so
-                // in-factory construction is per-evaluation on both paths.
+                // #6465/#5893 (see `fresh_binding` above): bind the declared
+                // name to a per-evaluation heap class object. Capturing classes
+                // carry this invocation's environment; private classes use the
+                // object's identity as their fresh brand. Because this is a
+                // real local (not an inferred static class alias), `new C()`
+                // constructs through the evaluated class VALUE.
                 if fresh_binding {
                     let class_local = ctx.define_local(class_name.clone(), Type::Any);
                     ctx.record_local_source_span(class_local, class_decl.ident.span);
@@ -367,8 +397,8 @@ pub fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<Ve
                         ty: Type::Any,
                         init: Some(Expr::ClassExprFresh {
                             template: template_name,
-                            named_statics: Vec::new(),
-                            symbol_statics: Vec::new(),
+                            named_statics,
+                            symbol_statics,
                             captured_args: captured_exprs,
                         }),
                         mutable: false,

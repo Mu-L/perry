@@ -867,9 +867,92 @@ mod sso_tests_1781 {
     }
 }
 
+/// Stamp an instance constructed through a `ClassExprFresh` value with the
+/// identity of that particular class evaluation. The brand lives in the
+/// object's traced metadata record so it neither shifts user field slots nor
+/// changes the instance's ShapeId / own-key enumeration.
+pub(crate) unsafe fn stamp_private_evaluation_brand(obj: *mut ObjectHeader, class_value: f64) {
+    if obj.is_null() || !super::super::class_registry::is_class_object_value(class_value) {
+        return;
+    }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let obj_handle = scope.root_raw_mut_ptr(obj);
+    let class_handle = scope.root_nanbox_f64(class_value);
+    let (meta, _) =
+        obj_handle.across_mut::<ObjectHeader, _>(|| crate::object::object_meta_ensure(obj));
+    let brand = class_handle.get_nanbox_f64().to_bits();
+    (*meta).private_evaluation_brand = brand;
+    crate::gc::runtime_write_barrier_slot(
+        meta as usize,
+        &(*meta).private_evaluation_brand as *const u64 as usize,
+        brand,
+    );
+}
+
+/// Return the per-evaluation brand carried by `value`, provided it belongs to
+/// `declaring_class_id`'s compile-time template. A fresh class object is its
+/// own static brand; instances carry that object in the hidden slot above.
+fn private_evaluation_brand(value: f64, declaring_class_id: u32) -> Option<u64> {
+    if declaring_class_id == 0 {
+        return None;
+    }
+    if super::super::class_registry::is_class_object_value(value) {
+        let object = JSValue::from_bits(value.to_bits()).as_pointer::<ObjectHeader>();
+        if !object.is_null() && js_object_get_class_id(object) == declaring_class_id {
+            return Some(value.to_bits());
+        }
+    }
+    let value = JSValue::from_bits(value.to_bits());
+    if !value.is_pointer() {
+        return None;
+    }
+    let object = value.as_pointer::<ObjectHeader>();
+    let brand = unsafe {
+        if object.is_null() || !crate::object::object_is_shaped(object) || (*object).meta.is_null()
+        {
+            return None;
+        }
+        f64::from_bits((*(*object).meta).private_evaluation_brand)
+    };
+    if !super::super::class_registry::is_class_object_value(brand) {
+        return None;
+    }
+    let object = JSValue::from_bits(brand.to_bits()).as_pointer::<ObjectHeader>();
+    (!object.is_null() && js_object_get_class_id(object) == declaring_class_id)
+        .then_some(brand.to_bits())
+}
+
+/// If the lexical class evaluation can be recovered from `brand_owner`,
+/// compare `obj` against that exact evaluation. `None` asks callers to retain
+/// the existing template-class check for ordinary (single-evaluation) classes.
+fn private_evaluation_brand_matches(
+    obj: f64,
+    brand_owner: f64,
+    declaring_class_id: u32,
+) -> Option<bool> {
+    // A static method/accessor closes over the PrivateEnvironment of its class
+    // evaluation. Its visible `this` may be replaced by call/apply, so dispatch
+    // records the lexical owner separately from ambient IMPLICIT_THIS.
+    let brand_owner = if super::super::class_registry::is_class_object_value(brand_owner) {
+        let captured_owner = super::super::static_private_owner_current().unwrap_or(brand_owner);
+        if super::super::class_registry::is_class_object_value(captured_owner)
+            && private_evaluation_brand(captured_owner, declaring_class_id).is_some()
+        {
+            captured_owner
+        } else {
+            brand_owner
+        }
+    } else {
+        brand_owner
+    };
+    let expected = private_evaluation_brand(brand_owner, declaring_class_id)?;
+    Some(private_evaluation_brand(obj, declaring_class_id) == Some(expected))
+}
+
 #[no_mangle]
 pub extern "C" fn js_private_brand_check(
     obj: f64,
+    brand_owner: f64,
     declaring_class_id: u32,
     field_name_ptr: *const u8,
     field_name_len: u32,
@@ -880,32 +963,9 @@ pub extern "C" fn js_private_brand_check(
         return false_value;
     }
 
-    let value = JSValue::from_bits(obj.to_bits());
-    if !value.is_pointer() {
-        return false_value;
-    }
-    let obj_ptr = value.as_pointer::<ObjectHeader>();
-    if obj_ptr.is_null() {
-        return false_value;
-    }
-
-    let obj_class_id = js_object_get_class_id(obj_ptr);
-    if obj_class_id == 0 {
-        return false_value;
-    }
-
-    let mut cur = obj_class_id;
-    let mut has_declaring_brand = false;
-    for _ in 0..32 {
-        if cur == declaring_class_id {
-            has_declaring_brand = true;
-            break;
-        }
-        match super::super::class_registry::get_parent_class_id(cur) {
-            Some(parent) if parent != 0 && parent != cur => cur = parent,
-            _ => break,
-        }
-    }
+    let has_declaring_brand =
+        private_evaluation_brand_matches(obj, brand_owner, declaring_class_id)
+            .unwrap_or_else(|| unsafe { private_object_has_brand(obj, declaring_class_id) });
     if !has_declaring_brand {
         return false_value;
     }
@@ -982,6 +1042,7 @@ unsafe fn private_object_has_brand(obj: f64, declaring_class_id: u32) -> bool {
 #[no_mangle]
 pub extern "C" fn js_private_guard(
     obj: f64,
+    brand_owner: f64,
     declaring_class_id: u32,
     _field_name_ptr: *const u8,
     _field_name_len: u32,
@@ -993,13 +1054,17 @@ pub extern "C" fn js_private_guard(
     }
     let is_static = op >= 2;
     let read_write = op & 1; // 0=read, 1=write
-    let has_brand = if is_static {
-        // Static private brand: the receiver must be exactly the declaring
-        // class constructor (identity), not an instance or a subclass.
-        super::super::class_ref_id(obj) == Some(declaring_class_id)
-    } else {
-        unsafe { private_object_has_brand(obj, declaring_class_id) }
-    };
+    let has_brand = private_evaluation_brand_matches(obj, brand_owner, declaring_class_id)
+        .unwrap_or_else(|| {
+            if is_static {
+                // Static private brand: the receiver must be exactly the
+                // declaring class constructor (identity), not an instance or
+                // a subclass.
+                super::super::class_ref_id(obj) == Some(declaring_class_id)
+            } else {
+                unsafe { private_object_has_brand(obj, declaring_class_id) }
+            }
+        });
     if !has_brand {
         throw_private_type_error(
             "Cannot access private member from an object whose class did not declare it",
@@ -1017,6 +1082,45 @@ pub extern "C" fn js_private_guard(
         throw_private_type_error("Invalid private member operation for its kind");
     }
     obj
+}
+
+#[cfg(test)]
+mod private_evaluation_brand_tests {
+    use super::*;
+
+    #[test]
+    fn stamping_a_fresh_brand_preserves_instance_shape_and_slots() {
+        unsafe {
+            const CID: u32 = 62_441;
+            let class = crate::object::js_object_alloc(CID, 0);
+            crate::object::class_registry::js_object_mark_class(class as i64);
+            let class_value = crate::value::js_nanbox_pointer(class as i64);
+            assert!(crate::object::class_registry::is_class_object_value(
+                class_value
+            ));
+
+            let instance = crate::object::js_object_alloc(CID, 2);
+            let shape_before = crate::object::shapes::object_shape_id(instance);
+            let keys_before = crate::object::object_keys_array(instance);
+            let slots_before = crate::object::object_live_slot_count(instance);
+
+            stamp_private_evaluation_brand(instance, class_value);
+
+            assert_eq!(
+                crate::object::shapes::object_shape_id(instance),
+                shape_before
+            );
+            assert_eq!(crate::object::object_keys_array(instance), keys_before);
+            assert_eq!(
+                crate::object::object_live_slot_count(instance),
+                slots_before
+            );
+            assert_eq!(
+                private_evaluation_brand(crate::value::js_nanbox_pointer(instance as i64), CID),
+                Some(class_value.to_bits())
+            );
+        }
+    }
 }
 
 #[cfg(test)]
