@@ -510,6 +510,10 @@ pub struct ImportedClass {
     pub has_instance_fields: bool,
     /// Method names defined on this class.
     pub method_names: Vec<String>,
+    /// Declared return types parallel to `method_names`. Imported class stubs
+    /// retain these so a call such as `factory.make().run()` can recover the
+    /// returned receiver class without value-importing that class directly.
+    pub method_return_types: Vec<perry_hir::types::Type>,
     /// Per-method explicit param counts, parallel to `method_names`. Issue #235:
     /// codegen uses this to declare cross-module method symbols with the
     /// correct arity (was hardcoded "6 as safe upper bound", which made the
@@ -544,11 +548,29 @@ pub struct ImportedClass {
     /// missing method and fall through to `0.0` — turning every
     /// `await Foo.connect(...)` into a no-op that resolves with the number 0.
     pub static_method_names: Vec<String>,
+    /// Declared return types parallel to `static_method_names`.
+    pub static_method_return_types: Vec<perry_hir::types::Type>,
+    /// Declared parameter counts parallel to `static_method_names`. Imported
+    /// static-call lowering uses these counts to pad omitted arguments with
+    /// `undefined`, allowing the producer's default-parameter prologue to run.
+    pub static_method_param_counts: Vec<usize>,
+    /// Whether each static method has a rest-shaped HIR parameter. A hidden
+    /// `arguments` slot can follow a user-declared rest parameter.
+    pub static_method_has_rest: Vec<bool>,
+    /// Whether each static method has a user-declared rest parameter. This is
+    /// distinct from the hidden `arguments` slot: a method can have both and
+    /// then needs two trailing arrays at the cross-module call site.
+    pub static_method_has_user_rest: Vec<bool>,
+    /// Whether each static method's final HIR parameter is Perry's hidden
+    /// `arguments` binding rather than a user-declared rest parameter.
+    pub static_method_has_synthetic_arguments: Vec<bool>,
     /// Getter property names. Without these, cross-module `obj.prop` for a
     /// getter property silently falls through to `undefined` because the
     /// dispatch site at `expr.rs::PropertyGet` looks up `(class, "__get_prop")`
     /// in `method_names`, which previously had no cross-module entry.
     pub getter_names: Vec<String>,
+    /// Declared return types parallel to `getter_names`.
+    pub getter_return_types: Vec<perry_hir::types::Type>,
     /// Setter property names. Symmetric to `getter_names` for `obj.prop = v`.
     pub setter_names: Vec<String>,
     /// Parent class name, if any.

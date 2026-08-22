@@ -610,8 +610,64 @@ fn compute_object_cache_key_with_env(
             buf.push_str(&c.static_field_names.join(","));
             buf.push_str(":static_methods=");
             buf.push_str(&c.static_method_names.join(","));
+            buf.push_str(":method_return_types=");
+            buf.push_str(
+                &c.method_return_types
+                    .iter()
+                    .map(stable_type_key)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            buf.push_str(":static_method_return_types=");
+            buf.push_str(
+                &c.static_method_return_types
+                    .iter()
+                    .map(stable_type_key)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            buf.push_str(":static_method_arities=");
+            buf.push_str(
+                &c.static_method_param_counts
+                    .iter()
+                    .map(|count| count.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            buf.push_str(":static_method_rest=");
+            buf.push_str(
+                &c.static_method_has_rest
+                    .iter()
+                    .map(|is_rest| if *is_rest { "1" } else { "0" })
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            buf.push_str(":static_method_user_rest=");
+            buf.push_str(
+                &c.static_method_has_user_rest
+                    .iter()
+                    .map(|is_user_rest| if *is_user_rest { "1" } else { "0" })
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            buf.push_str(":static_method_synthetic_arguments=");
+            buf.push_str(
+                &c.static_method_has_synthetic_arguments
+                    .iter()
+                    .map(|is_synthetic| if *is_synthetic { "1" } else { "0" })
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
             buf.push_str(":getters=");
             buf.push_str(&c.getter_names.join(","));
+            buf.push_str(":getter_return_types=");
+            buf.push_str(
+                &c.getter_return_types
+                    .iter()
+                    .map(stable_type_key)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
             buf.push_str(":setters=");
             buf.push_str(&c.setter_names.join(","));
             buf.push_str(":field_types=");
