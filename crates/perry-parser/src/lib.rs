@@ -46,7 +46,7 @@ pub fn parse_typescript_with_cache(
     filename: &str,
     cache: &mut SourceCache,
 ) -> Result<ParseResult> {
-    let parse_source = normalize_unicode_identifier_escapes(source);
+    let parse_source = normalize_swc_class_syntax(&normalize_unicode_identifier_escapes(source));
     // Add the source to the cache
     let file_id = cache.add_file(filename, source.to_string());
 
@@ -97,7 +97,7 @@ pub fn parse_typescript_with_cache(
 /// This is the original parsing function for backward compatibility.
 /// For new code, prefer `parse_typescript_with_cache` for better diagnostics.
 pub fn parse_typescript(source: &str, filename: &str) -> Result<Module> {
-    let parse_source = normalize_unicode_identifier_escapes(source);
+    let parse_source = normalize_swc_class_syntax(&normalize_unicode_identifier_escapes(source));
     let source_map: Lrc<SourceMap> = Default::default();
     let source_file = source_map.new_source_file(
         Lrc::new(FileName::Custom(filename.to_string())),
@@ -839,6 +839,113 @@ fn normalize_unicode_identifier_escapes(source: &str) -> String {
     out
 }
 
+/// Normalize two valid class grammar corners that SWC currently rejects.
+/// String/comment contents are masked before tokenization, so source text that
+/// merely mentions these spellings is never rewritten.
+fn normalize_swc_class_syntax(source: &str) -> String {
+    #[derive(Clone, Copy)]
+    struct Token<'a> {
+        start: usize,
+        end: usize,
+        text: &'a str,
+    }
+
+    let masked = strip_comments_and_strings(source);
+    // `strip_comments_and_strings` preserves characters, not UTF-8 byte
+    // widths. Map its byte boundaries back to the original source so a
+    // non-ASCII comment before a class cannot skew replacement offsets.
+    let mut source_boundaries = source.char_indices().map(|(i, _)| i).collect::<Vec<_>>();
+    source_boundaries.push(source.len());
+    let mut masked_boundaries = masked.char_indices().map(|(i, _)| i).collect::<Vec<_>>();
+    masked_boundaries.push(masked.len());
+    let mut source_offset_for_masked = vec![0usize; masked.len() + 1];
+    for (masked_offset, source_offset) in masked_boundaries
+        .into_iter()
+        .zip(source_boundaries.into_iter())
+    {
+        source_offset_for_masked[masked_offset] = source_offset;
+    }
+    let bytes = masked.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        if bytes[i].is_ascii_alphabetic() || matches!(bytes[i], b'_' | b'$') {
+            i += 1;
+            while bytes
+                .get(i)
+                .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$'))
+            {
+                i += 1;
+            }
+        } else {
+            // Advance by a whole character, never a raw byte: a non-ASCII
+            // codepoint in code position (`const re = /a\u{20AC}b/;`) makes a
+            // byte cursor land mid-sequence, and the `&masked[start..i]`
+            // slice below then panics on a non-char-boundary index.
+            i += masked[i..].chars().next().map_or(1, char::len_utf8);
+        }
+        tokens.push(Token {
+            start,
+            end: i,
+            text: &masked[start..i],
+        });
+    }
+
+    let mut replacements: Vec<(usize, usize, &str)> = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if token.text == "await"
+            && index > 0
+            && tokens[index - 1].text == "class"
+            && tokens
+                .get(index + 1)
+                .is_some_and(|next| matches!(next.text, "{" | "extends"))
+        {
+            // Script grammar permits `await` as a BindingIdentifier here.
+            // Keep the replacement byte-for-byte the same length.
+            replacements.push((
+                source_offset_for_masked[token.start],
+                source_offset_for_masked[token.end],
+                "_wait",
+            ));
+            continue;
+        }
+        if token.text != "constructor" || tokens.get(index + 1).map(|t| t.text) != Some("(") {
+            continue;
+        }
+        let is_static_method = match index.checked_sub(1).map(|i| tokens[i].text) {
+            Some("static") => true,
+            Some("async" | "get" | "set") => index >= 2 && tokens[index - 2].text == "static",
+            Some("*") => {
+                (index >= 2 && tokens[index - 2].text == "static")
+                    || (index >= 3
+                        && tokens[index - 2].text == "async"
+                        && tokens[index - 3].text == "static")
+            }
+            _ => false,
+        };
+        if is_static_method {
+            // A computed spelling prevents SWC from mistaking a static method
+            // named `constructor` for the class's special constructor.
+            replacements.push((
+                source_offset_for_masked[token.start],
+                source_offset_for_masked[token.end],
+                "[\"constructor\"]",
+            ));
+        }
+    }
+
+    let mut result = source.to_string();
+    for (start, end, replacement) in replacements.into_iter().rev() {
+        result.replace_range(start..end, replacement);
+    }
+    result
+}
+
 /// Utility to convert SWC span to our span type.
 ///
 /// This is useful when processing SWC AST nodes and need to create
@@ -1247,6 +1354,61 @@ if (!ASCII_WHITESPACE_REPLACE_REGEX.test(' ')) {
             normalize_unicode_identifier_escapes(source),
             r#"let a = "\u0062";"#
         );
+    }
+
+    #[test]
+    fn normalize_valid_static_constructor_methods_for_swc() {
+        let source = r#"
+// André: static constructor() in a comment is untouched.
+const text = "static async constructor()";
+class C {
+  static constructor() {}
+  static async constructor() {}
+  static *constructor() {}
+  static async *constructor() {}
+  constructor() {}
+}
+"#;
+        let normalized = normalize_swc_class_syntax(source);
+        assert!(normalized.contains("// André: static constructor() in a comment"));
+        assert!(normalized.contains("\"static async constructor()\""));
+        assert!(normalized.contains("static [\"constructor\"]()"));
+        assert!(normalized.contains("static async [\"constructor\"]()"));
+        assert!(normalized.contains("static *[\"constructor\"]()"));
+        assert!(normalized.contains("static async *[\"constructor\"]()"));
+        assert!(normalized.contains("\n  constructor() {}"));
+        parse_typescript(&normalized, "static-constructor.js").unwrap();
+    }
+
+    #[test]
+    fn normalize_await_class_expression_name_for_script_parser() {
+        let normalized = normalize_swc_class_syntax("var C = class await {};");
+        assert_eq!(normalized, "var C = class _wait {};");
+        parse_typescript("var C = class await {};", "await-name.js").unwrap();
+        parse_typescript(r"var C = class \u0061wait {};", "await-name-escaped.js").unwrap();
+    }
+
+    #[test]
+    fn normalize_swc_class_syntax_walks_char_boundaries() {
+        // The tokenizer slices `&masked[start..i]`, so its cursor must never
+        // land inside a multi-byte codepoint. A raw non-ASCII char in code
+        // position (regex literal, identifier, operand) used to panic with
+        // "not a char boundary".
+        for source in [
+            "const re = /a\u{20AC}b/;\n",
+            "const \u{e9}t\u{e9} = 1;\n",
+            "const s = [\u{3bb}, \u{2603}];\n",
+        ] {
+            assert_eq!(normalize_swc_class_syntax(source), source);
+        }
+        // ...and the source/masked boundary map still lands on the right bytes
+        // when non-ASCII text precedes the token being rewritten.
+        let source =
+            "// caf\u{e9} \u{2603}\nconst t = \"\u{20ac}\";\nclass C { static constructor() {} }\n";
+        let normalized = normalize_swc_class_syntax(source);
+        assert!(normalized.contains("// caf\u{e9} \u{2603}"));
+        assert!(normalized.contains("\"\u{20ac}\""));
+        assert!(normalized.contains("static [\"constructor\"]() {}"));
     }
 
     #[test]
