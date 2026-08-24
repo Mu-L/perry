@@ -313,6 +313,13 @@ pub unsafe extern "C" fn js_new_function_construct(
         super::super::object_ops::throw_object_type_error(b"is not a constructor");
     }
     if let Some((module, method)) = bound_native_callable_module_and_method(func_value) {
+        // Native constructors and ordinary exports share the bound-method
+        // trampoline. Consult the export metadata before falling through to
+        // generic closure construction; some lower-case JavaScript wrappers
+        // are constructors while native functions such as path methods are not.
+        if !super::super::native_module::is_native_module_constructor_export(&module, &method) {
+            super::super::object_ops::throw_object_type_error(b"is not a constructor");
+        }
         if module == "perf_hooks" {
             if let Some(result) =
                 crate::perf_hooks::construct_perf_hooks_class(&method, args_ptr, args_len)
@@ -988,14 +995,14 @@ pub unsafe extern "C" fn js_new_function_construct(
             class_cid, class_cid, func_value, args_ptr, args_len,
         );
     }
-    if extends_target_must_throw(func_value) {
-        super::super::object_ops::throw_object_type_error(b"is not a constructor");
-    }
     if is_arrow_function_value(func_value) {
         crate::fs::validate::throw_type_error_with_code(
             "Arrow function is not a constructor",
             "ERR_INVALID_ARG_TYPE",
         );
+    }
+    if extends_target_must_throw(func_value) {
+        super::super::object_ops::throw_object_type_error(b"is not a constructor");
     }
     let cid = synthetic_class_id_for_function(func_value);
     // Allocate the instance with the synthetic class id (or 0 if the
@@ -1215,6 +1222,10 @@ pub(crate) fn js_value_is_constructor(value: f64) -> bool {
     if is_non_constructable_builtin_function_value(value) {
         return false;
     }
+    let ptr = JSValue::from_bits(value.to_bits()).as_pointer::<crate::closure::ClosureHeader>();
+    if crate::closure::closure_is_bound_method(ptr) {
+        return is_bound_native_constructor_closure_value(value);
+    }
     true
 }
 
@@ -1248,6 +1259,15 @@ pub(crate) fn extends_target_must_throw(value: f64) -> bool {
     if is_callable_function_value(value) {
         if is_arrow_function_value(value) || is_non_constructable_builtin_function_value(value) {
             return true;
+        }
+        // Native-module constructor exports use the same BOUND_METHOD
+        // trampoline as ordinary method reads. Their module/method captures
+        // are the distinguishing [[Construct]] metadata: rejecting the raw
+        // trampoline here breaks dynamic aliases such as
+        // `const Console = console.Console; new Console(...)` and native base
+        // construction reached through an indirect user-class chain.
+        if is_bound_native_constructor_closure_value(value) {
+            return false;
         }
         let ptr = jv.as_pointer::<crate::closure::ClosureHeader>();
         if !ptr.is_null() && is_valid_obj_ptr(ptr as *const u8) {
@@ -1673,8 +1693,8 @@ pub unsafe extern "C" fn js_new_function_construct_with_new_target(
                 | "BigUint64Array"
         ) {
             // Validate and initialize the typed-array contents before reading
-            // a custom newTarget prototype.  In particular, a Number/BigInt
-            // element-type mismatch must throw TypeError without observing a
+            // a custom newTarget prototype. In particular, invalid Symbol
+            // element conversion must throw TypeError without observing a
             // poisoned `newTarget.prototype` getter.
             let scope = crate::gc::RuntimeHandleScope::new();
             let nt_h = scope.root_nanbox_f64(nt);
