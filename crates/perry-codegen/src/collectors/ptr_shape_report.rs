@@ -219,11 +219,14 @@ pub(super) const ESC_CLOSURE_CAPTURE: ShapeDenial = ShapeDenial {
 
 pub(super) const ESC_CALL_ARGUMENT: ShapeDenial = ShapeDenial {
     rule: RULE2,
-    reason: "passed as a call argument. There is no mechanism yet by which a \
-             shape fact at a call site becomes a fact about the callee's \
-             parameter, so any argument position disqualifies.",
+    reason: "passed as a call argument that does not preserve whole-lifetime \
+             containment. An audited argument-shape clone can specialize a \
+             callee that never publishes the parameter, but every other \
+             argument position — and every call whose callee is not such a \
+             clone — disqualifies, because no shape fact at a call site \
+             becomes a fact about an arbitrary callee's parameter.",
     tier: Tier::CompilerLimitation,
-    issue: Some("#7034 §1 (argument positions via clone-and-route)"),
+    issue: Some("#8774 (guarded argument clone-and-route)"),
 };
 
 pub(super) const ESC_RETURN: ShapeDenial = ShapeDenial {

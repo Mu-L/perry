@@ -708,6 +708,14 @@ pub(crate) struct FnCtx<'a> {
     /// compiler-synthesized `arguments` binding and therefore receives every
     /// actual argument.
     pub method_has_synthetic_arguments: &'a std::collections::HashMap<(String, String), bool>,
+    /// Whole-program reverse capabilities for guarded short-spread method
+    /// calls. See `CompileOptions::short_spread_method_candidates`.
+    pub short_spread_method_candidates:
+        &'a std::collections::HashMap<String, Vec<crate::ShortSpreadMethodCandidate>>,
+    /// Whole-program exported object-literal candidates for dynamic receiver
+    /// calls. See `CompileOptions::object_literal_method_candidates`.
+    pub object_literal_method_candidates:
+        &'a std::collections::HashMap<String, Vec<crate::ObjectLiteralMethodCandidate>>,
     /// FFI manifest: `name -> (params, return)` from `package.json`
     /// `nativeLibrary.functions`. Descriptors use the shared native-library
     /// ABI vocabulary. `lower_call` consults
@@ -2202,21 +2210,49 @@ impl<'a> FnCtx<'a> {
             .or_else(|| self.native_facts.shape_proven_ptr_local(id))
     }
 
-    /// Caller-side containment proof used to admit a `$pshape_args` route.
+    /// Caller-side containment proof used to admit an argument-shape clone
+    /// route, paired with whether that route must still emit its runtime
+    /// class+ShapeId guard.
     ///
     /// This deliberately ignores the raw-pointer representation context gate:
     /// the caller keeps a tagged value, the route rechecks its live class and
     /// shape, and the clone binds its own tagged shadow slot. Only the proof
     /// that no external alias can reshape the argument is consumed here.
+    ///
+    /// The guard may be elided in exactly one case: the caller already holds
+    /// the BROAD `Ptr<Shape>` representation fact, which by construction was
+    /// proven in a barrier-free module (rule 5) with full containment (rules
+    /// 1-4). There the caller is itself licensed to read this object's
+    /// declared fields at fixed offsets without a guard, so the clone's reads
+    /// add no exposure and the guard is tautological.
+    ///
+    /// The route-only fact is weaker — it is collected with rule 5's
+    /// module-wide barrier kill BYPASSED — so it must never license guard-free
+    /// field access, and its route keeps the guard plus the generic fallback.
     pub(crate) fn ptr_shape_argument_route_fact(
         &self,
         e: &perry_hir::Expr,
-    ) -> Option<&crate::collectors::PtrShapeLocal> {
+    ) -> Option<(&crate::collectors::PtrShapeLocal, bool)> {
         match e {
             // Ordinary native facts are containment proofs. A selected clone
-            // parameter inherits the same contract from the only routes that
-            // can call that clone.
-            perry_hir::Expr::LocalGet(id) => self.ptr_shape_local_fact(*id),
+            // parameter inherits the class fact from its caller's guard, but
+            // forwarded clone parameters retain an explicit guard/fallback at
+            // the next route because their fact originates at a dynamic
+            // caller boundary.
+            perry_hir::Expr::LocalGet(id) => self
+                .proven_shape_params
+                .get(id)
+                .map(|fact| (fact, true))
+                .or_else(|| {
+                    self.native_facts
+                        .shape_proven_ptr_local(*id)
+                        .map(|fact| (fact, false))
+                })
+                .or_else(|| {
+                    self.native_facts
+                        .guarded_argument_route_local(*id)
+                        .map(|fact| (fact, true))
+                }),
             // `proven_this` may come from a runtime receiver guard rather than
             // containment, so it cannot justify an argument clone route.
             _ => None,

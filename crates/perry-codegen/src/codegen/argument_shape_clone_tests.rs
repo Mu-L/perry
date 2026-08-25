@@ -187,12 +187,12 @@ fn guarded_call_routes_to_shadow_rooted_direct_field_clone() {
 
     assert!(
         ir.contains(&format!("call double @{clone_name}(")),
-        "the guarded call site must route to the argument clone:\n{ir}"
+        "the exact contained call site must route to the argument clone:\n{ir}"
     );
     assert!(
-        ir.contains("pshape_arg.fallback")
+        !ir.contains("pshape_arg.fallback")
             && ir.contains("call double @perry_method_argument_shape_clone_ts__Registry__read("),
-        "guard failure must retain the ordinary method body:\n{ir}"
+        "fresh provenance must elide the redundant argument guard while other receiver routes retain the ordinary body:\n{ir}"
     );
     assert!(
         clone.contains("@js_shadow_slot_bind(")
@@ -300,5 +300,196 @@ fn aliased_or_reassigned_parameter_does_not_get_a_clone() {
     assert!(
         !ir.contains("Registry__read$pshape_args"),
         "a reassigned parameter must keep only generic semantics:\n{ir}"
+    );
+}
+
+fn define_property(target: Expr) -> Stmt {
+    Stmt::Expr(Expr::ObjectDefineProperty(
+        Box::new(target),
+        Box::new(Expr::String("unrelated".to_string())),
+        Box::new(Expr::Object(vec![("value".to_string(), Expr::Number(1.0))])),
+    ))
+}
+
+/// An unrelated §5.2 barrier does not suppress the route, but it DOES make the
+/// runtime guard load-bearing.
+///
+/// The route-only proof reaches this module by bypassing rule 5's module-wide
+/// barrier kill. That kill is the belt-and-braces backstop against blind spots
+/// in the containment walk (`ptr_shape.rs` rule 5), so with it bypassed the
+/// entry guard is the only thing left that can observe a reshaped argument.
+/// Eliding it here would leave the clone's fixed-offset reads with no check at
+/// all in exactly the modules whose barriers the analysis refuses to attribute.
+#[test]
+fn unrelated_module_shape_barrier_keeps_guarded_argument_route() {
+    let mut module = fixture();
+    module.init.insert(0, define_property(Expr::Object(vec![])));
+    let ir = String::from_utf8(compile_module(&module, opts()).expect("module compiles"))
+        .expect("LLVM IR is UTF-8");
+    let clone_name = "perry_method_argument_shape_clone_ts__Registry__read$pshape_args";
+
+    assert!(
+        ir.contains(&format!("call double @{clone_name}(")),
+        "an unrelated barrier must not suppress the exact guarded route:\n{ir}"
+    );
+    assert!(
+        ir.contains("pshape_arg.fallback")
+            && ir.contains("call double @perry_method_argument_shape_clone_ts__Registry__read("),
+        "a route that bypassed the module-wide barrier kill must keep its \
+         runtime guard and its generic fallback:\n{ir}"
+    );
+}
+
+#[test]
+fn barrier_targeting_argument_stays_on_generic_route() {
+    let mut module = fixture();
+    module.init.insert(2, define_property(Expr::LocalGet(11)));
+    let ir = String::from_utf8(compile_module(&module, opts()).expect("module compiles"))
+        .expect("LLVM IR is UTF-8");
+    let clone_name = "perry_method_argument_shape_clone_ts__Registry__read$pshape_args";
+
+    assert!(
+        !ir.contains(&format!("call double @{clone_name}(")),
+        "a value reshaped before the call must not receive a containment route:\n{ir}"
+    );
+}
+
+/// A clone that publishes its parameter gets NO caller-side route.
+///
+/// `PrefixContainedParamUse` proves a temporal property — the licensed field
+/// reads happen before the body's first bare use of the parameter. The fact
+/// map that would carry a caller-side route is keyed by local id and is
+/// therefore flow-INSENSITIVE: a fact kept past a publishing call is consulted
+/// again at every later route site for the same local, including sites that
+/// run once the alias exists. A per-local map cannot express "before", so the
+/// only sound reading is that no caller-side containment fact survives such a
+/// call at all.
+#[test]
+fn publishing_clone_gets_no_caller_side_route() {
+    let mut module = fixture();
+    let param_id = module.classes[1].methods[0].params[0].id;
+    module.classes[1].methods[0]
+        .body
+        .push(Stmt::Return(Some(Expr::LocalGet(param_id))));
+
+    let session = crate::opt_report::test_support::Session::start();
+    let ir = String::from_utf8(compile_module(&module, opts()).expect("module compiles"))
+        .expect("LLVM IR is UTF-8");
+    let clone_name = "perry_method_argument_shape_clone_ts__Registry__read$pshape_args";
+    assert!(
+        !ir.contains(&format!("call double @{clone_name}(")),
+        "a clone that publishes its parameter must not be routed from a \
+         caller-side containment fact:\n{ir}"
+    );
+    let entries = session.entries();
+    assert!(
+        !entries.iter().any(|entry| {
+            entry.name == "entity"
+                && entry.local_id == Some(11)
+                && entry.outcome == crate::opt_report::Outcome::Selected
+        }),
+        "a publishing clone must not preserve the caller's broad Ptr<Shape> fact: {entries:#?}"
+    );
+}
+
+/// #8833 regression: the three widenings must not compose into an unguarded
+/// fixed-offset read of a published object.
+///
+/// Fixture: a §5.2 barrier the analysis cannot attribute, a callee that
+/// publishes its parameter after its licensed read, and TWO route sites on the
+/// same caller local — so the second one executes after the alias exists. Every
+/// safety net that could catch a reshape here had been removed at once: rule
+/// 5's module kill (bypassed by the route-only proof), the caller's post-call
+/// containment requirement, and the runtime class+ShapeId guard.
+#[test]
+fn published_argument_in_a_barrier_module_never_reaches_an_unguarded_clone() {
+    let mut module = fixture();
+    let param_id = module.classes[1].methods[0].params[0].id;
+    // The callee reads the declared field, then publishes the parameter.
+    module.classes[1].methods[0]
+        .body
+        .push(Stmt::Return(Some(Expr::LocalGet(param_id))));
+    // A module-wide §5.2 barrier whose target the containment walk cannot
+    // attribute to any tracked local.
+    module.init.insert(0, define_property(Expr::Object(vec![])));
+    // A second route site on the same local, after the first published it.
+    let second_call = module.init.last().expect("fixture call").clone();
+    module.init.push(second_call);
+
+    let ir = String::from_utf8(compile_module(&module, opts()).expect("module compiles"))
+        .expect("LLVM IR is UTF-8");
+    let clone_name = "perry_method_argument_shape_clone_ts__Registry__read$pshape_args";
+    // Subject-liveness: the argument-clone machinery must actually be engaged
+    // by this fixture, or the assertion below would pass for the wrong reason.
+    assert!(
+        ir.contains(&format!("@{clone_name}(")),
+        "fixture must still emit the argument clone, or this test is vacuous:\n{ir}"
+    );
+    let unguarded_calls = ir.matches(&format!("call double @{clone_name}(")).count();
+    let guard_blocks = ir.matches("pshape_arg.fallback").count();
+
+    assert!(
+        unguarded_calls == 0 || guard_blocks > 0,
+        "a published argument in a barrier-carrying module reached the \
+         argument clone with no runtime class+ShapeId guard \
+         ({unguarded_calls} clone calls, {guard_blocks} guard blocks):\n{ir}"
+    );
+}
+
+#[test]
+fn field_read_after_publication_does_not_get_a_clone() {
+    let mut module = fixture();
+    let method = &mut module.classes[1].methods[0];
+    method
+        .body
+        .insert(0, Stmt::Expr(Expr::LocalGet(method.params[0].id)));
+    let ir = String::from_utf8(compile_module(&module, opts()).expect("module compiles"))
+        .expect("LLVM IR is UTF-8");
+    assert!(
+        !ir.contains("Registry__read$pshape_args"),
+        "an entry shape proof cannot license a field read after publication:\n{ir}"
+    );
+}
+
+#[test]
+fn forwarded_clone_parameter_retains_runtime_guard_and_fallback() {
+    let mut module = fixture();
+    let entity_param = 21;
+    let forward = function(
+        201,
+        "forward",
+        vec![param(
+            entity_param,
+            "entity",
+            Type::Named("Entity".to_string()),
+        )],
+        vec![
+            Stmt::Expr(field_get(entity_param, "id")),
+            Stmt::Expr(Expr::Call {
+                callee: Box::new(Expr::PropertyGet {
+                    object: Box::new(Expr::This),
+                    property: "read".to_string(),
+                    byte_offset: 0,
+                }),
+                args: vec![Expr::LocalGet(entity_param)],
+                type_args: Vec::new(),
+                byte_offset: 0,
+            }),
+        ],
+    );
+    module.classes[1].methods.push(forward);
+    let ir = String::from_utf8(compile_module(&module, opts()).expect("module compiles"))
+        .expect("LLVM IR is UTF-8");
+
+    assert!(
+        ir.contains("Registry__forward$pshape_args")
+            && ir.contains(
+                "call double @perry_method_argument_shape_clone_ts__Registry__read$pshape_args("
+            ),
+        "the forwarding clone must route its selected parameter onward:\n{ir}"
+    );
+    assert!(
+        ir.contains("pshape_arg.fallback"),
+        "a fact inherited from a dynamic clone boundary must retain an exact guard and generic fallback:\n{ir}"
     );
 }

@@ -968,7 +968,7 @@ pub(super) fn scoped_method_name(
 /// changing it desyncs cross-module symbol references (a module's prefix is
 /// `sanitize(module_name)` at the definition site and must match the prefix the
 /// importing module re-derives).
-pub(super) fn sanitize(name: &str) -> String {
+pub(crate) fn sanitize(name: &str) -> String {
     let mut s: String = name
         .chars()
         .map(|c| {
@@ -1027,6 +1027,33 @@ pub(super) fn sanitize_member(name: &str) -> String {
         }
     }
     s
+}
+
+/// Reserve the keys-global symbol for one source class. Keep this single
+/// implementation shared by capability harvesting and module emission: both
+/// passes must assign collision suffixes in the same source order or a
+/// harvested ShapeId external can name a global the producer never defines.
+pub(crate) fn unique_class_keys_global(
+    module_prefix: &str,
+    class_name: &str,
+    used: &mut std::collections::HashSet<String>,
+) -> String {
+    let base = format!(
+        "perry_class_keys_{}__{}",
+        module_prefix,
+        sanitize(class_name)
+    );
+    if used.insert(base.clone()) {
+        return base;
+    }
+    let mut suffix = 1u32;
+    loop {
+        let candidate = format!("{base}_{suffix}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        suffix += 1;
+    }
 }
 
 /// Host default triple.

@@ -16,8 +16,83 @@ fn local_get_is(expr: &Expr, expected: u32) -> bool {
     matches!(expr, Expr::LocalGet(id) if *id == expected)
 }
 
+fn eligible_method(
+    hir: &Module,
+    func_names: &HashMap<u32, String>,
+    class: &perry_hir::Class,
+    key: &str,
+    value: &Expr,
+) -> Option<ImportedObjectLiteralMethod> {
+    let source_prefix = crate::codegen::helpers::sanitize(&hir.name);
+    let (func_id, params, target) = match value {
+        Expr::Closure {
+            func_id,
+            params,
+            is_arrow: false,
+            is_async: false,
+            is_generator: false,
+            ..
+        } => (
+            *func_id,
+            params,
+            format!("perry_closure_{source_prefix}__{func_id}"),
+        ),
+        // HIR lifts a concise method that does not read `this` into a normal
+        // private function and stores its closure wrapper through IndexSet.
+        // The live-slot identity guard must compare/call that wrapper, not a
+        // nonexistent `perry_closure_*` symbol.
+        Expr::FuncRef(func_id) => {
+            let function = hir
+                .functions
+                .iter()
+                .find(|function| function.id == *func_id)?;
+            if function.is_async || function.is_generator {
+                return None;
+            }
+            let target = format!("__perry_wrap_{}", func_names.get(func_id)?);
+            (*func_id, &function.params, target)
+        }
+        _ => return None,
+    };
+    // The first slice uses the existing exact-arity closure guard. Rest and
+    // synthesized `arguments` slots remain generic.
+    if params
+        .iter()
+        .any(|param| param.is_rest || param.arguments_object.is_some())
+    {
+        return None;
+    }
+    let field_index = class.fields.iter().position(|field| field.name == key)? as u32;
+    Some(ImportedObjectLiteralMethod {
+        name: key.to_string(),
+        func_id,
+        target,
+        param_count: params.len(),
+        field_index,
+    })
+}
+
+fn class_shape_id_global(hir: &Module, class_name: &str) -> Option<String> {
+    let source_prefix = crate::codegen::helpers::sanitize(&hir.name);
+    let mut used = HashSet::new();
+    for class in &hir.classes {
+        let keys_global = crate::codegen::helpers::unique_class_keys_global(
+            &source_prefix,
+            &class.name,
+            &mut used,
+        );
+        if class.name == class_name {
+            return Some(crate::typed_shape::shape_id_global_name_from_keys_global(
+                &keys_global,
+            ));
+        }
+    }
+    None
+}
+
 fn capability_from_init(
     hir: &Module,
+    func_names: &HashMap<u32, String>,
     global_id: u32,
     init: &Expr,
 ) -> Option<ExportedObjectLiteralCapability> {
@@ -59,17 +134,29 @@ fn capability_from_init(
         return None;
     }
 
-    // Last source write wins. A later data/function-valued write to the same
-    // key deliberately erases an earlier concise-method capability.
+    let shape_id_global = class_shape_id_global(hir, &class.name)?;
+
+    // Last source write wins. A non-arrow closure stored through the ordinary
+    // data-property path is eligible too: HIR uses that path for a concise
+    // method whose body does not read `this` (the public suite's `perform(ctx)`
+    // shape), as well as for stable function-valued properties. The exact live
+    // closure guard makes both cases safe. Other values erase the capability.
     let mut final_methods: HashMap<String, Option<ImportedObjectLiteralMethod>> = HashMap::new();
     let mut saw_return = false;
     for stmt in body {
         match stmt {
-            Stmt::Expr(Expr::IndexSet { object, index, .. }) if local_get_is(object, param.id) => {
+            Stmt::Expr(Expr::IndexSet {
+                object,
+                index,
+                value,
+            }) if local_get_is(object, param.id) => {
                 let Expr::String(key) = index.as_ref() else {
                     return None;
                 };
-                final_methods.insert(key.clone(), None);
+                final_methods.insert(
+                    key.clone(),
+                    eligible_method(hir, func_names, class, key, value),
+                );
             }
             Stmt::Expr(Expr::Call { callee, args, .. }) => {
                 let Expr::ExternFuncRef { name, .. } = callee.as_ref() else {
@@ -84,37 +171,9 @@ fn capability_from_init(
                 if !local_get_is(receiver, param.id) {
                     return None;
                 }
-                let Expr::Closure {
-                    func_id,
-                    params,
-                    captures_this: true,
-                    is_arrow: false,
-                    is_async: false,
-                    is_generator: false,
-                    ..
-                } = value
-                else {
-                    final_methods.insert(key.clone(), None);
-                    continue;
-                };
-                // The first slice uses the existing exact-arity closure guard.
-                // Rest and synthesized `arguments` slots remain generic.
-                if params
-                    .iter()
-                    .any(|param| param.is_rest || param.arguments_object.is_some())
-                {
-                    final_methods.insert(key.clone(), None);
-                    continue;
-                }
-                let field_index = class.fields.iter().position(|field| field.name == *key)? as u32;
                 final_methods.insert(
                     key.clone(),
-                    Some(ImportedObjectLiteralMethod {
-                        name: key.clone(),
-                        func_id: *func_id,
-                        param_count: params.len(),
-                        field_index,
-                    }),
+                    eligible_method(hir, func_names, class, key, value),
                 );
             }
             Stmt::Return(Some(value)) if local_get_is(value, param.id) && !saw_return => {
@@ -150,6 +209,7 @@ fn capability_from_init(
         class_name: class.name.clone(),
         class_id: class.id,
         global_id,
+        shape_id_global,
         field_names,
         methods,
     })
@@ -158,6 +218,9 @@ fn capability_from_init(
 pub(crate) fn exported_object_literal_capabilities(
     hir: &Module,
 ) -> HashMap<String, ExportedObjectLiteralCapability> {
+    let source_prefix = crate::codegen::helpers::sanitize(&hir.name);
+    let func_names =
+        crate::codegen::func_registry::build_func_registry(hir, &source_prefix).func_names;
     let exported_objects: HashSet<&str> = hir.exported_objects.iter().map(String::as_str).collect();
     let mut exported_locals: HashSet<&str> = exported_objects.clone();
     for export in &hir.exports {
@@ -182,7 +245,7 @@ pub(crate) fn exported_object_literal_capabilities(
         if !exported_locals.contains(name.as_str()) {
             continue;
         }
-        if let Some(capability) = capability_from_init(hir, *id, init) {
+        if let Some(capability) = capability_from_init(hir, &func_names, *id, init) {
             by_local.insert(name.clone(), capability);
         }
     }

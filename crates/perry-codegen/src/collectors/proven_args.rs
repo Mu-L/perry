@@ -9,10 +9,11 @@
 //! tagged ABI, so the parameter is stored in (and reloaded from) its ordinary
 //! shadow-bound slot at every fixed-offset field access.
 //!
-//! This first increment deliberately accepts read-only declared-field uses.
-//! Stores through an aliased parameter have additional frozen/sealed-object
-//! semantics, and a bare use can publish the object to code the proof cannot
-//! inspect.  Both therefore keep the generic body.
+//! Direct declared-field reads are accepted only while the parameter remains
+//! contained. A later bare use may publish it, but then no later field read may
+//! consume the entry proof and the caller must drop its post-call containment
+//! fact. Stores/reassignment still keep the generic body because their
+//! frozen/sealed and changing-binding semantics need stronger modeling.
 
 use std::collections::{HashMap, HashSet};
 
@@ -30,6 +31,10 @@ pub struct ProvenShapeArg {
     pub param_index: usize,
     pub param_id: u32,
     pub fact: PtrShapeLocal,
+    /// True only when the method never publishes this argument. A false value
+    /// still permits guarded direct reads before the first escape, but the
+    /// caller must drop its broad post-call containment fact.
+    pub preserves_containment: bool,
 }
 
 /// The single, non-combinatorial exact-shape argument clone for a method.
@@ -44,21 +49,20 @@ pub(crate) fn pshape_args_method_name(public_name: &str) -> String {
     format!("{public_name}$pshape_args")
 }
 
-/// Nominate read-only parameters whose body uses declared class fields.
+/// Nominate parameters whose contained prefix reads declared class fields.
 ///
 /// A declared `C` type or unique unannotated field signature only chooses the
 /// expected class for the runtime guard emitted at every routed call site.
 /// Classes absent from `classes`, optional/default/rest/`arguments`
-/// parameters, async bodies, and any module carrying the conservative
-/// shape-barrier latch stand down.
+/// parameters, and async bodies stand down. Module-wide shape barriers do not
+/// reject a clone: every route revalidates the live argument's exact class and
+/// shape, and only a separate containment proof can make that route reachable.
 pub(crate) fn method_proven_shape_args(
     method: &Function,
     classes: &HashMap<String, &Class>,
-    local_class_names: &HashSet<&str>,
-    module_dispatch: &ModuleDispatchFacts,
+    visible_class_names: &HashSet<&str>,
 ) -> Option<ProvenShapeArgPlan> {
     if !super::ptr_shape::ptr_shape_locals_enabled()
-        || module_dispatch.has_shape_barrier_sites()
         || method.is_async
         || method.is_generator
         || method.was_plain_async
@@ -72,10 +76,12 @@ pub(crate) fn method_proven_shape_args(
         if param.default.is_some() || param.is_rest || param.arguments_object.is_some() {
             continue;
         }
-        let mut use_check = ReadOnlyParamUse {
+        let mut use_check = PrefixContainedParamUse {
             param_id: param.id,
             field_reads: HashSet::new(),
             safe: true,
+            escaped: false,
+            read_in_region: false,
         };
         use_check.walk_stmts(&method.body);
         if !use_check.safe || use_check.field_reads.is_empty() {
@@ -83,7 +89,7 @@ pub(crate) fn method_proven_shape_args(
         }
         let class_name = match &param.ty {
             Type::Named(class_name) => {
-                if !local_class_names.contains(class_name.as_str())
+                if !visible_class_names.contains(class_name.as_str())
                     || !class_fields_cover(classes, class_name, &use_check.field_reads)
                 {
                     continue;
@@ -94,7 +100,7 @@ pub(crate) fn method_proven_shape_args(
             // is only a nomination mechanism: runtime guards still prove the
             // exact class and shape at every route.
             Type::Any => {
-                let mut candidates = local_class_names.iter().filter(|class_name| {
+                let mut candidates = visible_class_names.iter().filter(|class_name| {
                     class_fields_cover(classes, class_name, &use_check.field_reads)
                 });
                 let Some(candidate) = candidates.next() else {
@@ -120,6 +126,7 @@ pub(crate) fn method_proven_shape_args(
                 numeric_fields: HashSet::new(),
                 report_name: crate::opt_report::enabled().then(|| param.name.clone()),
             },
+            preserves_containment: !use_check.escaped,
         });
     }
 
@@ -138,14 +145,24 @@ fn class_fields_cover(
     !fields.is_empty() && field_reads.is_subset(&fields)
 }
 
-/// The guarded clone's audited body cannot retain or reshape a matching
-/// tracked argument, so that exact route preserves caller-side containment.
+/// Check the caller-side provenance and alias terms for one guarded route.
+///
+/// A route may only be admitted when the clone preserves containment for the
+/// parameter's whole lifetime. That is not a stylistic preference: the fact
+/// map this feeds is keyed by local id and therefore flow-INSENSITIVE, so a
+/// fact kept past a publishing call is consulted again at every later route
+/// site for the same local — including sites that execute after the alias
+/// exists. `PrefixContainedParamUse` proves a temporal property ("the reads
+/// happen before the publication"), which a per-local map cannot express, so
+/// the only sound reading of a publishing clone is that no caller-side
+/// containment fact survives it at all.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn route_preserves_argument_containment(
     module_dispatch: &ModuleDispatchFacts,
     candidates: &HashMap<u32, String>,
     roots: &HashMap<u32, u32>,
-    receiver_root: u32,
-    owner_class: &str,
+    receiver_root: Option<u32>,
+    owner_class: Option<&str>,
     method: &str,
     param_index: usize,
     arg: &Expr,
@@ -161,7 +178,7 @@ pub(super) fn route_preserves_argument_containment(
     // formal can reshape a selected argument between its entry guard and a
     // fixed-offset read. Preserve containment only when this tracked object is
     // unique across every value supplied to the call.
-    if *root == receiver_root
+    if receiver_root == Some(*root)
         || call_args.iter().enumerate().any(|(other_index, other)| {
             other_index != param_index
                 && matches!(
@@ -172,20 +189,31 @@ pub(super) fn route_preserves_argument_containment(
     {
         return false;
     }
-    let Some(expected) = module_dispatch.argument_shape_class(owner_class, method, param_index)
-    else {
+    let route = match owner_class {
+        Some(owner) => module_dispatch.argument_shape_route(owner, method, param_index),
+        None => module_dispatch.unique_argument_shape_class(method, param_index),
+    };
+    let Some((expected, preserves_containment)) = route else {
         return false;
     };
-    candidates.get(root).is_some_and(|got| got == expected)
+    preserves_containment && candidates.get(root).is_some_and(|got| got == expected)
 }
 
-struct ReadOnlyParamUse {
+/// Direct declared-field reads are safe until the first bare use publishes the
+/// parameter. The tagged clone may continue generically after publication,
+/// but no later field access may consume its entry shape proof.
+struct PrefixContainedParamUse {
     param_id: u32,
     field_reads: HashSet<String>,
     safe: bool,
+    escaped: bool,
+    /// Whether the currently active repeated region performed any accepted
+    /// direct field read. This is independent of `field_reads` cardinality:
+    /// rereading a field already seen before the loop must still count.
+    read_in_region: bool,
 }
 
-impl ReadOnlyParamUse {
+impl PrefixContainedParamUse {
     fn walk_stmts(&mut self, stmts: &[Stmt]) {
         for stmt in stmts {
             self.walk_stmt(stmt);
@@ -212,9 +240,17 @@ impl ReadOnlyParamUse {
                     self.walk_stmts(branch);
                 }
             }
-            Stmt::While { condition, body } | Stmt::DoWhile { condition, body } => {
+            Stmt::While { condition, body } => {
+                let outer = self.enter_repeated_region();
                 self.walk_expr(condition);
                 self.walk_stmts(body);
+                self.finish_repeated_region(outer);
+            }
+            Stmt::DoWhile { condition, body } => {
+                let outer = self.enter_repeated_region();
+                self.walk_stmts(body);
+                self.walk_expr(condition);
+                self.finish_repeated_region(outer);
             }
             Stmt::For {
                 init,
@@ -225,6 +261,7 @@ impl ReadOnlyParamUse {
                 if let Some(init) = init {
                     self.walk_stmt(init);
                 }
+                let outer = self.enter_repeated_region();
                 if let Some(condition) = condition {
                     self.walk_expr(condition);
                 }
@@ -232,6 +269,7 @@ impl ReadOnlyParamUse {
                     self.walk_expr(update);
                 }
                 self.walk_stmts(body);
+                self.finish_repeated_region(outer);
             }
             Stmt::Try {
                 body,
@@ -271,6 +309,23 @@ impl ReadOnlyParamUse {
         }
     }
 
+    fn enter_repeated_region(&mut self) -> (bool, bool) {
+        let outer = (self.escaped, self.read_in_region);
+        self.read_in_region = false;
+        outer
+    }
+
+    fn finish_repeated_region(&mut self, outer: (bool, bool)) {
+        let (escaped_before, read_before) = outer;
+        // Even when every first-iteration read precedes publication, the next
+        // iteration would perform that read after publication. Refuse the
+        // whole-parameter overlay when a repeated region contains both.
+        if !escaped_before && self.escaped && self.read_in_region {
+            self.safe = false;
+        }
+        self.read_in_region |= read_before;
+    }
+
     fn walk_expr(&mut self, expr: &Expr) {
         if !self.safe {
             return;
@@ -282,7 +337,12 @@ impl ReadOnlyParamUse {
             Expr::PropertyGet {
                 object, property, ..
             } if matches!(object.as_ref(), Expr::LocalGet(id) if *id == self.param_id) => {
-                self.field_reads.insert(property.clone());
+                if self.escaped {
+                    self.safe = false;
+                } else {
+                    self.field_reads.insert(property.clone());
+                    self.read_in_region = true;
+                }
             }
             // A direct store/update has frozen/sealed and setter semantics not
             // implied by an exact-shape entry guard.
@@ -290,7 +350,9 @@ impl ReadOnlyParamUse {
             {
                 self.safe = false;
             }
-            Expr::LocalGet(id) if *id == self.param_id => self.safe = false,
+            // A bare use publishes the object. Reads already performed remain
+            // valid, but the entry proof cannot license any later field read.
+            Expr::LocalGet(id) if *id == self.param_id => self.escaped = true,
             Expr::LocalSet(id, _) if *id == self.param_id => self.safe = false,
             Expr::Closure { body, .. } => {
                 perry_hir::walker::walk_expr_children(expr, &mut |child| self.walk_expr(child));
@@ -303,6 +365,48 @@ impl ReadOnlyParamUse {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn field_read(param_id: u32) -> Expr {
+        Expr::PropertyGet {
+            object: Box::new(Expr::LocalGet(param_id)),
+            property: "id".to_string(),
+            byte_offset: 0,
+        }
+    }
+
+    #[test]
+    fn repeated_reread_before_publication_rejects_entry_shape_proof() {
+        let param_id = 7;
+        let mut use_check = PrefixContainedParamUse {
+            param_id,
+            field_reads: HashSet::new(),
+            safe: true,
+            escaped: false,
+            read_in_region: false,
+        };
+        use_check.walk_stmts(&[
+            Stmt::Expr(field_read(param_id)),
+            Stmt::While {
+                condition: Expr::Bool(true),
+                body: vec![
+                    // `id` is already in the HashSet before this loop. The
+                    // repeated-region proof must count this occurrence, not a
+                    // set-size delta, because the next iteration reads after
+                    // the publication below.
+                    Stmt::Expr(field_read(param_id)),
+                    Stmt::Expr(Expr::Call {
+                        callee: Box::new(Expr::LocalGet(99)),
+                        args: vec![Expr::LocalGet(param_id)],
+                        type_args: Vec::new(),
+                        byte_offset: 0,
+                    }),
+                ],
+            },
+        ]);
+        assert!(!use_check.safe);
+    }
+
     /// `$pshape_args` is an internal direct-call capability. Keep every place
     /// that can spell its suffix visible here so a future vtable/indirect-call
     /// registration fails the same kind of reachability ratchet as the
