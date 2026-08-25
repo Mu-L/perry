@@ -220,6 +220,7 @@ const FFI_REGISTRY: &[(&str, OwnerKind)] = &[
     ("js_https_request",                            OwnerKind::WellKnown("http")),
     ("js_https_get",                                OwnerKind::WellKnown("http")),
     ("js_http_on",                                  OwnerKind::WellKnown("http")),
+    ("js_http_once",                                OwnerKind::WellKnown("http")),
     ("js_http_set_header",                          OwnerKind::WellKnown("http")),
     ("js_http_set_timeout",                         OwnerKind::WellKnown("http")),
     ("js_http_set_timeout_full",                    OwnerKind::WellKnown("http")),
@@ -300,6 +301,7 @@ const FFI_REGISTRY: &[(&str, OwnerKind)] = &[
     ("js_node_http_server_ref",                     OwnerKind::WellKnown("http")),
     ("js_node_http_server_unref",                   OwnerKind::WellKnown("http")),
     ("js_node_http_im_on",                          OwnerKind::WellKnown("http")),
+    ("js_node_http_im_once",                        OwnerKind::WellKnown("http")),
     ("js_node_http_im_pause",                       OwnerKind::WellKnown("http")),
     ("js_node_http_im_resume",                      OwnerKind::WellKnown("http")),
     ("js_node_http_im_pause_self",                  OwnerKind::WellKnown("http")),
@@ -549,6 +551,8 @@ const FFI_REGISTRY: &[(&str, OwnerKind)] = &[
     ("js_event_emitter_new",                        OwnerKind::WellKnown("events")),
     ("js_event_emitter_new_with_options",           OwnerKind::WellKnown("events")),
     ("js_event_emitter_async_resource_new",         OwnerKind::WellKnown("events")),
+    ("js_event_emitter_async_resource_call",        OwnerKind::WellKnown("events")),
+    ("js_event_emitter_async_resource_subclass_init", OwnerKind::WellKnown("events")),
     ("js_event_emitter_async_resource_async_id",    OwnerKind::WellKnown("events")),
     ("js_event_emitter_async_resource_trigger_async_id", OwnerKind::WellKnown("events")),
     ("js_event_emitter_async_resource_async_resource", OwnerKind::WellKnown("events")),
@@ -639,6 +643,7 @@ const EXT_PREFIX_REGISTRY: &[(&str, &str)] = &[
     ("js_node_forge_", "node-forge"),
     // Native runtime TypeScript transpilation subset (#8511).
     ("js_typescript_", "typescript"),
+    ("js_qs_",         "qs"),
 ];
 
 /// Process-wide collector of provider keys observed during codegen.
@@ -1126,6 +1131,8 @@ mod tests {
             "js_event_emitter_set_max_listeners",
             "js_event_emitter_get_max_listeners",
             "js_event_emitter_domain_value",
+            "js_event_emitter_async_resource_call",
+            "js_event_emitter_async_resource_subclass_init",
         ] {
             assert_symbol_routes_to(symbol, OwnerKind::WellKnown("events"));
         }
@@ -1172,6 +1179,8 @@ mod tests {
             ("js_node_forge_create_certificate", "node-forge"),
             ("js_parcel_watcher_subscribe", "@parcel/watcher"),
             ("js_parcel_watcher_get_events_since", "@parcel/watcher"),
+            ("js_qs_stringify", "qs"),
+            ("js_qs_parse", "qs"),
         ] {
             assert_symbol_routes_to(symbol, OwnerKind::WellKnown(binding));
         }
