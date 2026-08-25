@@ -400,6 +400,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_map_set_string_string", I64, &[I64, I64, I64]);
     module.declare_function("js_map_set_number_key", I64, &[I64, DOUBLE, DOUBLE]);
     module.declare_function("js_map_get", DOUBLE, &[I64, DOUBLE]);
+    module.declare_function("js_declared_map_get", DOUBLE, &[DOUBLE, DOUBLE]);
     module.declare_function("js_map_get_string_key", DOUBLE, &[I64, I64]);
     module.declare_function("js_map_get_number_key", DOUBLE, &[I64, DOUBLE]);
     module.declare_function("js_map_has", I32, &[I64, DOUBLE]);
@@ -634,6 +635,7 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_set_add_f32", I64, &[I64, F32]);
     module.declare_function("js_set_add_bool", I64, &[I64, I32]);
     module.declare_function("js_set_has", I32, &[I64, DOUBLE]);
+    module.declare_function("js_readonly_set_has", DOUBLE, &[DOUBLE, DOUBLE]);
     module.declare_function("js_set_has_string", I32, &[I64, I64]);
     module.declare_function("js_set_has_number", I32, &[I64, DOUBLE]);
     module.declare_function("js_set_has_i32", I32, &[I64, I32]);
