@@ -784,6 +784,15 @@ pub(crate) fn array_from_spread_value(value: f64) -> *mut ArrayHeader {
         throw_not_iterable(value());
     }
 
+    // An Array Proxy is a small registry id, not an `ArrayHeader`. Route it
+    // through the full GetIterator path before any raw-address classifiers.
+    // `array_values_iter` stores the proxy value as a dedicated live backing,
+    // so the default Array iterator performs `Get(length)` / `Get(index)`
+    // through traps instead of dereferencing the id or unwrapping the target.
+    if crate::proxy::js_proxy_is_proxy(value()) != 0 {
+        return js_iterator_to_array(crate::symbol::js_get_iterator(value()));
+    }
+
     // #7533: the overwhelmingly common spread — an ordinary dense array — is a
     // straight element copy that nobody can observe as anything else. Take it
     // before the classification probes and long before the `@@iterator` walk

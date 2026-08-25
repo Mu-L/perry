@@ -12,6 +12,7 @@ use crate::ir::*;
 mod namespace;
 mod native_default_import;
 pub(super) mod native_profile_import;
+mod object_literal;
 mod typescript;
 
 // Re-export moved items so existing `crate::...` / `super::*` call paths keep
@@ -21,6 +22,7 @@ use native_default_import::{
     canonicalize_native_import_source, is_cjs_style_native_default_import,
     node_submodule_default_export_key,
 };
+use object_literal::is_direct_object_literal;
 
 pub(crate) fn lower_module_decl(
     ctx: &mut LoweringContext,
@@ -1179,7 +1181,13 @@ pub(crate) fn lower_module_decl(
                                 }
                             }
 
-                            let expr = lower_expr(ctx, init)?;
+                            let previous_shape_seed = ctx.prefer_exported_method_shape_seed;
+                            ctx.prefer_exported_method_shape_seed = var_decl.kind
+                                == ast::VarDeclKind::Const
+                                && is_direct_object_literal(init);
+                            let expr = lower_expr(ctx, init);
+                            ctx.prefer_exported_method_shape_seed = previous_shape_seed;
+                            let expr = expr?;
                             let id = if ctx.pre_registered_module_vars.remove(&name) {
                                 ctx.pre_registered_module_var_decls.remove(&name);
                                 let id = ctx.lookup_local(&name).unwrap();
@@ -1904,7 +1912,12 @@ pub(crate) fn lower_module_decl(
         }
         ast::ModuleDecl::ExportDefaultExpr(export_default_expr) => {
             // export default <expr>
-            let lowered = lower_expr(ctx, &export_default_expr.expr)?;
+            let previous_shape_seed = ctx.prefer_exported_method_shape_seed;
+            ctx.prefer_exported_method_shape_seed =
+                is_direct_object_literal(&export_default_expr.expr);
+            let lowered = lower_expr(ctx, &export_default_expr.expr);
+            ctx.prefer_exported_method_shape_seed = previous_shape_seed;
+            let lowered = lowered?;
 
             // If the expression is a FuncRef, add to exported_functions for proper wrapper generation
             if let Expr::FuncRef(func_id) = &lowered {

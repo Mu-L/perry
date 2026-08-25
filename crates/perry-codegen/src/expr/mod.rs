@@ -161,6 +161,9 @@ mod write_pic_barrier_tests;
 // and it now lives outside `crate::expr`.
 #[cfg(test)]
 mod call_spread_rooting_tests;
+mod call_spread_short;
+#[cfg(test)]
+mod call_spread_short_tests;
 #[cfg(test)]
 mod issue7628_rooting_tests;
 pub(crate) mod shadow_slot;
@@ -1265,10 +1268,17 @@ pub(crate) struct FnCtx<'a> {
     /// receiver calls.
     pub local_value_aliases: std::collections::HashMap<u32, u32>,
 
+    /// Immutable local aliases of producer-proven imported object literals.
+    /// The value is the original consumer import binding used to look up the
+    /// cross-module capability.
+    pub local_imported_object_aliases: std::collections::HashMap<u32, String>,
+
     /// Names of imports that are exported variables (not functions).
     /// When an ExternFuncRef with one of these names appears as a value,
     /// the codegen calls the getter instead of wrapping as a closure.
     pub imported_vars: &'a std::collections::HashSet<String>,
+    pub imported_object_literals:
+        &'a std::collections::HashMap<String, crate::codegen::ImportedObjectLiteral>,
 
     /// Compile-time constant values for specific module globals. When a
     /// global is a known compile-time constant (e.g., `__platform__`),
@@ -1620,6 +1630,22 @@ pub(crate) struct StablePackedLoopFact {
     pub array_local_id: u32,
     pub side_exit_label: String,
     pub descriptor: String,
+    /// Boxed bound passed to the runtime guard (`-1` requests live length).
+    pub bound: String,
+    /// Live-length versions must observe growth as well as shrink. The
+    /// iteration guard compares its refreshed bound with this admitted value
+    /// and side-exits when they differ.
+    pub admitted_bound: String,
+    pub live_length_bound: bool,
+    /// Captured receivers cannot keep a raw address across calls in the loop
+    /// body. They reload the closure slot and revalidate before the first
+    /// indexed effect of every iteration.
+    pub revalidate_each_iteration: bool,
+    /// A nested receiver derived from an outer guarded read may have pure
+    /// compiler temporaries before its first indexed use. Revalidate at that
+    /// use, after those temporaries, so none of their runtime loads can leave a
+    /// stale raw address.
+    pub revalidate_before_indexed_read: bool,
     pub live_receiver_handle: Option<String>,
     /// Admission scanned the complete indexed range and proved every value is
     /// an untagged IEEE Number. This is requested only when the indexed value
@@ -1628,6 +1654,10 @@ pub(crate) struct StablePackedLoopFact {
     /// Preheader-derived numeric storage bases. Admission proved the complete
     /// range is raw f64 and the call-free clone keeps these addresses stable.
     pub numeric_access: Option<StablePackedNumericAccess>,
+    /// Immutable locals initialized from this loop's guarded direct indexed
+    /// read. They may seed a nested candidate only while this fast-loop fact
+    /// is active.
+    pub derived_locals: std::collections::HashSet<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
