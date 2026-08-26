@@ -104,8 +104,9 @@ pub(crate) use pod_record::{
     try_lower_pod_field_set,
 };
 pub(crate) use proven_view_access::{
-    index_is_exact_i32_shape, local_is_proven_int_store_view,
+    index_is_exact_i32_shape, is_proven_u32_view_read, local_is_proven_int_store_view,
     try_lower_proven_view_checked_f64_load, try_lower_proven_view_checked_store,
+    try_lower_proven_view_checked_u32_load,
 };
 pub(crate) use range_facts::{
     bounds_for_buffer_access_width, effective_alias_state_for_access,
@@ -1643,6 +1644,10 @@ pub(crate) struct VersionedIndexedLoopFact {
 
 #[derive(Clone, Debug)]
 pub(crate) struct StablePackedNumericAccess {
+    /// One preheader-derived element-zero base for a mode-2 Array-subclass
+    /// prefix proven wholly inline or wholly spilled. When present, indexed
+    /// reads need no per-element storage-kind selection.
+    pub contiguous_base: Option<String>,
     /// Whether the admitted receiver is a plain Array rather than an
     /// Array-subclass object.
     pub is_plain: String,
@@ -1654,6 +1659,26 @@ pub(crate) struct StablePackedNumericAccess {
     pub object_inline_base: String,
     /// Address immediately before element zero in spill object storage.
     pub object_spill_base: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StablePackedReadCache {
+    /// The cache is keyed by the scalar loop counter rather than assumed to
+    /// expire on the back edge. This remains correct through `continue` edges
+    /// and lets LLVM promote all three slots without relying on block layout.
+    pub valid_slot: String,
+    pub counter_slot: String,
+    /// A boxed JS value. It is not a GC root: any call that could move a
+    /// pointer dirties the associated proof before entering the callee, and a
+    /// dirty cache is never loaded.
+    pub value_slot: String,
+    /// Canonical unsigned entity index paired with `value_slot`. Present only
+    /// when admission proved every element is an exact `u32`; consumers can
+    /// then reuse the native index without repeating ToUint32 conversion.
+    pub u32_slot: Option<String>,
+    /// Compile-time source-order state. The first lowered occurrence only
+    /// populates the slots; later occurrences emit a runtime hit/miss test.
+    pub has_producer: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1678,11 +1703,37 @@ pub(crate) struct StablePackedLoopFact {
     /// use, after those temporaries, so none of their runtime loads can leave a
     /// stale raw address.
     pub revalidate_before_indexed_read: bool,
+    /// Path-sensitive validity bit for a nested-derived raw receiver. Calls
+    /// set it before entering the callee; a successful exact revalidation
+    /// clears it. LLVM promotes the compiler-private alloca to SSA, so the
+    /// clean hot arm is one branch and no runtime call.
+    pub revalidation_dirty_slot: Option<String>,
+    /// Non-root cache paired with `revalidation_dirty_slot`. It is read only
+    /// on the clean arm; a call dirties the proof before a moving collection,
+    /// and successful revalidation refreshes this word before clearing it.
+    pub revalidation_live_raw_slot: Option<String>,
+    /// One exact `array[counter]` result shared by repeated occurrences in the
+    /// same source iteration. A hit additionally requires a clean revalidation
+    /// proof, so observable calls force an exact reread at the next occurrence.
+    pub repeated_read_cache: Option<StablePackedReadCache>,
     pub live_receiver_handle: Option<String>,
     /// Admission scanned the complete indexed range and proved every value is
     /// an untagged IEEE Number. This is requested only when the indexed value
     /// appears below a numeric operator in the cloned body.
     pub numeric_elements: bool,
+    /// The current guarded typed-array clone uses `array[counter]` as an
+    /// element key. Its first source occurrence validates and canonicalizes
+    /// the value to `u32`; repeated occurrences reuse those native bits.
+    pub u32_index_elements: bool,
+    /// Minimum immutable length of every pairwise-distinct admitted component
+    /// column. The entity guard checks its canonical index against this once,
+    /// allowing every component access in the iteration to be unchecked.
+    pub u32_component_bound: Option<String>,
+    /// Equal-length component admission makes an out-of-range entity a
+    /// no-effect iteration: every typed-array read is `undefined` and every
+    /// store is ignored. Branch directly to this loop's update rather than
+    /// restarting the generic clone and replaying earlier effects.
+    pub u32_out_of_bounds_label: Option<String>,
     /// Preheader-derived numeric storage bases. Admission proved the complete
     /// range is raw f64 and the call-free clone keeps these addresses stable.
     pub numeric_access: Option<StablePackedNumericAccess>,
@@ -1690,6 +1741,11 @@ pub(crate) struct StablePackedLoopFact {
     /// read. They may seed a nested candidate only while this fast-loop fact
     /// is active.
     pub derived_locals: std::collections::HashSet<u32>,
+    /// Immutable locals initialized from a proven Uint32Array view read in
+    /// this clone. Their ordinary JS slot still stores the exact Number, while
+    /// native stores may consume it with ToUint32 semantics without falling
+    /// back to the dynamic typed-array setter.
+    pub u32_view_derived_locals: std::collections::HashMap<u32, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2442,6 +2498,7 @@ pub(crate) use masked_window::masked_window_fact_for_index;
 mod computed_store_rooting_tests;
 mod index_set;
 mod index_set_guarded;
+mod index_set_packed_loop;
 mod index_set_typed_array;
 mod instance_misc1;
 mod member_update;
@@ -3629,6 +3686,26 @@ pub(crate) fn lower_expr_value(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<Optio
                 "LocalGet",
                 Some(*id),
                 "ordinary_expr_value.local_i1",
+                &lowered,
+                None,
+                None,
+                None,
+                false,
+                false,
+                Vec::new(),
+            );
+            Ok(Some(lowered))
+        }
+        Expr::LocalGet(id)
+            if crate::stmt::stable_packed_loop::u32_view_derived_local_slot(ctx, *id).is_some() =>
+        {
+            let slot = crate::stmt::stable_packed_loop::u32_view_derived_local_slot(ctx, *id)
+                .expect("guarded derived-u32 slot");
+            let lowered = LoweredValue::u32(ctx.block().load(I32, &slot));
+            ctx.record_lowered_value(
+                "LocalGet",
+                Some(*id),
+                "stable_packed_u32_view_derived_local",
                 &lowered,
                 None,
                 None,
