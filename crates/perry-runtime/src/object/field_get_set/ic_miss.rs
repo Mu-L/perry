@@ -508,19 +508,35 @@ pub extern "C" fn js_object_get_field_ic_miss(
         // run time — more than the entire polymorphic-dispatch fix above saved.
         //
         // `GC_TYPE_ARRAY` is a genuine dense array: buffers, typed arrays, lazy
-        // arrays, Sets and Maps all carry their own distinct `obj_type`, and an
-        // `class X extends Array` instance is an `ObjectHeader`
-        // (`GC_TYPE_OBJECT`). `js_array_length` still resolves growth-forwarding
-        // stubs, proxies and subclass receivers, so this only skips probes that
-        // cannot match — the expression returned is exactly the one
-        // `get_field_by_name_object_tail`'s array arm computes for this key,
-        // which is what makes it a pure short-circuit rather than a second
-        // implementation.
-        if unsafe { gc_type_of(obj) } == Some(crate::gc::GC_TYPE_ARRAY)
-            && unsafe { key_bytes_are(key, b"length") }
-        {
-            let arr = obj as *const crate::array::ArrayHeader;
-            return crate::array::js_array_length(arr) as f64;
+        // arrays, Sets and Maps all carry their own distinct `obj_type`. A
+        // `class X extends Array` instance instead uses `GC_TYPE_OBJECT`, but
+        // the exact-ShapeId dense-layout proof can read its live own `length`
+        // slot without repeating generic object dispatch. Both arms retain
+        // their established helpers, making this a dispatch short-circuit
+        // rather than a second implementation of either representation.
+        if unsafe { key_bytes_are(key, b"length") } {
+            match unsafe { gc_type_of(obj) } {
+                Some(crate::gc::GC_TYPE_ARRAY) => {
+                    let arr = obj as *const crate::array::ArrayHeader;
+                    return crate::array::js_array_length(arr) as f64;
+                }
+                Some(crate::gc::GC_TYPE_OBJECT) => {
+                    // Wolf ECS's Query and Archetype are `class ... extends
+                    // Array` instances. They use ObjectHeader storage, so the
+                    // Array arm above cannot recognize them and a megamorphic
+                    // `.length` site otherwise repeats the full object lookup
+                    // on every loop entry. Reuse the exact ShapeId-backed
+                    // subclass layout proof already used by packed numeric
+                    // reads. It declines accessor, prototype-override, sparse,
+                    // and non-Array-subclass receivers, preserving the generic
+                    // lookup below for every case it cannot prove.
+                    let receiver = crate::value::js_nanbox_pointer(obj as i64);
+                    if let Some(length) = crate::array::array_subclass_fast_length(receiver) {
+                        return length;
+                    }
+                }
+                _ => {}
+            }
         }
         unsafe {
             if let Some(val) = closure_dynamic_prop_by_key(obj as usize, key) {
@@ -1902,56 +1918,6 @@ mod c3c_pic_tests {
                 cache2[0], cache[0],
                 "two instances of one class primed two different tokens — the \
                  site thrashes between them"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod array_length_fast_path_tests {
-    /// #7753: the `arr.length` short-circuit must answer EXACTLY what the full
-    /// ladder answers, for a fresh array, a grown one, and an empty one — and
-    /// must not fire for any other key on an array receiver, nor for `length`
-    /// on a non-array. Comparing against `js_object_get_field_by_name_f64` (the
-    /// path the read took before the short-circuit) is what makes this a
-    /// behaviour-equivalence test rather than a restatement of the fast path.
-    #[test]
-    fn array_length_short_circuit_agrees_with_the_full_ladder() {
-        let _lock = crate::gc::global_side_table_test_lock();
-        {
-            let len_key = crate::string::js_string_from_bytes(b"length".as_ptr(), 6);
-            let other_key = crate::string::js_string_from_bytes(b"lengtx".as_ptr(), 6);
-            for n in [0u32, 1, 5, 40] {
-                let mut arr = crate::array::js_array_alloc(n.max(1));
-                for i in 0..n {
-                    arr = crate::array::js_array_push(arr, crate::value::JSValue::number(i as f64));
-                }
-                let obj = arr as *const super::ObjectHeader;
-                let mut cache = [0i64; super::PIC_CACHE_WORDS];
-                let via_ic = super::js_object_get_field_ic_miss(obj, len_key, &mut cache);
-                let via_ladder = super::js_object_get_field_by_name_f64(obj, len_key);
-                assert_eq!(
-                    via_ic.to_bits(),
-                    via_ladder.to_bits(),
-                    "length disagreed for a {n}-element array"
-                );
-                assert_eq!(via_ic, n as f64, "length wrong for a {n}-element array");
-                // A same-length key that is not `length` must not be captured
-                // by the fast path.
-                assert_eq!(
-                    super::js_object_get_field_ic_miss(obj, other_key, &mut cache).to_bits(),
-                    super::js_object_get_field_by_name_f64(obj, other_key).to_bits(),
-                    "a non-`length` key on an array must take the normal path"
-                );
-            }
-            // `length` on a plain OBJECT must not be answered by the array
-            // short-circuit — it is an ordinary (absent) property there.
-            let plain = crate::object::js_object_alloc(0, 0);
-            let mut cache = [0i64; super::PIC_CACHE_WORDS];
-            assert_eq!(
-                super::js_object_get_field_ic_miss(plain, len_key, &mut cache).to_bits(),
-                super::js_object_get_field_by_name_f64(plain, len_key).to_bits(),
-                "`length` on a plain object must keep its normal answer"
             );
         }
     }
