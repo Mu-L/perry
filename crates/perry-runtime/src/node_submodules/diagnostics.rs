@@ -602,7 +602,19 @@ thread_local! {
     /// string/primitive own properties. Stale entries after a GC move of the
     /// error are harmless (same model as the message-keyed tables above): a
     /// lookup at the new address simply misses.
-    pub(crate) static ERROR_USER_PROPS: RefCell<HashMap<usize, HashMap<String, ErrUserProp>>> =
+    /// Insertion-ORDERED per error: a `Vec`, not a `HashMap`.
+    ///
+    /// ECMA-262 enumerates an object's own string keys in insertion order, and
+    /// that order is observable through `Object.keys`, `for…in`, `{...err}` and
+    /// `JSON.stringify`. Backed by a `HashMap` this list came out in hash order,
+    /// so `error_user_props` sorted it alphabetically to at least be
+    /// deterministic — which is stable but still not node's order. A caught fs
+    /// error serialized as `{"code":…,"errno":…,"path":…,"syscall":…}` where
+    /// node writes `{"errno":…,"code":…,"syscall":…,"path":…}`.
+    ///
+    /// An error carries a handful of properties, so a linear scan is cheaper
+    /// than hashing and the order falls out for free.
+    pub(crate) static ERROR_USER_PROPS: RefCell<HashMap<usize, Vec<(String, ErrUserProp)>>> =
         RefCell::new(HashMap::new());
 }
 
@@ -629,10 +641,14 @@ pub fn set_error_user_prop(error_ptr: usize, key: &str, value: f64) {
         ErrUserProp::Bits(value.to_bits())
     };
     ERROR_USER_PROPS.with(|m| {
-        m.borrow_mut()
-            .entry(error_ptr)
-            .or_default()
-            .insert(key.to_string(), stored);
+        let mut map = m.borrow_mut();
+        let props = map.entry(error_ptr).or_default();
+        // Reassigning an existing key keeps its original position — `o.a=1;
+        // o.b=2; o.a=3` still enumerates `a,b` in node.
+        match props.iter_mut().find(|(k, _)| k == key) {
+            Some(slot) => slot.1 = stored,
+            None => props.push((key.to_string(), stored)),
+        }
     });
 }
 
@@ -645,7 +661,7 @@ pub fn error_user_prop(error_ptr: usize, key: &str) -> Option<f64> {
     }
     ERROR_USER_PROPS.with(|m| {
         m.borrow().get(&error_ptr).and_then(|props| {
-            props.get(key).map(|v| match v {
+            props.iter().find(|(k, _)| k == key).map(|(_, v)| match v {
                 ErrUserProp::Str(s) => {
                     let ptr = js_string_from_bytes(s.as_ptr(), s.len() as u32);
                     f64::from_bits(crate::js_nanbox_string(ptr as i64).to_bits())
@@ -666,7 +682,13 @@ pub fn remove_error_user_prop(error_ptr: usize, key: &str) -> bool {
     ERROR_USER_PROPS.with(|m| {
         m.borrow_mut()
             .get_mut(&error_ptr)
-            .map(|props| props.remove(key).is_some())
+            .map(|props| match props.iter().position(|(k, _)| k == key) {
+                Some(i) => {
+                    props.remove(i);
+                    true
+                }
+                None => false,
+            })
             .unwrap_or(false)
     })
 }
@@ -701,7 +723,8 @@ pub fn error_user_props(error_ptr: usize) -> Vec<(String, f64)> {
             (key, materialized)
         })
         .collect();
-    props.sort_by(|a, b| a.0.cmp(&b.0));
+    // No sort: the Vec is already in insertion order, which is the order
+    // ECMA-262 specifies and node emits.
     props
 }
 
@@ -1938,63 +1961,5 @@ pub(crate) fn ensure_diag_noop_closure() -> *mut ClosureHeader {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn inactive_state() -> DiagChannelState {
-        DiagChannelState {
-            name: 0.0,
-            obj: std::ptr::null_mut(),
-            subscribers: Vec::new(),
-            stores: Vec::new(),
-        }
-    }
-
-    // #1309: crossing the soft cap evicts a batch of the oldest inactive
-    // channels so the live-channel map stays bounded.
-    #[test]
-    fn diag_channels_capped_by_evicting_inactive() {
-        DIAG_CHANNELS.with(|m| m.borrow_mut().clear());
-        DIAG_CHANNEL_BY_KEY.with(|m| m.borrow_mut().clear());
-        for _ in 0..DIAG_CHANNEL_SOFT_CAP + 100 {
-            let id = next_diag_id();
-            DIAG_CHANNELS.with(|m| {
-                m.borrow_mut().insert(id, inactive_state());
-            });
-        }
-        evict_inactive_diag_channels_if_needed();
-        let len = DIAG_CHANNELS.with(|m| m.borrow().len());
-        assert!(len <= DIAG_CHANNEL_SOFT_CAP, "expected <= cap, got {len}");
-        assert!(
-            len >= DIAG_CHANNEL_SOFT_CAP - DIAG_CHANNEL_EVICT_BATCH,
-            "should evict at most one batch, got {len}"
-        );
-        DIAG_CHANNELS.with(|m| m.borrow_mut().clear());
-    }
-
-    // #1309: a subscribed (active) channel is never evicted, even when the
-    // map is over the cap.
-    #[test]
-    fn active_diag_channel_survives_eviction() {
-        DIAG_CHANNELS.with(|m| m.borrow_mut().clear());
-        DIAG_CHANNEL_BY_KEY.with(|m| m.borrow_mut().clear());
-        let active_id = next_diag_id();
-        DIAG_CHANNELS.with(|m| {
-            let mut s = inactive_state();
-            s.subscribers.push(1.0);
-            m.borrow_mut().insert(active_id, s);
-        });
-        for _ in 0..DIAG_CHANNEL_SOFT_CAP + 100 {
-            let id = next_diag_id();
-            DIAG_CHANNELS.with(|m| {
-                m.borrow_mut().insert(id, inactive_state());
-            });
-        }
-        evict_inactive_diag_channels_if_needed();
-        assert!(
-            DIAG_CHANNELS.with(|m| m.borrow().contains_key(&active_id)),
-            "subscribed channel must not be evicted"
-        );
-        DIAG_CHANNELS.with(|m| m.borrow_mut().clear());
-    }
-}
+#[path = "diagnostics_tests.rs"]
+mod diagnostics_tests;
