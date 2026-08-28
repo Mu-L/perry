@@ -533,80 +533,9 @@ impl ObjectHotTables {
 /// faster than the hash overhead (memory access, cache footprint).
 const KEYS_INDEX_THRESHOLD: u32 = 32;
 
-/// Raw dense-slot view of a (validated) keys array: resolve a grow-forward
-/// pointer ONCE, then hand back the backing slots for direct indexing. The
-/// generic `js_array_get` element getter re-runs the whole per-element
-/// gauntlet — forward-resolution, lazy/Map/Set receiver probes (each a TLS +
-/// registry HashMap hit), descriptor gates — on EVERY slot, which made the
-/// keys_array scan loops (`own_key_present`, the sidecar/wide-index builds)
-/// pay ~µs per element. Callers have already validated `keys` is a
-/// `GC_TYPE_ARRAY`; keys arrays are dense (no holes), and a slot that is not
-/// a string simply fails the key match. (#6748 grind)
-#[inline]
-pub(crate) unsafe fn keys_array_dense_slots(
-    keys: *const crate::array::ArrayHeader,
-) -> (*const f64, usize) {
-    let arr = crate::array::clean_arr_ptr(keys);
-    if arr.is_null() {
-        return (std::ptr::null(), 0);
-    }
-    let len = (*arr).length.min((*arr).capacity) as usize;
-    (
-        (arr as *const u8).add(std::mem::size_of::<crate::array::ArrayHeader>()) as *const f64,
-        len,
-    )
-}
-
-/// FNV-1a hash of the bytes behind a string header. Same hash function
-/// as `key_content_hash_impl` so callers can mix paths.
-#[inline(always)]
-fn key_bytes_hash(name_ptr: *const u8, name_len: usize) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    unsafe {
-        for i in 0..name_len {
-            h ^= *name_ptr.add(i) as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-    }
-    h
-}
-
-/// Locate `key` in `obj`'s keys array via the shape record (#6759 C1:
-/// keyed on keys_array identity — shared across same-shape objects —
-/// replacing the per-object sidecar). Returns `Some(slot)` on a
-/// content-validated hit, `None` on miss (caller falls through to
-/// append/grow or the linear scan).
-#[inline]
-unsafe fn keys_index_lookup(
-    _obj: *const ObjectHeader,
-    keys: *const crate::array::ArrayHeader,
-    key_bytes: &[u8],
-    key_hash: u64,
-) -> Option<u32> {
-    let key_count = crate::array::js_array_length(keys);
-    if key_count < KEYS_INDEX_THRESHOLD {
-        return None;
-    }
-    shapes::shape_slot_lookup(keys, key_bytes, key_hash, key_count, true)
-}
-
-/// Record a new (key_hash → slot) entry on the POST-append keys array's
-/// shape after a key was appended. Caller passes `crate::object::object_keys_array(obj)`
-/// (the definitive post-append array — a clone or grow-realloc lands
-/// under its new identity, or nowhere if no shape entry exists yet) and
-/// ensures `new_count` equals the new keys_array length.
-#[inline]
-fn keys_index_insert(
-    keys: *const crate::array::ArrayHeader,
-    new_count: u32,
-    key_hash: u64,
-    slot: u32,
-) {
-    if new_count < KEYS_INDEX_THRESHOLD {
-        return;
-    }
-    shapes::shape_note_append(keys, new_count, key_hash, slot);
-}
+#[path = "keys_lookup.rs"]
+mod keys_lookup;
+pub(crate) use keys_lookup::*;
 
 pub(crate) mod array_tail_transition;
 mod call_method_depth;
@@ -834,7 +763,7 @@ pub(crate) unsafe fn interned_key_ptr(key: *const crate::StringHeader) -> usize 
 fn key_content_hash_impl(key: *const crate::StringHeader) -> u64 {
     unsafe {
         let len = (*key).byte_len as usize;
-        let data = (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
+        let data = keys_lookup::string_header_payload(key);
         let mut h: u64 = 0xcbf29ce484222325;
         for i in 0..len {
             h ^= *data.add(i) as u64;
