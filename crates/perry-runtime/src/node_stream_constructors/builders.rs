@@ -194,6 +194,28 @@ pub extern "C" fn js_array_subclass_init(this: f64, n: f64) -> f64 {
             n.floor().min(MAX_SAFE_INTEGER)
         }
     };
+    if crate::array::subclass_elements::array_subclass_elements_enabled() {
+        // Elements-backed instance: `length` and the indices live in the
+        // store, never as shape-carried properties.
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let this_root = scope.root_nanbox_f64(this);
+        unsafe {
+            crate::array::subclass_elements::install_elements(obj, len.min(u32::MAX as f64) as u32)
+        };
+        // The Array surface the instance relies on, installed exactly as in
+        // the shape-carried form. It must NOT be hidden behind a property
+        // descriptor: that sets `OBJ_FLAG_HAS_DESCRIPTORS` on every instance,
+        // which the codegen class-field inline guard rejects — every field
+        // read then takes the IC miss (measured: 6x on the wolf-ecs twins).
+        // `fill` showing up in `getOwnPropertyNames` is the pre-existing
+        // divergence tracked in #8953, unchanged by the elements store.
+        let this = this_root.get_nanbox_f64();
+        let obj = raw_ptr_from_value(this) as *mut ObjectHeader;
+        crate::closure::js_register_closure_arity(ns_array_fill as *const u8, 1);
+        let methods: [(&str, StubFn); 1] = [("fill", super::cast1(ns_array_fill))];
+        install_methods_on_existing_object(obj, this, &methods, &[]);
+        return this_root.get_nanbox_f64();
+    }
     let length_key = crate::string::js_string_from_bytes(b"length".as_ptr(), 6);
     js_object_set_field_by_name(obj, length_key, len);
     crate::closure::js_register_closure_arity(ns_array_fill as *const u8, 1);

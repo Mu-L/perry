@@ -15,7 +15,7 @@ use crate::object::ObjectHeader;
 use crate::value::JSValue;
 
 #[path = "subclass_loop_guard.rs"]
-mod loop_guard;
+pub(super) mod loop_guard;
 // The loop-guard entry points are exported C symbols; only the unit tests
 // reach them through Rust paths.
 #[cfg(test)]
@@ -96,9 +96,9 @@ struct DenseSubclassLayout {
 /// Array-subclass mutation reuse that single header read for brand, layout,
 /// and frozen/sealed/no-extend checks.
 #[derive(Clone, Copy)]
-struct ValidatedObjectReceiver {
-    object: *const ObjectHeader,
-    object_flags: u16,
+pub(super) struct ValidatedObjectReceiver {
+    pub(super) object: *const ObjectHeader,
+    pub(super) object_flags: u16,
 }
 
 /// Read the per-instance prototype-divergence bit after the caller has already
@@ -439,23 +439,43 @@ pub(crate) unsafe fn array_subclass_named_prefix_token_for_slot(
     if declared_keys.is_null() {
         return 0;
     }
-    let shape_id = (*obj).parent_class_id;
-    let cache_key = dense_cache_key(class_id, shape_id);
-    let layout = cached_dense_layout(cache_key).or_else(|| {
-        let layout = build_dense_layout(obj)?;
-        publish_dense_layout(cache_key, layout);
-        Some(layout)
-    });
-    let Some(layout) = layout else {
-        return 0;
+    // An elements-backed instance (`super::subclass_elements`) has NO numeric
+    // keys and no `length` property in its shape, so `build_dense_layout`
+    // (which locates `length` by name) cannot describe it — and without a
+    // token the descriptor-bearing IC-miss path below never primes the PIC,
+    // leaving every declared-field read to miss forever (measured: 17.8M
+    // misses on `change`/`sset`/`mask` in a 2 s wolf-ecs run). Its named
+    // prefix is simply the WHOLE shape: the strongest form of the same
+    // proof, validated by the identical declared-prefix comparison below.
+    let elements_backed = !super::subclass_elements::elements_of(obj).is_null();
+    let (element_base, dense_prefix_len, length_slot) = if elements_backed {
+        (u32::MAX, 0, u32::MAX)
+    } else {
+        let shape_id = (*obj).parent_class_id;
+        let cache_key = dense_cache_key(class_id, shape_id);
+        let layout = cached_dense_layout(cache_key).or_else(|| {
+            let layout = build_dense_layout(obj)?;
+            publish_dense_layout(cache_key, layout);
+            Some(layout)
+        });
+        let Some(layout) = layout else {
+            return 0;
+        };
+        (
+            layout.element_base,
+            layout.dense_prefix_len,
+            layout.length_slot,
+        )
     };
     // Descriptor-bearing Array subclasses cannot use the ordinary exact-shape
     // raw-load PIC even while empty: their unrelated `length` descriptor sends
     // them through the descriptor arm. Admit the fully validated named prefix
     // before the first numeric key exists as well. `element_base` is the first
     // prospective numeric slot and `dense_prefix_len == 0` proves there is no
-    // tail yet; the complete-prefix equality below remains the authority.
-    if requested_slot >= layout.element_base as usize {
+    // tail yet; the complete-prefix equality below remains the authority. An
+    // elements-backed instance has no numeric slot at all (`u32::MAX`), so
+    // only the declared-prefix bound below applies to it.
+    if requested_slot >= element_base as usize {
         return 0;
     }
     let cached = (*meta).array_subclass_named_prefix_token;
@@ -475,11 +495,17 @@ pub(crate) unsafe fn array_subclass_named_prefix_token_for_slot(
         crate::object::keys_array_dense_slots(declared_keys as *const ArrayHeader);
     let current_count = (shape.logical_key_count as usize).min(current_physical_len);
     let declared_count = (declared_count as usize).min(declared_physical_len);
-    if current_slots.is_null()
-        || declared_slots.is_null()
-        || declared_count > current_count
-        || layout.element_base as usize + layout.dense_prefix_len as usize != current_count
-    {
+    if current_slots.is_null() || declared_slots.is_null() || declared_count > current_count {
+        return 0;
+    }
+    // Every key is either in the named prefix or in the numeric tail. An
+    // elements-backed instance has no tail, so the requested slot must simply
+    // be a declared one; the shape-carried form keeps the exact partition.
+    if elements_backed {
+        if requested_slot >= declared_count {
+            return 0;
+        }
+    } else if element_base as usize + dense_prefix_len as usize != current_count {
         return 0;
     }
 
@@ -523,25 +549,32 @@ pub(crate) unsafe fn array_subclass_named_prefix_token_for_slot(
     // existing slot; otherwise the exact missing names must follow the
     // declared prefix in that order. Anything else is instance-specific.
     let declared_count = declared_count as u32;
-    let expected_length_slot = if let Some(slot) = declared_length_slot {
-        slot
-    } else {
-        declared_count
-    };
-    if layout.length_slot != expected_length_slot {
-        return 0;
-    }
     let mut expected_runtime_names: [&[u8]; 2] = [&[]; 2];
     let mut expected_runtime_count = 0usize;
-    if declared_length_slot.is_none() {
-        expected_runtime_names[expected_runtime_count] = b"length";
-        expected_runtime_count += 1;
+    if !elements_backed {
+        // The shape-carried form carries `length` as an own property, at the
+        // declared slot when the class declared that name and appended
+        // otherwise.
+        let expected_length_slot = declared_length_slot.unwrap_or(declared_count);
+        if length_slot != expected_length_slot {
+            return 0;
+        }
+        if declared_length_slot.is_none() {
+            expected_runtime_names[expected_runtime_count] = b"length";
+            expected_runtime_count += 1;
+        }
+    } else if declared_length_slot.is_some() {
+        // A class that declares its own `length` field is not modelled by the
+        // elements store (the store owns `length`); keep it off this token.
+        return 0;
     }
     if !declared_fill {
         expected_runtime_names[expected_runtime_count] = b"fill";
         expected_runtime_count += 1;
     }
-    if layout.element_base != declared_count.saturating_add(expected_runtime_count as u32) {
+    if !elements_backed
+        && element_base != declared_count.saturating_add(expected_runtime_count as u32)
+    {
         return 0;
     }
     for (offset, expected) in expected_runtime_names[..expected_runtime_count]
@@ -855,6 +888,11 @@ fn nonnegative_u32_length(value: JSValue) -> Option<u32> {
 /// semantics; descriptor/prototype-divergent shapes decline above.
 #[inline]
 pub(crate) fn array_subclass_fast_length(value: f64) -> Option<f64> {
+    if let Some(elements) = validated_object_receiver_for_value(value)
+        .and_then(|r| super::subclass_elements::elements_for_validated(&r))
+    {
+        return Some(f64::from(unsafe { (*elements).length }));
+    }
     let (obj, layout) = dense_layout_for_value(value)?;
     Some(f64::from_bits(layout_length_value(obj, layout).bits()))
 }
@@ -868,6 +906,13 @@ pub(crate) fn array_subclass_fast_length(value: f64) -> Option<f64> {
 /// into the cache, so moving GC needs neither a root nor a rewrite hook.
 #[inline]
 pub(crate) fn array_subclass_fast_length_with_ic(value: f64, cache: *mut u64) -> Option<f64> {
+    if let Some(elements) = validated_object_receiver_for_value(value)
+        .and_then(|r| super::subclass_elements::elements_for_validated(&r))
+    {
+        // No shape layout to publish: the IC words describe inline slots,
+        // and an elements-backed receiver has none for `length`.
+        return Some(f64::from(unsafe { (*elements).length }));
+    }
     let (obj, layout) = dense_layout_for_value(value)?;
     let result = f64::from_bits(layout_length_value(obj, layout).bits());
     if !cache.is_null() {
@@ -893,6 +938,9 @@ pub(crate) fn array_subclass_fast_length_with_ic(value: f64, cache: *mut u64) ->
 pub(crate) fn array_subclass_fast_length_raw(arr: *const ArrayHeader) -> Option<f64> {
     let raw = (arr as u64 & crate::value::POINTER_MASK) as usize;
     let receiver = validated_object_receiver(raw)?;
+    if let Some(elements) = super::subclass_elements::elements_for_validated(&receiver) {
+        return Some(f64::from(unsafe { (*elements).length }));
+    }
     let layout = dense_layout_for_validated_object(receiver.object)?;
     Some(f64::from_bits(
         layout_length_value(receiver.object, layout).bits(),
@@ -904,6 +952,11 @@ pub(crate) fn array_subclass_fast_length_raw(arr: *const ArrayHeader) -> Option<
 /// proof when a length-only grow created holes without changing the shape.
 #[inline]
 pub(crate) fn array_subclass_fast_index_get(value: f64, index: u32) -> Option<f64> {
+    if let Some(elements) = validated_object_receiver_for_value(value)
+        .and_then(|r| super::subclass_elements::elements_for_validated(&r))
+    {
+        return super::subclass_elements::elements_index_get(elements, index);
+    }
     let (obj, layout) = dense_layout_for_value(value)?;
     dense_index_get_with_layout(obj, layout, index)
 }
@@ -915,6 +968,9 @@ pub(crate) fn array_subclass_fast_index_get_raw(
 ) -> Option<f64> {
     let raw = (arr as u64 & crate::value::POINTER_MASK) as usize;
     let receiver = validated_object_receiver(raw)?;
+    if let Some(elements) = super::subclass_elements::elements_for_validated(&receiver) {
+        return super::subclass_elements::elements_index_get(elements, index);
+    }
     let layout = dense_layout_for_validated_object(receiver.object)?;
     dense_index_get_with_layout(receiver.object, layout, index)
 }
@@ -1108,7 +1164,7 @@ pub(crate) fn array_subclass_tail_descriptors_are_plain(
 }
 
 #[inline(always)]
-fn mutation_receiver_allows_plain_tail(object_flags: u16) -> bool {
+pub(super) fn mutation_receiver_allows_plain_tail(object_flags: u16) -> bool {
     object_flags
         & (crate::gc::OBJ_FLAG_FROZEN | crate::gc::OBJ_FLAG_SEALED | crate::gc::OBJ_FLAG_NO_EXTEND)
         == 0
@@ -1146,6 +1202,9 @@ fn array_subclass_fast_index_set_validated(
     index: u32,
     value: f64,
 ) -> bool {
+    if let Some(done) = super::subclass_elements::elements_index_set(&receiver, index, value) {
+        return done;
+    }
     let obj = receiver.object;
     let Some(layout) = dense_layout_for_validated_object(obj) else {
         return false;
@@ -1226,6 +1285,9 @@ fn array_subclass_fast_push_one_validated(
     value: f64,
     proven_u31: Option<u32>,
 ) -> Option<f64> {
+    if super::subclass_elements::elements_for_validated(&receiver).is_some() {
+        return super::subclass_elements::elements_push(&receiver, value);
+    }
     let obj = receiver.object;
     let layout = dense_layout_for_validated_object(obj)?;
     let length = nonnegative_u32_length(layout_length_value(obj, layout))?;
@@ -1351,6 +1413,9 @@ pub(crate) fn array_subclass_fast_pop_raw(arr: *const ArrayHeader) -> Option<f64
 
 #[inline]
 fn array_subclass_fast_pop_validated(receiver: ValidatedObjectReceiver) -> Option<f64> {
+    if super::subclass_elements::elements_for_validated(&receiver).is_some() {
+        return super::subclass_elements::elements_pop(&receiver);
+    }
     let obj = receiver.object;
     let layout = dense_layout_for_validated_object(obj)?;
     let length = nonnegative_u32_length(layout_length_value(obj, layout))?;
@@ -1495,7 +1560,17 @@ pub extern "C" fn js_packed_arraylike_index_get(receiver: f64, index: f64, cache
                     && header.gc_flags & crate::gc::GC_FLAG_FORWARDED == 0
                 {
                     let obj = raw.cast::<ObjectHeader>();
-                    if let Some(layout) = dense_layout_for_validated_object(obj) {
+                    // Elements-backed instance: an in-bounds non-hole element
+                    // answers directly; a hole continues to the complete
+                    // dispatcher (prototype chain).
+                    let elements = unsafe { super::subclass_elements::elements_of(obj) };
+                    if !elements.is_null() {
+                        if let Some(value) =
+                            super::subclass_elements::elements_index_get(elements, index_u32)
+                        {
+                            return value;
+                        }
+                    } else if let Some(layout) = dense_layout_for_validated_object(obj) {
                         // The codegen hit path handles both inline and
                         // object-owned spill slots.  In spill mode, publish a
                         // class-wide dense-tail identity when the owner has
@@ -1601,6 +1676,11 @@ pub fn is_array_subclass_instance(object: f64) -> bool {
 /// therefore yields `undefined` rather than a preserved hole — an accepted
 /// limitation for this rare case.
 pub fn array_subclass_dense_snapshot(recv: f64) -> f64 {
+    // An elements-backed instance iterates its live inner array, exactly as
+    // a plain Array does (no snapshot: a live length, live holes).
+    if let Some((_, elements)) = crate::array::subclass_elements::backed_value(recv) {
+        return crate::value::js_nanbox_pointer(elements as i64);
+    }
     let len = al_length(recv).max(0);
     // ArrayCreate throws a RangeError for len ≥ 2^32 (matching `js_arraylike_map`)
     // — and, critically, this guard prevents the `as u32` truncation below from
@@ -1754,6 +1834,21 @@ pub(crate) fn array_object_method(recv: f64, method: &str, args: &[f64]) -> Opti
         if let Some(value) = array_subclass_fast_pop(recv) {
             return Some(value);
         }
+    } else if method == "fill" {
+        // `Array.prototype.fill` over the receiver's own `length` + indexed
+        // properties. An elements-backed instance has no own `fill` method
+        // (see `js_array_subclass_init`), so this funnel is where the
+        // inherited one is served.
+        return Some(crate::array::js_array_fill_generic(
+            recv,
+            args.first()
+                .copied()
+                .unwrap_or(f64::from_bits(crate::value::TAG_UNDEFINED)),
+            i32::from(args.len() > 1),
+            args.get(1).copied().unwrap_or(0.0),
+            i32::from(args.len() > 2),
+            args.get(2).copied().unwrap_or(0.0),
+        ));
     }
     let (ptr, len) = (args.as_ptr(), args.len());
     if let Some(result) = super::generic::run_object_mutator(recv, method, ptr, len) {
@@ -1814,6 +1909,11 @@ pub(crate) fn array_object_index_set(recv: f64, index: u32, value: f64) {
 /// on a bounded parent walk. `key` is a property-key VALUE; a non-canonical
 /// array index (`"length"`, `"foo"`, `"01"`, a symbol) is a no-op.
 pub(crate) fn note_array_subclass_index_write(recv: f64, key: f64) {
+    // An elements-backed instance's `length` is the inner array's: the index
+    // store already maintained it, and no numeric proof lives on the shape.
+    if crate::array::subclass_elements::backed_value(recv).is_some() {
+        return;
+    }
     // Stringifying a numeric key can allocate and evacuate the object. Keep
     // both inputs live, then re-read the receiver before retiring its proof.
     let scope = crate::gc::RuntimeHandleScope::new();
@@ -1848,6 +1948,9 @@ pub(crate) fn note_array_subclass_index_write(recv: f64, key: f64) {
 /// generic OBJECT index-store funnels can apply it without re-entering the
 /// store.
 pub(crate) fn maintain_array_exotic_length(recv: f64, index: u32) {
+    if crate::array::subclass_elements::backed_value(recv).is_some() {
+        return;
+    }
     let current = al_length(recv);
     if (index as i64) < current {
         return;
@@ -1870,6 +1973,10 @@ pub(crate) fn maintain_array_exotic_length(recv: f64, index: u32) {
 #[cold]
 #[inline(never)]
 pub(crate) fn array_object_set_length(recv: f64, new_length: f64) {
+    if let Some((obj, elements)) = crate::array::subclass_elements::backed_value(recv) {
+        unsafe { crate::array::subclass_elements::set_length(obj, elements, new_length) };
+        return;
+    }
     if !new_length.is_finite() || new_length < 0.0 || new_length.trunc() != new_length {
         crate::array::array_length_range_error();
     }

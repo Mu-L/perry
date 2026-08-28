@@ -29,6 +29,7 @@ mod sort;
 mod species;
 mod splice_slice;
 mod subclass;
+pub(crate) mod subclass_elements;
 
 #[cfg(test)]
 mod collection_tag_tests;
@@ -40,6 +41,8 @@ mod push_pop_tests;
 mod spread_dense_tests;
 #[cfg(test)]
 mod strict_store_tests;
+#[cfg(test)]
+mod subclass_elements_tests;
 #[cfg(test)]
 mod subclass_tests;
 #[cfg(test)]
@@ -184,11 +187,12 @@ pub(crate) use indexing_support::test_swap_array_index_fast_path_invalidated;
 // points, plus the Array-exotic `length` maintenance the generic OBJECT index
 // store needs for a `class X extends Array` receiver.
 pub(crate) use self::subclass::{
-    array_object_set_length, array_subclass_fast_index_get, array_subclass_fast_length,
-    array_subclass_fast_length_with_ic, array_subclass_named_prefix_token_for_slot,
-    array_subclass_tail_descriptors_are_plain, clear_array_subclass_named_prefix_token,
-    clear_packed_subclass_numeric_proof, is_array_subclass_class_id, is_array_subclass_value,
-    note_array_subclass_index_write, note_packed_subclass_spill_store,
+    array_object_set_length, array_subclass_fast_index_get, array_subclass_fast_index_set,
+    array_subclass_fast_length, array_subclass_fast_length_with_ic,
+    array_subclass_named_prefix_token_for_slot, array_subclass_tail_descriptors_are_plain,
+    clear_array_subclass_named_prefix_token, clear_packed_subclass_numeric_proof,
+    is_array_subclass_class_id, is_array_subclass_value, note_array_subclass_index_write,
+    note_packed_subclass_spill_store,
 };
 // Issue #1572 — flatten helpers reused by `node_stream::ns_iter_flat_map`
 // so an `async function*` mapper return is driven through the iterator

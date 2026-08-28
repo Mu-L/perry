@@ -75,7 +75,7 @@ mod data_view_registry;
 mod dataview_proto_thunks;
 mod date_proto_thunks;
 mod delete_rest;
-mod descriptors;
+pub(crate) mod descriptors;
 mod disposable_proto_thunks;
 pub(crate) mod exotic_expando;
 pub(crate) mod field_get_set;
@@ -1611,6 +1611,15 @@ pub struct ObjectMeta {
     /// child edge: it moves with its owner, dies with its owner, and needs no
     /// address bookkeeping at all.
     pub expando: u64,
+    /// Elements backing store of a `class X extends Array` instance: a
+    /// `GC_TYPE_ARRAY` (`*mut ArrayHeader` bits, 0 = none) holding the
+    /// instance's indexed elements and `length`, exactly as a plain Array
+    /// does — so `push`/`pop`/`obj[i]` are element operations instead of
+    /// property-shape transitions (`array/subclass_elements.rs`). A traced
+    /// child edge exactly like `spill`: lives and moves with this record.
+    /// Installed by `js_array_subclass_init` under
+    /// `array_subclass_elements_enabled()`; never present otherwise.
+    pub elements: u64,
 }
 
 pub(crate) const OBJECT_META_FLAG_PROTO_OVERRIDE: u64 = 1;
@@ -1654,6 +1663,11 @@ pub(crate) unsafe fn object_is_shaped(obj: *const ObjectHeader) -> bool {
 const _: () = assert!(std::mem::offset_of!(ObjectMeta, spill) == 32);
 const _: () = assert!(std::mem::offset_of!(ObjectMeta, array_subclass_named_prefix_token) == 48);
 const _: () = assert!(std::mem::offset_of!(ObjectMeta, array_tail_object_hot) == 56);
+// The Array-subclass elements store: codegen's inline `elem.*` tiers load
+// `ObjectHeader.meta` then this word (perry-codegen `expr/index_get` and
+// `property_get/composed_ics.rs`). Keep in lock-step.
+const _: () = assert!(std::mem::offset_of!(ObjectMeta, elements) == 96);
+const _: () = assert!(std::mem::offset_of!(ObjectHeader, meta) == 8);
 const _: () = assert!(std::mem::size_of::<crate::array::ArrayHeader>() == 8);
 
 /// Fetch-or-allocate the per-object meta record. Caller must have already

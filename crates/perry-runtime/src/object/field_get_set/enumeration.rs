@@ -1043,6 +1043,27 @@ fn registered_buffer_enum(addr: usize, what: MapSetEnum) -> Option<*mut ArrayHea
 /// Otherwise (the common case), this returns the stored keys array directly.
 #[no_mangle]
 pub extern "C" fn js_object_keys(obj: *const ObjectHeader) -> *mut ArrayHeader {
+    // An elements-backed Array-subclass instance: its present indices come
+    // first (ascending, as strings), then the shape's own enumerable keys.
+    // `length` is non-enumerable and not in the shape, so it never appears.
+    if unsafe { crate::array::subclass_elements::backed(obj as usize) }.is_some() {
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let obj_h = scope.root_raw_const_ptr(obj);
+        let (shape_keys, obj) = obj_h.across_const::<ObjectHeader, _>(|| js_object_keys_shape(obj));
+        if let Some((_, elements)) =
+            unsafe { crate::array::subclass_elements::backed(obj as usize) }
+        {
+            return unsafe {
+                crate::array::subclass_elements::prepend_index_keys(elements, shape_keys, false)
+            };
+        }
+        return shape_keys;
+    }
+    js_object_keys_shape(obj)
+}
+
+/// [`js_object_keys`] over the shape alone.
+fn js_object_keys_shape(obj: *const ObjectHeader) -> *mut ArrayHeader {
     // #8149: a registered BUFFER receiver — node `Buffer`, `Uint8Array`,
     // `ArrayBuffer`, `SharedArrayBuffer` or `DataView`. Asked FIRST, above the
     // `is_valid_obj_ptr` guard: a `BufferHeader` is not an `ObjectHeader`, and
@@ -1405,6 +1426,27 @@ pub(crate) unsafe fn descriptor_marks_non_enumerable(
 /// Returns an array of the object's field values
 #[no_mangle]
 pub extern "C" fn js_object_values(obj: *const ObjectHeader) -> *mut ArrayHeader {
+    // An elements-backed Array-subclass instance: its present elements come
+    // first (ascending), then the shape's own enumerable properties.
+    if unsafe { crate::array::subclass_elements::backed(obj as usize) }.is_some() {
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let obj_h = scope.root_raw_const_ptr(obj);
+        let (shape_part, obj) =
+            obj_h.across_const::<ObjectHeader, _>(|| js_object_values_shape(obj));
+        if let Some((_, elements)) =
+            unsafe { crate::array::subclass_elements::backed(obj as usize) }
+        {
+            return unsafe {
+                crate::array::subclass_elements::prepend_index_values(elements, shape_part)
+            };
+        }
+        return shape_part;
+    }
+    js_object_values_shape(obj)
+}
+
+/// [`js_object_values`] over the shape alone.
+fn js_object_values_shape(obj: *const ObjectHeader) -> *mut ArrayHeader {
     // #8149: a registered BUFFER receiver — node `Buffer`, `Uint8Array`,
     // `ArrayBuffer`, `SharedArrayBuffer` or `DataView`. Asked FIRST, above the
     // `is_valid_obj_ptr` guard: a `BufferHeader` is not an `ObjectHeader`, and
@@ -1568,6 +1610,27 @@ pub extern "C" fn js_object_values(obj: *const ObjectHeader) -> *mut ArrayHeader
 /// Returns an array where each element is a 2-element array [key, value]
 #[no_mangle]
 pub extern "C" fn js_object_entries(obj: *const ObjectHeader) -> *mut ArrayHeader {
+    // An elements-backed Array-subclass instance: its present elements come
+    // first (ascending), then the shape's own enumerable properties.
+    if unsafe { crate::array::subclass_elements::backed(obj as usize) }.is_some() {
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let obj_h = scope.root_raw_const_ptr(obj);
+        let (shape_part, obj) =
+            obj_h.across_const::<ObjectHeader, _>(|| js_object_entries_shape(obj));
+        if let Some((_, elements)) =
+            unsafe { crate::array::subclass_elements::backed(obj as usize) }
+        {
+            return unsafe {
+                crate::array::subclass_elements::prepend_index_entries(elements, shape_part)
+            };
+        }
+        return shape_part;
+    }
+    js_object_entries_shape(obj)
+}
+
+/// [`js_object_entries`] over the shape alone.
+fn js_object_entries_shape(obj: *const ObjectHeader) -> *mut ArrayHeader {
     // #8149: a registered BUFFER receiver — node `Buffer`, `Uint8Array`,
     // `ArrayBuffer`, `SharedArrayBuffer` or `DataView`. Asked FIRST, above the
     // `is_valid_obj_ptr` guard: a `BufferHeader` is not an `ObjectHeader`, and
