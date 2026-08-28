@@ -246,9 +246,12 @@ pub(crate) fn lower_assign_target_to_expr(
                     Ok(Expr::IndexGet { object, index })
                 }
                 ast::MemberProp::PrivateName(private) => {
-                    // Compound and logical assignments lower the read and write
-                    // halves separately. Match ordinary private-member reads:
-                    // guard the receiver and use the class-mangled storage key.
+                    // A compound/logical assignment reads the target before
+                    // writing it back. Private fields do not live under their
+                    // source spelling (`#n`): use the same guarded, class-id-
+                    // qualified storage lookup as an ordinary `this.#n` read.
+                    // Reading `#n` as a public property returns `undefined`,
+                    // which made `this.#n += 1` store NaN in the real slot.
                     let private_name = format!("#{}", private.name);
                     let object = wrap_private_guard(ctx, object, &private_name, PRIV_OP_READ);
                     let property = private_storage_property(ctx, &private_name);
