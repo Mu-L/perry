@@ -33,7 +33,9 @@ use std::cell::RefCell;
 
 #[path = "shapes_slot_list.rs"]
 mod shapes_slot_list;
-pub(crate) use shapes_slot_list::{record_shape_scan_outcome, SlotList};
+pub(crate) use shapes_slot_list::{
+    record_shape_scan_outcome, shape_index_migrate_after_delete, SlotList,
+};
 
 pub(crate) struct ShapeIndex {
     /// Key count covered by `slots`. Longer live array ⟹ catch up
