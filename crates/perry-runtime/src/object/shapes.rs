@@ -31,6 +31,10 @@
 use crate::array::ArrayHeader;
 use std::cell::RefCell;
 
+#[path = "shapes_slot_list.rs"]
+mod shapes_slot_list;
+pub(crate) use shapes_slot_list::{record_shape_scan_outcome, SlotList};
+
 pub(crate) struct ShapeIndex {
     /// Key count covered by `slots`. Longer live array ⟹ catch up
     /// incrementally (append-only while shared); shorter ⟹ a delete
@@ -45,7 +49,7 @@ pub(crate) struct ShapeIndex {
     /// `bench_populated_delete.ts` — perry's worst object-model gap against
     /// node — `hash_one::<&usize>` plus `sip::Hasher::write` were **14.7% of
     /// self time**, second only to the lookup that performs them.
-    slots: crate::fast_hash::PtrHashMap<u64, Vec<u32>>,
+    slots: crate::fast_hash::PtrHashMap<u64, SlotList>,
 }
 
 /// Immutable facts named by one ShapeId.
@@ -1601,7 +1605,12 @@ unsafe fn index_range(shape: &mut ShapeIndex, keys: *const ArrayHeader, key_coun
         let v = crate::JSValue::from_bits((*slots.add(i as usize)).to_bits());
         if let Some(b) = crate::string::js_string_key_bytes(v, &mut sso) {
             let h = super::key_bytes_hash(b.as_ptr(), b.len());
-            shape.slots.entry(h).or_default().push(i);
+            match shape.slots.entry(h) {
+                std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().push(i),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(SlotList::One(i));
+                }
+            }
         }
     }
     shape.indexed_len = key_count;
@@ -1649,7 +1658,7 @@ pub(crate) unsafe fn shape_slot_lookup(
     let candidates = shape.slots.get(&key_hash)?;
     let mut sso = [0u8; crate::value::SHORT_STRING_MAX_LEN];
     let (slots, slot_len) = super::keys_array_dense_slots(keys);
-    for &i in candidates {
+    for &i in candidates.iter() {
         if (i as usize) >= slot_len || i >= key_count {
             continue;
         }
@@ -1676,7 +1685,12 @@ pub(crate) fn shape_note_append(
     if let Some(shape) = inner.indices.get_mut(&(keys as usize)) {
         if shape.indexed_len + 1 == new_count {
             shape.indexed_len = new_count;
-            shape.slots.entry(key_hash).or_default().push(slot);
+            match shape.slots.entry(key_hash) {
+                std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().push(slot),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(SlotList::One(slot));
+                }
+            }
         }
     }
 }
@@ -1686,7 +1700,12 @@ pub(crate) fn shape_note_append(
 pub(crate) fn shape_note_hit(keys: *const ArrayHeader, key_hash: u64, slot: u32) {
     let mut inner = crate::state::state().shapes.inner.borrow_mut();
     if let Some(shape) = inner.indices.get_mut(&(keys as usize)) {
-        shape.slots.entry(key_hash).or_default().push(slot);
+        match shape.slots.entry(key_hash) {
+            std::collections::hash_map::Entry::Occupied(mut e) => e.get_mut().push(slot),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(SlotList::One(slot));
+            }
+        }
     }
 }
 
@@ -1792,37 +1811,6 @@ crate::perry_thread_local! {
     /// single-word shape `PtrHasher` is built for.
     static PROBE_MEMO: std::cell::RefCell<crate::fast_hash::PtrHashMap<usize, (bool, usize)>> =
         std::cell::RefCell::new(crate::fast_hash::new_ptr_hash_map());
-}
-
-/// Per-descriptor bookkeeping after its keys address has been probed.
-///
-/// Lifted out of `scan_shape_table_rekey_mut`'s loop so the memoised path and
-/// the probing path cannot drift apart — the probe is what is deduplicated,
-/// never the bookkeeping, which still runs once per descriptor.
-#[inline]
-fn record_shape_scan_outcome(
-    visitor: &mut crate::gc::RuntimeRootVisitor<'_>,
-    id: &u32,
-    descriptor: &mut ShapeDescriptor,
-    addr: usize,
-    moved: bool,
-    dead_descriptor_ids: &mut Vec<u32>,
-    descriptor_rekeys: &mut Vec<u32>,
-) {
-    // Validate the POST-visit address. A stale shape key can follow the
-    // forwarding record of the non-array tenant that recycled its address;
-    // checking only an unmoved old address misses that case.
-    if visitor.is_metadata_rewrite_phase() && shape_keys_address_is_recycled(addr) {
-        dead_descriptor_ids.push(*id);
-    } else if moved {
-        descriptor.keys = addr as u64;
-    }
-    // A live-object edge can rewrite the boxed `keys` slot before this metadata
-    // pass. Comparing against the address represented in the reverse maps
-    // catches both that ordering and a move observed here.
-    if descriptor.keys != descriptor.indexed_keys {
-        descriptor_rekeys.push(*id);
-    }
 }
 
 /// Metadata-only forwarding repair for the weak descriptor table and
