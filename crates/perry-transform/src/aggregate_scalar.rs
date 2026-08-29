@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 
 use perry_hir::types::{LocalId, Type};
-use perry_hir::{Expr, Function, Module, Stmt};
+use perry_hir::{Export, Expr, Function, Module, Stmt};
 
 const MAX_SCALAR_AGGREGATE_LEN: usize = 8;
 const MAX_SCALAR_AGGREGATE_FIELDS: usize = 16;
@@ -89,6 +89,11 @@ pub fn run(module: &mut Module) {
                 .map(|member| collect_function_refs(&member.function)),
         );
     }
+    // An exported binding has consumers outside this module that cannot appear
+    // as LocalGet references in its HIR. Model that unknown consumer as one
+    // additional region so the existing cross-region escape barrier keeps the
+    // carrier materialized.
+    region_refs.push(collect_exported_local_ids(module));
     let mut reference_region_counts: HashMap<LocalId, usize> = HashMap::new();
     for refs in &region_refs {
         for id in refs {
@@ -195,6 +200,26 @@ fn collect_function_refs(function: &Function) -> HashSet<LocalId> {
     let mut refs = collect_stmt_refs(&function.body);
     refs.extend(function.captures.iter().copied());
     refs
+}
+
+fn collect_exported_local_ids(module: &Module) -> HashSet<LocalId> {
+    let mut exported_names: HashSet<&str> =
+        module.exported_objects.iter().map(String::as_str).collect();
+    exported_names.extend(module.exports.iter().filter_map(|export| match export {
+        Export::Named { local, .. } => Some(local.as_str()),
+        Export::ReExport { .. } | Export::ExportAll { .. } | Export::NamespaceReExport { .. } => {
+            None
+        }
+    }));
+
+    module
+        .init
+        .iter()
+        .filter_map(|stmt| match stmt {
+            Stmt::Let { id, name, .. } if exported_names.contains(name.as_str()) => Some(*id),
+            _ => None,
+        })
+        .collect()
 }
 
 fn scalarize_stmts(
@@ -1711,7 +1736,7 @@ mod tests {
         }
     }
 
-    fn aggregate_fixture(observe_identity: bool) -> Module {
+    pub(super) fn aggregate_fixture(observe_identity: bool) -> Module {
         let mut module = Module::new("aggregate-scalar.ts");
         module.init = vec![
             Stmt::Let {
@@ -2012,3 +2037,7 @@ mod tests {
         assert!(format!("{stmts:?}").contains("__AnonShape_short"));
     }
 }
+
+#[cfg(test)]
+#[path = "aggregate_scalar_export_tests.rs"]
+mod export_tests;
