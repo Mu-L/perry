@@ -96,6 +96,45 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
     };
 
     let module_reassigned_locals = crate::collectors::reassigned_locals_in_module(hir);
+    // #9071 follow-up: module-wide GUARD-FREE closure bindings. #7170 R1's
+    // `single_binding_closure_locals` is the strong fact: exactly one `Let`,
+    // never written at any depth in any body, never rebound by a parameter or
+    // catch clause — "a call through this binding names that closure" with
+    // `Expr::FuncRef` strength, which is why the function-body pipeline
+    // already devirtualizes (and LLVM then folds) these calls. Closure bodies
+    // get the same treatment through this map: seeded into the known-func_id
+    // path, and the identity guard skipped outright.
+    let closure_param_counts: std::collections::HashMap<u32, usize> = closures
+        .iter()
+        .filter_map(|(func_id, expr)| match expr {
+            perry_hir::Expr::Closure { params, .. } => Some((*func_id, params.len())),
+            _ => None,
+        })
+        .collect();
+    // `PERRY_CALL_DEVIRT=0`/`off`/`false` empties the map, restoring the
+    // entry-resolved indirect path for every binding (A/B bisection).
+    let call_devirt_enabled = !matches!(
+        std::env::var("PERRY_CALL_DEVIRT").as_deref(),
+        Ok("0") | Ok("off") | Ok("false")
+    );
+    let immutable_closure_bindings: std::collections::HashMap<u32, (u32, usize)> =
+        crate::collectors::spec_abi_sites::single_binding_closure_locals(hir)
+            .into_iter()
+            // A closure with a trusted-box clone is better served by the
+            // ENTRY-RESOLVED path: `js_closure_resolve_arrow_direct_call`
+            // hands back the trusted clone with its entry-cached box-capture
+            // pointers, which beats the known arm's public/typed call for
+            // capturing bodies (measured: 2.5 vs 5.1 ns). Seeding such an id
+            // would also make the resolution emitter skip it, robbing the
+            // call of the faster path.
+            .filter(|_| call_devirt_enabled)
+            .filter(|(_, func_id)| !trusted_box_closures.contains_key(func_id))
+            .filter_map(|(id, func_id)| {
+                closure_param_counts
+                    .get(&func_id)
+                    .map(|count| (id, (func_id, *count)))
+            })
+            .collect();
     progress.checkpoint("reassigned-local analysis");
 
     let closure_started = Instant::now();
@@ -160,6 +199,7 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
             module_boxed_vars,
             module_receiver_types,
             &module_reassigned_locals,
+            &immutable_closure_bindings,
             closure_rest_params,
             cross_module,
             false,
@@ -186,6 +226,7 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
                 module_boxed_vars,
                 module_receiver_types,
                 &module_reassigned_locals,
+                &immutable_closure_bindings,
                 closure_rest_params,
                 cross_module,
                 true,
@@ -213,6 +254,7 @@ pub(super) fn emit_module_artifacts(c: ModuleArtifactsCtx<'_>) -> Result<()> {
                 module_boxed_vars,
                 module_receiver_types,
                 &module_reassigned_locals,
+                &immutable_closure_bindings,
                 closure_rest_params,
                 cross_module,
                 true,
