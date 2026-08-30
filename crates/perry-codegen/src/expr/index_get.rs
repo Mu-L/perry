@@ -40,7 +40,10 @@ use super::{
     TypedFeedbackContract, TypedFeedbackKind,
 };
 
+mod foreign_counter;
 mod guarded_array;
+pub(crate) use foreign_counter::packed_f64_loop_index_parts;
+use foreign_counter::{foreign_packed_loop_read, packed_f64_loop_fact_for_index};
 mod inline_dyn_typed_array;
 
 use guarded_array::{
@@ -197,55 +200,6 @@ pub(crate) fn numeric_index_has_integer_array_index_proof(ctx: &FnCtx<'_>, index
 }
 
 use super::proven_view_access::bitand_has_nonnegative_i32_mask;
-
-/// #6011: decompose a packed-loop index expression into `(counter_local_id,
-/// constant_offset)`. Matches `i`, `i + c`, `c + i`, and `i - c` with a small
-/// |c| — exactly the shapes the packed-f64 range loop matcher admits, so any
-/// offset seen here on a fact-carrying (array, counter) pair is inside the
-/// range guard's validated window.
-pub(crate) fn packed_f64_loop_index_parts(index: &Expr) -> Option<(u32, i32)> {
-    use perry_hir::BinaryOp;
-    match index {
-        Expr::LocalGet(id) => Some((*id, 0)),
-        Expr::Binary { op, left, right } if matches!(op, BinaryOp::Add | BinaryOp::Sub) => {
-            let (id, offset) = match (left.as_ref(), right.as_ref()) {
-                (Expr::LocalGet(id), Expr::Integer(c)) => {
-                    let offset = if matches!(op, BinaryOp::Sub) {
-                        c.checked_neg()?
-                    } else {
-                        *c
-                    };
-                    (*id, offset)
-                }
-                (Expr::Integer(c), Expr::LocalGet(id)) if matches!(op, BinaryOp::Add) => (*id, *c),
-                _ => return None,
-            };
-            let offset = i32::try_from(offset).ok()?;
-            if offset.unsigned_abs() > 64 {
-                return None;
-            }
-            Some((id, offset))
-        }
-        _ => None,
-    }
-}
-
-/// Look up a packed-f64 loop fact for `(arr, index-expr)`. Zero-offset
-/// indices match any fact; non-zero offsets only match hole-tolerant facts
-/// (established by the range guard, which validated the whole offset window —
-/// the length-bound guard of the classic matcher only proves `i` itself).
-fn packed_f64_loop_fact_for_index(
-    ctx: &FnCtx<'_>,
-    arr_id: u32,
-    index: &Expr,
-) -> Option<(PackedF64LoopFact, u32, i32)> {
-    let (idx_id, offset) = packed_f64_loop_index_parts(index)?;
-    let fact = packed_f64_loop_fact(ctx, arr_id, idx_id)?;
-    if offset != 0 && !fact.allow_holes && !fact.window_validated {
-        return None;
-    }
-    Some((fact, idx_id, offset))
-}
 
 /// Load the packed-loop counter's i32 shadow slot and apply the constant
 /// index offset.
@@ -802,7 +756,21 @@ pub(crate) fn lower_numeric_index_get_for_number_context(
                 let arr_box = lower_expr(ctx, object)?;
                 let idx_i32 = load_packed_loop_index_i32(ctx, &i32_slot, offset);
                 return Ok(Some(lower_packed_f64_loop_index_get(
-                    ctx, *arr_id, &arr_box, &idx_i32, &fact,
+                    ctx, *arr_id, &arr_box, &idx_i32, &fact, false,
+                )));
+            }
+        }
+        // The same clone, read at an index that is NOT its counter: an
+        // enclosing loop's i32 counter, admitted by
+        // `is_packed_f64_loop_foreign_read_index` for read-only bodies. The
+        // guard already proved this receiver's packed layout, so the element
+        // load is the clone's raw slot load behind one inline bounds check.
+        if let Some((fact, idx_id)) = foreign_packed_loop_read(ctx, *arr_id, index.as_ref()) {
+            if let Some(i32_slot) = ctx.i32_counter_slots.get(&idx_id).cloned() {
+                let arr_box = lower_expr(ctx, object)?;
+                let idx_i32 = ctx.block().load(I32, &i32_slot);
+                return Ok(Some(lower_packed_f64_loop_index_get(
+                    ctx, *arr_id, &arr_box, &idx_i32, &fact, true,
                 )));
             }
         }
@@ -1667,7 +1635,18 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                             let arr_box = lower_expr(ctx, object)?;
                             let idx_i32 = load_packed_loop_index_i32(ctx, &i32_slot, offset);
                             return Ok(lower_packed_f64_loop_index_get(
-                                ctx, *arr_id, &arr_box, &idx_i32, &fact,
+                                ctx, *arr_id, &arr_box, &idx_i32, &fact, false,
+                            ));
+                        }
+                    }
+                    if let Some((fact, idx_id)) =
+                        foreign_packed_loop_read(ctx, *arr_id, index.as_ref())
+                    {
+                        if let Some(i32_slot) = ctx.i32_counter_slots.get(&idx_id).cloned() {
+                            let arr_box = lower_expr(ctx, object)?;
+                            let idx_i32 = ctx.block().load(I32, &i32_slot);
+                            return Ok(lower_packed_f64_loop_index_get(
+                                ctx, *arr_id, &arr_box, &idx_i32, &fact, true,
                             ));
                         }
                     }
