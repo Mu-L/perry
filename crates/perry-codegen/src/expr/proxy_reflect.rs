@@ -46,6 +46,10 @@ use super::{
     lower_expr, nanbox_pointer_inline, unbox_str_handle, unbox_to_i64, FnCtx,
 };
 
+#[path = "proxy_reflect_write_ic.rs"]
+mod proxy_reflect_write_ic;
+use proxy_reflect_write_ic::StableTombstoneSlotCheck;
+
 /// Runtime write-PIC flags that force the miss path. Class-vs-instance kind is
 /// encoded by the authoritative ShapeId and therefore owns no header flag.
 // Includes the packed Array-subclass numeric-proof authority bit (0x80).
@@ -530,6 +534,9 @@ fn lower_put_value_static_write_ic(
     let dispatch4_idx = ctx.new_block("put.pic.dispatch4");
     let dispatch5_idx = ctx.new_block("put.pic.dispatch5");
     let hit_idx = ctx.new_block("put.pic.hit");
+    let hit_slot_check =
+        StableTombstoneSlotCheck::new(ctx, "put.pic.hit.validate", "put.pic.hit.store");
+    let deleted_idx = ctx.new_block("put.pic.deleted");
     let miss_idx = ctx.new_block("put.pic.miss");
     let miss2_idx = ctx.new_block("put.pic.miss2");
     let miss3_idx = ctx.new_block("put.pic.miss3");
@@ -545,6 +552,7 @@ fn lower_put_value_static_write_ic(
     let dispatch4_label = ctx.block_label(dispatch4_idx);
     let dispatch5_label = ctx.block_label(dispatch5_idx);
     let hit_label = ctx.block_label(hit_idx);
+    let deleted_label = ctx.block_label(deleted_idx);
     let miss_label = ctx.block_label(miss_idx);
     let miss2_label = ctx.block_label(miss2_idx);
     let miss3_label = ctx.block_label(miss3_idx);
@@ -728,6 +736,12 @@ fn lower_put_value_static_write_ic(
         let field_ptr = blk.inttoptr(I64, &field_addr);
         (field_ptr, field_addr)
     };
+    // A stable tombstone keeps the receiver token unchanged, so the selected
+    // slot needs one liveness check. Keep the extra load entirely off ordinary
+    // objects: their already-loaded `_reserved` word takes the direct store
+    // edge, preserving the hot write path.
+    hit_slot_check.emit(ctx, &reserved, &field_ptr, &deleted_label);
+    hit_slot_check.enter_live(ctx);
     if pointer_possible {
         let slot_i32 = ctx.block().trunc(I64, &selected_slot, I32);
         // The one behavioural difference from the `_aware` emitter this
@@ -796,8 +810,23 @@ fn lower_put_value_static_write_ic(
     ctx.block().br(&merge_label);
     let hit_end_label = ctx.block().label.clone();
 
-    ctx.current_block = miss_idx;
+    ctx.current_block = deleted_idx;
     let strict_i32 = if strict { "1" } else { "0" };
+    let deleted_value = ctx.block().call(
+        DOUBLE,
+        "js_put_value_set_ic_miss",
+        &[
+            (DOUBLE, &target_value),
+            (I64, &key_handle),
+            (DOUBLE, &stored_value),
+            (I32, strict_i32),
+            (PTR, &cache_ref),
+        ],
+    );
+    let deleted_end_label = ctx.block().label.clone();
+    ctx.block().br(&merge_label);
+
+    ctx.current_block = miss_idx;
     let miss_value = ctx.block().call(
         DOUBLE,
         "js_put_value_set_ic_miss",
@@ -877,6 +906,7 @@ fn lower_put_value_static_write_ic(
         DOUBLE,
         &[
             (&stored_value, &hit_end_label),
+            (&deleted_value, &deleted_end_label),
             (&miss_value, &miss_end_label),
             (&miss2_value, &miss2_end_label),
             (&miss3_value, &miss3_end_label),
@@ -942,6 +972,8 @@ fn lower_put_value_dyn_ic_inline(
     let way1_idx = ctx.new_block("put.dynic.way1");
     let way2_idx = ctx.new_block("put.dynic.way2");
     let store_idx = ctx.new_block("put.dynic.store");
+    let store_slot_check =
+        StableTombstoneSlotCheck::new(ctx, "put.dynic.store.validate", "put.dynic.store.dispatch");
     let store_scalar_idx = ctx.new_block("put.dynic.store.scalar");
     let store_ref_idx = ctx.new_block("put.dynic.store.ref");
     let slow_idx = ctx.new_block("put.dynic.slow");
@@ -1046,6 +1078,8 @@ fn lower_put_value_dyn_ic_inline(
     let slot_off = ctx.block().add(I64, &slot_bytes, &header_bytes);
     let obj_ptr = ctx.block().inttoptr(I64, &t_handle);
     let slot_ptr = ctx.block().gep_inbounds(I8, &obj_ptr, &[(I64, &slot_off)]);
+    store_slot_check.emit(ctx, &reserved, &slot_ptr, &slow_label);
+    store_slot_check.enter_live(ctx);
     ctx.block()
         .cond_br(&v_scalar, &store_scalar_label, &store_ref_label);
 
