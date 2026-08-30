@@ -1,5 +1,7 @@
 //! NaN-boxed value to-string conversion helpers.
 
+pub(crate) use super::to_string_class_ref::class_ref_to_primitive;
+use super::to_string_class_ref::{custom_to_primitive, CustomToPrimitiveOutcome};
 use super::*;
 use std::cell::Cell;
 use std::sync::atomic::Ordering;
@@ -147,7 +149,7 @@ unsafe fn value_is_null_proto_object(value: f64) -> bool {
 }
 
 #[cold]
-fn throw_cannot_convert_to_primitive() -> ! {
+pub(crate) fn throw_cannot_convert_to_primitive() -> ! {
     let msg = b"Cannot convert object to primitive value";
     let s = crate::string::js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
     let err = crate::error::js_typeerror_new(s);
@@ -327,13 +329,7 @@ pub(crate) enum OrdinaryToPrimitiveOutcome {
     TypeError,
 }
 
-enum CustomToPrimitiveOutcome {
-    Absent,
-    Primitive(f64),
-    TypeError,
-}
-
-fn is_primitive_value(value: f64) -> bool {
+pub(crate) fn is_primitive_value(value: f64) -> bool {
     let jsval = JSValue::from_bits(value.to_bits());
     jsval.is_any_string()
         || jsval.is_number()
@@ -499,62 +495,13 @@ pub(crate) unsafe fn to_primitive_number(value: f64) -> OrdinaryToPrimitiveOutco
         return OrdinaryToPrimitiveOutcome::Primitive(value);
     }
 
-    match custom_to_primitive_number(value) {
+    match custom_to_primitive(value, b"number") {
         CustomToPrimitiveOutcome::Absent => {}
         CustomToPrimitiveOutcome::Primitive(p) => return OrdinaryToPrimitiveOutcome::Primitive(p),
         CustomToPrimitiveOutcome::TypeError => return OrdinaryToPrimitiveOutcome::TypeError,
     }
 
     ordinary_to_primitive_number_for_add(value)
-}
-
-unsafe fn custom_to_primitive_number(value: f64) -> CustomToPrimitiveOutcome {
-    let scope = crate::gc::RuntimeHandleScope::new();
-    let value_handle = scope.root_nanbox_f64(value);
-    let to_primitive = crate::symbol::well_known_symbol("toPrimitive");
-    let sym_value = f64::from_bits(POINTER_TAG | (to_primitive as u64 & POINTER_MASK));
-    let method =
-        crate::symbol::js_object_get_symbol_property(value_handle.get_nanbox_f64(), sym_value);
-    let method_jsv = JSValue::from_bits(method.to_bits());
-    if method_jsv.is_undefined() || method_jsv.is_null() {
-        return CustomToPrimitiveOutcome::Absent;
-    }
-
-    let method_bits = method.to_bits();
-    if (method_bits & 0xFFFF_0000_0000_0000) != POINTER_TAG {
-        return CustomToPrimitiveOutcome::TypeError;
-    }
-    let method_handle = scope.root_nanbox_f64(method);
-    let hint_ptr = crate::string::js_string_from_bytes(b"number".as_ptr(), 6);
-    let hint_handle = scope.root_string_ptr(hint_ptr);
-    let hint = f64::from_bits(
-        STRING_TAG
-            | (hint_handle.get_raw_const_ptr::<crate::string::StringHeader>() as u64
-                & POINTER_MASK),
-    );
-    let receiver = value_handle.get_nanbox_f64();
-    let method = method_handle.get_nanbox_f64();
-    let result = if crate::proxy::js_proxy_is_proxy(method) == 1 {
-        if !crate::proxy::proxy_wraps_callable(method) {
-            return CustomToPrimitiveOutcome::TypeError;
-        }
-        crate::proxy::call_proxy_value_with_this(method, receiver, &[hint])
-    } else {
-        let method_ptr = (method.to_bits() & POINTER_MASK) as usize;
-        if !crate::closure::is_closure_ptr(method_ptr) {
-            return CustomToPrimitiveOutcome::TypeError;
-        }
-        let prev_this = crate::object::js_implicit_this_set(receiver);
-        let result = crate::closure::js_native_call_value(method, &hint, 1);
-        crate::object::js_implicit_this_set(prev_this);
-        result
-    };
-
-    if is_primitive_value(result) {
-        CustomToPrimitiveOutcome::Primitive(result)
-    } else {
-        CustomToPrimitiveOutcome::TypeError
-    }
 }
 
 /// `OrdinaryToPrimitive(O, "number"|"default")` for addition. The method
@@ -1100,6 +1047,10 @@ pub extern "C" fn js_jsvalue_to_string(value: f64) -> *mut crate::string::String
         let n = jsval.as_int32();
         let cid = (value.to_bits() & 0xFFFF_FFFF) as u32;
         if crate::object::is_class_id_registered(cid) {
+            if !skip_to_primitive {
+                let primitive = unsafe { class_ref_to_primitive(value, 2) };
+                return js_jsvalue_to_string(primitive);
+            }
             let name = crate::object::class_name_for_id(cid).unwrap_or_default();
             let s = format!("function {name}() {{ [native code] }}");
             return crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32);
