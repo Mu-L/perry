@@ -56,6 +56,14 @@ pub(crate) fn test_element_accessor_calls() -> u64 {
     ELEMENT_ACCESSOR_CALLS.with(std::cell::Cell::get)
 }
 
+// The two strict-dense store helpers live in `strict_dense_test_helpers`
+// (2000-line cap). Re-exported by name so `super::indexing::…` paths in the
+// existing test modules keep resolving — a glob would not propagate.
+#[cfg(test)]
+pub(crate) use super::strict_dense_test_helpers::{
+    test_strict_dense_number_store, test_strict_dense_pointer_overwrite,
+};
+
 pub(crate) fn object_prototype_has_index_flag() -> bool {
     OBJECT_PROTO_HAS_INDEX.load(Ordering::Relaxed)
 }
@@ -85,13 +93,23 @@ pub(crate) fn note_array_index_write(arr: usize) {
 #[inline]
 unsafe fn array_oob_prototype_get(receiver: usize, index: u32) -> f64 {
     const TAG_UNDEFINED_F64: f64 = f64::from_bits(0x7FFC_0000_0000_0001u64);
-    // A custom array [[Prototype]] (Object.setPrototypeOf(arr, otherArray))
-    // replaces the default chain — gated on a global relaxed flag.
+    // A custom [[Prototype]] (`Object.setPrototypeOf(arr, p)`) replaces the
+    // default chain — gated on a global relaxed flag. #9192: `p` need not be an
+    // array; a plain object / `Object.create(Array.prototype)` result answers
+    // the whole lookup through the generic resolver.
     if crate::object::prototype_chain::array_static_proto_recorded() {
-        if let Some(proto_arr) = array_custom_array_prototype(receiver as *const ArrayHeader) {
-            if index < (*proto_arr).length && array_has_own_index(proto_arr, index) {
-                return js_array_get_f64(proto_arr, index);
+        let arr = receiver as *const ArrayHeader;
+        match array_custom_prototype(arr) {
+            Some(ArrayCustomProto::Null) => return TAG_UNDEFINED_F64,
+            Some(ArrayCustomProto::Other(bits)) => {
+                return array_object_proto_index_get(arr, bits, index).unwrap_or(TAG_UNDEFINED_F64)
             }
+            Some(ArrayCustomProto::Array(proto_arr)) => {
+                if index < (*proto_arr).length && array_has_own_index(proto_arr, index) {
+                    return js_array_get_f64(proto_arr, index);
+                }
+            }
+            None => {}
         }
     }
     if ARRAY_PROTO_HAS_INDEX.load(Ordering::Relaxed) {
@@ -221,13 +239,23 @@ pub(crate) fn array_spec_has_index(arr: *const ArrayHeader, index: u32) -> bool 
         if array_has_own_index(arr, index) {
             return true;
         }
-        // An explicit `Object.setPrototypeOf(arr, otherArray)` replaces the
-        // default chain — consult that array's own indices first (test262
-        // copyWithin/coerced-values-start-change-*).
-        if let Some(proto_arr) = array_custom_array_prototype(arr) {
-            if index < (*proto_arr).length && array_has_own_index(proto_arr, index) {
-                return true;
+        // An explicit `Object.setPrototypeOf(arr, p)` REPLACES the default
+        // chain. A real-array `p` keeps the original lane (its own indices
+        // first, then the implicit `Array.prototype` tail below — test262
+        // copyWithin/coerced-values-start-change-*). #9192: any other `p`
+        // answers the whole question by itself, so the default-chain tail must
+        // not run after it.
+        match array_custom_prototype(arr) {
+            Some(ArrayCustomProto::Null) => return false,
+            Some(ArrayCustomProto::Other(bits)) => {
+                return array_object_proto_index_has(bits, index)
             }
+            Some(ArrayCustomProto::Array(proto_arr)) => {
+                if index < (*proto_arr).length && array_has_own_index(proto_arr, index) {
+                    return true;
+                }
+            }
+            None => {}
         }
         if ARRAY_PROTO_HAS_INDEX.load(Ordering::Relaxed) {
             let proto = array_prototype_addr();
@@ -247,12 +275,53 @@ pub(crate) fn array_spec_has_index(arr: *const ArrayHeader, index: u32) -> bool 
     }
 }
 
-/// A custom `[[Prototype]]` installed on `arr` via `Object.setPrototypeOf`
-/// that happens to be a real array — `null` otherwise.
-unsafe fn array_custom_array_prototype(arr: *const ArrayHeader) -> Option<*const ArrayHeader> {
+/// How a recorded custom `[[Prototype]]` on a real array must be consulted.
+///
+/// #9192: before this classification the array index paths accepted a recorded
+/// prototype ONLY when it was itself a `GC_TYPE_ARRAY`; every other shape (a
+/// plain object, an `Object.create(Array.prototype)` result, a class prototype)
+/// was recorded — latching the process-wide index deopt — and then silently
+/// ignored, so the array inherited nothing at all.
+pub(crate) enum ArrayCustomProto {
+    /// `Object.setPrototypeOf(arr, null)`: nothing is inherited, and the
+    /// implicit `Array.prototype` → `Object.prototype` chain is gone too.
+    Null,
+    /// The recorded prototype is itself a real array — the original lane, kept
+    /// bit-for-bit (test262 copyWithin/coerced-values-start-change-*).
+    Array(*const ArrayHeader),
+    /// Any other object: resolved through the generic object machinery with the
+    /// array as the receiver, so prototype accessors see the right `this` and
+    /// further hops (`Object.create(Array.prototype)`, proxies) are walked.
+    Other(u64),
+}
+
+/// Classify the `[[Prototype]]` an explicit `Object.setPrototypeOf` /
+/// `__proto__` / `Reflect.setPrototypeOf` recorded for `arr`. `None` when the
+/// array still carries the default `Array.prototype` chain.
+pub(crate) unsafe fn array_custom_prototype(arr: *const ArrayHeader) -> Option<ArrayCustomProto> {
     let bits = crate::object::prototype_chain::object_static_prototype(arr as usize)?;
-    // The recorded proto may be NaN-boxed (0x7FFD) or a RAW untagged pointer
-    // (module-level arrays are stored as raw I64s).
+    if bits == crate::value::TAG_NULL {
+        return Some(ArrayCustomProto::Null);
+    }
+    if let Some(proto_arr) = array_custom_array_prototype_from_bits(arr, bits) {
+        return Some(ArrayCustomProto::Array(proto_arr));
+    }
+    // A Proxy prototype keeps its existing dedicated handling in the `in` /
+    // property-get arms; routing it through the generic resolver here as well
+    // would invoke the `has` trap twice, which is observable.
+    if crate::proxy::js_proxy_is_proxy(f64::from_bits(bits)) != 0 {
+        return None;
+    }
+    // A pointer-shaped record that is not a real array is the #9192 case. A
+    // record that is not pointer-shaped at all (a stale/garbage entry) is
+    // reported as "no custom prototype", exactly as before.
+    pointer_bits_of_recorded_prototype(bits).map(|_| ArrayCustomProto::Other(bits))
+}
+
+/// The heap address a recorded prototype's bits name, if they are pointer
+/// shaped at all. The record may be NaN-boxed (0x7FFD) or a RAW untagged
+/// pointer (module-level arrays are stored as raw I64s).
+fn pointer_bits_of_recorded_prototype(bits: u64) -> Option<usize> {
     let raw = if (bits >> 48) == 0x7FFD {
         (bits & crate::value::POINTER_MASK) as usize
     } else if (bits >> 48) == 0 && bits > 0x10000 {
@@ -260,7 +329,27 @@ unsafe fn array_custom_array_prototype(arr: *const ArrayHeader) -> Option<*const
     } else {
         return None;
     };
+    if raw == 0 {
+        None
+    } else {
+        Some(raw)
+    }
+}
+
+/// A custom `[[Prototype]]` installed on `arr` via `Object.setPrototypeOf`
+/// that happens to be a real array — `None` for every other recorded shape
+/// (which [`array_custom_prototype`] reports as [`ArrayCustomProto::Other`]).
+unsafe fn array_custom_array_prototype_from_bits(
+    arr: *const ArrayHeader,
+    bits: u64,
+) -> Option<*const ArrayHeader> {
+    let raw = pointer_bits_of_recorded_prototype(bits)?;
     if raw < crate::gc::GC_HEADER_SIZE + 0x1000 || raw == arr as usize {
+        return None;
+    }
+    // A Proxy prototype is a small registered id, not a heap allocation — the
+    // GC-header read below would deref a fake pointer.
+    if crate::proxy::js_proxy_is_proxy(f64::from_bits(bits)) != 0 {
         return None;
     }
     // #5625: the recorded prototype may be a *grown* array whose stored pointer
@@ -285,6 +374,97 @@ unsafe fn array_custom_array_prototype(arr: *const ArrayHeader) -> Option<*const
     }
 }
 
+/// #9192: `[[Get]]`(index) through a NON-array custom `[[Prototype]]`, binding
+/// `arr` as the receiver so an inherited index accessor sees the array as
+/// `this`. `None` when the whole (replaced) chain lacks the index.
+///
+/// Everything here allocates — `index.to_string()` interns a key, and the
+/// resolver can run a user getter — so the array and the prototype are rooted
+/// and re-read across the call.
+unsafe fn array_object_proto_index_get(
+    arr: *const ArrayHeader,
+    proto_bits: u64,
+    index: u32,
+) -> Option<f64> {
+    // The caller may still hold a pre-grow forwarding stub; the receiver an
+    // inherited accessor observes must be the live head.
+    let arr = clean_arr_ptr(arr);
+    if arr.is_null() {
+        return None;
+    }
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let receiver = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(arr as i64));
+    let proto = scope.root_heap_word_u64(proto_bits);
+    let key = index.to_string();
+    let key_hdr = crate::string::js_string_from_bytes(key.as_ptr(), key.len() as u32);
+    if key_hdr.is_null() {
+        return None;
+    }
+    let key_handle = scope.root_nanbox_f64(crate::value::nanbox_string_key(key_hdr));
+    let receiver_addr = crate::value::js_nanbox_get_pointer(receiver.get_nanbox_f64()) as usize;
+    let key_ptr = crate::value::js_nanbox_get_pointer(key_handle.get_nanbox_f64())
+        as *const crate::StringHeader;
+    crate::object::prototype_chain::resolve_inherited_field_from_prototype(
+        receiver_addr,
+        proto.get_heap_word_u64(),
+        key_ptr,
+    )
+    .map(|v| f64::from_bits(v.bits()))
+}
+
+/// #9192: the first object in a NON-array custom `[[Prototype]]` chain that
+/// owns `key` with a descriptor — the owner whose accessor / attributes the
+/// spec `Set` must observe before creating an own element on the array. A plain
+/// writable data property carries no side-table entry and correctly reports no
+/// owner: the Set then creates the own element, as the spec requires.
+unsafe fn array_object_proto_index_owner(proto_bits: u64, key: &str) -> usize {
+    let mut bits = proto_bits;
+    for _ in 0..64 {
+        if bits == crate::value::TAG_NULL {
+            return 0;
+        }
+        if crate::proxy::js_proxy_is_proxy(f64::from_bits(bits)) != 0 {
+            return 0;
+        }
+        let Some(addr) = pointer_bits_of_recorded_prototype(bits) else {
+            return 0;
+        };
+        // Pair the band predicate with the validity check (#6279): a handle
+        // value sits below HANDLE_BAND_MAX and would otherwise be dereferenced
+        // as if it were an object pointer.
+        if !crate::value::addr_class::is_above_handle_band(addr as usize)
+            || !crate::object::is_valid_obj_ptr(addr as *const u8)
+        {
+            return 0;
+        }
+        if crate::object::get_accessor_descriptor(addr, key).is_some()
+            || crate::object::get_property_attrs(addr, key).is_some()
+        {
+            return addr;
+        }
+        match crate::object::prototype_chain::object_static_prototype(addr) {
+            Some(next) => bits = next,
+            None => return 0,
+        }
+    }
+    0
+}
+
+/// #9192: `[[HasProperty]]`(index) through a NON-array custom `[[Prototype]]`.
+unsafe fn array_object_proto_index_has(proto_bits: u64, index: u32) -> bool {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let proto = scope.root_heap_word_u64(proto_bits);
+    let key = index.to_string();
+    let key_hdr = crate::string::js_string_from_bytes(key.as_ptr(), key.len() as u32);
+    if key_hdr.is_null() {
+        return false;
+    }
+    let key_handle = scope.root_nanbox_f64(crate::value::nanbox_string_key(key_hdr));
+    let key_ptr = crate::value::js_nanbox_get_pointer(key_handle.get_nanbox_f64())
+        as *const crate::StringHeader;
+    crate::object::prototype_value_has_property(proto.get_heap_word_u64(), key_ptr)
+}
+
 /// Spec `[[Get]]`(O, ToString(index)) for an ordinary Array receiver: own value
 /// (firing index accessors via `js_array_get_f64`) or, for an absent own index,
 /// the inherited `Array.prototype[index]`. Returns `undefined` when absent.
@@ -301,10 +481,19 @@ pub(crate) fn array_spec_get(arr: *const ArrayHeader, index: u32) -> f64 {
         if array_has_own_index(arr, index) {
             return js_array_get_f64(arr, index);
         }
-        if let Some(proto_arr) = array_custom_array_prototype(arr) {
-            if index < (*proto_arr).length && array_has_own_index(proto_arr, index) {
-                return array_inherited_index_get(proto_arr, index, receiver.get_nanbox_f64());
+        // #9192: see `array_spec_has_index` — a non-array custom prototype
+        // replaces the default chain outright.
+        match array_custom_prototype(arr) {
+            Some(ArrayCustomProto::Null) => return TAG_UNDEFINED_F64,
+            Some(ArrayCustomProto::Other(bits)) => {
+                return array_object_proto_index_get(arr, bits, index).unwrap_or(TAG_UNDEFINED_F64)
             }
+            Some(ArrayCustomProto::Array(proto_arr)) => {
+                if index < (*proto_arr).length && array_has_own_index(proto_arr, index) {
+                    return array_inherited_index_get(proto_arr, index, receiver.get_nanbox_f64());
+                }
+            }
+            None => {}
         }
         if ARRAY_PROTO_HAS_INDEX.load(Ordering::Relaxed) {
             let proto = array_prototype_addr();
@@ -353,12 +542,26 @@ pub(crate) fn array_spec_set(arr: *mut ArrayHeader, index: u32, value: f64) -> *
             );
         }
 
-        let mut inherited_owner =
-            array_custom_array_prototype(arr_handle.get_raw_mut_ptr::<ArrayHeader>())
-                .filter(|proto| array_has_own_index(*proto, index))
-                .map(|proto| proto as usize)
-                .unwrap_or(0);
-        if inherited_owner == 0 {
+        // #9192: a non-array custom `[[Prototype]]` owns the whole answer — its
+        // chain supplies the inherited accessor / non-writable attributes, and
+        // the implicit `Array.prototype` / `Object.prototype` tail below must
+        // not run. An explicit null prototype inherits nothing at all.
+        let mut default_chain = true;
+        let mut inherited_owner = 0usize;
+        match array_custom_prototype(arr_handle.get_raw_mut_ptr::<ArrayHeader>()) {
+            Some(ArrayCustomProto::Null) => default_chain = false,
+            Some(ArrayCustomProto::Other(bits)) => {
+                default_chain = false;
+                inherited_owner = array_object_proto_index_owner(bits, &key);
+            }
+            Some(ArrayCustomProto::Array(proto_arr)) => {
+                if array_has_own_index(proto_arr, index) {
+                    inherited_owner = proto_arr as usize;
+                }
+            }
+            None => {}
+        }
+        if inherited_owner == 0 && default_chain {
             let proto = array_prototype_addr();
             inherited_owner = if proto != 0
                 && proto != arr_handle.get_raw_mut_ptr::<ArrayHeader>() as usize
@@ -425,7 +628,10 @@ unsafe fn array_inherited_index_get(
     js_array_get_f64(proto_arr, index)
 }
 
-fn array_get_property_by_key(arr: *const ArrayHeader, key: *const crate::StringHeader) -> f64 {
+pub(crate) fn array_get_property_by_key(
+    arr: *const ArrayHeader,
+    key: *const crate::StringHeader,
+) -> f64 {
     // #7891: an erased Array declaration can feed this ABI a heap StringHeader.
     // The receiver arrived unboxed and no longer carries STRING_TAG, so recover
     // its runtime kind from the GC header before ordinary by-name lookup. A
@@ -917,11 +1123,11 @@ pub extern "C" fn js_array_get_f64(arr: *const ArrayHeader, index: u32) -> f64 {
         // are gated (registry lookup / relaxed atomic) so the dense hot path
         // is unchanged.
         if raw.to_bits() == crate::value::TAG_HOLE {
-            if let Some(proto_arr) = array_custom_array_prototype(arr) {
-                if index < (*proto_arr).length && array_has_own_index(proto_arr, index) {
-                    return js_array_get_f64(proto_arr, index);
-                }
-            }
+            // #9192: the custom-`[[Prototype]]` probe this arm used to inline
+            // accepted only a real-array prototype. `array_oob_prototype_get`
+            // now classifies every recorded shape (array / ordinary object /
+            // explicit null) behind the same latch, so the duplicate probe is
+            // gone and a plain-object prototype fills the hole too.
             return array_oob_prototype_get(arr as usize, index);
         }
         raw
@@ -1191,7 +1397,7 @@ fn array_strict_index_write_guard_resolved(clean: *mut ArrayHeader, index: u32, 
 /// `f64` the raw-f64 layout stores), cannot be a heap pointer (no barrier, no
 /// pointer-mask update), and keeps a pointer-free or tag-scanned layout valid.
 #[inline]
-unsafe fn try_strict_dense_number_store(
+pub(crate) unsafe fn try_strict_dense_number_store(
     arr: *mut ArrayHeader,
     index: u32,
     value: f64,
@@ -1306,14 +1512,6 @@ unsafe fn try_strict_dense_number_store(
 }
 
 /// Exercised by the unit tests: `true` when the fast lane answered the store.
-#[cfg(test)]
-pub(crate) fn test_strict_dense_number_store(
-    arr: *mut ArrayHeader,
-    index: u32,
-    value: f64,
-) -> bool {
-    unsafe { try_strict_dense_number_store(arr, index, value) }.is_some()
-}
 
 /// The strict store's third exact lane: an in-range overwrite of a slot that
 /// holds a heap pointer with another heap pointer — `column[index] = record`
@@ -1339,7 +1537,7 @@ pub(crate) fn test_strict_dense_number_store(
 /// # Safety
 /// `arr` is decoded and validated before any dereference, exactly as in
 /// [`try_strict_dense_number_store`].
-unsafe fn try_strict_dense_pointer_overwrite(
+pub(crate) unsafe fn try_strict_dense_pointer_overwrite(
     arr: *mut ArrayHeader,
     index: u32,
     value: f64,
@@ -1410,14 +1608,6 @@ unsafe fn try_strict_dense_pointer_overwrite(
 
 /// Exercised by the unit tests: `true` when the pointer-overwrite lane
 /// answered the store.
-#[cfg(test)]
-pub(crate) fn test_strict_dense_pointer_overwrite(
-    arr: *mut ArrayHeader,
-    index: u32,
-    value: f64,
-) -> bool {
-    unsafe { try_strict_dense_pointer_overwrite(arr, index, value) }.is_some()
-}
 
 #[no_mangle]
 pub extern "C" fn js_array_set_f64_extend_strict(
@@ -1804,56 +1994,5 @@ unsafe fn js_array_set_f64_extend_resolved(
         }
 
         arr
-    }
-}
-
-#[cfg(test)]
-mod keys_len_cap_tests {
-    use super::{js_array_length, keys_array_len_capped_to_capacity};
-
-    #[test]
-    fn keys_len_capped_bounds_bogus_length_to_capacity() {
-        // Freshly-allocated array: well-formed (length 0 <= capacity), so the
-        // cap is a no-op and returns the real length.
-        let arr = crate::array::js_array_alloc(8);
-        let capacity = unsafe { (*arr).capacity } as usize;
-        assert!(capacity >= 8);
-        assert_eq!(unsafe { keys_array_len_capped_to_capacity(arr) }, 0);
-
-        // Simulate a malformed keys array whose length field reports a bogus,
-        // pointer-sized value — the pathology the object property walks guard
-        // against. Un-capped, callers would iterate/allocate ~645M slots.
-        unsafe {
-            (*arr).length = 645_115_168;
-        }
-        assert_eq!(
-            js_array_length(arr) as usize,
-            645_115_168,
-            "sanity: js_array_length reflects the forged length"
-        );
-        assert_eq!(
-            unsafe { keys_array_len_capped_to_capacity(arr) },
-            capacity,
-            "cap must bound a bogus oversized length to the array's capacity"
-        );
-    }
-}
-
-#[cfg(test)]
-mod claimed_array_string_receiver_tests {
-    use super::array_get_property_by_key;
-
-    #[test]
-    fn numeric_string_key_reads_a_heap_string_before_by_name_fallback() {
-        let receiver = crate::string::js_string_from_bytes(b"ss".as_ptr(), 2);
-        let zero = crate::string::js_string_from_bytes(b"0".as_ptr(), 1);
-        let indexed = array_get_property_by_key(receiver.cast(), zero);
-        assert_eq!(
-            crate::builtins::jsvalue_string_content(indexed).as_deref(),
-            Some("s")
-        );
-
-        let length = crate::string::js_string_from_bytes(b"length".as_ptr(), 6);
-        assert_eq!(array_get_property_by_key(receiver.cast(), length), 2.0);
     }
 }

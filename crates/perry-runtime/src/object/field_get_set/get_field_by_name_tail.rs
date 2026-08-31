@@ -889,6 +889,15 @@ pub(crate) fn get_field_by_name_object_tail(
                 if key_bytes == b"length" {
                     return JSValue::number(crate::array::js_array_length(arr) as f64);
                 }
+                // #9192: `arr.__proto__` IS the array's `[[Prototype]]` (the
+                // spec models it as an `Object.prototype` accessor returning
+                // `[[GetPrototypeOf]](this)`) — the same shape the closure arm
+                // above resolves off the static-prototype side table. Without
+                // it a retargeted array reported the WRONG object here while
+                // `Object.getPrototypeOf(arr)` reported the right one.
+                if key_bytes == b"__proto__" {
+                    return super::array_retargeted_proto::array_proto_slot(obj);
+                }
                 // date-fns / drizzle / lodash duck-typing path:
                 // `arr.constructor === Array`, `new arr.constructor(...)`,
                 // etc. expect a non-undefined function-typed value that
@@ -905,6 +914,13 @@ pub(crate) fn get_field_by_name_object_tail(
                     }
                     if let Some(v) = crate::array::array_named_property_get(arr, key) {
                         return JSValue::from_bits(v.to_bits());
+                    }
+                    // A recorded custom `[[Prototype]]` replaces the whole
+                    // implicit chain, so `constructor` must be resolved through
+                    // it (a plain `{}` prototype answers `Object`, not `Array`)
+                    // rather than short-circuiting to the global `Array`. #9192.
+                    if let Some(v) = super::array_retargeted_proto::array_constructor_slot(obj) {
+                        return v;
                     }
                     let v = js_get_global_this_builtin_value(b"Array".as_ptr(), 5);
                     return JSValue::from_bits(v.to_bits());
