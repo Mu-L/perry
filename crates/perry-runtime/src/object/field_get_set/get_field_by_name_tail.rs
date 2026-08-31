@@ -889,12 +889,7 @@ pub(crate) fn get_field_by_name_object_tail(
                 if key_bytes == b"length" {
                     return JSValue::number(crate::array::js_array_length(arr) as f64);
                 }
-                // #9192: `arr.__proto__` IS the array's `[[Prototype]]` (the
-                // spec models it as an `Object.prototype` accessor returning
-                // `[[GetPrototypeOf]](this)`) — the same shape the closure arm
-                // above resolves off the static-prototype side table. Without
-                // it a retargeted array reported the WRONG object here while
-                // `Object.getPrototypeOf(arr)` reported the right one.
+                // #9192; see `array_retargeted_proto::array_proto_slot`.
                 if key_bytes == b"__proto__" {
                     return super::array_retargeted_proto::array_proto_slot(obj);
                 }
@@ -915,10 +910,7 @@ pub(crate) fn get_field_by_name_object_tail(
                     if let Some(v) = crate::array::array_named_property_get(arr, key) {
                         return JSValue::from_bits(v.to_bits());
                     }
-                    // A recorded custom `[[Prototype]]` replaces the whole
-                    // implicit chain, so `constructor` must be resolved through
-                    // it (a plain `{}` prototype answers `Object`, not `Array`)
-                    // rather than short-circuiting to the global `Array`. #9192.
+                    // #9192; see `array_retargeted_proto::array_constructor_slot`.
                     if let Some(v) = super::array_retargeted_proto::array_constructor_slot(obj) {
                         return v;
                     }
@@ -1357,6 +1349,10 @@ pub(crate) fn get_field_by_name_object_tail(
         let keys = crate::object::object_keys_array(obj);
 
         if keys.is_null() {
+            // #9131; see `prototype_override::inherited_field_if_overridden`.
+            if let Some(v) = super::prototype_override::inherited_field_if_overridden(obj, key) {
+                return v;
+            }
             // #809: an object with no own keys (e.g. an `Object.create(proto)`
             // result, or a `Function.prototype = obj` instance) still has to
             // resolve inherited props/methods. Pre-fix this returned undefined
@@ -1725,6 +1721,11 @@ pub(crate) fn get_field_by_name_object_tail(
                     };
                 }
             }
+        }
+
+        // Shaped-receiver own-key miss; same rule as the keyless arm above.
+        if let Some(v) = super::prototype_override::inherited_field_if_overridden(obj, key) {
+            return v;
         }
 
         // Key not found in the keys_array — fall back to the class
