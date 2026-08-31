@@ -176,70 +176,7 @@ pub(crate) fn build_and_run_link(
     // (mimalloc is the only C dep in perry-runtime's closure today) and
     // any that turn out unreferenced are dead-stripped via --gc-sections.
     if is_harmonyos {
-        let triple = super::rust_target_triple(target).unwrap_or("aarch64-unknown-linux-ohos");
-        let build_roots: Vec<std::path::PathBuf> = {
-            let mut roots: Vec<std::path::PathBuf> = Vec::new();
-            // auto_rebuild emits into a perry-auto-<hash> dir; the workspace's
-            // own target/ is a fallback for non-auto flows.
-            if let Ok(entries) = std::fs::read_dir("target") {
-                for entry in entries.flatten() {
-                    let name = entry.file_name();
-                    let name_str = name.to_string_lossy();
-                    if name_str.starts_with("perry-auto-") || name_str == triple {
-                        roots.push(entry.path());
-                    }
-                }
-            }
-            // When invoked from outside the workspace, auto_rebuild still
-            // lands under the perry source tree's target/. Add that.
-            if let Some(ws_root) = super::super::find_perry_workspace_root() {
-                let ws_target = ws_root.join("target");
-                if let Ok(entries) = std::fs::read_dir(&ws_target) {
-                    for entry in entries.flatten() {
-                        let name = entry.file_name();
-                        let name_str = name.to_string_lossy();
-                        if name_str.starts_with("perry-auto-") {
-                            roots.push(entry.path());
-                        }
-                    }
-                }
-            }
-            roots
-        };
-        let mut native_objs: Vec<std::path::PathBuf> = Vec::new();
-        for root in &build_roots {
-            let build_dir = root.join(triple).join("release").join("build");
-            let entries = match std::fs::read_dir(&build_dir) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            for crate_build in entries.flatten() {
-                let out_dir = crate_build.path().join("out");
-                // Walk the out/ dir recursively (cc-rs can nest into source-
-                // mirror subdirs like c_src/mimalloc/v2/src/).
-                if let Ok(walker) = walkdir::WalkDir::new(&out_dir)
-                    .into_iter()
-                    .collect::<Result<Vec<_>, _>>()
-                {
-                    for entry in walker {
-                        if entry.file_type().is_file()
-                            && entry.path().extension().and_then(|e| e.to_str()) == Some("o")
-                        {
-                            native_objs.push(entry.path().to_path_buf());
-                        }
-                    }
-                }
-            }
-        }
-        if !native_objs.is_empty() && matches!(format, crate::OutputFormat::Text) {
-            println!(
-                "  harmonyos: linking {} build.rs native object(s)",
-                native_objs.len()
-            );
-        }
-        for obj in native_objs {
-            cmd.arg(obj);
-        }
+        super::harmonyos_objects::push_harmonyos_native_objects(&mut cmd, target, format);
     }
 
     // Dead code stripping — safe because compile_init() emits func_addr
@@ -441,6 +378,13 @@ pub(crate) fn build_and_run_link(
     // Multiple specifiers can route to the same native archive (`http` and
     // `https` both select perry_ext_http). They were de-duplicated before the
     // archive-preparation pass so the expensive transform also runs once.
+    // #8930: the archives below reference each other in BOTH directions and
+    // ELF `ld` scans each once — bracket them (see `ElfArchiveGroup`).
+    let archive_group = ElfArchiveGroup::open(
+        &mut cmd,
+        !is_windows && (is_linux || is_android || is_harmonyos),
+        !skip_runtime || ctx.needs_stdlib,
+    );
     if !skip_runtime {
         if ctx.needs_stdlib || is_windows {
             // On Windows/MSVC, always try to link stdlib because codegen unconditionally
@@ -554,6 +498,7 @@ pub(crate) fn build_and_run_link(
             eprintln!("Warning: stdlib required but libperry_stdlib.a not found");
         }
     }
+    archive_group.close(&mut cmd);
 
     // Issue #76 — wasmi host runtime, opt-in via `--enable-wasm-runtime`.
     // Append after stdlib so the linker can resolve `perry_wasm_host_*`
