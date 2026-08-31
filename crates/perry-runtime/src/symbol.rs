@@ -89,7 +89,7 @@ use crate::fast_hash::{
 use crate::string::StringHeader;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 // NaN-boxing tags (must match value.rs)
@@ -448,7 +448,7 @@ pub(crate) fn test_disable_symbol_magic_screen(disabled: bool) -> bool {
     TEST_DISABLE_SYMBOL_MAGIC_SCREEN.with(|c| c.replace(disabled))
 }
 
-/// Smallest and largest pointer ever registered as a Symbol, as a conservative
+/// Which pointers have ever been registered as a Symbol — a conservative
 /// filter in front of the process-global registry mutex.
 ///
 /// `SYMBOL_EVER_REGISTERED` answers "has any symbol EVER been registered?",
@@ -457,21 +457,43 @@ pub(crate) fn test_disable_symbol_magic_screen(disabled: bool) -> bool {
 /// `is_registered_symbol_slow` took the global mutex on EVERY probe, including
 /// the overwhelming majority asking about pointers that are not symbols at all.
 ///
-/// The range only ever widens, and registration extends it before taking the
+/// The filter only ever gains bits, and registration admits before taking the
 /// lock — the same ordering, and for the same reason, as the latch arm above
-/// it: a pointer outside the range cannot be in the set, so rejecting is sound,
-/// while accepting merely falls through to the lookup that was already there.
-/// Death pruning removes entries without narrowing the range, which is
+/// it: a pointer the filter rejects cannot be in the set, so rejecting is
+/// sound, while accepting merely falls through to the lookup that was already
+/// there. Death pruning removes entries without clearing bits, which is
 /// harmless: those pointers reach the lookup, which correctly says no.
-static SYMBOL_ADDR_MIN: AtomicUsize = AtomicUsize::new(usize::MAX);
-static SYMBOL_ADDR_MAX: AtomicUsize = AtomicUsize::new(0);
+///
+/// # Why this is a filter and not the `[lo, hi]` range #9177 shipped
+///
+/// #9177 put a monotone address RANGE in front of the registry mutex, inside
+/// `is_registered_symbol_slow`. Symbols are `gc_malloc`'d, so they are spread
+/// through the object heap rather than clustered: replaying this probe's real
+/// argument stream from a `claude-code --help` run against the range those
+/// registrations build, **only 38.3% of 378,163 calls fall outside it** — the
+/// other 61.7% were admitted and paid the process-global mutex and the hash
+/// anyway. That is where the probe's 0.65% of the run lives.
+///
+/// A Bloom filter over the same addresses rejects **99.58%** of them (measured
+/// the same way, by simulating the filter bit-for-bit against the real address
+/// stream: 376,555 of 378,163, with all 622 genuine `true` answers preserved
+/// and 985 false positives). It also inlines: the range check sat behind an
+/// out-of-line call and a `OnceLock` load for an env kill switch, and the
+/// filter replaces both with a load and a test at the call site.
+///
+/// The env kill switch went with it. It guarded an enumeration ("every
+/// inserter widens"), and this file no longer relies on one: `debug_assertions`
+/// builds re-derive every rejection from `SYMBOL_POINTERS` itself, so an
+/// inserter added without admitting panics in the first test that touches it.
+static SYMBOL_ADDR_FILTER: crate::registry_latch::RegistryAddrFilter =
+    crate::registry_latch::RegistryAddrFilter::new();
 
-/// Widen the address range to admit `ptr`.
+/// Admit `ptr` into [`SYMBOL_ADDR_FILTER`].
 ///
 /// EVERY path that puts a pointer into `SYMBOL_POINTERS` must call this
-/// first, not just the registration one. `is_registered_symbol_slow` rejects
-/// an out-of-range pointer WITHOUT consulting the set, so a member outside
-/// the range is a live symbol the probe reports as "not a symbol".
+/// first, not just the registration one. `is_registered_symbol` rejects a
+/// filtered-out pointer WITHOUT consulting the set, so a member the filter
+/// does not hold is a live symbol the probe reports as "not a symbol".
 ///
 /// That is not a theoretical second inserter: `SYMBOL_POINTERS` is a GC root
 /// registry, and `rewrite_symbol_pointer_metadata_if_forwarded` re-keys an
@@ -479,67 +501,78 @@ static SYMBOL_ADDR_MAX: AtomicUsize = AtomicUsize::new(0);
 /// symbol evacuated out of the range established by its own allocation would
 /// otherwise stop answering to `typeof`, symbol-keyed property lookup and
 /// `Symbol.iterator` dispatch — while still being perfectly alive.
-pub(crate) fn widen_symbol_addr_range(ptr: usize) {
-    SYMBOL_ADDR_MIN.fetch_min(ptr, Ordering::Release);
-    SYMBOL_ADDR_MAX.fetch_max(ptr, Ordering::Release);
+pub(crate) fn admit_symbol_pointer(ptr: usize) {
+    SYMBOL_ADDR_FILTER.admit(ptr);
 }
 
-/// The ONLY way to put a pointer into `SYMBOL_POINTERS`. Widening and
+/// The ONLY way to put a pointer into `SYMBOL_POINTERS`. Admitting and
 /// inserting are one operation on purpose: there are three insert sites (the
 /// registration, and two forwarding rewrites — a per-slot one and the bulk
-/// one the copying minor actually drives), and a range filter is only sound
-/// while every one of them widens.
+/// one the copying minor actually drives), and the filter is only sound while
+/// every one of them admits.
 pub(crate) fn insert_symbol_pointer_in_set(set: &mut PtrHashSet<usize>, ptr: usize) {
-    widen_symbol_addr_range(ptr);
+    admit_symbol_pointer(ptr);
     set.insert(ptr);
 }
 
-/// Save/restore the range filter's bounds around a test that needs to observe
-/// a NARROW range. The bounds are process-global and only ever widen in
-/// production, so a test that resets them must put back at least what it
-/// found — otherwise a later test in the same binary gets a range too narrow
-/// for symbols registered before it ran, and fails for no reason of its own.
+/// Width of the symbol filter's bit array, for tests that snapshot it.
 #[cfg(test)]
-pub(crate) struct SymbolAddrRangeGuard(usize, usize);
+pub(crate) const SYMBOL_FILTER_WORDS: usize = crate::registry_latch::RegistryAddrFilter::words();
+
+/// Save/restore the address filter around a test that needs to observe a
+/// NEARLY-EMPTY filter. It is process-global and only ever gains bits in
+/// production, so a test that clears it must put back at least what it found —
+/// otherwise a later test in the same binary gets a filter that no longer holds
+/// symbols registered before it ran, and fails for no reason of its own.
+#[cfg(test)]
+pub(crate) struct SymbolAddrRangeGuard([u64; SYMBOL_FILTER_WORDS]);
 
 #[cfg(test)]
 impl SymbolAddrRangeGuard {
-    /// Reset to the empty range, so only what the test registers is admitted.
+    /// Empty the filter, so only what the test registers is admitted.
     pub(crate) fn reset() -> Self {
-        let g = SymbolAddrRangeGuard(
-            SYMBOL_ADDR_MIN.load(Ordering::Acquire),
-            SYMBOL_ADDR_MAX.load(Ordering::Acquire),
-        );
-        SYMBOL_ADDR_MIN.store(usize::MAX, Ordering::Release);
-        SYMBOL_ADDR_MAX.store(0, Ordering::Release);
-        g
+        SymbolAddrRangeGuard(SYMBOL_ADDR_FILTER.take_for_tests())
     }
 }
 
 #[cfg(test)]
 impl Drop for SymbolAddrRangeGuard {
     fn drop(&mut self) {
-        // Union of what we saved and what the test widened to, so neither the
-        // pre-existing members nor the test's own survive outside the range.
-        SYMBOL_ADDR_MIN.fetch_min(self.0, Ordering::Release);
-        SYMBOL_ADDR_MAX.fetch_max(self.1, Ordering::Release);
+        // Union of what we saved and what the test admitted, so neither the
+        // pre-existing members nor the test's own fall out of the filter.
+        SYMBOL_ADDR_FILTER.restore_for_tests(self.0);
     }
 }
 
 #[cfg(test)]
-pub(crate) fn test_symbol_addr_range() -> (usize, usize) {
-    (
-        SYMBOL_ADDR_MIN.load(Ordering::Acquire),
-        SYMBOL_ADDR_MAX.load(Ordering::Acquire),
-    )
+pub(crate) fn test_symbol_filter_snapshot() -> [u64; SYMBOL_FILTER_WORDS] {
+    SYMBOL_ADDR_FILTER.snapshot_for_tests()
+}
+
+/// What the filter WOULD have answered for `ptr` against a snapshot taken
+/// earlier. A test that moves a symbol uses this to show the forwarding
+/// rewrite's admission was load-bearing rather than a lucky collision.
+#[cfg(test)]
+pub(crate) fn test_symbol_filter_snapshot_may_contain(
+    words: &[u64; SYMBOL_FILTER_WORDS],
+    ptr: usize,
+) -> bool {
+    crate::registry_latch::RegistryAddrFilter::snapshot_may_contain(words, ptr)
+}
+
+/// How many bits the symbol filter has set — the discrimination it still has
+/// left. Tests use it to assert a fixture starts from a nearly-empty filter.
+#[cfg(test)]
+pub(crate) fn test_symbol_filter_bits_set() -> u32 {
+    SYMBOL_ADDR_FILTER.bits_set()
 }
 
 pub(crate) fn register_symbol_pointer(ptr: usize) {
     // Arm before taking the lock, so the entry is never reachable while the
     // latch still reads idle.
     SYMBOL_EVER_REGISTERED.arm();
-    // Widen before the insert, for the same reason.
-    widen_symbol_addr_range(ptr);
+    // Admit before the insert, for the same reason.
+    admit_symbol_pointer(ptr);
     let mut guard = crate::gc::lock_gc_root_registry(&SYMBOL_POINTERS);
     if guard.is_none() {
         *guard = Some(new_ptr_hash_set());
@@ -560,6 +593,22 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn test_symbol_registry_probe_count() -> u64 {
     TEST_SYMBOL_REGISTRY_PROBES.with(|c| c.get())
+}
+
+#[cfg(test)]
+thread_local! {
+/// Every probe that got past `SYMBOL_ADDR_FILTER` and reached
+/// `SYMBOL_POINTERS`. `TEST_SYMBOL_REGISTRY_PROBES` counts ENTRIES into
+/// `is_registered_symbol` and so cannot see the filter working; this counts the
+/// calls the filter was added to remove. (Twin of
+/// `typedarray::TEST_TA_WINDOW_ADMITTED_PROBES`, for the same reason.)
+    static TEST_SYMBOL_FILTER_ADMITTED_PROBES: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn test_symbol_filter_admitted_probe_count() -> u64 {
+    TEST_SYMBOL_FILTER_ADMITTED_PROBES.with(|c| c.get())
 }
 
 #[cfg(test)]
@@ -610,33 +659,60 @@ pub fn is_registered_symbol(ptr: usize) -> bool {
     if SYMBOL_EVER_REGISTERED.is_idle() {
         return false;
     }
+    // Counted BEFORE the filter on purpose: this counter's contract is "an
+    // entry that got past the latch", and two other suites
+    // (`get_field_by_name_probe_tests`, `native_call_method::probe_dispatch_tests`)
+    // assert against exactly that — including sabotage checks that DEFEAT a
+    // cheaper screen upstream and require this to move. Counting filter
+    // admissions is a different question; `TEST_SYMBOL_FILTER_ADMITTED_PROBES`
+    // below answers it.
     #[cfg(test)]
     TEST_SYMBOL_REGISTRY_PROBES.with(|c| c.set(c.get().wrapping_add(1)));
+    // Armed says only that SOME symbol exists — which is true of every program
+    // that touches a well-known symbol, i.e. essentially all of them. An
+    // address the filter rejects is not one of them, and rejecting it here
+    // keeps the negative answer inline: no call, no mutex, no hash. This is
+    // 99.58% of the calls on `claude-code --help`. See `SYMBOL_ADDR_FILTER`.
+    if !SYMBOL_ADDR_FILTER.may_contain(ptr) {
+        // Machine-check the writer set rather than enumerate it. Every route
+        // into `SYMBOL_POINTERS` goes through `insert_symbol_pointer_in_set`,
+        // which widens first — but that is a property of today's code, and a
+        // route added without it would not crash: it would silently report a
+        // live symbol as "not a symbol", so `typeof`, symbol-keyed lookup and
+        // `Symbol.iterator` dispatch would quietly stop working for it. In a
+        // debug build every rejection is therefore re-derived from the
+        // authoritative set, which turns that into a panic in the first test
+        // that exercises the route. Compiled out entirely in release.
+        #[cfg(debug_assertions)]
+        {
+            // `try_lock`, not `lock`. The rejection path never took this mutex
+            // before, so a blocking audit would introduce a deadlock that the
+            // code it audits cannot have: a caller that probes an unregistered
+            // address while holding `SYMBOL_POINTERS` is fine today and would
+            // hang here. A `try_lock` that loses the race simply does not audit
+            // that one rejection, and the suite performs millions of them.
+            let present = SYMBOL_POINTERS
+                .try_lock()
+                .ok()
+                .is_some_and(|g| g.as_ref().is_some_and(|s| s.contains(&ptr)));
+            assert!(
+                !present,
+                "SYMBOL_ADDR_FILTER rejected {ptr:#x}, but it IS in \
+                 SYMBOL_POINTERS. Some route reached the set without going \
+                 through `insert_symbol_pointer_in_set` (which admits into the \
+                 filter) first."
+            );
+        }
+        return false;
+    }
+    #[cfg(test)]
+    TEST_SYMBOL_FILTER_ADMITTED_PROBES.with(|c| c.set(c.get().wrapping_add(1)));
     is_registered_symbol_slow(ptr)
-}
-
-/// `PERRY_SYMBOL_RANGE_FILTER=0` restores the unconditional mutex acquisition.
-fn symbol_range_filter_enabled() -> bool {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        !matches!(
-            std::env::var("PERRY_SYMBOL_RANGE_FILTER").as_deref(),
-            Ok("0") | Ok("off") | Ok("false")
-        )
-    })
 }
 
 #[inline(never)]
 fn is_registered_symbol_slow(ptr: usize) -> bool {
     if ptr < 0x10000 {
-        return false;
-    }
-    // Outside the registered range ⟹ not a symbol, without the global mutex.
-    if symbol_range_filter_enabled()
-        && (ptr < SYMBOL_ADDR_MIN.load(Ordering::Acquire)
-            || ptr > SYMBOL_ADDR_MAX.load(Ordering::Acquire))
-    {
         return false;
     }
     let guard = SYMBOL_POINTERS.lock().unwrap();
