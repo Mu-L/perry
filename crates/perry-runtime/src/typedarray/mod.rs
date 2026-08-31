@@ -356,10 +356,52 @@ fn ta_kind_cache_get(addr: usize) -> Option<Option<u8>> {
 static TYPED_ARRAY_EVER_REGISTERED: crate::registry_latch::RegistryLatch =
     crate::registry_latch::RegistryLatch::new();
 
+/// Smallest and largest address ever entered into `TYPED_ARRAY_REGISTRY`.
+///
+/// The latch above stops discriminating at the first typed array. On
+/// `claude-code --help` there are 42 registrations against 3,566,956 probes —
+/// and every one of those probes answered `None` (uretprobe count, one run:
+/// not a single `Some` in the whole run). Each still paid the
+/// out-of-line call, the direct-mapped cache probe and, on the (usual) cold
+/// miss, a thread-local resolution, a hash **and a negative-entry write-back
+/// that dirties a shared cache line**.
+///
+/// `register_typed_array` is the only writer of `TYPED_ARRAY_REGISTRY` and of
+/// the positive entries in `PERRY_TA_KIND_CACHE`, and it widens this window
+/// before it touches either, so an address outside the window is definitively
+/// not a registered typed array. Unlike a `GcHeader` tag test this never
+/// dereferences the candidate — which matters, because a registered typed array
+/// is not required to have a readable `ptr - GC_HEADER_SIZE` (see the
+/// guard-page fixture in `promise::combinators`).
+static TYPED_ARRAY_ADDR_WINDOW: crate::registry_latch::RegistryAddrWindow =
+    crate::registry_latch::RegistryAddrWindow::new();
+
+/// Test hook: the registered-address window's current bounds.
+#[cfg(test)]
+pub(crate) fn test_typed_array_addr_window_bounds() -> Option<(usize, usize)> {
+    TYPED_ARRAY_ADDR_WINDOW.bounds_for_tests()
+}
+
+#[cfg(test)]
+thread_local! {
+/// Test-only count of probes that got past `TYPED_ARRAY_ADDR_WINDOW` and
+/// reached [`lookup_registered_typed_array_kind`]. `TEST_TA_REGISTRY_PROBES`
+/// counts ENTRIES into `lookup_typed_array_kind` and so cannot see the window
+/// working; this counts the calls the window was added to remove.
+    static TEST_TA_WINDOW_ADMITTED_PROBES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn test_typed_array_window_admitted_probe_count() -> u64 {
+    TEST_TA_WINDOW_ADMITTED_PROBES.with(|c| c.get())
+}
+
 pub fn register_typed_array(ptr: *const TypedArrayHeader, kind: u8) {
     // Arm BEFORE either table becomes readable — an arm placed after the stores
     // would leave a window in which `lookup_typed_array_kind` answers `None` for
-    // this very array. See `crate::registry_latch`.
+    // this very array. See `crate::registry_latch`. The address window carries
+    // the same obligation and is widened first for the same reason.
+    TYPED_ARRAY_ADDR_WINDOW.admit(ptr as usize);
     TYPED_ARRAY_EVER_REGISTERED.arm();
     // Keep the cache authoritative: overwrite any colliding/stale slot so a
     // freed-then-reused address never reads back its previous kind.
@@ -426,6 +468,36 @@ pub fn lookup_typed_array_kind(addr: usize) -> Option<u8> {
     if TYPED_ARRAY_EVER_REGISTERED.is_idle() {
         return None;
     }
+    // Armed says only that SOME typed array exists. An address outside the
+    // registered window is not this one, and rejecting it here keeps the whole
+    // negative answer inline: no call, no cache-slot load, and — the part that
+    // costs the most on a cold address — no negative-entry write-back into the
+    // shared `PERRY_TA_KIND_CACHE`. See `TYPED_ARRAY_ADDR_WINDOW`.
+    if !TYPED_ARRAY_ADDR_WINDOW.may_contain(addr) {
+        // Completeness audit — see the twin in `buffer::header::
+        // is_registered_buffer` for why the writer set is machine-checked
+        // rather than enumerated. Read the registry DIRECTLY rather than
+        // through `lookup_registered_typed_array_kind`: that function writes a
+        // negative entry into `PERRY_TA_KIND_CACHE` on a miss, and an audit
+        // that mutates the state it audits changes what the next probe does.
+        // `TYPED_ARRAY_REGISTRY` is authoritative anyway — every positive cache
+        // entry is derived from it. Compiled out entirely in release.
+        #[cfg(debug_assertions)]
+        {
+            assert!(
+                TYPED_ARRAY_REGISTRY
+                    .with(|r| r.borrow().get(&addr).copied())
+                    .is_none(),
+                "TYPED_ARRAY_ADDR_WINDOW rejected {addr:#x}, but it IS in \
+                 TYPED_ARRAY_REGISTRY. Some route reached the registry without \
+                 calling `TYPED_ARRAY_ADDR_WINDOW.admit()` (via \
+                 `register_typed_array`) first."
+            );
+        }
+        return None;
+    }
+    #[cfg(test)]
+    TEST_TA_WINDOW_ADMITTED_PROBES.with(|c| c.set(c.get().wrapping_add(1)));
     lookup_registered_typed_array_kind(addr)
 }
 
