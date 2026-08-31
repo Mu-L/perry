@@ -58,12 +58,20 @@ use anyhow::{anyhow, Context, Result};
 /// Magic at the start of every emitted blob.
 const GC_MAP_MAGIC: &[u8; 4] = b"PGCM";
 /// Format version. Bump on any layout change — the runtime rejects others.
+///
+/// v5: a `u32 stream_offset` per function follows the function table, so the
+/// runtime can decode ONE function's records without decoding every function
+/// before it. The record stream and the instruction-offset array are byte for
+/// byte what v4 emitted; this is an added array and nothing else. It costs
+/// +1.3% of the section, and it is what lets a collection read the 74 records
+/// a `claude --help` run needs instead of all 2,078,970.
+///
 /// v4 (#7803): the record header word gained a has-derived bit and records
 /// carry DERIVED (interior) pointer slots tied to their bases. v3 collapsed
 /// every statepoint (base, derived) pair to one slot on the false premise
 /// that Perry emits no interior pointers; the runtime decoder fails closed on
 /// a version mismatch, so both sides bump together.
-const GC_MAP_VERSION: u8 = 4;
+const GC_MAP_VERSION: u8 = 5;
 /// Section the compact map is emitted into, and the label it is given.
 const GC_MAP_LABEL: &str = "_perry_gc_map";
 const MACHO_SECTION: &str = "__PERRY_GCMAP,__perry_gcmap";
@@ -734,9 +742,40 @@ fn encode_slots(stream: &mut Vec<u8>, slots: impl Iterator<Item = (u16, i32)>) {
     }
 }
 
-fn encode_stream(functions: &[FunctionMap]) -> Vec<u8> {
+/// The varint root stream, plus where each function's records start in it.
+///
+/// `function_offsets[i]` is not derived from anything: it is `bytes.len()` at
+/// the moment `encode_stream` begins function `i`, so it IS that function's
+/// position by construction. Nothing recomputes it, and a wrong value is not
+/// expressible without changing the one line that records it.
+///
+/// It exists because a decoder that wants one function's records has no other
+/// way to find them — the stream is varint-chained, so reaching function `i`
+/// means decoding functions `0..i` first. `verify_roundtrip` proves the
+/// offsets against the sequential decode on every compile, for every function.
+#[derive(Clone)]
+struct CompactStream {
+    bytes: Vec<u8>,
+    /// One entry per function, in `functions` order.
+    function_offsets: Vec<u32>,
+}
+
+fn encode_stream(functions: &[FunctionMap]) -> Result<CompactStream, String> {
     let mut stream = Vec::new();
+    let mut function_offsets = Vec::with_capacity(functions.len());
     for function in functions {
+        // Recorded BEFORE any of this function's bytes are pushed. `u32`
+        // because that is the width a map format can afford to spend on it
+        // per function; a blob that outgrows it must say so here rather than
+        // silently wrap and point a decoder at another function's records.
+        function_offsets.push(u32::try_from(stream.len()).map_err(|_| {
+            format!(
+                "{}: the compact stream reached {} bytes, past the u32 a per-function offset can \
+                 hold. A wrapped offset would point a decoder at another function's records.",
+                function.symbol,
+                stream.len()
+            )
+        })?);
         let mut previous_record: Option<(&Vec<(u16, i32)>, &Vec<(u32, u16, i32)>)> = None;
         for record in &function.records {
             if previous_record == Some((&record.roots, &record.derived)) {
@@ -783,7 +822,10 @@ fn encode_stream(functions: &[FunctionMap]) -> Vec<u8> {
             previous_record = Some((&record.roots, &record.derived));
         }
     }
-    stream
+    Ok(CompactStream {
+        bytes: stream,
+        function_offsets,
+    })
 }
 
 fn read_varint(bytes: &[u8], mut at: usize) -> Option<(u64, usize)> {
@@ -862,9 +904,37 @@ fn decode_slots(
     Ok((slots, cursor))
 }
 
-fn verify_roundtrip(functions: &[FunctionMap], stream: &[u8]) -> Result<(), String> {
+fn verify_roundtrip(functions: &[FunctionMap], compact: &CompactStream) -> Result<(), String> {
+    let stream = &compact.bytes[..];
     let mut cursor = 0usize;
-    for function in functions {
+    for (function_index, function) in functions.iter().enumerate() {
+        // The per-function offset must BE the position the sequential decode
+        // reaches. Checked here rather than in a test because this runs on
+        // every compile over every function of the binary being produced —
+        // 72,669 of them for claude-code — so an offset that is ever wrong
+        // fails the compile instead of pointing a decoder at another
+        // function's live set. It cannot fire while nothing emits or reads
+        // these offsets, which is the point of checking it now.
+        let recorded = compact
+            .function_offsets
+            .get(function_index)
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "{}: the encoder recorded {} function offsets for {} functions",
+                    function.symbol,
+                    compact.function_offsets.len(),
+                    functions.len()
+                )
+            })?;
+        if recorded as usize != cursor {
+            return Err(format!(
+                "{}: the encoder recorded this function's records starting at stream offset \
+                 {recorded}, but decoding every earlier function reaches {cursor}. A decoder \
+                 that trusted the recorded offset would read another function's live set.",
+                function.symbol
+            ));
+        }
         let mut previous: Option<(Vec<(u16, i32)>, Vec<(u32, u16, i32)>)> = None;
         for (index, record) in function.records.iter().enumerate() {
             let where_ = || format!("{} record {index}", function.symbol);
@@ -941,13 +1011,21 @@ fn verify_roundtrip(functions: &[FunctionMap], stream: &[u8]) -> Result<(), Stri
 ///
 /// ```text
 ///   0  "PGCM"
-///   4  u8 version, u8 reserved, u16 reserved
+///   4  u8 version, u8 reserved, u16 flags
 ///   8  u32 function_count
 ///  12  u32 total_len          -- lets the runtime walk concatenated blobs
 ///  16  function_count x { u64 address, u32 stack_size, u32 record_count }
+///      function_count x u32 stream_offset   -- v5; see below
 ///      record_count_total x u32 instruction_offset
 ///      varint root stream (see `encode_stream`)
 /// ```
+///
+/// The v5 `stream_offset` array is where each function's records begin in the
+/// varint stream. Without it the stream is only readable from the front — it
+/// is delta- and repeat-chained — so a collector that wanted one frame's live
+/// set had to decode the whole section. It is placed AFTER the function table
+/// rather than inside it so the table's relocated addresses stay 8-byte
+/// aligned and the entry keeps its v4 shape.
 ///
 /// The function table starts at 16 so every relocated address is 8-byte
 /// aligned, and the offset array that follows it is 4-byte aligned.
@@ -981,11 +1059,18 @@ fn format_for(target: &str) -> ObjectFormat {
     }
 }
 
-fn emit_asm(functions: &[FunctionMap], stream: &[u8], format: ObjectFormat, ptr64: bool) -> String {
+fn emit_asm(
+    functions: &[FunctionMap],
+    compact: &CompactStream,
+    format: ObjectFormat,
+    ptr64: bool,
+) -> String {
+    let stream = &compact.bytes[..];
     let record_total: usize = functions.iter().map(|f| f.records.len()).sum();
     let addr_bytes = if ptr64 { 8 } else { 4 };
     let entry_bytes = addr_bytes + 8; // address + u32 stack_size + u32 records
-    let total_len = 16 + functions.len() * entry_bytes + record_total * 4 + stream.len();
+    let total_len =
+        16 + functions.len() * entry_bytes + functions.len() * 4 + record_total * 4 + stream.len();
     let mut out = String::new();
     out.push_str(&format!(
         "\t.section\t{}\n",
@@ -1015,6 +1100,10 @@ fn emit_asm(functions: &[FunctionMap], stream: &[u8], format: ObjectFormat, ptr6
         ));
         out.push_str(&format!("\t.long\t{}\n", function.stack_size as u32));
         out.push_str(&format!("\t.long\t{}\n", function.records.len()));
+    }
+    // v5: where each function's records begin in the varint stream.
+    for offset in &compact.function_offsets {
+        out.push_str(&format!("\t.long\t{offset}\n"));
     }
     for function in functions {
         for record in &function.records {
@@ -1058,15 +1147,16 @@ fn compact_stack_map_asm(asm: &str, target: &str) -> Result<Option<(String, GcMa
     let ptr64 = !target.starts_with("arm64_32");
     let block = parse_block(&lines, word_width_for(target))?;
     let functions = decode_v3(&block)?;
-    let stream = encode_stream(&functions);
+    let stream = encode_stream(&functions)?;
     verify_roundtrip(&functions, &stream)?;
 
     let stats = GcMapStats {
         original_bytes: block.bytes.len(),
         compact_bytes: 16
             + functions.len() * (if ptr64 { 16 } else { 12 })
+            + functions.len() * 4
             + functions.iter().map(|f| f.records.len()).sum::<usize>() * 4
-            + stream.len(),
+            + stream.bytes.len(),
         functions: functions.len(),
         records: functions.iter().map(|f| f.records.len()).sum(),
         roots: functions
@@ -1135,7 +1225,7 @@ pub(crate) fn decode_stack_map_roots(
     }
     let block = parse_block(&lines, word_width_for(target))?;
     let functions = decode_v3(&block)?;
-    let stream = encode_stream(&functions);
+    let stream = encode_stream(&functions)?;
     verify_roundtrip(&functions, &stream)?;
     Ok(functions
         .into_iter()
