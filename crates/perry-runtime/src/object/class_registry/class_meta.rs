@@ -575,7 +575,9 @@ mod anon_shape_collision_tests {
         );
         let mut guard = CLASS_VTABLE_REGISTRY.write().unwrap();
         if guard.is_none() {
-            *guard = Some(HashMap::new());
+            // #9203 moved this registry to a PtrHasher map; a plain
+            // `HashMap::new()` infers the default hasher and no longer type-checks.
+            *guard = Some(new_ptr_hash_map());
         }
         guard.as_mut().unwrap().insert(
             class_id,
