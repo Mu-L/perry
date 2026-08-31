@@ -1056,6 +1056,13 @@ static KEEP_JS_GLOBAL_GET_OR_THROW_UNRESOLVED: extern "C-unwind" fn(f64) -> f64 
 /// can run when the debug runtime is linked.
 #[no_mangle]
 pub extern "C-unwind" fn js_global_get_or_throw_unresolved(name_value: f64) -> f64 {
+    // `js_get_global_this` lazily builds the realm on first use and can collect
+    // while doing so. Generated code may pass a nursery string here from a
+    // registered module-root slot, but this argument is only a copied NaN-box:
+    // the collector rewrites the slot, not this Rust local. Root it before the
+    // first allocation and reload it at every later GC-capable boundary.
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let name_handle = scope.root_nanbox_f64(name_value);
     let g = crate::object::js_get_global_this();
     let gj = crate::value::JSValue::from_bits(g.to_bits());
     if gj.is_pointer() {
@@ -1064,9 +1071,8 @@ pub extern "C-unwind" fn js_global_get_or_throw_unresolved(name_value: f64) -> f
         // was extracted into a raw Rust local *before* the coercion and
         // dereferenced by `js_object_get_field_by_name` after it. Root the
         // receiver and re-derive the header from the refreshed value.
-        let scope = crate::gc::RuntimeHandleScope::new();
         let g_handle = scope.root_heap_word_u64(g.to_bits());
-        let key = crate::builtins::js_string_coerce(name_value);
+        let key = crate::builtins::js_string_coerce(name_handle.get_nanbox_f64());
         let g = f64::from_bits(g_handle.get_heap_word_u64());
         let gptr = (g.to_bits() & crate::value::POINTER_MASK) as *const crate::object::ObjectHeader;
         if !gptr.is_null() && !key.is_null() {
@@ -1083,14 +1089,14 @@ pub extern "C-unwind" fn js_global_get_or_throw_unresolved(name_value: f64) -> f
             // binding always is) before falling through to the throw.
             let has = crate::object::js_object_has_own(
                 f64::from_bits(g_handle.get_heap_word_u64()),
-                name_value,
+                name_handle.get_nanbox_f64(),
             );
             if crate::value::js_is_truthy(has) != 0 {
                 return f64::from_bits(crate::value::JSValue::undefined().bits());
             }
         }
     }
-    let name = value_to_lossy_string(name_value);
+    let name = value_to_lossy_string(name_handle.get_nanbox_f64());
     let msg = format!("{} is not defined", name);
     let msg_str = js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
     let err_ptr = js_referenceerror_new(msg_str);
@@ -1121,6 +1127,8 @@ static KEEP_JS_GLOBAL_UPDATE: extern "C" fn(f64, f64, f64) -> f64 = js_global_up
 pub extern "C" fn js_global_update(name_value: f64, is_increment: f64, is_prefix: f64) -> f64 {
     let is_increment = crate::value::js_is_truthy(is_increment);
     let is_prefix = crate::value::js_is_truthy(is_prefix) != 0;
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let name_handle = scope.root_nanbox_f64(name_value);
     let g = crate::object::js_get_global_this();
     let gj = crate::value::JSValue::from_bits(g.to_bits());
     // #6943: `js_string_coerce` allocates for every non-heap-string name, and
@@ -1130,9 +1138,8 @@ pub extern "C" fn js_global_update(name_value: f64, is_increment: f64, is_prefix
     // from the pre-coercion `gj`) and the coerced key string were raw Rust
     // locals across all of it, and `gptr` is the receiver of the WRITE-BACK at
     // the end. Root both and re-derive the header at each use.
-    let scope = crate::gc::RuntimeHandleScope::new();
     let g_handle = scope.root_heap_word_u64(g.to_bits());
-    let key = crate::builtins::js_string_coerce(name_value);
+    let key = crate::builtins::js_string_coerce(name_handle.get_nanbox_f64());
     let key_handle = scope.root_string_ptr(key);
     let mut present = false;
     let old = if gj.is_pointer() && !key.is_null() {
@@ -1146,7 +1153,7 @@ pub extern "C" fn js_global_update(name_value: f64, is_increment: f64, is_prefix
             if !v.is_undefined()
                 || crate::object::js_object_has_own(
                     f64::from_bits(g_handle.get_heap_word_u64()),
-                    name_value,
+                    name_handle.get_nanbox_f64(),
                 )
                 .to_bits()
                     == crate::value::TAG_TRUE
@@ -1161,7 +1168,7 @@ pub extern "C" fn js_global_update(name_value: f64, is_increment: f64, is_prefix
         f64::from_bits(crate::value::TAG_UNDEFINED)
     };
     if !present {
-        let name = value_to_lossy_string(name_value);
+        let name = value_to_lossy_string(name_handle.get_nanbox_f64());
         let msg = format!("{} is not defined", name);
         let msg_str = js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
         let err_ptr = js_referenceerror_new(msg_str);
@@ -1212,6 +1219,9 @@ static KEEP_JS_GLOBAL_ASSIGN_EXISTING_OR_THROW: extern "C" fn(f64, f64) -> f64 =
 /// that may CREATE the binding.
 #[no_mangle]
 pub extern "C" fn js_global_assign_existing_or_throw(name_value: f64, value: f64) -> f64 {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let name_handle = scope.root_nanbox_f64(name_value);
+    let value_handle = scope.root_nanbox_f64(value);
     let g = crate::object::js_get_global_this();
     let gj = crate::value::JSValue::from_bits(g.to_bits());
     // #6943: the textbook shape of this family — a receiver AND the value being
@@ -1220,10 +1230,8 @@ pub extern "C" fn js_global_assign_existing_or_throw(name_value: f64, value: f64
     // the not-defined path (`js_string_from_bytes`, `js_referenceerror_new`)
     // allocate on top of that, and `gptr` is the receiver of the final write.
     // Root the global, the coerced key and `value` for the whole helper.
-    let scope = crate::gc::RuntimeHandleScope::new();
     let g_handle = scope.root_heap_word_u64(g.to_bits());
-    let value_handle = scope.root_nanbox_f64(value);
-    let key = crate::builtins::js_string_coerce(name_value);
+    let key = crate::builtins::js_string_coerce(name_handle.get_nanbox_f64());
     let key_handle = scope.root_string_ptr(key);
     let mut present = false;
     if gj.is_pointer() && !key.is_null() {
@@ -1237,7 +1245,7 @@ pub extern "C" fn js_global_assign_existing_or_throw(name_value: f64, value: f64
             if !v.is_undefined()
                 || crate::object::js_object_has_own(
                     f64::from_bits(g_handle.get_heap_word_u64()),
-                    name_value,
+                    name_handle.get_nanbox_f64(),
                 )
                 .to_bits()
                     == crate::value::TAG_TRUE
@@ -1247,7 +1255,7 @@ pub extern "C" fn js_global_assign_existing_or_throw(name_value: f64, value: f64
         }
     }
     if !present {
-        let name = value_to_lossy_string(name_value);
+        let name = value_to_lossy_string(name_handle.get_nanbox_f64());
         let msg = format!("{} is not defined", name);
         let msg_str = js_string_from_bytes(msg.as_ptr(), msg.len() as u32);
         let err_ptr = js_referenceerror_new(msg_str);
@@ -1271,14 +1279,15 @@ pub extern "C" fn js_global_assign_existing_or_throw(name_value: f64, value: f64
 /// property set — #3575) must still be observed.
 #[no_mangle]
 pub extern "C" fn js_global_get_optional(name_value: f64) -> f64 {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let name_handle = scope.root_nanbox_f64(name_value);
     let g = crate::object::js_get_global_this();
     let gj = crate::value::JSValue::from_bits(g.to_bits());
     if gj.is_pointer() {
         // #6943: root the global across the GC-capable coercion and re-derive
         // its header afterwards — see `js_global_get_or_throw_unresolved`.
-        let scope = crate::gc::RuntimeHandleScope::new();
         let g_handle = scope.root_heap_word_u64(g.to_bits());
-        let key = crate::builtins::js_string_coerce(name_value);
+        let key = crate::builtins::js_string_coerce(name_handle.get_nanbox_f64());
         let g = f64::from_bits(g_handle.get_heap_word_u64());
         let gptr = (g.to_bits() & crate::value::POINTER_MASK) as *const crate::object::ObjectHeader;
         if !gptr.is_null() && !key.is_null() {
@@ -1854,107 +1863,8 @@ static KEEP_AGGREGATEERROR_NEW_FULL: extern "C" fn(
 static KEEP_ERROR_IS_ERROR: extern "C" fn(f64) -> f64 = js_error_is_error;
 
 #[cfg(test)]
-mod tostring_tests {
-    use super::*;
-
-    #[test]
-    fn not_a_function_throw_bridge_is_unwind_capable() {
-        let _: extern "C-unwind" fn(*const u8, usize, *const u8, usize) -> ! =
-            js_throw_type_error_not_a_function;
-    }
-
-    fn s(bytes: &[u8]) -> *mut StringHeader {
-        js_string_from_bytes(bytes.as_ptr(), bytes.len() as u32)
-    }
-
-    #[test]
-    fn error_to_string_name_and_message() {
-        let e = js_error_new_with_message(s(b"boom"));
-        let out = unsafe { read_string_header_owned(js_error_to_string(e)) };
-        assert_eq!(out, "Error: boom");
-    }
-
-    #[test]
-    fn error_to_string_no_message_is_just_name() {
-        let e = js_error_new_with_message(s(b""));
-        let out = unsafe { read_string_header_owned(js_error_to_string(e)) };
-        assert_eq!(out, "Error");
-    }
-
-    #[test]
-    fn typed_error_to_string_uses_subclass_name() {
-        let e = js_error_new_with_name_message(b"TypeError", s(b"bad"));
-        let out = unsafe { read_string_header_owned(js_error_to_string(e)) };
-        assert_eq!(out, "TypeError: bad");
-    }
-
-    #[test]
-    fn get_errors_on_regular_object_reads_real_property_not_fixed_slot() {
-        // Codegen lowers EVERY `obj.errors` read to `js_error_get_errors` and
-        // then OR-s POINTER_TAG onto the result. For a *regular* object (not a
-        // native error), the `ErrorHeader.errors` byte offset (+48) is an
-        // unrelated slot — historically this returned NaN-boxed garbage that
-        // the caller's re-tag turned into a handle-band id (e.g.
-        // `0x7FFD_0000_0000_0001`), crashing `for…of`. The fix resolves the
-        // `errors` property generically for non-errors.
-        let arr = crate::array::js_array_alloc(2);
-        crate::array::js_array_push_f64(arr, 11.0);
-        crate::array::js_array_push_f64(arr, 22.0);
-        let arr_boxed = crate::value::js_nanbox_pointer(arr as i64);
-
-        // Plain object with an own `errors` property pointing at `arr`.
-        let obj = crate::object::js_object_alloc(0, 2);
-        let key = s(b"errors");
-        crate::object::js_object_set_field_by_name(obj, key, arr_boxed);
-
-        // The accessor receives the *cleaned* (untagged) pointer, as codegen
-        // strips the tag before the call.
-        let got = js_error_get_errors(obj as *mut ErrorHeader);
-        assert_eq!(
-            got as usize, arr as usize,
-            "regular object's .errors must resolve to its real array property, \
-             not the +48 ErrorHeader slot"
-        );
-
-        // An object with no `errors` property yields null (→ caller re-tag is a
-        // null receiver that `for…of` rejects as not iterable, matching the
-        // generic property read).
-        let empty = crate::object::js_object_alloc(0, 1);
-        assert!(js_error_get_errors(empty as *mut ErrorHeader).is_null());
-
-        // A small-handle-band "pointer" must never be dereferenced.
-        assert!(js_error_get_errors(1usize as *mut ErrorHeader).is_null());
-    }
-
-    #[test]
-    fn get_errors_on_native_aggregate_error_uses_fixed_slot() {
-        let arr = crate::array::js_array_alloc(1);
-        crate::array::js_array_push_f64(arr, 7.0);
-        let agg = js_aggregateerror_new(arr, s(b"agg"));
-        let got = js_error_get_errors(agg);
-        assert_eq!(
-            got as usize, arr as usize,
-            "native AggregateError must read its fixed errors slot"
-        );
-    }
-
-    #[test]
-    fn eval_and_uri_errors_have_distinct_kinds_and_names() {
-        let eval = js_evalerror_new(s(b"eval"));
-        assert_eq!(js_error_get_kind(eval), ERROR_KIND_EVAL_ERROR);
-        assert_eq!(
-            unsafe { read_string_header_owned(js_error_get_name(eval)) },
-            "EvalError"
-        );
-
-        let uri = js_urierror_new(s(b"uri"));
-        assert_eq!(js_error_get_kind(uri), ERROR_KIND_URI_ERROR);
-        assert_eq!(
-            unsafe { read_string_header_owned(js_error_get_name(uri)) },
-            "URIError"
-        );
-    }
-}
+#[path = "error_tostring_tests.rs"]
+mod tostring_tests;
 
 #[cfg(test)]
 mod header_unification_tests {

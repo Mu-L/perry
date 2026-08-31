@@ -151,19 +151,6 @@ fn force_localize_symbol(symbol: &str) -> bool {
         || is_panic_unwind_symbol(symbol)
 }
 
-/// True if `path` is an ELF object file (first four bytes `0x7F 'E' 'L' 'F'`).
-/// Used to skip panic/unwind-symbol localization on ELF, where localizing
-/// `rust_eh_personality` / `DW.ref.rust_eh_personality` breaks PIE relocations
-/// (see [`RUST_PANIC_UNWIND_SYMBOL_PARTS`]).
-fn object_is_elf(path: &Path) -> bool {
-    use std::io::Read;
-    let mut magic = [0u8; 4];
-    std::fs::File::open(path)
-        .and_then(|mut f| f.read_exact(&mut magic))
-        .map(|_| magic == [0x7f, b'E', b'L', b'F'])
-        .unwrap_or(false)
-}
-
 pub(super) fn find_path_tool(name: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths)
@@ -1162,44 +1149,76 @@ pub(super) fn strip_duplicate_objects_from_well_known_lib(lib_path: &PathBuf) ->
         return Err(anyhow::anyhow!("failed to extract {lib_name}: {stderr}"));
     }
 
-    for (member, symbols) in &forced_symbols_by_member {
-        let member_path = extract_dir.join(member);
+    // Decide the container format from the extracted members, never from the
+    // archive's file name. This function is handed the intermediate wrapper
+    // produced by `strip_duplicate_objects_from_no_shared_deps`, which is named
+    // `_<lib>_nosharedeps.lib` on EVERY platform — so an extension check claims
+    // COFF on macOS and Linux as well. `llvm-ar --format=coff` then writes a
+    // GNU-style symbol table whose `/` member is not a Mach-O file, and Apple's
+    // linker rejects the whole archive ("archive member '/' not a mach-o file").
+    let is_coff = members
+        .iter()
+        .filter_map(|member| extracted_archive_member(&extract_dir, member))
+        .any(|member_path| object_is_coff(&member_path));
+
+    let archive_tag: String = lib_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    for (member_index, (member, symbols)) in forced_symbols_by_member.iter().enumerate() {
+        let member_path = extracted_archive_member(&extract_dir, member)
+            .ok_or_else(|| anyhow::anyhow!("failed to locate extracted archive member {member}"))?;
         // On ELF, localizing the panic/unwind personality symbols (including the
         // compiler-emitted `DW.ref.rust_eh_personality`) breaks PIE relocations
         // → "undefined hidden symbol ... can not be used when making a PIE
         // object". That dedup is only needed for tier-3 Mach-O (-Zbuild-std);
         // skip it for ELF members and keep localizing the allocator shims.
         let skip_panic_unwind = object_is_elf(&member_path);
-        for symbol in symbols {
+        for (symbol_index, symbol) in symbols.iter().enumerate() {
             if skip_panic_unwind && is_panic_unwind_symbol(symbol) {
                 continue;
             }
-            let out = Command::new(&objcopy)
-                .arg("--localize-symbol")
-                .arg(symbol)
-                .arg(&member_path)
-                .output()?;
+            // LLVM objcopy does not implement --localize-symbol for COFF, and
+            // --strip-symbol rejects definitions mentioned by relocations
+            // (including their own debug records). Rename the wrapper copy
+            // instead: objcopy updates those relocations, the new name is
+            // unique across archives, and unresolved sibling references keep
+            // binding to the canonical runtime / stdlib definition.
+            let mut command = Command::new(&objcopy);
+            if is_coff {
+                let renamed =
+                    format!("__perry_wrapper_local_{archive_tag}_{member_index}_{symbol_index}");
+                command
+                    .arg("--redefine-sym")
+                    .arg(format!("{symbol}={renamed}"));
+            } else {
+                command.arg("--localize-symbol").arg(symbol);
+            }
+            let out = command.arg(&member_path).output()?;
             if !out.status.success() {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 return Err(anyhow::anyhow!(
-                    "failed to localize {symbol} in {member}: {stderr}"
+                    "failed to rewrite {symbol} in {member}: {stderr}"
                 ));
             }
         }
     }
 
-    let mut ar_cmd = Command::new(&llvm_ar);
-    ar_cmd.arg("crs").arg(&trimmed_lib);
-    for member in &members {
-        ar_cmd.arg(extract_dir.join(member));
-    }
-    let ar_out = ar_cmd.output()?;
-    if !ar_out.status.success() {
-        let stderr = String::from_utf8_lossy(&ar_out.stderr);
-        return Err(anyhow::anyhow!(
-            "failed to create well-known wrapper archive for {lib_name}: {stderr}"
-        ));
-    }
+    let member_paths: Vec<PathBuf> = members
+        .iter()
+        .map(|member| {
+            extracted_archive_member(&extract_dir, member).ok_or_else(|| {
+                anyhow::anyhow!("failed to locate extracted archive member {member}")
+            })
+        })
+        .collect::<Result<_>>()?;
+    rebuild_archive(&llvm_ar, &trimmed_lib, &member_paths, is_coff)?;
 
     eprintln!(
         "[strip-dedup] {lib_name}: localized wrapper-only globals in {} member(s)",
@@ -1797,6 +1816,9 @@ fn shared_dep_members_to_remove(
 fn requires_bundled_native_companion(symbol: &str) -> bool {
     symbol.trim_start_matches('_').starts_with("ring_core_")
 }
+
+mod object_format;
+use object_format::{object_is_coff, object_is_elf};
 
 mod stub_symbols;
 pub(super) use stub_symbols::localize_stdlib_stub_symbols;

@@ -20,6 +20,9 @@ enum ClassSideTableRootSlot {
     DeclPrototypeObject {
         class_id: u32,
     },
+    StaticPrototype {
+        class_id: u32,
+    },
     ParentClosure {
         class_id: u32,
     },
@@ -122,6 +125,16 @@ pub fn scan_class_side_table_roots_mut(visitor: &mut crate::gc::RuntimeRootVisit
                 map.visit_root_slots(|proto_addr| {
                     visitor.visit_usize_slot(proto_addr);
                 });
+            }
+        }
+    });
+
+    CLASS_STATIC_PROTOTYPES.with(|table| {
+        if let Ok(mut guard) = table.write() {
+            if let Some(map) = guard.as_mut() {
+                for proto_addr in map.values_mut() {
+                    visitor.visit_usize_slot(proto_addr);
+                }
             }
         }
     });
@@ -271,6 +284,16 @@ fn class_side_table_root_snapshot() -> Vec<ClassSideTableRootSlot> {
         }
     });
 
+    CLASS_STATIC_PROTOTYPES.with(|table| {
+        if let Ok(guard) = table.read() {
+            if let Some(map) = guard.as_ref() {
+                for &class_id in map.keys() {
+                    slots.push(ClassSideTableRootSlot::StaticPrototype { class_id });
+                }
+            }
+        }
+    });
+
     CLASS_PARENT_CLOSURES.with(|table| {
         if let Ok(guard) = table.read() {
             if let Some(map) = guard.as_ref() {
@@ -401,6 +424,15 @@ fn scan_class_side_table_root_slot(
                         map.visit_root_slot_for(*class_id, |proto_addr| {
                             visitor.visit_usize_slot(proto_addr);
                         });
+                    }
+                }
+            });
+        }
+        ClassSideTableRootSlot::StaticPrototype { class_id } => {
+            CLASS_STATIC_PROTOTYPES.with(|table| {
+                if let Ok(mut guard) = table.write() {
+                    if let Some(proto_addr) = guard.as_mut().and_then(|map| map.get_mut(class_id)) {
+                        visitor.visit_usize_slot(proto_addr);
                     }
                 }
             });
@@ -639,6 +671,11 @@ pub(crate) fn test_clear_class_side_table_roots() {
         }
     });
     CLASS_DECL_PROTOTYPE_OBJECTS.with(|table| {
+        if let Ok(mut guard) = table.write() {
+            *guard = None;
+        }
+    });
+    CLASS_STATIC_PROTOTYPES.with(|table| {
         if let Ok(mut guard) = table.write() {
             *guard = None;
         }

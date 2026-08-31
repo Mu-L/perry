@@ -14,6 +14,7 @@ use super::wrap::{wrap_commonjs, wrap_commonjs_for_target, wrap_commonjs_with_bo
 use std::fs;
 use std::path::PathBuf;
 
+mod hoist_scanner;
 mod source_graph;
 
 // #5247: the wrapped output must report where the ORIGINAL body begins, and

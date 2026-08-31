@@ -68,17 +68,20 @@ pub(crate) use state::{
     class_object_value_root_store, class_own_enumerable_field_names, class_own_static_field_value,
     class_parent_closure, class_parent_closure_root_store, class_prototype_method_is_enumerable,
     class_prototype_method_set_enumerable, class_prototype_method_value_cache_root_store,
-    class_prototype_object_root_store, class_static_defined_attrs, class_static_set_defined_attrs,
-    class_unmark_key_deleted, global_object_prototype_bits,
-    is_bound_native_constructor_closure_value, is_non_constructable_builtin_function_value,
-    parent_closure_in_chain, throw_non_constructable_builtin_function,
+    class_prototype_object_root_store, class_static_defined_attrs, class_static_prototype,
+    class_static_prototype_is_nulled, class_static_prototype_root_clear,
+    class_static_prototype_root_store, class_static_set_defined_attrs, class_unmark_key_deleted,
+    global_object_prototype_bits, is_bound_native_constructor_closure_value,
+    is_non_constructable_builtin_function_value, parent_closure_in_chain,
+    throw_non_constructable_builtin_function,
 };
 pub use state::{
     ClassVTable, VTableMethodEntry, CLASS_DECL_PROTOTYPE_OBJECTS, CLASS_DYNAMIC_PARENT_VALUE,
     CLASS_METHOD_BIND_LENGTHS, CLASS_OBJECT_VALUES, CLASS_PARENT_CLOSURES,
     CLASS_PROTOTYPE_METHOD_NONENUM, CLASS_PROTOTYPE_OBJECTS, CLASS_STATIC_ACCESSORS,
-    CLASS_STATIC_METHODS, CLASS_STATIC_METHOD_BIND_LENGTHS, CLASS_SYMBOL_ACCESSORS,
-    CLASS_SYMBOL_METHODS, CLASS_VTABLE_REGISTRY, FUNCTION_CLASS_IDS, REGISTERED_CLASS_IDS,
+    CLASS_STATIC_METHODS, CLASS_STATIC_METHOD_BIND_LENGTHS, CLASS_STATIC_PROTOTYPES,
+    CLASS_SYMBOL_ACCESSORS, CLASS_SYMBOL_METHODS, CLASS_VTABLE_REGISTRY, FUNCTION_CLASS_IDS,
+    REGISTERED_CLASS_IDS,
 };
 
 // ── prototype_objects.rs ────────────────────────────────────────────────────
@@ -95,11 +98,11 @@ pub(crate) use class_meta::test_text_encoding_stream_new_with_constructor;
 #[cfg(feature = "global-text")]
 pub(crate) use class_meta::text_decoder_bool_option;
 pub use class_meta::{
-    class_length_for_id, class_name_for_id, is_anon_shape_class_id, js_compression_stream_new,
-    js_decompression_stream_new, js_register_anon_shape_class_id, js_register_class_id,
-    js_register_class_length, js_register_class_name, js_text_decoder_stream_new,
-    js_text_encoder_stream_new, js_text_encoding_stream_new, ANON_SHAPE_CLASS_IDS, CLASS_LENGTHS,
-    CLASS_NAMES,
+    class_length_for_id, class_name_for_id, declared_class_outranks_anon_shape,
+    is_anon_shape_class_id, js_compression_stream_new, js_decompression_stream_new,
+    js_register_anon_shape_class_id, js_register_class_id, js_register_class_length,
+    js_register_class_name, js_text_decoder_stream_new, js_text_encoder_stream_new,
+    js_text_encoding_stream_new, ANON_SHAPE_CLASS_IDS, CLASS_LENGTHS, CLASS_NAMES,
 };
 pub(crate) use class_meta::{
     identify_global_builtin_constructor, report_dispatch_miss,

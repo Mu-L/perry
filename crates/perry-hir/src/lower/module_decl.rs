@@ -13,6 +13,7 @@ mod namespace;
 mod native_default_import;
 pub(super) mod native_profile_import;
 mod object_literal;
+mod static_import_bindings;
 mod typescript;
 
 // Re-export moved items so existing `crate::...` / `super::*` call paths keep
@@ -23,6 +24,9 @@ use native_default_import::{
     node_submodule_default_export_key,
 };
 use object_literal::is_direct_object_literal;
+pub(super) use static_import_bindings::{
+    import_is_runtime_erased, pre_register_static_import_bindings,
+};
 
 pub(crate) fn lower_module_decl(
     ctx: &mut LoweringContext,
@@ -128,6 +132,7 @@ pub(crate) fn lower_module_decl(
                 return Ok(());
             }
             let whole_decl_type_only = import_decl.type_only;
+            let runtime_erased = import_is_runtime_erased(import_decl, whole_decl_type_only);
 
             // Parse import specifiers
             let mut specifiers = Vec::new();
@@ -482,6 +487,7 @@ pub(crate) fn lower_module_decl(
                 module_kind,
                 resolved_path: None, // Will be set by compiler driver during module resolution
                 type_only: whole_decl_type_only,
+                runtime_erased,
                 is_dynamic: false,
                 is_dynamic_target: false,
                 is_deferred_require: false,

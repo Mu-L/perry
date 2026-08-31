@@ -372,6 +372,19 @@ pub extern "C" fn js_object_get_prototype_of(obj_value: f64) -> f64 {
     };
     if top16 == 0x7FFE {
         let class_id = (bits & 0xFFFF_FFFF) as u32;
+        // An explicit `Object.setPrototypeOf(Ctor, obj)` wins over every
+        // derived answer below — it IS the constructor's [[Prototype]].
+        if super::super::class_prototype_ref_id(obj_value).is_none() {
+            let static_proto = super::super::class_registry::class_static_prototype(class_id);
+            if !static_proto.is_null() {
+                return f64::from_bits(
+                    crate::value::js_nanbox_pointer(static_proto as i64).to_bits(),
+                );
+            }
+            if super::super::class_registry::class_static_prototype_is_nulled(class_id) {
+                return f64::from_bits(TAG_NULL);
+            }
+        }
         if super::super::class_prototype_ref_id(obj_value).is_none() {
             // A class whose heritage is a runtime function value has no Perry
             // parent class id. Its constructor's [[Prototype]] is that exact
@@ -530,9 +543,25 @@ pub extern "C" fn js_object_get_prototype_of(obj_value: f64) -> f64 {
                 // class_id 0 / anonymous-shape / unregistered ids), so synthetic
                 // function-ctor instances and plain objects keep the existing
                 // `constructor`-based resolution unchanged.
+                // A declared class keeps its reflective prototype even when its
+                // id is ALSO marked as an anon shape. Class ids are allocated
+                // per module, so one module's anon-shape id can collide with
+                // another's declared class (observed: Effect's monomorphized
+                // `Union$AST`, whose instances started reporting
+                // `Object.prototype` once an unrelated module's init registered
+                // the same number). `Object.create(Object.getPrototypeOf(ast),
+                // descriptors)` — the standard prototype-preserving clone, used
+                // by SchemaAST's `modifyOwnPropertyDescriptors` — then produced
+                // objects with none of the class's methods. A registered class
+                // name plus a non-empty prototype vtable is positive evidence of
+                // a real declared class, so prefer it over the collision.
+                let instance_class_id = (*obj).class_id;
                 if (*gc).obj_type == crate::gc::GC_TYPE_OBJECT
-                    && (*obj).class_id != 0
-                    && !is_anon_shape_class_id((*obj).class_id)
+                    && instance_class_id != 0
+                    && (!is_anon_shape_class_id(instance_class_id)
+                        || super::super::class_registry::declared_class_outranks_anon_shape(
+                            instance_class_id,
+                        ))
                 {
                     if let Some(proto) =
                         super::super::class_registry::class_decl_prototype_value_for_instance_class(
