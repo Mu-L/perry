@@ -89,8 +89,7 @@ pub(crate) fn diag_enabled() -> bool {
     })
 }
 
-const ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-";
+const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+-";
 
 fn decode_char(c: u8) -> Option<u64> {
     let v = match c {
@@ -544,21 +543,23 @@ pub(crate) unsafe fn materialize_error_stack(error: *mut ErrorHeader) -> *mut St
     let error_handle = scope.root_nanbox_f64(crate::value::js_nanbox_pointer(error as i64));
     let stack_ptr = js_string_from_bytes(text.as_ptr(), text.len() as u32);
     let stack_handle = scope.root_string_ptr(stack_ptr);
-    let error = crate::value::js_nanbox_get_pointer(error_handle.get_nanbox_f64()) as *mut ErrorHeader;
-    let stack_ptr = stack_handle.get_raw_const_ptr::<StringHeader>() as *mut StringHeader;
-    crate::gc::runtime_store_gc_heap_word_slot(
-        error as usize,
-        &(*error).stack as *const _ as usize,
-        stack_ptr as u64,
-    );
-    // The capture has served its purpose; releasing it keeps a long-lived
-    // error from pinning 128 bytes of encoded addresses forever.
-    crate::gc::runtime_store_gc_heap_word_slot(
-        error as usize,
-        &(*error).frames as *const _ as usize,
-        0,
-    );
-    stack_ptr
+    let error =
+        crate::value::js_nanbox_get_pointer(error_handle.get_nanbox_f64()) as *mut ErrorHeader;
+    stack_handle.with_mut_ptr::<StringHeader, _>(|stack_ptr| {
+        crate::gc::runtime_store_gc_heap_word_slot(
+            error as usize,
+            &(*error).stack as *const _ as usize,
+            stack_ptr as u64,
+        );
+        // The capture has served its purpose; releasing it keeps a long-lived
+        // error from pinning 128 bytes of encoded addresses forever.
+        crate::gc::runtime_store_gc_heap_word_slot(
+            error as usize,
+            &(*error).frames as *const _ as usize,
+            0,
+        );
+        stack_ptr
+    })
 }
 
 #[cfg(test)]
@@ -581,7 +582,10 @@ mod tests {
     #[test]
     fn a_malformed_blob_decodes_to_nothing_rather_than_to_addresses() {
         assert!(decode_pcs(b"AAA").is_empty(), "short blob");
-        assert!(decode_pcs(b"AAAAAAA!").is_empty(), "character outside the alphabet");
+        assert!(
+            decode_pcs(b"AAAAAAA!").is_empty(),
+            "character outside the alphabet"
+        );
         assert!(decode_pcs(b"").is_empty(), "empty blob");
     }
 

@@ -879,10 +879,11 @@ fn pump_stdin_data_chunks() {
         for cb in data_listeners {
             let scope = crate::gc::RuntimeHandleScope::new();
             let cb_handle = scope.root_raw_const_ptr(cb as *const crate::closure::ClosureHeader);
-            let closure = cb_handle.get_raw_const_ptr::<crate::closure::ClosureHeader>();
             // Node calls stream listeners with `this === stream`.
             let prev_this = crate::object::js_implicit_this_set(this);
-            crate::closure::js_closure_call1(closure, arg_handle.get_nanbox_f64());
+            cb_handle.with_const_ptr::<crate::closure::ClosureHeader, _>(|closure| {
+                crate::closure::js_closure_call1(closure, arg_handle.get_nanbox_f64());
+            });
             crate::object::js_implicit_this_set(prev_this);
         }
         return;
@@ -900,9 +901,10 @@ fn pump_stdin_data_chunks() {
     for cb in readable_listeners {
         let scope = crate::gc::RuntimeHandleScope::new();
         let cb_handle = scope.root_raw_const_ptr(cb as *const crate::closure::ClosureHeader);
-        let closure = cb_handle.get_raw_const_ptr::<crate::closure::ClosureHeader>();
         let prev_this = crate::object::js_implicit_this_set(this);
-        crate::closure::js_closure_call0(closure);
+        cb_handle.with_const_ptr::<crate::closure::ClosureHeader, _>(|closure| {
+            crate::closure::js_closure_call0(closure);
+        });
         crate::object::js_implicit_this_set(prev_this);
     }
 }
@@ -946,9 +948,10 @@ fn maybe_fire_stdin_end() {
                 let scope = crate::gc::RuntimeHandleScope::new();
                 let cb_handle =
                     scope.root_raw_const_ptr(cb as *const crate::closure::ClosureHeader);
-                let closure = cb_handle.get_raw_const_ptr::<crate::closure::ClosureHeader>();
                 let prev_this = crate::object::js_implicit_this_set(this);
-                crate::closure::js_closure_call1(closure, flush_handle.get_nanbox_f64());
+                cb_handle.with_const_ptr::<crate::closure::ClosureHeader, _>(|closure| {
+                    crate::closure::js_closure_call1(closure, flush_handle.get_nanbox_f64());
+                });
                 crate::object::js_implicit_this_set(prev_this);
             }
         }
@@ -981,9 +984,10 @@ fn maybe_fire_stdin_end() {
     for cb in end_listeners {
         let scope = crate::gc::RuntimeHandleScope::new();
         let cb_handle = scope.root_raw_const_ptr(cb as *const crate::closure::ClosureHeader);
-        let closure = cb_handle.get_raw_const_ptr::<crate::closure::ClosureHeader>();
         let prev_this = crate::object::js_implicit_this_set(this);
-        crate::closure::js_closure_call0(closure);
+        cb_handle.with_const_ptr::<crate::closure::ClosureHeader, _>(|closure| {
+            crate::closure::js_closure_call0(closure);
+        });
         crate::object::js_implicit_this_set(prev_this);
     }
 }

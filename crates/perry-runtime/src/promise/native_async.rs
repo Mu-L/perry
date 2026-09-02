@@ -750,12 +750,11 @@ mod tests {
         // pointer, so it must live in non-moving (malloc) space — an arena
         // resident would be relocated by the copying minor behind that
         // pointer's back.
-        let header = unsafe {
-            (promise as *mut u8).sub(crate::gc::GC_HEADER_SIZE) as *const crate::gc::GcHeader
-        };
-        assert_eq!(
-            unsafe { (*header).gc_flags } & crate::gc::GC_FLAG_ARENA,
-            0,
+        assert!(
+            matches!(
+                crate::arena::classify_heap_space(promise as usize),
+                crate::arena::HeapSpace::Unknown
+            ),
             "native async token promise must not be arena (nursery) resident"
         );
         assert!(native_async_promise_has_token(promise));
