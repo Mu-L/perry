@@ -971,7 +971,7 @@ fn typed_object_literal_stable_path_installs_pointer_mask_descriptor() {
 #[test]
 fn typed_object_literal_pointer_free_descriptor_precedes_dynamic_mutation() {
     let row_ty = object_type(&[("count", Type::Number)]);
-    let module = base_module(
+    let mut module = base_module(
         "typed_shape_mutation.ts",
         vec![
             Stmt::Let {
@@ -990,6 +990,10 @@ fn typed_object_literal_pointer_free_descriptor_precedes_dynamic_mutation() {
         ],
         Vec::new(),
     );
+    // #9459 made SLOPPY PropertySet route through `js_put_value_set` (silent
+    // rejection), bypassing the typed-feedback wrapper this test pins. Real TS
+    // modules are ESM and therefore strict — pin the strict path explicitly.
+    module.functions[0].is_strict = true;
 
     let ir = ir_for(module);
     let descriptor_pos = ir
