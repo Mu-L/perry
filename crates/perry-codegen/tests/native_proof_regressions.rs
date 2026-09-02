@@ -15311,9 +15311,17 @@ fn nested_same_shape_object_writes_version_one_through_four_fields() {
             collected
         };
         let fast_body = fast_body.as_str();
+        // #9499's root-reload launder (`%x.rs4o = call i64 asm "", "=r,0"(...)
+        // "gc-leaf-function"`) is an empty inline-asm register copy, not a
+        // runtime call and not a GC transition — the "call/GC-free" invariant
+        // this proof guards is about real calls, so launder lines are exempt.
+        let real_calls: Vec<&str> = fast_body
+            .lines()
+            .filter(|l| l.contains("call ") && !l.contains(r#"call i64 asm "", "=r,0""#))
+            .collect();
         assert!(
-            !fast_body.contains("call "),
-            "the successful raw-pointer clone must stay call/GC-free:\n{fast_body}"
+            real_calls.is_empty(),
+            "the successful raw-pointer clone must stay call/GC-free:\n{real_calls:?}\n{fast_body}"
         );
         assert!(
             fast_body.matches("store double").count() >= field_count
