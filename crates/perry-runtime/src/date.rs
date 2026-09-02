@@ -1593,17 +1593,28 @@ pub extern "C" fn js_date_to_locale_time_string(timestamp: f64) -> *mut crate::S
 /// support), so the LLVM codegen routes statically-Number receivers
 /// here and Date receivers to `js_date_to_locale_string` below. Decimal
 /// part follows JS spec: trailing zeros after the decimal stripped,
-/// leading sign preserved, NaN/Infinity passed through as the literal
-/// strings "NaN" / "Infinity" / "-Infinity".
+/// leading sign preserved.
+///
+/// The non-finite and signed-zero spellings are ECMA-402's, not Rust's
+/// (#9452): the operation is defined as "format with a default
+/// `Intl.NumberFormat`", whose number pattern renders the infinities with
+/// U+221E ("∞" / "-∞") and keeps the sign of negative zero ("-0"). `NaN`
+/// stays the literal "NaN" in both. Before #9452 this returned Rust's
+/// `Display` spelling "Infinity"/"-Infinity" and dropped the sign of `-0`,
+/// so `x.toLocaleString()` disagreed with `x.toLocaleString("en-US")` —
+/// which since #9448 goes through the real formatter (see
+/// `intl::number_format`, whose sign test this now mirrors).
 #[no_mangle]
 pub extern "C" fn js_number_to_locale_string(n: f64) -> *mut crate::StringHeader {
     if n.is_nan() {
         return alloc_runtime_string("NaN");
     }
     if n.is_infinite() {
-        return alloc_runtime_string(if n > 0.0 { "Infinity" } else { "-Infinity" });
+        return alloc_runtime_string(if n > 0.0 { "\u{221e}" } else { "-\u{221e}" });
     }
-    let negative = n < 0.0;
+    // `-0.0 < 0.0` is false, so the sign of a negative zero has to be read
+    // off the bit pattern — the same test `intl::number_format` applies.
+    let negative = n < 0.0 || (n == 0.0 && n.is_sign_negative());
     let abs = n.abs();
     // Split into integer and decimal parts. JS's default
     // `Number.prototype.toLocaleString()` shows up to 3 fraction digits
@@ -1889,6 +1900,62 @@ mod tests {
         assert_eq!(parse_date_string("01 Jan 1970 00:00:00 GMT"), 0.0);
         assert_eq!(parse_date_string("2020"), 1_577_836_800_000.0);
         assert!(parse_date_string("not a date").is_nan());
+    }
+
+    /// #9449: ECMA-262 §21.4.3.2 reads an offsetless date-TIME as LOCAL wall
+    /// clock and an offsetless date-ONLY form as UTC. The local half is
+    /// asserted through the local-component decoder so the test is host-zone
+    /// independent; the UTC half and the explicit designators are fixed
+    /// epochs and are asserted directly.
+    #[test]
+    fn test_date_parse_iso_offsetless_datetime_is_local() {
+        let wall = |s: &str| {
+            let ts = parse_date_string(s);
+            assert!(!ts.is_nan(), "expected a valid date for {s:?}");
+            let (y, mo, d, h, mi, sec, _) =
+                timestamp_to_local_components((ts as i64).div_euclid(1000));
+            (y, mo, d, h, mi, sec)
+        };
+        // Both separators, every clock precision.
+        assert_eq!(wall("2026-09-01T10:30"), (2026, 9, 1, 10, 30, 0));
+        assert_eq!(wall("2026-09-01T10:30:45"), (2026, 9, 1, 10, 30, 45));
+        assert_eq!(wall("2026-09-01T10:30:45.123"), (2026, 9, 1, 10, 30, 45));
+        assert_eq!(wall("2026-09-01 10:30"), (2026, 9, 1, 10, 30, 0));
+        assert_eq!(wall("2026-09-01 10:30:45.123"), (2026, 9, 1, 10, 30, 45));
+        assert_eq!(wall("2026-09-01T00:00"), (2026, 9, 1, 0, 0, 0));
+        // A January row and a July row: a FIXED offset in place of the offset
+        // in effect AT THAT INSTANT breaks one of the two in any DST zone.
+        assert_eq!(wall("2026-01-15T10:30"), (2026, 1, 15, 10, 30, 0));
+        assert_eq!(wall("2026-07-15T10:30"), (2026, 7, 15, 10, 30, 0));
+        // Sub-second precision survives the conversion (zone offsets are whole
+        // minutes, so the millisecond is untouched in every host zone).
+        assert_eq!(parse_date_string("2026-09-01T10:30:45.123") % 1000.0, 123.0);
+
+        // The date-ONLY half must stay UTC, and an explicit designator must
+        // keep winning in the date-time form.
+        assert_eq!(parse_date_string("2020-01-02"), 1_577_923_200_000.0);
+        assert_eq!(
+            parse_date_string("2020-01-02T03:04:05.006Z"),
+            1_577_934_245_006.0
+        );
+        assert_eq!(
+            parse_date_string("2020-01-02T03:04:05+02:30"),
+            1_577_925_245_000.0
+        );
+        // A trailing GMT / UTC / UT / Z WORD is a designator too — node
+        // accepts it in the space-separated spelling, and it was silently
+        // ignored here while every offsetless form was read as UTC.
+        for s in [
+            "2020-01-02 03:04:05 GMT",
+            "2020-01-02 03:04:05 UTC",
+            "2020-01-02 03:04:05 ut",
+            "2020-01-02 03:04:05 z",
+            "2020-01-02 03:04:05 Z",
+        ] {
+            assert_eq!(parse_date_string(s), 1_577_934_245_000.0, "{s:?}");
+        }
+        // ...but a trailing parenthesised comment is not, so it stays local.
+        assert_eq!(wall("2026-09-01 10:30 (comment)"), (2026, 9, 1, 10, 30, 0));
     }
 
     /// #9414: the numeric slash grammar node accepts as its
