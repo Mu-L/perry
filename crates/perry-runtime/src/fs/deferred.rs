@@ -99,10 +99,9 @@ fn park_promise(path: f64, data: f64, options: f64, mode: f64) -> f64 {
     let data_handle = scope.root_nanbox_f64(data);
     let options_handle = scope.root_nanbox_f64(options);
     let promise = crate::promise::js_promise_new();
-    let promise_handle = scope
-        .root_nanbox_f64(f64::from_bits(
-            crate::value::JSValue::pointer(promise as *const u8).bits(),
-        ));
+    let promise_handle = scope.root_nanbox_f64(f64::from_bits(
+        crate::value::JSValue::pointer(promise as *const u8).bits(),
+    ));
     park(
         path_handle.get_nanbox_f64(),
         data_handle.get_nanbox_f64(),

@@ -462,7 +462,10 @@ entry:
                               rewrite-statepoints-for-gc,function(instcombine)";
         let target = crate::codegen::default_target_triple();
         let rewritten = crate::inprocess::statepoint_rewritten_ir_with_passes(
-            &lowered, &target, "reroot_9499", PASSES,
+            &lowered,
+            &target,
+            "reroot_9499",
+            PASSES,
         )
         .expect("fixture survives the rewrite pipeline");
 

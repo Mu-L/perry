@@ -225,9 +225,9 @@ fn emit_event_loop_liveness(ctx: &mut FnCtx<'_>, needs_stdlib: bool) -> String {
         "0".to_string()
     };
     let has_stdlib = ctx.block().call(I32, "js_stdlib_has_active_handles", &[]);
-    let has_ffi_callbacks = ctx
-        .block()
-        .call(I32, "js_bun_ffi_has_active_threadsafe_callbacks", &[]);
+    let has_ffi_callbacks =
+        ctx.block()
+            .call(I32, "js_bun_ffi_has_active_threadsafe_callbacks", &[]);
     // #591: TASK_QUEUE may carry a pending `.then` continuation that was
     // queued by `js_run_stdlib_pump`'s resolution path in the SAME body
     // iteration that already drained the inflight counter and

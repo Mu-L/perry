@@ -273,10 +273,7 @@ unsafe fn alloc_error(
     let frames_handle = if payload.is_empty() {
         None
     } else {
-        Some(scope.root_string_ptr(js_string_from_bytes(
-            payload.as_ptr(),
-            payload.len() as u32,
-        )))
+        Some(scope.root_string_ptr(js_string_from_bytes(payload.as_ptr(), payload.len() as u32)))
     };
 
     let raw = crate::arena::arena_alloc_gc(

@@ -1846,35 +1846,8 @@ fn escape_string(s: &str) -> String {
 /// whitespace, numeric-leading, and non-ASCII names are quoted. `$` is a
 /// valid JavaScript identifier character but Node deliberately quotes it in
 /// inspected object keys.
-fn format_inspect_property_key(key: &str) -> String {
-    let mut chars = key.chars();
-    let is_bare = chars
-        .next()
-        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
-        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
-    if is_bare {
-        return key.to_string();
-    }
-
-    // Node prefers the delimiter that avoids an escape when exactly one kind
-    // of quote occurs in the key.
-    if key.contains('\'') && !key.contains('"') {
-        let escaped = key
-            .chars()
-            .flat_map(|c| match c {
-                '\\' => "\\\\".chars().collect::<Vec<_>>(),
-                '"' => "\\\"".chars().collect(),
-                '\n' => "\\n".chars().collect(),
-                '\r' => "\\r".chars().collect(),
-                '\t' => "\\t".chars().collect(),
-                _ => vec![c],
-            })
-            .collect::<String>();
-        format!("\"{}\"", escaped)
-    } else {
-        format!("'{}'", escape_string(key))
-    }
-}
+mod inspect_property_key;
+use inspect_property_key::format_inspect_property_key;
 
 #[cfg(test)]
 mod inspect_property_key_tests;
