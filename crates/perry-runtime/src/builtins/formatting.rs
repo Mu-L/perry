@@ -429,6 +429,28 @@ pub fn register_function_name_if_absent(func_ptr: usize, name: &str) {
     }
 }
 
+/// #9486: how many `(function address, name)` pairs the registry currently
+/// holds. Cheap enough to consult on every `.stack` read, so the stack-frame
+/// resolver can tell a stale address-sorted snapshot from a current one
+/// without cloning the table to compare it.
+pub fn function_name_registry_len() -> Option<usize> {
+    function_name_registry().lock().ok().map(|map| map.len())
+}
+
+/// #9486: snapshot the registry as `(function address, name bytes)` pairs for
+/// the `Error.stack` frame resolver to sort by address.
+///
+/// The `Arc` clones make this a pointer copy per entry rather than a name
+/// copy, and the lock is held only for the walk — resolution (a binary search
+/// per frame) happens outside it, so a `.stack` read never blocks a
+/// concurrent registration for longer than the snapshot itself.
+pub fn function_name_registry_entries() -> Option<Vec<(usize, std::sync::Arc<[u8]>)>> {
+    function_name_registry()
+        .lock()
+        .ok()
+        .map(|map| map.iter().map(|(k, v)| (*k, v.clone())).collect())
+}
+
 /// Look up the codegen-registered JS name for a function pointer.
 ///
 /// Returns the name registered by `js_register_function_name` (keyed on the
@@ -699,8 +721,16 @@ unsafe fn format_error_headline(error_ptr: *const crate::error::ErrorHeader) -> 
     }
 }
 
-unsafe fn format_error_stack_frame(error_ptr: *const crate::error::ErrorHeader) -> Option<String> {
-    let stack = string_header_to_string((*error_ptr).stack, "");
+/// The one stack line `util.inspect` shows under an error's headline.
+///
+/// #9486: through the accessor, never off the field — `alloc_error` leaves
+/// `stack` null and the first read materialises it, so a direct field read
+/// here made `console.log(err)` print no frame at all. It is called from
+/// `format_error_value` as the LAST use of `error_ptr` on purpose: the
+/// accessor allocates, and a moving scavenge during that allocation would
+/// leave any later read of `error_ptr` pointing at from-space.
+unsafe fn format_error_stack_frame(error_ptr: *mut crate::error::ErrorHeader) -> Option<String> {
+    let stack = string_header_to_string(crate::error::js_error_get_stack(error_ptr), "");
     stack
         .lines()
         .skip(1)
@@ -758,7 +788,7 @@ unsafe fn format_error_value(error_ptr: *const crate::error::ErrorHeader, depth:
     }
 
     let mut out = headline;
-    if let Some(frame) = format_error_stack_frame(error_ptr) {
+    if let Some(frame) = format_error_stack_frame(error_ptr as *mut _) {
         out.push('\n');
         out.push_str(&frame);
         out.push_str(" {");
