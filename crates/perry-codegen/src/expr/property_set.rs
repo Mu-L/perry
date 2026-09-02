@@ -557,7 +557,15 @@ fn lower_runtime_property_set_by_name(
     object: &Expr,
     property: &str,
     value: &Expr,
+    // #9459: `js_object_set_field_by_property_id` resolves the dispatch id and
+    // hands the key to `js_object_set_field_by_name`, which has no `strict`
+    // parameter and rejects by throwing. Correct for a strict `PutValue`, wrong
+    // for sloppy.
+    assignment_strict: bool,
 ) -> Result<String> {
+    if !assignment_strict {
+        return lower_sloppy_property_set_by_name(ctx, object, property, value);
+    }
     // #7154: root the receiver across the value's evaluation, which allocates.
     // The group re-reads it as part of emitting the store, so no register of
     // the receiver exists across the window.
@@ -574,6 +582,67 @@ fn lower_runtime_property_set_by_name(
         );
         Ok(val_double.clone())
     })
+}
+
+/// #9459: the SLOPPY terminal store for `Expr::PropertySet`.
+///
+/// `Set(O, P, V, false)` -- ordinary `[[Set]]` with the receiver, and a
+/// rejection (frozen / sealed / non-writable own or inherited data property /
+/// getter-only accessor / non-extensible new key) reported as `false` and
+/// discarded rather than thrown. That is exactly `js_put_value_set(target, key,
+/// value, receiver, 0)`, the entry sloppy `o.x = v` has always used through
+/// `Expr::PutValueSet`; routing here makes `o.x += 1`, `for (o.x of it)` and
+/// `[o.x] = arr` agree with it instead of throwing where node is silent.
+///
+/// `target` and `receiver` are the same expression, evaluated ONCE -- the
+/// property reference's base is one evaluation, and `with_operands_rooted`
+/// hands the single lowered box to both operand slots.
+///
+/// Rooting is the #7154 window the strict tail also opens: the receiver is live
+/// across `value`'s lowering, which is arbitrary user code and can drive an
+/// evacuating minor.
+fn lower_sloppy_property_set_by_name(
+    ctx: &mut FnCtx<'_>,
+    object: &Expr,
+    property: &str,
+    value: &Expr,
+) -> Result<String> {
+    rooting::with_operands_rooted_across(
+        ctx,
+        &[object],
+        &[value],
+        |ctx| {
+            lower_value_for_dynamic_property_set(
+                ctx,
+                value,
+                "property_set.sloppy_dynamic_value_bits",
+                "sloppy_property_set_helper_edge",
+            )
+        },
+        |ctx, vals, (val_double, _val_bits)| {
+            let obj_box = vals[0].clone();
+            let key_idx = ctx.strings.intern(property);
+            let key_handle_global = format!("@{}", ctx.strings.entry(key_idx).handle_global);
+            let obj_bits = ctx.block().bitcast_double_to_i64(&obj_box);
+            // The nullish receiver check is the same one the strict tail emits:
+            // `undefined.x = 1` is a TypeError in BOTH modes (GetValue on the
+            // base runs before PutValue's Throw flag is ever consulted).
+            emit_nullish_write_guard(ctx, &obj_bits, property, "pset_sloppy");
+            let key_box = ctx.block().load(DOUBLE, &key_handle_global);
+            let _ = ctx.block().call(
+                DOUBLE,
+                "js_put_value_set",
+                &[
+                    (DOUBLE, &obj_box),
+                    (DOUBLE, &key_box),
+                    (DOUBLE, &val_double),
+                    (DOUBLE, &obj_box),
+                    (I32, "0"),
+                ],
+            );
+            Ok(val_double)
+        },
+    )
 }
 
 fn lower_value_for_dynamic_property_set(
@@ -638,7 +707,19 @@ pub(crate) fn emit_nullish_write_guard(
     ctx.current_block = ok_idx;
 }
 
-pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
+/// Lower an `Expr::PropertySet`.
+///
+/// `assignment_strict` is the assignment's own `Throw` flag (ES2024 SS6.2.5.7
+/// `PutValue` calls `Set(O, P, V, Throw)` with `Throw = IsStrictReference`).
+/// #9459: the HIR node carries no strictness, so it comes from the caller --
+/// `ctx.is_strict_fn` for the ordinary dispatch (`expr/dispatch.rs`, the same
+/// source `Expr::IndexSet` uses since #9426), and `PutValueSet::strict` for the
+/// two routes that synthesize a `PropertySet` from a `PutValue`
+/// (`expr/proxy_reflect.rs`). A rejected SLOPPY `[[Set]]` is a silent no-op, so
+/// every arm below whose runtime entry rejects by THROWING is strict-only; the
+/// sloppy twin of each is the strictness-aware `js_put_value_set(..., 0)` that
+/// the surrounding `PutValueSet` lowering already uses for `o.x = v`.
+pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr, assignment_strict: bool) -> Result<String> {
     match expr {
         Expr::PropertySet {
             object,
@@ -672,7 +753,20 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // (route to js_array_set_length when the target is registered as
             // an array). Deliberately out of scope here; the static-typed
             // case covers the issue's repro.
-            if property == "length" && crate::type_analysis::is_array_expr(ctx, object) {
+            //
+            // #9459: strict only. `js_array_set_length_strict` is named for the
+            // `Throw` flag it hard-codes -- `Set(O, "length", n, true)`. A SLOPPY
+            // `arr.length` write that `OrdinarySet` rejects (frozen array, or an
+            // explicit `writable: false` on `length`) must be a silent no-op, so
+            // sloppy falls through to the generic `js_put_value_set(..., 0)` tail
+            // below. That is already where sloppy `arr.length = 0` goes today --
+            // `put_value_static_property_fast_path` refuses this arm for sloppy
+            // references (`expr/proxy_reflect.rs`), and #9422's fixture pins the
+            // result -- so the two spellings agree rather than diverging by lane.
+            if assignment_strict
+                && property == "length"
+                && crate::type_analysis::is_array_expr(ctx, object)
+            {
                 // #7637: this arm had NO store-operand guard, while every other
                 // `PropertySet` arm in this file has had one since #7154. It is
                 // the same window: `arr.length = f()` lowers the receiver first
@@ -804,6 +898,66 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     return Ok(val_double);
                 }
             }
+            // #9460: the local IS scalar-replaced, but this property has no
+            // field slot -- so there is nothing to store into, and nothing that
+            // could ever read it back.
+            //
+            // `stmt/let_stmt.rs`'s scalar-replacement arm creates slots for a
+            // synthetic `__AnonShape_*` class (an object literal) only for the
+            // fields in `non_escaping_new_used_fields`, which by design tracks
+            // READS: "writes still need their RHS evaluated for JS side effects,
+            // but the scalar slot/store can be elided when the field is never
+            // observed" (`collectors/escape_news.rs`). It then registers
+            // `ctx.locals[id]` as a DUMMY entry-block alloca that is never
+            // initialized, because the binding has stopped being an object at
+            // all, and overwrites `local_types[id]` with the synthetic class.
+            //
+            // Without this arm a slotless store fell through to the class-field /
+            // `Ptr<Shape>` lowerings below, which load that dummy slot as an
+            // `ObjectHeader*` and store through `null + <header size>` --
+            // SIGSEGV on `const o: any = {x:1}; o.x = 7;` with no later read of
+            // `o.x`, in BOTH modes. The read side has had the matching guard
+            // since the synthetic-shape work (`expr/property_get.rs`, whose
+            // comment names the same hazard: "the generic runtime helper that
+            // crashes on the dummy slot"); the write side never got it, which is
+            // why adding a `console.log(o.x)` made the crash disappear -- the
+            // read is what creates the slot.
+            //
+            // Discarding the store is what the contract above promises and is
+            // unobservable: the receiver is a non-escaping fresh literal, so no
+            // alias exists, and a read of a slotless field already answers
+            // `undefined` on the read side. The RHS is still lowered, so its side
+            // effects happen -- same shape as the `this` arm just below, which
+            // has always evaluated the value and dropped the store when the
+            // inlined constructor's target field has no slot.
+            if let Expr::LocalGet(id) = object.as_ref() {
+                if ctx.scalar_replaced.contains_key(id) {
+                    let val_double = lower_expr(ctx, value)?;
+                    let lowered = LoweredValue {
+                        semantic: SemanticKind::JsValue,
+                        rep: NativeRep::JsValue,
+                        llvm_ty: DOUBLE,
+                        value: val_double.clone(),
+                    };
+                    ctx.record_lowered_value_with_access_mode(
+                        "ScalarObjectFieldSetElided",
+                        Some(*id),
+                        "scalar_object_field_store.unobserved",
+                        &lowered,
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                        false,
+                        vec![
+                            format!("field={}", property),
+                            "reason=field_never_read_no_scalar_slot".to_string(),
+                        ],
+                    );
+                    return Ok(val_double);
+                }
+            }
             // Handle `this` during scalar-replaced constructor inlining:
             if let Expr::This = object.as_ref() {
                 if let Some(target_id) = ctx.scalar_ctor_target.last().copied() {
@@ -906,7 +1060,13 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 if class_has_computed_runtime_members(ctx, &class_name)
                     && !ctx.is_static_class_this(object)
                 {
-                    return lower_runtime_property_set_by_name(ctx, object, property, value);
+                    return lower_runtime_property_set_by_name(
+                        ctx,
+                        object,
+                        property,
+                        value,
+                        assignment_strict,
+                    );
                 }
                 let setter_key = (class_name.clone(), format!("__set_{}", property));
                 // STATIC accessors compile under the static (no-`this`)
@@ -920,7 +1080,11 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                     if let Some(fn_name) = ctx.methods.get(&setter_key).cloned() {
                         if proven_class_name.is_none() {
                             return lower_runtime_property_set_by_name(
-                                ctx, object, property, value,
+                                ctx,
+                                object,
+                                property,
+                                value,
+                                assignment_strict,
                             );
                         }
                         return with_class_store_operands(
@@ -937,6 +1101,35 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                             },
                         );
                     }
+                }
+                // #9459: SLOPPY code stops here. Every class-field arm below
+                // terminates in `js_class_field_set_ic` /
+                // `js_class_field_set_fallback`, whose miss path is
+                // `js_object_set_field_by_name` -- no `strict` parameter, rejects
+                // by throwing. That is the same reason
+                // `put_value_static_property_fast_path` bars sloppy references
+                // from this route for `PutValueSet` (#6542), and the recovery is
+                // the same one #7288/#5094 built for that lowering: the #5093
+                // inline precheck declines every receiver whose store could be
+                // REJECTED (frozen, descriptor-bearing, wrong class or keys token,
+                // accessor in the chain), so its fast arm is mode-independent and
+                // only its miss needed a sloppy-correct tail. A decline lands on
+                // the same `js_put_value_set(..., 0)` the generic sloppy tail uses,
+                // so the two are one behaviour with two speeds.
+                //
+                // The setter-dispatch arm above is deliberately AHEAD of this: a
+                // compiled `__set_<property>` accessor runs in both modes, and a
+                // setter that throws does so because of its own body, not because
+                // of the assignment's `Throw` flag.
+                if !assignment_strict {
+                    if matches!(object.as_ref(), Expr::LocalGet(_) | Expr::This) {
+                        if let Some(result) =
+                            try_lower_sloppy_class_field_store(ctx, object, property, value)?
+                        {
+                            return Ok(result);
+                        }
+                    }
+                    return lower_sloppy_property_set_by_name(ctx, object, property, value);
                 }
                 // Fast path: known class instance + plain instance field.
                 // The runtime guard checks the receiver's class/shape and
@@ -1658,6 +1851,19 @@ pub(crate) fn lower(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         );
                     }
                 }
+            }
+            // #9459: the generic SLOPPY tail. The strict tail below ends in
+            // `js_typed_feedback_object_set_field_by_name_fast`, whose underlying
+            // `js_object_set_field_by_name` has no `strict` parameter and rejects
+            // by throwing; sloppy `PutValue` must discard the rejection instead.
+            //
+            // `caller`/`arguments` are excluded in BOTH modes: those two names are
+            // routed here from `PutValueSet` specifically to reach
+            // `js_object_set_field_by_name`'s poisoned-accessor handling, which is
+            // not a `Throw`-flag decision, and diverting them would change
+            // behaviour this issue is not about.
+            if !assignment_strict && !matches!(property.as_str(), "caller" | "arguments") {
+                return lower_sloppy_property_set_by_name(ctx, object, property, value);
             }
             // #7154: the value expression can collect, and an evacuating minor
             // inside it relocates the receiver out from under `obj_box` --
