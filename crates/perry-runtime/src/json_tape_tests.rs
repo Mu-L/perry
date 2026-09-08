@@ -8,6 +8,55 @@
 
 use super::*;
 
+#[test]
+fn tape_scans_strings_and_numbers_across_word_boundaries() {
+    for n in [
+        0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129,
+    ] {
+        let pad = "a".repeat(n);
+        for token in [
+            "0",
+            "-0",
+            "123456789012345678901234567890",
+            "0.01234567890123456789",
+            "-1234.125e+12345",
+        ] {
+            let input = format!(r#"["{pad}",{token},"\u1234\n\"\\",true]"#);
+            let tape = build_tape(input.as_bytes()).expect("valid token grammar");
+            assert_eq!(
+                tape.entries.iter().map(|e| e.kind).collect::<Vec<_>>(),
+                [
+                    KIND_ARR_START,
+                    KIND_STRING,
+                    KIND_NUMBER,
+                    KIND_STRING,
+                    KIND_TRUE,
+                    KIND_ARR_END
+                ]
+            );
+            assert_eq!(tape.entries[2].offset as usize, n + 4);
+            assert_eq!(tape.entries[3].offset as usize, n + 5 + token.len());
+            assert_eq!(tape.entries[0].link, 5);
+            assert_eq!(tape.entries[5].link, 0);
+        }
+        for token in [
+            "-", "01", "-01", "1.", "1e", "1e+", "1e-", "1e+-1", "1x", "1.2.3", "0x1", "1e1.0",
+            "1e00x",
+        ] {
+            let input = format!("[\"{pad}\",{token}]");
+            assert!(build_tape(input.as_bytes()).is_none(), "accepted {input:?}");
+        }
+        for token in [r#""\x""#, r#""\u12xz""#, r#""\u123""#, r#""unterminated"#] {
+            let input = format!("[\"{pad}\",{token}]");
+            assert!(build_tape(input.as_bytes()).is_none(), "accepted {input:?}");
+        }
+        for control in 0..32u8 {
+            let input = format!("[\"{pad}{}\"]", control as char);
+            assert!(build_tape(input.as_bytes()).is_none(), "accepted {input:?}");
+        }
+    }
+}
+
 /// Tape structure invariants on a simple object — exercises the
 /// OBJ_START → KEY → scalar → OBJ_END chain and the backfilled
 /// `link` for skip-over.
@@ -218,9 +267,8 @@ fn tape_entry_layout() {
 /// The claim is structural, not a convention, and this pins the structure:
 /// every `TapeEntry` field is an integer, and `offset`/`link` are `u32` — too
 /// narrow to hold a 48-bit heap address even if some future code tried. `kind`
-/// is a `u8`. There is exactly one writer of the region
-/// (`json_tape_store::allocate`'s `copy_nonoverlapping` from a
-/// `&[TapeEntry]`), so nothing can smuggle a reference in behind it.
+/// is a `u8`. The tape builder writes these integer fields; storage is copied
+/// or transferred intact into the side allocation.
 ///
 /// If someone widens a field to pointer size this fails, and the whole
 /// direction has to be revisited: a tape that can carry a heap edge would need
@@ -659,4 +707,53 @@ fn force_materialize_declines_reparse_when_the_tape_root_is_not_the_blob_root() 
         crate::array::js_array_get(arr, 1).bits(),
         JSValue::number(8.0).bits()
     );
+}
+#[test]
+fn raw_tape_callback_can_release_source_after_scanning() {
+    let bytes = br#"[1,{"a":"value"},true]"#.to_vec();
+    let data = bytes.as_ptr();
+    let len = bytes.len();
+    let count = unsafe {
+        with_built_tape_raw(data, len, |entries| {
+            drop(bytes);
+            assert_eq!(entries[0].kind, KIND_ARR_START);
+            entries.len()
+        })
+    };
+    assert!(count.unwrap() > 3);
+    assert!(
+        unsafe { with_built_tape_raw::<()>(b"[".as_ptr(), 1, |_| panic!("invalid tape")) }
+            .is_none()
+    );
+}
+
+#[test]
+fn owned_tape_callback_transfers_storage_and_recovers_after_large_invalid_input() {
+    let mut invalid = vec![b'['; 100_000];
+    invalid.push(b'?');
+    assert!(unsafe {
+        with_built_tape_mut_raw::<()>(invalid.as_ptr(), invalid.len(), |_| {
+            panic!("invalid input must not produce an owned tape")
+        })
+    }
+    .is_none());
+    let input = br#"[1,{"a":"owned"},true]"#.to_vec();
+    let data = input.as_ptr();
+    let len = input.len();
+    let owned = unsafe {
+        with_built_tape_mut_raw(data, len, |entries| {
+            drop(input);
+            std::mem::take(entries)
+        })
+    }
+    .unwrap();
+    let original = owned.as_ptr();
+    let next = with_built_tape(b"[null]", |entries| {
+        assert_ne!(entries.as_ptr(), original);
+        entries[1].kind
+    });
+    assert_eq!(next, Some(KIND_NULL));
+    assert_eq!(owned[0].kind, KIND_ARR_START);
+    assert_eq!(owned[1].kind, KIND_NUMBER);
+    assert_eq!(owned.last().unwrap().kind, KIND_ARR_END);
 }

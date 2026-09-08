@@ -6413,6 +6413,7 @@ dependencies = [
 name = "perry-runtime"
 version = "0.5.1521"
 dependencies = [
+ "ahash 0.8.12",
  "anyhow",
  "base64 0.22.1",
  "cc",
@@ -6449,9 +6450,11 @@ dependencies = [
  "resolv-conf",
  "rustc-demangle",
  "ryu",
+ "ryu-js",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "simdutf8",
  "socket2",
  "taffy",
  "temporal_rs",

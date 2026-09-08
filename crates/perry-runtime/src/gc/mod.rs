@@ -35,7 +35,9 @@ use std::time::{Duration, Instant};
 
 mod types;
 pub use types::*;
+mod json_defer;
 mod policy;
+pub(crate) use json_defer::JsonParseAllocation;
 pub(crate) use policy::gc_runtime_safepoint;
 /// The one writer of `GC_SAFEPOINT_PENDING` — it also keeps the poll's global
 /// arming shadow in step. See `gc/poll_arm.rs`.
@@ -1649,6 +1651,18 @@ pub extern "C" fn js_gc_pause_stats(
 pub(crate) unsafe fn mark_shape_shared(user_ptr: *mut u8) {
     let header = layout::header_from_user_ptr(user_ptr);
     (*header).gc_flags |= GC_FLAG_SHAPE_SHARED;
+}
+
+/// Return the header for a user pointer whose GC provenance was already
+/// established by the caller. Keeping the layout cast inside `gc` makes that
+/// proof explicit at hot runtime call sites without repeating address-map
+/// classification during a callback-free operation.
+///
+/// # Safety
+/// `user_ptr` must point at the live payload of a Perry GC allocation.
+#[inline(always)]
+pub(crate) unsafe fn header_from_trusted_user_ptr(user_ptr: *const u8) -> *const GcHeader {
+    layout::header_from_user_ptr(user_ptr)
 }
 
 #[cfg(test)]

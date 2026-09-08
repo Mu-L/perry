@@ -101,6 +101,8 @@ impl AsRef<[u8]> for OwnedStringBytes {
 // below so external callers see the same names as before.
 
 mod alloc;
+mod json_construction;
+pub(crate) use json_construction::string_from_json_bytes;
 mod append;
 mod base64_codec;
 mod char_ops;
@@ -117,6 +119,7 @@ mod pad;
 mod raw;
 mod slice_ops;
 mod split;
+mod utf16_count;
 #[cfg(feature = "regex-engine")]
 pub(crate) use split::{spec_fancy_regex_split, spec_regex_split};
 
@@ -241,6 +244,10 @@ pub(crate) use format::{
 /// Flag: string bytes contain WTF-8 lone-surrogate sequences (U+D800..U+DFFF).
 /// Set by js_string_from_wtf8_bytes. Checked by isWellFormed/toWellFormed.
 pub const STRING_FLAG_HAS_LONE_SURROGATES: u32 = 1;
+/// The payload came from an unescaped JSON token, so quoting it requires no
+/// byte-level escape scan. String-producing mutations do not propagate this
+/// provenance bit unless they independently prove the resulting payload.
+pub(crate) const STRING_FLAG_JSON_ESCAPE_FREE: u32 = 1 << 1;
 
 /// A static empty string that can be used as a safe fallback for null pointers.
 /// Has utf16_len=0, byte_len=0, capacity=0, refcount=0, flags=0 (shared).
@@ -502,6 +509,9 @@ pub(crate) fn compute_utf16_len(data: *const u8, byte_len: u32) -> u32 {
     if bytes.iter().all(|&b| b < 0x80) {
         return byte_len;
     }
+    if bytes.len() >= 64 {
+        return utf16_count::count_bytes(bytes);
+    }
     match str::from_utf8(bytes) {
         Ok(s) => s.encode_utf16().count() as u32,
         Err(_) => compute_utf16_len_wtf8(bytes),
@@ -637,8 +647,30 @@ pub(crate) fn string_storage_alloc(capacity: u32) -> (*mut StringHeader, *mut u8
     let payload_size = std::mem::size_of::<StringHeader>() + capacity as usize;
     let raw = crate::arena::arena_alloc_gc(payload_size, 8, crate::gc::GC_TYPE_STRING);
     let ptr = raw as *mut StringHeader;
-    let data = unsafe { raw.add(std::mem::size_of::<StringHeader>()) };
+    let data = string_data(ptr).cast_mut();
     zero_alignment_padding_tail(raw, payload_size);
+    (ptr, data)
+}
+
+/// JSON results at or above this size use individually tracked storage.
+pub(crate) const JSON_MALLOC_OUTPUT_THRESHOLD: u32 = 1024 * 1024;
+
+/// Allocate a large, pointer-free JSON result outside old-generation arenas.
+///
+/// Ordinary large strings are born old because copying them through survivor
+/// space is wasteful. Repeated `JSON.stringify` is different: each result is a
+/// leaf commonly discarded at the next loop edge. Tracking that leaf as an
+/// individual malloc object lets the next minor sweep reclaim it without a
+/// whole-old-heap trace. Smaller results retain the arena fast path.
+#[inline]
+pub(crate) fn json_output_storage_alloc(capacity: u32) -> (*mut StringHeader, *mut u8) {
+    if capacity < JSON_MALLOC_OUTPUT_THRESHOLD {
+        return string_storage_alloc(capacity);
+    }
+    let payload_size = std::mem::size_of::<StringHeader>() + capacity as usize;
+    let raw = crate::gc::gc_malloc(payload_size, crate::gc::GC_TYPE_STRING);
+    let ptr = raw as *mut StringHeader;
+    let data = unsafe { raw.add(std::mem::size_of::<StringHeader>()) };
     (ptr, data)
 }
 

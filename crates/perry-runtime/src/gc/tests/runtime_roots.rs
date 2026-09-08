@@ -9,7 +9,11 @@ mod generator_attach_prototype;
 mod hook_dispatch_handles;
 mod interned_string_caches;
 mod iter_result_keys;
+mod json_construction;
+mod json_key_lifetime;
+mod json_record_output;
 mod json_shape_template;
+mod json_tape_owned;
 mod native_module_name;
 mod old_defrag_contract;
 mod prototype_addr_cache;
@@ -40,7 +44,7 @@ fn assert_panics_with(expected: &str, f: impl FnOnce()) {
     );
 }
 
-fn force_next_general_arena_alloc_slow() {
+pub(super) fn force_next_general_arena_alloc_slow() {
     const TEST_BLOCK_SIZE: usize = 1024 * 1024;
     let _ = crate::arena::arena_alloc(TEST_BLOCK_SIZE, 8);
 }

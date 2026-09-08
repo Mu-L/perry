@@ -1,39 +1,24 @@
-//! Issue #179 Step 2 Phase 1: tape representation for JSON values.
+//! Flat tape representation for lazy JSON arrays and iterative materialization.
 //!
-//! A *tape* is a flat `Vec<TapeEntry>` recording the structural
-//! positions of every significant token in a JSON blob: object/array
-//! starts and ends, object key positions, and scalar value positions.
-//! Each entry carries a byte-offset into the original blob and a
-//! lightweight kind tag. Parsing a JSON document to a tape is a
-//! single pass with bounded memory (tape size is O(token count),
-//! not O(tree size) — closer to 8-16 bytes per token versus the
-//! ~80+ bytes per JSValue object the tree representation costs).
+//! Tape entries contain only token kinds, byte offsets and subtree links.
+//! Scanning validates syntax without constructing a managed value for each
+//! token. Lazy array results retain the source and their tape, materializing
+//! accessed elements or reparsing the full array when traversal warrants it.
+//! The automatic parse route uses this for eligible array roots between 1 KB
+//! and 16 MB; PERRY_JSON_TAPE can force or disable the route.
 //!
-//! This module is the foundation for:
-//!   Phase 2 — `JSON.parse(x).length` reads tape's top-level array
-//!     length directly, no tree materialization
-//!   Phase 3 — indexed/property access on a tape-backed value
-//!     materializes only the touched subtree
-//!   Phase 4 — `JSON.stringify(taped)` on an unmutated tape memcpys
-//!     the original blob bytes instead of walking a tree
-//!
-//! This Phase 1 commit ships the tape builder + a materializer that
-//! produces the same `JSValue` tree as the existing `DirectParser`.
-//! It is opt-in via the `PERRY_JSON_TAPE=1` env var so production
-//! behavior is unchanged. Correctness is verified by running all
-//! existing `JSON.parse` tests through both the direct and
-//! tape-materialize paths and comparing their `JSON.stringify`
-//! output byte-for-byte.
-//!
-//! The tape+materialize path intentionally performs no better than
-//! the direct path (it does strictly more work). The value lands
-//! when Phase 2+ intercept access and skip materialization.
+//! Modest native scratch buffers are reused. Larger completed tapes transfer
+//! into the result's exact-size side allocation; they do not retain a second
+//! scratch copy. Eager and deeply nested materialization still borrow scratch.
+//! Input byte borrows end before callbacks that may collect and move the input.
 
 use crate::value::JSValue;
 use std::cell::Cell;
 
 mod iterative;
 pub(crate) use iterative::materialize_iterative;
+mod mutation;
+pub(crate) use mutation::{resolve_materialized_array, set_lazy_index};
 
 /// One tape entry. Kind + byte offset + (for container kinds) a
 /// parent/sibling pointer that lets materialization skip over
@@ -200,6 +185,11 @@ fn build_tape_into(bytes: &[u8], entries: &mut Vec<TapeEntry>, stack: &mut Vec<u
         debug_assert_eq!(bytes[*pos], b'"');
         *pos += 1;
         while *pos < bytes.len() {
+            let Some(offset) = crate::json::simd::find_string_terminator(&bytes[*pos..]) else {
+                *pos = bytes.len();
+                return false;
+            };
+            *pos += offset;
             let c = bytes[*pos];
             if c == b'"' {
                 *pos += 1;
@@ -242,18 +232,14 @@ fn build_tape_into(bytes: &[u8], entries: &mut Vec<TapeEntry>, stack: &mut Vec<u
             Some(b'0') => *pos += 1,
             Some(b'1'..=b'9') => {
                 *pos += 1;
-                while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
-                    *pos += 1;
-                }
+                *pos += crate::json::simd::count_ascii_digits(&bytes[*pos..]);
             }
             _ => return false,
         }
         if *pos < bytes.len() && bytes[*pos] == b'.' {
             *pos += 1;
             let fraction_start = *pos;
-            while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
-                *pos += 1;
-            }
+            *pos += crate::json::simd::count_ascii_digits(&bytes[*pos..]);
             if *pos == fraction_start {
                 return false;
             }
@@ -264,9 +250,7 @@ fn build_tape_into(bytes: &[u8], entries: &mut Vec<TapeEntry>, stack: &mut Vec<u
                 *pos += 1;
             }
             let exponent_start = *pos;
-            while *pos < bytes.len() && bytes[*pos].is_ascii_digit() {
-                *pos += 1;
-            }
+            *pos += crate::json::simd::count_ascii_digits(&bytes[*pos..]);
             if *pos == exponent_start {
                 return false;
             }
@@ -501,11 +485,45 @@ fn build_tape_into(bytes: &[u8], entries: &mut Vec<TapeEntry>, stack: &mut Vec<u
 /// only while it remains modest; large blobs are allowed to return
 /// their backing allocation to the system allocator instead of pinning
 /// a high-water tape buffer for the rest of the thread.
+#[cfg(test)]
 pub(crate) fn with_built_tape<R>(bytes: &[u8], f: impl FnOnce(&[TapeEntry]) -> R) -> Option<R> {
+    unsafe { with_built_tape_raw(bytes.as_ptr(), bytes.len(), f) }
+}
+
+/// Build a tape before a callback that may relocate or release the source.
+/// The input borrow ends with `build_tape_into`, before invoking `f`.
+///
+/// # Safety
+/// `data` must describe `len` live readable bytes until `f` starts. The callback
+/// must obtain a fresh source pointer after any collection; the tape itself
+/// contains offsets, never source pointers. Nothing reads `data` after `f`.
+pub(crate) unsafe fn with_built_tape_raw<R>(
+    data: *const u8,
+    len: usize,
+    f: impl FnOnce(&[TapeEntry]) -> R,
+) -> Option<R> {
+    with_built_tape_mut_raw(data, len, |entries| f(entries))
+}
+
+/// As `with_built_tape_raw`, but the callback can transfer the completed Vec.
+/// Only native tape storage is mutable; no source borrow crosses the callback.
+///
+/// # Safety
+/// The source-pointer contract is the same as `with_built_tape_raw`.
+pub(crate) unsafe fn with_built_tape_mut_raw<R>(
+    data: *const u8,
+    len: usize,
+    f: impl FnOnce(&mut Vec<TapeEntry>) -> R,
+) -> Option<R> {
     TAPE_SCRATCH.with(|cell| {
         let mut scratch = cell.take().unwrap_or_else(TapeScratch::new);
-        let result = if build_tape_into(bytes, &mut scratch.entries, &mut scratch.stack) {
-            Some(f(&scratch.entries))
+        let built = build_tape_into(
+            std::slice::from_raw_parts(data, len),
+            &mut scratch.entries,
+            &mut scratch.stack,
+        );
+        let result = if built {
+            Some(f(&mut scratch.entries))
         } else {
             None
         };
@@ -1205,35 +1223,16 @@ impl LazyArrayHeader {
     }
 }
 
-/// Arena-allocate a lazy array header owning `tape_entries` as a side
-/// allocation. Returns the pointer that `JSON.parse` hands back as a
-/// POINTER_TAG'd JSValue.
+/// Keep the small lazy header old-gen, born tenured and immovable (#7539).
+/// Its tape is a separate native allocation, so tape size no longer contributes
+/// dead arena capacity. The registry keys ownership by the header address.
 ///
-/// #7539: the tape used to be copied INLINE after the header, making this one
-/// allocation as large as the tape (~2.4 MB on a 10 k-record blob). That is
-/// over `LARGE_OBJECT_THRESHOLD_BYTES`, so `arena_alloc_gc` routed it into the
-/// old generation with `GC_FLAG_TENURED` and only a FULL collection could ever
-/// reclaim it. The header is ~88 bytes now and is born in the nursery like any
-/// other short-lived object; `json_tape_store` owns the tape bytes.
-/// The header's own bytes.
-///
-/// **Old generation, born tenured — and that is load-bearing, not incidental.**
-/// Before #7539 the header carried its tape inline, so it was multi-megabyte
-/// and `arena_alloc_gc`'s large-object arm put it here; every caller outside
-/// this module has therefore always been free to hold a raw
-/// `*mut LazyArrayHeader` across an allocation, and several do
-/// (`json::stringify_api::try_stringify_lazy_array` reads `blob_bytes` off a
-/// raw header and then allocates the result string; the array accessors pass
-/// raw headers into `force_materialize_lazy`).
-///
-/// Shrinking the header to ~88 bytes without pinning it here made it
-/// nursery-resident and therefore MOVABLE for the first time, and the copying
-/// minor promptly relocated it out from under those callers: `field_access`
-/// went non-deterministic, emitting a JSON string of NUL bytes for
-/// `JSON.stringify(parsed)` on 3 of 60 iterations (a stale `blob_str` read
-/// through a moved-from header). Keeping the header exactly where it has
-/// always been costs ~96 bytes of old generation per parse — the tape's
-/// ~2.4 MB is what had to leave — and keeps that contract intact.
+/// Before the tape moved out of line, the large-object allocator made every
+/// header old-gen. Callers therefore hold raw header pointers across allocation
+/// (`try_stringify_lazy_array`, lazy access and materialization). Making the
+/// smaller header movable broke those contracts: copied minors left stale
+/// `blob_str` reads and stringify emitted NUL bytes. Preserve its generation;
+/// ownership transfer changes only the pointer-free tape backing allocation.
 #[inline]
 fn alloc_lazy_header_bytes() -> *mut u8 {
     crate::arena::arena_alloc_gc_old_born_tenured(
@@ -1249,6 +1248,37 @@ pub unsafe fn alloc_lazy_array(
     cached_length: u32,
     blob_str: *const crate::StringHeader,
 ) -> *mut LazyArrayHeader {
+    alloc_lazy_array_backing(
+        crate::json_tape_store::TapeBacking::Borrowed(tape_entries),
+        root_idx,
+        cached_length,
+        blob_str,
+    )
+}
+
+pub(crate) unsafe fn alloc_lazy_array_from_scratch(
+    entries: &mut Vec<TapeEntry>,
+    root_idx: u32,
+    cached_length: u32,
+    blob_str: *const crate::StringHeader,
+) -> *mut LazyArrayHeader {
+    let backing = if entries.capacity() * std::mem::size_of::<TapeEntry>()
+        > MAX_RETAINED_TAPE_SCRATCH_BYTES
+    {
+        crate::json_tape_store::TapeBacking::Owned(std::mem::take(entries))
+    } else {
+        crate::json_tape_store::TapeBacking::Borrowed(entries)
+    };
+    alloc_lazy_array_backing(backing, root_idx, cached_length, blob_str)
+}
+
+unsafe fn alloc_lazy_array_backing(
+    backing: crate::json_tape_store::TapeBacking<'_>,
+    root_idx: u32,
+    cached_length: u32,
+    blob_str: *const crate::StringHeader,
+) -> *mut LazyArrayHeader {
+    let tape_len = backing.len() as u32;
     let scope = crate::gc::RuntimeHandleScope::new();
     let blob_handle = scope.root_string_ptr(blob_str);
     // Detach the tape FIRST, while there is no header address to invalidate.
@@ -1256,14 +1286,14 @@ pub unsafe fn alloc_lazy_array(
     // collection. `allocate` does account the bytes as external side pressure,
     // which can trigger, but the only live thing we hold across it is
     // `blob_handle`, which is rooted.
-    let (tape_ptr, tape_allocation) = crate::json_tape_store::allocate(tape_entries);
+    let (tape_ptr, tape_allocation) = backing.allocate();
     let (raw, blob_str) =
         blob_handle.across_const::<crate::StringHeader, _>(alloc_lazy_header_bytes);
     let hdr = raw as *mut LazyArrayHeader;
     (*hdr).cached_length = cached_length;
     (*hdr).magic = LAZY_ARRAY_MAGIC;
     (*hdr).root_idx = root_idx;
-    (*hdr).tape_len = tape_entries.len() as u32;
+    (*hdr).tape_len = tape_len;
     // GC_STORE_AUDIT(POINTER_FREE): side-allocated tape bytes, not a heap edge —
     // no barrier, and deliberately absent from the LazyArray rewrite descriptor.
     (*hdr).tape = tape_ptr;
@@ -1493,17 +1523,11 @@ pub unsafe fn lazy_get(hdr: *mut LazyArrayHeader, i: u32) -> JSValue {
     if hdr.is_null() {
         return JSValue::from_bits(crate::value::TAG_UNDEFINED);
     }
-    // Fast path 1: full-materialize already triggered. Read from
-    // the real array at arr+8+i*8.
-    let mat = (*hdr).materialized;
+    // Full materialization may have been followed by growth or mutation.
+    // Use the ordinary accessor to preserve forwarding, holes and getters.
+    let mat = resolve_materialized_array(hdr);
     if !mat.is_null() {
-        let length = (*mat).length;
-        if i >= length {
-            return JSValue::from_bits(crate::value::TAG_UNDEFINED);
-        }
-        let elements_ptr =
-            (mat as *const u8).add(std::mem::size_of::<crate::array::ArrayHeader>()) as *const u64;
-        return JSValue::from_bits(*elements_ptr.add(i as usize));
+        return crate::array::js_array_get(mat, i);
     }
 
     let cached_length = (*hdr).cached_length;
@@ -1810,7 +1834,7 @@ pub unsafe fn force_materialize_lazy(hdr: *mut LazyArrayHeader) -> *mut crate::a
         return std::ptr::null_mut();
     }
     if !(*hdr).materialized.is_null() {
-        return (*hdr).materialized;
+        return resolve_materialized_array(hdr);
     }
     let cached_length = (*hdr).cached_length;
     // Same helper `lazy_get`'s scan-flip trigger consults, so the trigger

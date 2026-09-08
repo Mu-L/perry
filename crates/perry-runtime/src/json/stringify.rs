@@ -11,7 +11,7 @@ use std::fmt::Write as FmtWrite;
 
 pub(crate) use super::stringify_scalars::{
     bigint_apply_to_json, serialize_bigint, throw_bigint_serialize, write_escaped_string,
-    write_number,
+    write_heap_string, write_number, write_short_string,
 };
 // The homogeneous-array shape template lives in a sibling (file-size gate);
 // both the object and the array emitter below drive it.
@@ -74,7 +74,7 @@ pub unsafe fn ptr_is_tracked_heap_object(ptr: *const u8) -> bool {
 /// Dynamic SSO writes keep short property names inline; module-slot shapes may
 /// still carry the legacy validated raw `StringHeader` pointer form.
 #[inline]
-unsafe fn object_key_str<'a>(
+pub(super) unsafe fn object_key_str<'a>(
     key_bits: u64,
     sso: &'a mut [u8; crate::value::SHORT_STRING_MAX_LEN],
 ) -> Option<&'a str> {
@@ -278,10 +278,9 @@ pub(crate) unsafe fn object_get_to_json(ptr: *const u8) -> Option<f64> {
 
     let obj_ptr = recv_handle.get_nanbox_f64();
     let obj_ptr = (obj_ptr.to_bits() & POINTER_MASK) as *const crate::ObjectHeader;
-    let method = crate::object::js_object_get_field_by_name(
-        obj_ptr,
-        key_handle.get_raw_const_ptr::<crate::string::StringHeader>(),
-    );
+    let method = key_handle.with_const_ptr(|key: *const crate::string::StringHeader| {
+        crate::object::js_object_get_field_by_name(obj_ptr, key)
+    });
 
     // Only treat it as toJSON if it actually resolved to a callable closure
     // (POINTER_TAG + closure). A plain object with no `toJSON`, or a `toJSON`
@@ -1093,7 +1092,15 @@ pub(crate) unsafe fn stringify_object_inner(ptr: *const u8, buf: &mut String, de
         && (*obj).class_id == 0
     {
         if let Some(tmpl_ptr) = shape_template_for(ptr) {
-            if try_emit_shape_element(make_pointer_bits(ptr), &*tmpl_ptr, buf, depth) {
+            let mut data_record_global_proof = false;
+            if try_emit_shape_element(
+                make_pointer_bits(ptr),
+                &*tmpl_ptr,
+                buf,
+                depth,
+                None,
+                &mut data_record_global_proof,
+            ) {
                 if depth > MAX_FAST_DEPTH {
                     STRINGIFY_STACK.with(|s| s.borrow_mut().pop());
                 }
@@ -1120,12 +1127,14 @@ pub(crate) unsafe fn stringify_object_inner(ptr: *const u8, buf: &mut String, de
     // `keys_array` field is rewritten by the collector when it moves).
     let scope = crate::gc::RuntimeHandleScope::new();
     let obj_handle = scope.root_raw_const_ptr(obj);
-    let cur_obj = || obj_handle.get_raw_const_ptr::<crate::ObjectHeader>();
     let key_at = |f: u32| -> f64 {
-        let keys_arr = crate::object::object_keys_array(cur_obj());
-        let keys_elements =
-            (keys_arr as *const u8).add(std::mem::size_of::<crate::ArrayHeader>()) as *const f64;
-        *keys_elements.add(f as usize)
+        obj_handle.with_const_ptr(|obj: *const crate::ObjectHeader| {
+            let keys_arr = crate::object::object_keys_array(obj);
+            let keys_elements = (keys_arr as *const u8)
+                .add(std::mem::size_of::<crate::ArrayHeader>())
+                as *const f64;
+            *keys_elements.add(f as usize)
+        })
     };
     // Closes #307: iterate up to keys_len, not min(num_fields, keys_len).
     // Parser-built objects with ≥9 fields cap field_count at the inline
@@ -1140,14 +1149,15 @@ pub(crate) unsafe fn stringify_object_inner(ptr: *const u8, buf: &mut String, de
     // for any parsed object with ≥9 fields.
     let alloc_limit = std::cmp::max(num_fields, crate::object::INLINE_SLOT_FLOOR as u32);
     let read_field_bits = |f: u32| -> u64 {
-        let obj = cur_obj();
-        if f < alloc_limit {
-            let fields_ptr =
-                (obj as *const u8).add(std::mem::size_of::<crate::ObjectHeader>()) as *const f64;
-            (*fields_ptr.add(f as usize)).to_bits()
-        } else {
-            crate::object::js_object_get_field(obj, f).bits()
-        }
+        obj_handle.with_const_ptr(|obj: *const crate::ObjectHeader| {
+            if f < alloc_limit {
+                let fields_ptr = (obj as *const u8).add(std::mem::size_of::<crate::ObjectHeader>())
+                    as *const f64;
+                (*fields_ptr.add(f as usize)).to_bits()
+            } else {
+                crate::object::js_object_get_field(obj, f).bits()
+            }
+        })
     };
     let actual_fields = keys_len;
 
@@ -1156,6 +1166,23 @@ pub(crate) unsafe fn stringify_object_inner(ptr: *const u8, buf: &mut String, de
     // insertion order. `None` means no array-index keys, so insertion order
     // already matches spec and the loop walks `0..actual_fields` directly.
     let key_order = crate::object::ecma_own_key_order(keys_arr);
+
+    // Nested one-field leaves and wide inline objects can prove primitive
+    // fields by one raw walk, avoiding the generic closure scan's handle retrievals
+    // and repeated retrievals during emission. No pointer/BigInt field,
+    // descriptor or class can reach the borrowed emit interval.
+    if (actual_fields == 1 || actual_fields > 32)
+        && !has_overflow_fields
+        && (*obj).class_id == 0
+        && !crate::object::object_has_descriptors(ptr as usize)
+        && super::stringify_primitive_object::fields_are_primitive(obj, actual_fields)
+    {
+        super::stringify_primitive_object::emit_validated(obj, keys_arr, key_order.as_deref(), buf);
+        if depth > MAX_FAST_DEPTH {
+            STRINGIFY_STACK.with(|s| s.borrow_mut().pop());
+        }
+        return;
+    }
 
     // Deferred toJSON + closure checks (issue #67 tightening): scan fields
     // once to detect if any field is actually a closure. For data-only
@@ -1237,8 +1264,6 @@ pub(crate) unsafe fn stringify_object_inner(ptr: *const u8, buf: &mut String, de
         }
     }
 
-    buf.push('{');
-    let mut first = true;
     // Only own ENUMERABLE keys are serialized; gated on the process-wide
     // atomic AND the per-object `OBJ_FLAG_HAS_DESCRIPTORS` header flag
     // (#6009) — the global flag flips for good the first time ANY program
@@ -1247,6 +1272,8 @@ pub(crate) unsafe fn stringify_object_inner(ptr: *const u8, buf: &mut String, de
     // `json_object_getter_value`) on objects that never had a descriptor.
     let filter_non_enum =
         crate::object::descriptors_in_use() && crate::object::object_has_descriptors(ptr as usize);
+    buf.push('{');
+    let mut first = true;
     // `pos(j)` maps the j-th enumerated slot to its key/field index: spec
     // order when array-index keys are present, else slot `j` (no allocation).
     let pos = |j: u32| -> u32 {
@@ -1264,16 +1291,22 @@ pub(crate) unsafe fn stringify_object_inner(ptr: *const u8, buf: &mut String, de
         // Private elements (`#x`) live in a class instance's keys_array but are
         // not serializable own properties. (`has_prototype_chain` == class_id != 0.)
         if has_prototype_chain
-            && crate::object::instance_private_key_hidden(
-                cur_obj(),
-                JSValue::from_bits(key_at(f).to_bits()),
-            )
+            && obj_handle.with_const_ptr(|obj: *const crate::ObjectHeader| {
+                crate::object::instance_private_key_hidden(
+                    obj,
+                    JSValue::from_bits(key_at(f).to_bits()),
+                )
+            })
         {
             continue;
         }
         // Skip non-enumerable own keys (e.g. `Object.defineProperty(o, k,
         // { enumerable: false })`) before touching the value.
-        if filter_non_enum && json_key_non_enumerable(cur_obj(), key_at(f)) {
+        if filter_non_enum
+            && obj_handle.with_const_ptr(|obj: *const crate::ObjectHeader| {
+                json_key_non_enumerable(obj, key_at(f))
+            })
+        {
             continue;
         }
         let mut field_bits = read_field_bits(f);
@@ -1284,7 +1317,9 @@ pub(crate) unsafe fn stringify_object_inner(ptr: *const u8, buf: &mut String, de
         // The getter is USER CODE: every pointer below is re-derived from the
         // rooted handle after it returns.
         if filter_non_enum {
-            if let Some(gv) = crate::object::json_object_getter_value(cur_obj(), key_at(f)) {
+            if let Some(gv) = obj_handle.with_const_ptr(|obj: *const crate::ObjectHeader| {
+                crate::object::json_object_getter_value(obj, key_at(f))
+            }) {
                 field_bits = gv.to_bits();
             }
         }
@@ -1447,6 +1482,12 @@ pub(crate) unsafe fn stringify_array_depth(ptr: *const u8, buf: &mut String, dep
         SUPPRESS_NEXT_TO_JSON.with(|c| c.set(false));
         return;
     }
+    // A primitive-only array cannot recurse, invoke user code or collect.
+    // Its emitter borrows the resolved element storage for this call only;
+    // complex values fall back before writing any output.
+    if super::stringify_primitive_array::try_emit(arr, buf) {
+        return;
+    }
     // Circular-reference detection (ECMA-262 25.5.2 SerializeJSONArray step
     // 1-2). Unlike objects, the compact array path does NOT bump `depth`, so
     // an all-array cycle (`a=[]; a.push(a)`) would otherwise recurse until the
@@ -1466,6 +1507,22 @@ pub(crate) unsafe fn stringify_array_depth(ptr: *const u8, buf: &mut String, dep
     }
     STRINGIFY_STACK.with(|s| s.borrow_mut().push(arr as usize));
     let len = (*arr).length;
+    // A descriptor/prototype-aware Get can invoke a getter, mutate later
+    // indices or move the array. Raw slot reads (including template probing)
+    // cannot preserve those effects. Keep this walk outside the dense path.
+    let array_flags = crate::value::addr_class::try_read_tracked_gc_header(arr as usize)
+        .map_or(0, |header| header.as_ref()._reserved);
+    if crate::array::array_iteration_is_exotic_resolved(arr, array_flags)
+        || crate::object::prototype_chain::object_static_prototype(arr as usize).is_some()
+    {
+        stringify_exotic_array(arr, len, buf, depth);
+        STRINGIFY_STACK.with(|s| s.borrow_mut().pop());
+        return;
+    }
+    if super::stringify_nested_records::try_emit(arr, buf, depth) {
+        STRINGIFY_STACK.with(|s| s.borrow_mut().pop());
+        return;
+    }
     // Root the array and re-derive the element base per access: a nested
     // `toJSON` / getter / any allocation inside the recursive serialization
     // below can trigger a GC that sweeps or moves this array while a hoisted
@@ -1475,8 +1532,10 @@ pub(crate) unsafe fn stringify_array_depth(ptr: *const u8, buf: &mut String, dep
     let scope = crate::gc::RuntimeHandleScope::new();
     let arr_handle = scope.root_raw_const_ptr(arr);
     let elem_at = |i: usize| -> f64 {
-        let arr = arr_handle.get_raw_const_ptr::<crate::ArrayHeader>();
-        *((arr as *const u8).add(std::mem::size_of::<crate::ArrayHeader>()) as *const f64).add(i)
+        arr_handle.with_const_ptr(|arr: *const crate::ArrayHeader| {
+            *((arr as *const u8).add(std::mem::size_of::<crate::ArrayHeader>()) as *const f64)
+                .add(i)
+        })
     };
 
     // Homogeneous-shape fast path for arrays of objects sharing one
@@ -1519,21 +1578,28 @@ pub(crate) unsafe fn stringify_array_depth(ptr: *const u8, buf: &mut String, dep
     };
 
     if let Some(ref tmpl) = template {
+        let mut data_record_global_proof = false;
         buf.push('[');
         for i in 0..len {
             if i > 0 {
                 buf.push(',');
             }
-            // An element's `toJSON` key is its stringified index (#5909). Set
-            // before the shape emit (which may run the element's own `toJSON`)
-            // and the per-element fallback below.
-            set_to_json_key_index(i as usize);
             // Re-derived per element: the previous element's serialization can
             // have run user code / allocated (and moved this array).
             let elem = elem_at(i as usize);
             let elem_bits = elem.to_bits();
-            if !try_emit_shape_element(elem_bits, tmpl, buf, depth + 1) {
+            if !try_emit_shape_element(
+                elem_bits,
+                tmpl,
+                buf,
+                depth + 1,
+                Some(i as usize),
+                &mut data_record_global_proof,
+            ) {
                 // The element is one container below its enclosing array.
+                // `try_emit_shape_element` can decline before reaching its
+                // callback-capable section, so publish the index for fallback.
+                set_to_json_key_index(i as usize);
                 stringify_value_depth(elem, TYPE_UNKNOWN, buf, depth + 1);
             }
         }
@@ -1698,6 +1764,37 @@ pub(crate) unsafe fn stringify_array_depth(ptr: *const u8, buf: &mut String, dep
     }
     buf.push(']');
     STRINGIFY_STACK.with(|s| s.borrow_mut().pop());
+}
+
+unsafe fn stringify_exotic_array(
+    arr: *const crate::ArrayHeader,
+    len: u32,
+    buf: &mut String,
+    depth: u32,
+) {
+    let scope = crate::gc::RuntimeHandleScope::new();
+    let input = scope.root_raw_const_ptr(arr);
+    buf.push('[');
+    for i in 0..len {
+        if i != 0 {
+            buf.push(',');
+        }
+        let element = input.with_const_ptr(|arr| crate::array::array_spec_get(arr, i));
+        let bits = element.to_bits();
+        if bits == TAG_UNDEFINED
+            || bits == crate::value::TAG_HOLE
+            || is_closure_value(bits)
+            || is_symbol_value(bits)
+        {
+            buf.push_str("null");
+        } else {
+            let element_scope = crate::gc::RuntimeHandleScope::new();
+            let element = element_scope.root_nanbox_f64(element);
+            set_to_json_key_index(i as usize);
+            stringify_value_depth(element.get_nanbox_f64(), TYPE_UNKNOWN, buf, depth + 1);
+        }
+    }
+    buf.push(']');
 }
 
 #[inline]

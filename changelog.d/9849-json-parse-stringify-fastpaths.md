@@ -1,0 +1,5 @@
+Accelerate JSON parse and stringify with bounded scanners, direct scalar and record construction, reusable native shape plans, exact number formatting, transferred tape storage, and direct final-string output. Specialized paths retain exact semantic guards and fall back before callbacks or unsupported object behavior.
+
+Keep collection outside partially constructed JSON graphs: parse batches allocation and finalization within bounded no-collection windows, then publishes only complete objects; stringify schedules malloc-backed output reclamation only after the result is complete. Caches contain native bytes and stable IDs rather than managed pointers.
+
+On the accepted M1 comparison against Perry 0.5.1520, Node 26.5.1, and Bun 1.3.14, Perry wins 26 of 38 CPU rows against Node and 27 of 38 against Bun. The final stable-prefix cache reduces six-field record stringify from 215.12 ns to 170.44 ns (-20.77%) with flat 1M-to-10M-call RSS, while the final tiny-object parse path runs at about 103 ns. The final artifacts pass 114/114 cross-runtime output rows and the serial runtime suite at 3,313 passed, 0 failed, 4 ignored.

@@ -50,13 +50,14 @@ pub unsafe extern "C" fn js_json_parse_or_null(text_ptr: *const StringHeader) ->
 pub(crate) unsafe fn test_json_parse_direct(text_ptr: *const StringHeader) -> JSValue {
     assert!(!text_ptr.is_null());
     let len = (*text_ptr).byte_len as usize;
-    let data_ptr = (text_ptr as *const u8).add(std::mem::size_of::<StringHeader>());
+    let data_ptr = crate::string::string_data(text_ptr);
     let bytes = std::slice::from_raw_parts(data_ptr, len);
 
     crate::gc::gc_suppress();
     let text_root = parse_root_push(JSValue::string_ptr(text_ptr as *mut StringHeader));
-    let mut parser = DirectParser::new(bytes);
+    let mut parser = DirectParser::new_batched(bytes);
     let result = parser.parse_value();
+    let _ = parser.finish();
     parse_root_push(result);
     crate::gc::gc_unsuppress();
     parse_root_restore(text_root);
@@ -92,10 +93,23 @@ fn throw_range_error(message: &str) -> ! {
 /// one of the three and appeared to do nothing at all, because the entry point
 /// codegen actually calls was one of the other two.
 fn requires_iterative_parse(bytes: &[u8]) -> bool {
-    crate::json::parser::nesting_depth_exceeds(
-        bytes,
-        crate::json::parser::MAX_RECURSIVE_NESTING_DEPTH,
-    )
+    // Every nesting level requires an opening byte, even in malformed input.
+    // Keep the small-input proof here so the large scanner's body is unchanged.
+    bytes.len() > crate::json::parser::MAX_RECURSIVE_NESTING_DEPTH
+        && crate::json::parser::nesting_depth_exceeds(
+            bytes,
+            crate::json::parser::MAX_RECURSIVE_NESTING_DEPTH,
+        )
+}
+
+#[test]
+fn json_parse_entry_depth_bound_preserves_the_first_excess_opening() {
+    let limit = crate::json::parser::MAX_RECURSIVE_NESTING_DEPTH;
+    assert!(!requires_iterative_parse(&vec![b'['; limit]));
+    assert!(requires_iterative_parse(&vec![b'['; limit + 1]));
+    assert!(!requires_iterative_parse(&vec![b'}'; limit + 1]));
+    let quoted = format!("\"{}\"", "[".repeat(limit + 1));
+    assert!(!requires_iterative_parse(quoted.as_bytes()));
 }
 
 fn exceeds_iterative_budget(bytes: &[u8]) -> bool {
@@ -117,33 +131,35 @@ fn iterative_budget_message() -> String {
 /// likewise keeps pending containers on the heap. This path runs only beyond
 /// the recursive fast path's safe depth, so ordinary JSON keeps its existing
 /// allocation and shape-specialization behavior.
-unsafe fn try_parse_deep_iterative(
-    text_ptr: *const StringHeader,
-    len: usize,
-    bytes: &[u8],
-) -> Option<JSValue> {
+unsafe fn try_parse_deep_iterative(text_ptr: *const StringHeader, len: usize) -> Option<JSValue> {
     let text_root = parse_root_push(JSValue::string_ptr(text_ptr as *mut StringHeader));
-    let result = crate::json_tape::with_built_tape(bytes, |tape_entries| {
-        crate::gc::gc_collect_pending_suppressed_parse();
-        crate::gc::gc_check_trigger();
-        crate::gc::gc_suppress();
+    let result = crate::json_tape::with_built_tape_raw(
+        crate::string::string_data(text_ptr),
+        len,
+        |tape_entries| {
+            crate::gc::gc_collect_pending_suppressed_parse();
+            crate::gc::gc_check_trigger();
+            let gc_allocation = crate::gc::JsonParseAllocation::begin(len);
+            crate::gc::gc_suppress();
 
-        let bytes = {
-            let moved = parse_root_get(text_root);
-            let hdr = moved.as_string_ptr();
-            // Canonical payload accessor, not an open-coded header offset.
-            std::slice::from_raw_parts(crate::string::string_data(hdr), len)
-        };
-        let result = crate::json_tape::materialize_iterative(tape_entries, bytes);
-        if let Some(value) = result {
-            parse_root_push(value);
-        }
+            let bytes = {
+                let moved = parse_root_get(text_root);
+                let hdr = moved.as_string_ptr();
+                // Canonical payload accessor, not an open-coded header offset.
+                std::slice::from_raw_parts(crate::string::string_data(hdr), len)
+            };
+            let result = crate::json_tape::materialize_iterative(tape_entries, bytes);
+            if let Some(value) = result {
+                parse_root_push(value);
+            }
 
-        crate::gc::gc_unsuppress();
-        crate::gc::gc_bump_malloc_trigger();
-        crate::gc::gc_schedule_parse_boundary_collection_if_pressure();
-        result
-    })
+            crate::gc::gc_unsuppress();
+            crate::gc::gc_bump_json_malloc_trigger_deferred();
+            crate::gc::gc_schedule_parse_boundary_collection_if_pressure();
+            gc_allocation.finish();
+            result
+        },
+    )
     .flatten();
     parse_root_restore(text_root);
 
@@ -170,18 +186,56 @@ pub unsafe fn js_json_parse_result(text_ptr: *const StringHeader) -> Result<JSVa
         return Err(syntax_error_value("Unexpected end of JSON input"));
     }
     let len = (*text_ptr).byte_len as usize;
-    let data_ptr = (text_ptr as *const u8).add(std::mem::size_of::<StringHeader>());
-    let bytes = std::slice::from_raw_parts(data_ptr, len);
-
+    let data_ptr = crate::string::string_data(text_ptr);
     if len == 0 {
         return Err(syntax_error_value("Unexpected end of JSON input"));
     }
+    if matches!(*data_ptr, b'{' | b'[') {
+        return parse_result_slow(text_ptr, len);
+    }
+    parse_result_noncontainer(text_ptr, len)
+}
 
+#[inline(never)]
+unsafe fn parse_result_noncontainer(
+    text_ptr: *const StringHeader,
+    len: usize,
+) -> Result<JSValue, f64> {
+    let bytes = std::slice::from_raw_parts(crate::string::string_data(text_ptr), len);
+    if let Some(value) = super::parse_scalar::try_parse_scalar(bytes) {
+        // Decoding has finished. Neither the result nor any remaining local
+        // use needs a heap pointer, so pending work can run without a parse
+        // root or suppression/rebaseline cycle. Keep the existing debt hook.
+        crate::gc::gc_collect_pending_suppressed_parse();
+        super::parse_scalar::clear_oversized_key_cache();
+        return Ok(value);
+    }
+
+    parse_result_slow(text_ptr, len)
+}
+
+// Keep the rooted/allocating parser's stack frame out of scalar calls.
+#[inline(never)]
+unsafe fn parse_result_slow(text_ptr: *const StringHeader, len: usize) -> Result<JSValue, f64> {
+    // Derive the borrow here, rather than passing a shared-reference argument
+    // whose function-wide protection would cross the collection points below.
+    let data_ptr = (text_ptr as *const u8).add(std::mem::size_of::<StringHeader>());
+    let bytes = std::slice::from_raw_parts(data_ptr, len);
+    if super::parse_empty::is_empty_object(bytes) {
+        return Ok(super::parse_empty::allocate_empty_object());
+    }
+    if len <= super::parse_inline_object::MAX_BYTES {
+        if let Some(plan) = super::parse_inline_object::decode(bytes) {
+            if let Some(value) = super::parse_inline_object::allocate(&plan) {
+                return Ok(value);
+            }
+        }
+    }
     if requires_iterative_parse(bytes) {
         if exceeds_iterative_budget(bytes) {
             return Err(range_error_value(&iterative_budget_message()));
         }
-        return try_parse_deep_iterative(text_ptr, len, bytes)
+        return try_parse_deep_iterative(text_ptr, len)
             .ok_or_else(|| syntax_error_value("JSON parse error: malformed deep document"));
     }
 
@@ -195,6 +249,7 @@ pub unsafe fn js_json_parse_result(text_ptr: *const StringHeader) -> Result<JSVa
 
     crate::gc::gc_collect_pending_suppressed_parse();
     crate::gc::gc_check_trigger();
+    let gc_allocation = crate::gc::JsonParseAllocation::begin(len);
     crate::gc::gc_suppress();
 
     //
@@ -208,13 +263,14 @@ pub unsafe fn js_json_parse_result(text_ptr: *const StringHeader) -> Result<JSVa
         // Canonical payload accessor, not an open-coded header offset.
         std::slice::from_raw_parts(crate::string::string_data(hdr), len)
     };
-    let mut parser = DirectParser::new(bytes);
+    let mut parser = DirectParser::new_batched(bytes);
     let result = parser.parse_value();
     let parse_ok = parser.finish();
     parse_root_push(result);
     crate::gc::gc_unsuppress();
-    crate::gc::gc_bump_malloc_trigger();
+    crate::gc::gc_bump_json_malloc_trigger_deferred();
     crate::gc::gc_schedule_parse_boundary_collection_if_pressure();
+    gc_allocation.finish();
     parse_root_restore(text_root);
 
     PARSE_KEY_CACHE.with(|c| {
@@ -279,22 +335,61 @@ pub unsafe extern "C" fn js_json_parse(text_ptr: *const StringHeader) -> JSValue
     }
     let len = (*text_ptr).byte_len as usize;
     let data_ptr = (text_ptr as *const u8).add(std::mem::size_of::<StringHeader>());
-    let bytes = std::slice::from_raw_parts(data_ptr, len);
-
     if len == 0 {
         throw_syntax_error("Unexpected end of JSON input");
+    }
+    if matches!(*data_ptr, b'{' | b'[') {
+        return parse_slow(text_ptr, len);
+    }
+    parse_noncontainer(text_ptr, len)
+}
+
+// Keep scalar decoding's register frame off the ordinary container branch.
+#[inline(never)]
+unsafe fn parse_noncontainer(text_ptr: *const StringHeader, len: usize) -> JSValue {
+    let bytes = std::slice::from_raw_parts(crate::string::string_data(text_ptr), len);
+    if let Some(value) = super::parse_scalar::try_parse_scalar(bytes) {
+        // No input access follows this collection point, and `value` is
+        // entirely inline. Allocating parses retain their existing flow.
+        crate::gc::gc_collect_pending_suppressed_parse();
+        super::parse_scalar::clear_oversized_key_cache();
+        return value;
+    }
+    parse_slow(text_ptr, len)
+}
+
+#[inline(never)]
+unsafe fn parse_slow(text_ptr: *const StringHeader, len: usize) -> JSValue {
+    let data_ptr = (text_ptr as *const u8).add(std::mem::size_of::<StringHeader>());
+    let bytes = std::slice::from_raw_parts(data_ptr, len);
+    if super::parse_empty::is_empty_object(bytes) {
+        return super::parse_empty::allocate_empty_object();
+    }
+    if len <= super::parse_inline_object::MAX_BYTES {
+        if let Some(plan) = super::parse_inline_object::decode(bytes) {
+            if let Some(value) = super::parse_inline_object::allocate(&plan) {
+                return value;
+            }
+        }
     }
     if requires_iterative_parse(bytes) {
         if exceeds_iterative_budget(bytes) {
             throw_range_error(&iterative_budget_message());
         }
-        return match try_parse_deep_iterative(text_ptr, len, bytes) {
+        return match try_parse_deep_iterative(text_ptr, len) {
             Some(value) => value,
             None => throw_syntax_error("JSON parse error: malformed deep document"),
         };
     }
 
+    // Pending parse debt can evacuate the input before the later trigger.
+    // Root once for both routes and derive every later borrow from this slot.
+    let text_root = parse_root_push(JSValue::string_ptr(text_ptr as *mut StringHeader));
     crate::gc::gc_collect_pending_suppressed_parse();
+    let bytes = std::slice::from_raw_parts(
+        crate::string::string_data(parse_root_get(text_root).as_string_ptr()),
+        len,
+    );
 
     // Issue #179 Step 2 Phase 1 → default-on: tape-based lazy parse
     // is now the default for top-level arrays on blobs larger than
@@ -346,7 +441,8 @@ pub unsafe extern "C" fn js_json_parse(text_ptr: *const StringHeader) -> JSValue
     // a correctness fallback).
     let use_tape = tape_route_eligible(len, bytes);
     if use_tape {
-        if let Some(result) = try_parse_via_tape(text_ptr, bytes) {
+        if let Some(result) = try_parse_via_tape(text_root, len) {
+            parse_root_restore(text_root);
             return result;
         }
         // Malformed input or non-array top-level — fall through to
@@ -382,14 +478,13 @@ pub unsafe extern "C" fn js_json_parse(text_ptr: *const StringHeader) -> JSValue
     // already moved away from — so re-deriving from that slot returns the same
     // stale pointer and fixes nothing. Rooting first means the collector
     // rewrites the slot, and the re-read yields the post-move payload.
-    let text_root = parse_root_push(JSValue::string_ptr(text_ptr as *mut StringHeader));
-
     crate::gc::gc_check_trigger();
 
     // Suppress GC for the duration of the parse. Parse is synchronous and
     // roots all intermediates in PARSE_ROOTS, so no collection is needed
     // until we're done. This eliminates O(n*m) overhead from mid-parse GC
     // cycles walking an ever-growing live set (issue #59).
+    let gc_allocation = crate::gc::JsonParseAllocation::begin(len);
     crate::gc::gc_suppress();
 
     let bytes = {
@@ -399,17 +494,18 @@ pub unsafe extern "C" fn js_json_parse(text_ptr: *const StringHeader) -> JSValue
         std::slice::from_raw_parts(crate::string::string_data(hdr), len)
     };
 
-    let mut parser = DirectParser::new(bytes);
+    let mut parser = DirectParser::new_batched(bytes);
     let result = parser.parse_value();
     let parse_ok = parser.finish();
     parse_root_push(result);
 
-    // Re-enable GC and rebaseline triggers while the result is still
-    // rooted. Tiny parse-churn pressure may collect here; keeping the
-    // parse roots until after the bump protects the value being returned.
+    // Complete construction and record debt without collecting the result
+    // before returning. The scheduler owns the bounded lifetime grace period;
+    // all object layouts and old-to-young edges are already complete.
     crate::gc::gc_unsuppress();
-    crate::gc::gc_bump_malloc_trigger();
+    crate::gc::gc_bump_json_malloc_trigger_deferred();
     crate::gc::gc_schedule_parse_boundary_collection_if_pressure();
+    gc_allocation.finish();
     parse_root_restore(text_root);
 
     // Keep key intern cache across parses — scan_parse_roots marks cached
@@ -479,49 +575,53 @@ pub(crate) fn tape_mode_from_env() -> TapeMode {
 /// parser (pending parse-boundary collection → gc_check_trigger →
 /// suppress → parse → unsuppress → bump malloc trigger + cache trim) so
 /// it's a drop-in replacement behind the feature flag.
-pub(crate) unsafe fn try_parse_via_tape(
-    text_ptr: *const StringHeader,
-    bytes: &[u8],
-) -> Option<JSValue> {
-    crate::json_tape::with_built_tape(bytes, |tape_entries| {
-        crate::gc::gc_collect_pending_suppressed_parse();
-        crate::gc::gc_check_trigger();
-        crate::gc::gc_suppress();
-        let text_root = parse_root_push(JSValue::string_ptr(text_ptr as *mut StringHeader));
+unsafe fn try_parse_via_tape(text_root: usize, len: usize) -> Option<JSValue> {
+    // The caller owns the input root. Build the native tape before collecting,
+    // as in the original allocation order, but end the input borrow first.
+    let text_ptr = parse_root_get(text_root).as_string_ptr();
+    crate::json_tape::with_built_tape_mut_raw(
+        crate::string::string_data(text_ptr),
+        len,
+        |tape_entries| {
+            crate::gc::gc_collect_pending_suppressed_parse();
+            crate::gc::gc_check_trigger();
+            let gc_allocation = crate::gc::JsonParseAllocation::begin(len);
+            crate::gc::gc_suppress();
+            let text_ptr = parse_root_get(text_root).as_string_ptr();
+            let bytes = std::slice::from_raw_parts(crate::string::string_data(text_ptr), len);
+            // Phase 2: if the top-level value is an array, return a lazy
+            // array header instead of materializing the tree. Every other
+            // shape (objects, scalars) still materializes eagerly — this
+            // commit's scope is top-level arrays only (the shape that
+            // dominates `bench_json_roundtrip` and most realistic JSON.parse
+            // workloads). Extending to top-level objects in a follow-up is a
+            // straightforward mirror of the same construction.
+            let result = if !tape_entries.is_empty()
+                && tape_entries[0].kind == crate::json_tape::KIND_ARR_START
+            {
+                let len = crate::json_tape::count_array_length(tape_entries, 0);
+                let hdr =
+                    crate::json_tape::alloc_lazy_array_from_scratch(tape_entries, 0, len, text_ptr);
+                JSValue::object_ptr(hdr as *mut u8)
+            } else {
+                crate::json_tape::materialize_from_idx(tape_entries, bytes, 0)
+            };
+            let result_root = parse_root_push(result);
+            crate::gc::gc_unsuppress();
+            crate::gc::gc_bump_json_malloc_trigger_deferred();
+            gc_allocation.finish();
 
-        // Phase 2: if the top-level value is an array, return a lazy
-        // array header instead of materializing the tree. Every other
-        // shape (objects, scalars) still materializes eagerly — this
-        // commit's scope is top-level arrays only (the shape that
-        // dominates `bench_json_roundtrip` and most realistic JSON.parse
-        // workloads). Extending to top-level objects in a follow-up is a
-        // straightforward mirror of the same construction.
-        let result = if !tape_entries.is_empty()
-            && tape_entries[0].kind == crate::json_tape::KIND_ARR_START
-        {
-            let len = crate::json_tape::count_array_length(tape_entries, 0);
-            let hdr = crate::json_tape::alloc_lazy_array(tape_entries, 0, len, text_ptr);
-            JSValue::object_ptr(hdr as *mut u8)
-        } else {
-            crate::json_tape::materialize_from_idx(tape_entries, bytes, 0)
-        };
-        parse_root_push(result);
-
-        crate::gc::gc_unsuppress();
-        crate::gc::gc_bump_malloc_trigger();
-        parse_root_restore(text_root);
-
-        PARSE_KEY_CACHE.with(|c| {
-            let cache = c.borrow();
-            if cache.len() > 4096 {
-                drop(cache);
-                c.borrow_mut().clear();
-                clear_parse_key_ring();
-            }
-        });
-
-        result
-    })
+            PARSE_KEY_CACHE.with(|c| {
+                let cache = c.borrow();
+                if cache.len() > 4096 {
+                    drop(cache);
+                    c.borrow_mut().clear();
+                    clear_parse_key_ring();
+                }
+            });
+            parse_root_get(result_root)
+        },
+    )
 }
 
 // ─── JSON.parse<T[]>: schema-directed typed parse ─────────────────────────────
@@ -588,20 +688,27 @@ pub unsafe extern "C" fn js_json_parse_typed_array(
         return js_json_parse(text_ptr);
     }
 
-    // Build the shape hint once. The keys_array + pre-interned key
-    // pointers are owned by longlived arena + shape-cache structures,
-    // so they outlive the parse and survive any intervening GC.
-    let shape = match build_shape_hint(packed_keys, packed_keys_len, field_count) {
-        Some(s) => s,
-        None => return js_json_parse(text_ptr),
-    };
-
     // Same pre-parse cleanup + GC suppression as `js_json_parse` —
     // root before the collection point and re-derive the source bytes after it.
     let text_root = parse_root_push(JSValue::string_ptr(text_ptr as *mut StringHeader));
     crate::gc::gc_collect_pending_suppressed_parse();
     crate::gc::gc_check_trigger();
+    let gc_allocation = crate::gc::JsonParseAllocation::begin(len);
     crate::gc::gc_suppress();
+
+    // Cached parse keys are movable. Capture the hint only AFTER the entry
+    // collection, inside the construction window: the cache scanner repairs
+    // its owning slots, but cannot repair copies in a Rust-local hint.
+    let shape = match build_shape_hint(packed_keys, packed_keys_len, field_count) {
+        Some(s) => s,
+        None => {
+            let text = parse_root_get(text_root).as_string_ptr();
+            crate::gc::gc_unsuppress();
+            gc_allocation.finish();
+            parse_root_restore(text_root);
+            return js_json_parse(text);
+        }
+    };
 
     let bytes = {
         let moved = crate::json::parse_root_get(text_root);
@@ -616,7 +723,8 @@ pub unsafe extern "C" fn js_json_parse_typed_array(
     parse_root_push(result);
 
     crate::gc::gc_unsuppress();
-    crate::gc::gc_bump_malloc_trigger();
+    crate::gc::gc_bump_json_malloc_trigger_deferred();
+    gc_allocation.finish();
     parse_root_restore(text_root);
 
     PARSE_KEY_CACHE.with(|c| {
@@ -636,7 +744,7 @@ pub unsafe extern "C" fn js_json_parse_typed_array(
 }
 
 /// Build the one-per-call shape hint: intern key strings into
-/// `PARSE_KEY_CACHE` (longlived arena) and build a shared
+/// `PARSE_KEY_CACHE` and build a shared
 /// `keys_array` via the existing `js_build_class_keys_array` path so
 /// `scan_shape_cache_roots` keeps it marked. Returns `None` if
 /// `packed_keys` is malformed (no separators, unexpected count).

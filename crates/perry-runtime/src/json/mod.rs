@@ -22,19 +22,33 @@ use crate::string::js_string_from_ascii_bytes;
 use crate::{js_string_from_bytes, JSValue, StringHeader};
 use std::cell::RefCell;
 
+mod construction_array;
 mod parse_api;
+mod parse_empty;
+mod parse_inline_object;
+mod parse_scalar;
 mod parser;
 // `pub(crate)` so `gc::mod` can register `scan_raw_json_key_root_mut` (#7211):
 // the interned `"rawJSON"` key is a GC root.
 pub(crate) mod raw_json;
 mod replacer;
 mod reviver;
-mod simd;
+pub(crate) mod simd;
 mod stringify;
 mod stringify_api;
 mod stringify_buffer;
+mod stringify_copy;
+mod stringify_data_record;
+mod stringify_escaped_output;
+mod stringify_flat;
+mod stringify_nested_records;
+mod stringify_primitive_array;
+mod stringify_primitive_object;
+mod stringify_record_output;
 mod stringify_scalars;
 pub(crate) mod stringify_shape_template;
+mod stringify_small;
+mod stringify_string;
 mod stringify_tojson_probe;
 
 // Public FFI re-exports — preserve the `crate::json::js_json_*` path used by
@@ -66,6 +80,10 @@ pub use stringify_api::{
 // below so the re-export must precede the `thread_local!` block.
 #[cfg(test)]
 pub(crate) use parse_api::test_json_parse_direct;
+#[cfg(test)]
+pub(crate) unsafe fn test_json_stringify_record_output(bits: u64) -> Option<JSValue> {
+    stringify_record_output::try_object(bits)
+}
 pub(crate) use parser::{DirectParser, ObjectShapeHint};
 pub(crate) use raw_json::{ptr_is_raw_json_wrapper, raw_json_text_bytes};
 #[cfg(test)]
@@ -74,7 +92,7 @@ pub(crate) use simd::find_string_terminator;
 pub(crate) use stringify::{
     arm_to_json_result_guard, check_stringify_nesting_depth, estimate_json_size, is_closure_value,
     is_object_pointer, is_symbol_value, object_get_to_json, stringify_value, write_escaped_string,
-    write_number,
+    write_heap_string, write_number, write_short_string,
 };
 pub(crate) use stringify_api::{redirect_lazy_to_materialized, try_stringify_lazy_array};
 pub(crate) use stringify_buffer::{
@@ -140,7 +158,8 @@ thread_local! {
     /// Key string intern cache for JSON.parse (issue #51 follow-up).
     /// Maps key bytes → already-allocated StringHeader pointer.
     /// Avoids re-allocating "id", "name", etc. for every record in a
-    /// homogeneous JSON array. Cleared at the end of each top-level parse.
+    /// homogeneous JSON array. Cleared after a top-level parse exceeds the
+    /// key budget; the returned graph then owns the evicted key strings.
     /// `pub(crate)` so `json_tape`'s materializer can share the cache —
     /// without this, each tape-path force-materialize re-allocates every
     /// key and burns 3× the time + RSS vs the direct parser.
@@ -200,11 +219,9 @@ thread_local! {
 
     /// Cached verdict on whether the default `Object.prototype` carries a
     /// `toJSON` property (#6009). One of `PROTO_TOJSON_DIRTY` /
-    /// `PROTO_TOJSON_ABSENT` / `PROTO_TOJSON_PRESENT`. Computed lazily by the
-    /// first `object_get_to_json` fast-path probe of a stringify call and
-    /// invalidated at every top-level stringify entry and after every user
-    /// callback (`toJSON` / replacer) — the only points where user code could
-    /// have added `Object.prototype.toJSON` since the last computation.
+    /// `PROTO_TOJSON_ABSENT` / `PROTO_TOJSON_PRESENT`. General serializer
+    /// entries and callbacks invalidate it; specialized plain-data entries
+    /// reuse it only while the live prototype signature still matches.
     pub(crate) static OBJECT_PROTO_TOJSON_STATE: std::cell::Cell<u8> =
         const { std::cell::Cell::new(0) };
 
@@ -239,9 +256,16 @@ thread_local! {
 pub(crate) struct ParseShapeCacheEntry {
     pub(crate) keys: Vec<*const StringHeader>,
     pub(crate) keys_array: *mut crate::ArrayHeader,
+    pub(crate) shape_id: u32,
 }
 
 pub(crate) const PARSE_SHAPE_CACHE_CAP: usize = 256;
+// Bound retained key graphs as well as entry count. Above the parse-key
+// cache's 4096-key limit, that cache is cleared at the parse boundary, so
+// repeated wide documents get new key pointers and cannot hit this
+// pointer-identity cache. Retaining up to 256 such graphs made sustained
+// wide-object parsing spend most of its CPU tracing obsolete metadata.
+pub(crate) const PARSE_SHAPE_CACHE_KEY_BUDGET: usize = 4096;
 
 // ─── Shared file-local NaN-box tag / type-hint constants ─────────────────────
 
@@ -354,11 +378,7 @@ pub(crate) fn cached_parse_key_ptr(key_bytes: &[u8]) -> *const StringHeader {
         return ptr;
     }
 
-    // Issue #179: allocate cached key strings in the longlived arena. They
-    // are rooted by `scan_parse_roots_mut` and reused across repeated parses
-    // of homogeneous JSON records.
-    let ptr =
-        crate::string::js_string_from_bytes_longlived(key_bytes.as_ptr(), key_bytes.len() as u32);
+    let ptr = allocate_parse_key(key_bytes);
     PARSE_KEY_CACHE.with(|c| {
         c.borrow_mut().insert(key_bytes.to_vec(), ptr);
     });
@@ -380,14 +400,39 @@ fn remember_parse_key_ring(ptr: *const StringHeader) {
     });
 }
 
+/// The cache roots and rewrites its keys; eviction releases that ownership.
+/// Permanent storage would leak every distinct key whenever a wide parse
+/// clears the cache. Ordinary strings instead follow their actual owners.
+/// Keep misses collection-free, as the old allocator was: reviver source
+/// annotation also calls this helper while holding raw object pointers.
+#[inline]
+fn allocate_parse_key(key_bytes: &[u8]) -> *const StringHeader {
+    let _suppressed = crate::gc::GcSuppressScope::new();
+    js_string_from_bytes(key_bytes.as_ptr(), key_bytes.len() as u32)
+}
+
 pub(crate) fn clear_parse_key_ring() {
     PARSE_KEY_RING.with(|ring| ring.borrow_mut().clear());
 }
 
+#[cfg(test)]
 #[inline]
 pub(crate) unsafe fn parse_shape_keys_array(
     keys: &[*const StringHeader],
 ) -> *mut crate::ArrayHeader {
+    parse_shape_keys_array_with_id(keys).0
+}
+
+#[inline]
+pub(crate) unsafe fn parse_shape_keys_array_with_id(
+    keys: &[*const StringHeader],
+) -> (*mut crate::ArrayHeader, u32) {
+    debug_assert!(crate::gc::gc_is_suppressed());
+    if keys.len() > PARSE_SHAPE_CACHE_KEY_BUDGET {
+        let arr = allocate_parse_shape_keys_array(keys);
+        let shape_id = crate::object::shapes::shape_id_for_keys_ensure(arr, keys.len() as u32);
+        return (arr, shape_id);
+    }
     PARSE_SHAPE_CACHE.with(|cache| {
         {
             let cache = cache.borrow();
@@ -399,32 +444,48 @@ pub(crate) unsafe fn parse_shape_keys_array(
                         .zip(keys.iter())
                         .all(|(a, b)| std::ptr::eq(*a, *b))
                 {
-                    return entry.keys_array;
+                    return (entry.keys_array, entry.shape_id);
                 }
             }
         }
 
-        let arr = crate::array::js_array_alloc_with_length_longlived(keys.len() as u32);
-        let elements_ptr =
-            (arr as *mut u8).add(std::mem::size_of::<crate::ArrayHeader>()) as *mut f64;
-        for (i, &key_ptr) in keys.iter().enumerate() {
-            let bits = crate::value::STRING_TAG | (key_ptr as u64 & crate::value::POINTER_MASK);
-            // GC_STORE_AUDIT(INIT): parse shape keys array is filled before cache publication.
-            *elements_ptr.add(i) = f64::from_bits(bits);
-            crate::array::note_array_slot_layout_only(arr, i, bits);
-        }
-        let header = (arr as *mut u8).sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader;
-        (*header).gc_flags |= crate::gc::GC_FLAG_SHAPE_SHARED;
-
+        let arr = allocate_parse_shape_keys_array(keys);
+        // All callers are inside the parse suppression window, so the
+        // newly allocated array cannot move before the cache roots it.
+        let shape_id = crate::object::shapes::shape_id_for_keys_ensure(arr, keys.len() as u32);
         let mut cache = cache.borrow_mut();
-        if cache.len() < PARSE_SHAPE_CACHE_CAP {
+        if cache.len() < PARSE_SHAPE_CACHE_CAP
+            && cache.iter().map(|entry| entry.keys.len()).sum::<usize>() + keys.len()
+                <= PARSE_SHAPE_CACHE_KEY_BUDGET
+        {
             cache.push(ParseShapeCacheEntry {
                 keys: keys.to_vec(),
                 keys_array: arr,
+                shape_id,
             });
         }
-        arr
+        (arr, shape_id)
     })
+}
+
+#[inline]
+unsafe fn allocate_parse_shape_keys_array(keys: &[*const StringHeader]) -> *mut crate::ArrayHeader {
+    // Shape-cache entries and live receivers own this ordinary array. The
+    // construction helper publishes its pointer layout and, for large arrays
+    // born in old generation, remembers young key strings before return.
+    let _suppressed = crate::gc::GcSuppressScope::new();
+    let mut batch = crate::arena::ConstructionBatch::new();
+    let mut array = construction_array::ConstructionArray::new(&mut batch, keys.len() as u32);
+    for &key_ptr in keys {
+        array.push(
+            &mut batch,
+            JSValue::string_ptr(key_ptr as *mut StringHeader),
+        );
+    }
+    let arr = array.finish(&batch);
+    let header = (arr as *mut u8).sub(crate::gc::GC_HEADER_SIZE) as *mut crate::gc::GcHeader;
+    (*header).gc_flags |= crate::gc::GC_FLAG_SHAPE_SHARED;
+    arr
 }
 
 // ─── Stringify scratch / shape-cache lifecycle ───────────────────────────────
@@ -658,6 +719,8 @@ pub(crate) fn test_seed_stringify_shape_cache(keys_arr: *mut crate::ArrayHeader)
             prefixes: vec![String::from("{\"id\":")],
             shape_fields: 1,
             primitive_only: true,
+            data_record_candidate: false,
+            own_keys_exclude_to_json: true,
         }));
     });
 }

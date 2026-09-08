@@ -39,18 +39,61 @@ pub(crate) unsafe fn write_number(buf: &mut String, value: f64) {
         // Fast path for in-range integers (the overwhelming majority of JSON
         // numbers); identical to ECMAScript NumberToString below 2^53. Above it
         // the exact integer can carry more digits than the shortest round-trip
-        // (`2**58`), so those fall through to `js_format_f64` in the else (#6127).
+        // (`2**58`), so those use shortest-round-trip formatting below (#6127).
         let mut itoa_buf = itoa::Buffer::new();
         buf.push_str(itoa_buf.format(value as i64));
+    } else if write_compact_decimal(buf, value) {
+        // The guarded decimal spelling already round-trips to this number.
     } else {
-        // ECMAScript Number::toString (spec 6.1.6.1.20): fixed notation for an
-        // exponent in -6..=20, else exponential with an `e+`/`e-` sign. `ryu`
-        // emits shortest round-trip digits but its own notation (`1e20`,
-        // `1e-6`, `1e21`), so JSON.stringify diverged from `String(n)` and
-        // Node. Reuse the shared JS formatter so `JSON.stringify(1e20)` is
-        // `100000000000000000000` (not `1e20`) and `1e21` is `1e+21`.
-        buf.push_str(&crate::string::js_format_f64(value));
+        // ECMAScript shortest-round-trip digits and notation, directly into
+        // stack storage. The general Rust formatter allocated a temporary
+        // String for every non-integer element and could choose a different
+        // final digit at a tie. Plain `ryu` also uses different exponent
+        // thresholds; `ryu-js` implements Number::toString's spelling.
+        let mut number = ryu_js::Buffer::new();
+        buf.push_str(number.format_finite(value));
     }
+}
+
+/// Fast fixed-point spelling when at most three fractional digits suffice.
+/// Fail without changing the output if any guard does not hold.
+#[inline]
+pub(crate) fn write_compact_decimal(buf: &mut String, value: f64) -> bool {
+    let abs = value.abs();
+    if !(0.001..1e12).contains(&abs) {
+        return false;
+    }
+    let scaled = abs * 1000.0;
+    let digits = scaled as u64;
+    let fraction = digits % 1000;
+    if fraction == 0 || digits as f64 != scaled || digits as f64 / 1000.0 != abs {
+        return false;
+    }
+    // digits < 10^15 is exact as f64. Below 10^12 the distance between
+    // adjacent thousandths exceeds eight ULPs, so another three-or-fewer
+    // fractional-digit spelling cannot round to this float. Removing trailing
+    // zeros gives the shortest spelling; ECMAScript uses fixed notation here.
+    if value < 0.0 {
+        buf.push('-');
+    }
+    let mut integer = itoa::Buffer::new();
+    buf.push_str(integer.format(digits / 1000));
+    buf.push('.');
+    let bytes = [
+        b'0' + (fraction / 100) as u8,
+        b'0' + ((fraction / 10) % 10) as u8,
+        b'0' + (fraction % 10) as u8,
+    ];
+    let len = if fraction % 10 != 0 {
+        3
+    } else if fraction % 100 != 0 {
+        2
+    } else {
+        1
+    };
+    // All three bytes were constructed as ASCII digits.
+    buf.push_str(unsafe { std::str::from_utf8_unchecked(&bytes[..len]) });
+    true
 }
 
 #[inline]
@@ -65,16 +108,14 @@ pub(crate) unsafe fn write_escaped_string(buf: &mut String, s: &str) {
     // (issue #1182): a lead byte of 0xED followed by 0xA0..=0xBF means
     // we have a 3-byte encoding of U+D800..=U+DFFF and need to emit a
     // `\uXXXX` escape rather than the raw (invalid-UTF-8) bytes.
-    let needs_escape = bytes
-        .iter()
-        .any(|&b| b < 0x20 || b == b'"' || b == b'\\' || b == 0xED);
-    if !needs_escape {
+    let first_escape = super::simd::find_string_escape(bytes);
+    let Some(first_escape) = first_escape else {
         buf.reserve(bytes.len() + 2);
         buf.push('"');
         buf.push_str(s);
         buf.push('"');
         return;
-    }
+    };
 
     buf.push('"');
     let mut start = 0;
@@ -94,7 +135,7 @@ pub(crate) unsafe fn write_escaped_string(buf: &mut String, s: &str) {
     // codebase treats stringify output as a byte stream — and an
     // ill-formed result is strictly preferable to a SIGABRT.
     let buf_vec = buf.as_mut_vec();
-    let mut i = 0;
+    let mut i = first_escape;
     while i < bytes.len() {
         let b = bytes[i];
         // WTF-8 surrogate handling (issue #1182). A 0xED 0xA0..=0xBF
@@ -147,7 +188,7 @@ pub(crate) unsafe fn write_escaped_string(buf: &mut String, s: &str) {
                     continue;
                 }
             }
-            buf_vec.extend_from_slice(format!("\\u{:04x}", high_cu).as_bytes());
+            append_code_unit_escape(buf_vec, high_cu as u16);
             i += 3;
             start = i;
             continue;
@@ -164,7 +205,7 @@ pub(crate) unsafe fn write_escaped_string(buf: &mut String, s: &str) {
                 if start < i {
                     buf_vec.extend_from_slice(&bytes[start..i]);
                 }
-                buf_vec.extend_from_slice(format!("\\u{:04x}", b).as_bytes());
+                append_code_unit_escape(buf_vec, b as u16);
                 start = i + 1;
                 i += 1;
                 continue;
@@ -184,6 +225,57 @@ pub(crate) unsafe fn write_escaped_string(buf: &mut String, s: &str) {
         buf_vec.extend_from_slice(&bytes[start..]);
     }
     buf_vec.push(b'"');
+}
+
+/// Quote a heap string, using parser provenance to skip a redundant escape
+/// scan for payloads borrowed from an unescaped JSON token.
+#[inline]
+pub(crate) unsafe fn write_heap_string(buf: &mut String, ptr: *const StringHeader) -> bool {
+    let Some(text) = str_from_header(ptr) else {
+        return false;
+    };
+    if (*ptr).flags & crate::string::STRING_FLAG_JSON_ESCAPE_FREE != 0 {
+        buf.reserve(text.len() + 2);
+        buf.push('"');
+        buf.push_str(text);
+        buf.push('"');
+    } else {
+        write_escaped_string(buf, text);
+    }
+    true
+}
+
+/// Quote an inline short-string byte payload. Returns false for malformed
+/// UTF-8, preserving the existing serializer fallback. Plain ASCII is proven
+/// together with escape absence so the common path avoids a second scan.
+#[inline]
+pub(crate) unsafe fn write_short_string(buf: &mut String, bytes: &[u8]) -> bool {
+    if !super::simd::short_string_is_plain_ascii(bytes) {
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return false;
+        };
+        write_escaped_string(buf, text);
+        return true;
+    }
+    let out = buf.as_mut_vec();
+    out.reserve(bytes.len() + 2);
+    out.push(b'"');
+    out.extend_from_slice(bytes);
+    out.push(b'"');
+    true
+}
+
+#[inline]
+fn append_code_unit_escape(buf: &mut Vec<u8>, unit: u16) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    buf.extend_from_slice(&[
+        b'\\',
+        b'u',
+        HEX[(unit >> 12) as usize],
+        HEX[((unit >> 8) & 15) as usize],
+        HEX[((unit >> 4) & 15) as usize],
+        HEX[(unit & 15) as usize],
+    ]);
 }
 
 /// ECMA-262 SerializeJSONProperty step 2 for a BigInt: `GetV(value, "toJSON")`
@@ -265,3 +357,7 @@ pub(crate) fn throw_bigint_serialize() -> ! {
         POINTER_TAG | (err_ptr as u64 & POINTER_MASK),
     ))
 }
+
+#[cfg(test)]
+#[path = "stringify_scalars_tests.rs"]
+mod tests;

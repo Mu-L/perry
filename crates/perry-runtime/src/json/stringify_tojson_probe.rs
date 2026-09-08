@@ -14,14 +14,34 @@ pub(crate) const PROTO_TOJSON_DIRTY: u8 = 0;
 const PROTO_TOJSON_ABSENT: u8 = 1;
 const PROTO_TOJSON_PRESENT: u8 = 2;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ObjectProtoToJsonSignature {
+    proto_addr: usize,
+    keys_addr: usize,
+    keys_len: u32,
+    obj_flags: u16,
+    class_id: u32,
+    semantic_epoch: u64,
+}
+
+crate::perry_thread_local! {
+    /// Address-bearing fields are comparison tokens only: they are never
+    /// dereferenced from this cache. Moving GC therefore turns a prior entry
+    /// into a signature miss without requiring another collector root.
+    static OBJECT_PROTO_TOJSON_SIGNATURE: std::cell::Cell<Option<ObjectProtoToJsonSignature>> =
+        const { std::cell::Cell::new(None) };
+    #[cfg(test)]
+    static OBJECT_PROTO_TOJSON_RECOMPUTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Invalidate the cached `Object.prototype`-has-`toJSON` verdict. Called at
-/// every top-level stringify entry and after every user callback the
-/// stringify machinery invokes (`toJSON` / replacer) — the only points where
-/// user code could have (un)installed an `Object.prototype.toJSON` since the
-/// verdict was last computed.
+/// general top-level stringify entries and after every user callback the
+/// stringify machinery invokes (`toJSON` / replacer). Specialized plain-data
+/// entries instead validate the complete prototype signature before reuse.
 #[inline]
 pub(crate) fn invalidate_object_proto_tojson_state() {
     OBJECT_PROTO_TOJSON_STATE.with(|c| c.set(PROTO_TOJSON_DIRTY));
+    OBJECT_PROTO_TOJSON_SIGNATURE.with(|c| c.set(None));
 }
 
 /// Scan `keys` (an object's `keys_array`) for any key that could make the
@@ -59,22 +79,68 @@ unsafe fn keys_array_may_carry_to_json(keys: *mut crate::ArrayHeader) -> bool {
     let elements = (keys as *const u8).add(std::mem::size_of::<crate::ArrayHeader>()) as *const f64;
     for i in 0..key_count {
         let stored = JSValue::from_bits((*elements.add(i)).to_bits());
-        if crate::string::js_string_key_matches_bytes(stored, b"toJSON")
-            || crate::string::js_string_key_matches_bytes(
-                stored,
-                crate::object::FETCH_SUBCLASS_HANDLE_FIELD,
-            )
-            || crate::string::js_string_key_matches_bytes(stored, b"__module__")
-        {
+        if key_may_carry_to_json(stored) {
             return true;
         }
-        #[cfg(feature = "temporal")]
-        if crate::string::js_string_key_matches_bytes(
-            stored,
-            crate::object::TEMPORAL_SUBCLASS_CELL_FIELD,
-        ) {
-            return true;
-        }
+    }
+    false
+}
+
+// All forwarding markers are longer than the inline-string representation.
+// Keep the short-string and leading-byte exclusions tied to their constants.
+const _: () = {
+    assert!(crate::value::SHORT_STRING_MAX_LEN < b"toJSON".len());
+    assert!(crate::object::FETCH_SUBCLASS_HANDLE_FIELD.len() >= b"toJSON".len());
+    assert!(crate::object::FETCH_SUBCLASS_HANDLE_FIELD[0] == b'_');
+    #[cfg(feature = "temporal")]
+    {
+        assert!(crate::object::TEMPORAL_SUBCLASS_CELL_FIELD.len() >= b"toJSON".len());
+        assert!(crate::object::TEMPORAL_SUBCLASS_CELL_FIELD[0] == b'_');
+    }
+};
+
+#[inline]
+unsafe fn key_may_carry_to_json(stored: JSValue) -> bool {
+    if !stored.is_string() {
+        return false;
+    }
+    let header = stored.as_string_ptr();
+    if header.is_null() {
+        return false;
+    }
+    let len = (*header).byte_len as usize;
+    if len < b"toJSON".len() {
+        return false;
+    }
+    let data = crate::string::string_data(header);
+    if !matches!(*data, b't' | b'_') {
+        return false;
+    }
+    marker_bytes_may_carry_to_json(std::slice::from_raw_parts(data, len))
+}
+
+/// Reuse the marker proof when a serializer already has the key bytes.
+#[inline]
+pub(super) fn key_bytes_may_carry_to_json(bytes: &[u8]) -> bool {
+    bytes.len() >= b"toJSON".len()
+        && matches!(bytes[0], b't' | b'_')
+        && marker_bytes_may_carry_to_json(bytes)
+}
+
+/// Ordinary keys do not need the long marker constants in their hot loop.
+/// No verdict is retained: changed keys are read again on the next probe.
+#[cold]
+#[inline(never)]
+fn marker_bytes_may_carry_to_json(bytes: &[u8]) -> bool {
+    if bytes == b"toJSON"
+        || bytes == crate::object::FETCH_SUBCLASS_HANDLE_FIELD
+        || bytes == b"__module__"
+    {
+        return true;
+    }
+    #[cfg(feature = "temporal")]
+    if bytes == crate::object::TEMPORAL_SUBCLASS_CELL_FIELD {
+        return true;
     }
     false
 }
@@ -86,6 +152,8 @@ unsafe fn keys_array_may_carry_to_json(keys: *mut crate::ArrayHeader) -> bool {
 /// only means the probe falls back to the (correct) slow path.
 #[cold]
 unsafe fn compute_object_proto_tojson_state() -> u8 {
+    #[cfg(test)]
+    OBJECT_PROTO_TOJSON_RECOMPUTES.with(|count| count.set(count.get() + 1));
     // Resolve the default `Object.prototype` once per thread and cache the
     // bits — the `Object.prototype` property is non-writable/non-configurable
     // per spec, so re-resolving per call (a globalThis generic-getter walk
@@ -127,14 +195,74 @@ unsafe fn compute_object_proto_tojson_state() -> u8 {
     PROTO_TOJSON_ABSENT
 }
 
+#[cfg(test)]
+pub(super) fn test_reset_object_proto_tojson_recomputes() {
+    OBJECT_PROTO_TOJSON_RECOMPUTES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn test_object_proto_tojson_recomputes() -> u64 {
+    OBJECT_PROTO_TOJSON_RECOMPUTES.with(std::cell::Cell::get)
+}
+
+/// Snapshot every part of the default-prototype lookup whose change can alter
+/// the negative verdict. Key-array contents can only change without changing
+/// identity/length through delete or descriptor/prototype operations, all of
+/// which advance the shared semantic property epoch.
+unsafe fn object_proto_tojson_signature() -> Option<ObjectProtoToJsonSignature> {
+    let proto_bits = CACHED_OBJECT_PROTO_BITS.with(|c| c.get());
+    if proto_bits == 0 {
+        return None;
+    }
+    let proto_addr = (proto_bits & POINTER_MASK) as usize;
+    let header = crate::value::addr_class::try_read_tracked_gc_header(proto_addr)?.as_ref();
+    if header.obj_type != crate::gc::GC_TYPE_OBJECT
+        || header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
+    {
+        return None;
+    }
+    let proto = proto_addr as *const crate::ObjectHeader;
+    let keys = crate::object::object_keys_array(proto);
+    let (keys_addr, keys_len) = if keys.is_null() {
+        (0, 0)
+    } else {
+        let keys_addr = keys as usize;
+        let keys_header = crate::value::addr_class::try_read_tracked_gc_header(keys_addr)?.as_ref();
+        if keys_header.obj_type != crate::gc::GC_TYPE_ARRAY
+            || keys_header.gc_flags & crate::gc::GC_FLAG_FORWARDED != 0
+            || (*keys).length > (*keys).capacity
+        {
+            return None;
+        }
+        (keys_addr, (*keys).length)
+    };
+    Some(ObjectProtoToJsonSignature {
+        proto_addr,
+        keys_addr,
+        keys_len,
+        obj_flags: header._reserved,
+        class_id: (*proto).class_id,
+        semantic_epoch: crate::object::prop_plan::prop_plan_semantic_epoch(),
+    })
+}
+
 #[inline]
 unsafe fn object_proto_may_have_to_json() -> bool {
     let state = OBJECT_PROTO_TOJSON_STATE.with(|c| c.get());
     if state != PROTO_TOJSON_DIRTY {
-        return state == PROTO_TOJSON_PRESENT;
+        let now = object_proto_tojson_signature();
+        if now.is_some() && OBJECT_PROTO_TOJSON_SIGNATURE.with(|signature| signature.get()) == now {
+            return state == PROTO_TOJSON_PRESENT;
+        }
     }
     let computed = compute_object_proto_tojson_state();
-    OBJECT_PROTO_TOJSON_STATE.with(|c| c.set(computed));
+    let signature = object_proto_tojson_signature();
+    if signature.is_some() {
+        OBJECT_PROTO_TOJSON_STATE.with(|c| c.set(computed));
+        OBJECT_PROTO_TOJSON_SIGNATURE.with(|c| c.set(signature));
+    } else {
+        invalidate_object_proto_tojson_state();
+    }
     computed == PROTO_TOJSON_PRESENT
 }
 
@@ -180,11 +308,16 @@ fn class_chain_may_have_to_json(class_id: u32) -> bool {
     false
 }
 
-/// #6009: prove — with nothing but direct reads — that resolving `toJSON` on
+/// #6009: prove that resolving `toJSON` on
 /// `ptr` (a validated `GC_TYPE_OBJECT`) through `js_object_get_field_by_name`
 /// would miss, so the probe can skip the generic dispatcher entirely. The
 /// generic walk can only produce a `toJSON` from four places, each covered
 /// here:
+///
+/// Own/class/prototype checks use direct reads, but the first default-prototype
+/// lookup can initialize globalThis and allocate its lookup key. Callers that
+/// need the receiver afterward must root it across this probe. The data-only
+/// emitter uses `to_json_definitely_absent_without_gc` to decline that lookup.
 ///
 /// 1. an OWN key (object-literal method, expando, or an
 ///    `Object.defineProperty` accessor — all of which register the key in
@@ -199,7 +332,8 @@ fn class_chain_may_have_to_json(class_id: u32) -> bool {
 ///    `Object.create` with a Proxy prototype) — any recorded entry defers to
 ///    the slow path;
 /// 4. a `toJSON` monkey-patched onto the default `Object.prototype` —
-///    `object_proto_may_have_to_json` (verdict cached per stringify call).
+///    `object_proto_may_have_to_json` (verdict cached under a live mutation
+///    signature across callback-free specialized stringify calls).
 ///
 /// Before this probe, every object literal paid ~3 recursive
 /// `js_object_get_field_by_name` miss cascades per stringify call — ~90% of
@@ -210,6 +344,15 @@ pub(crate) unsafe fn to_json_definitely_absent(ptr: *const u8) -> bool {
     if !keys.is_null() && keys_array_may_carry_to_json(keys) {
         return false;
     }
+    to_json_definitely_absent_after_own_keys(ptr)
+}
+
+/// Finish the negative probe after the caller validated and scanned every
+/// own key with `key_bytes_may_carry_to_json`. That proof must still apply:
+/// no callback or key mutation may intervene. The receiver must be rooted
+/// because the default-prototype lookup can allocate on its first use.
+pub(super) unsafe fn to_json_definitely_absent_after_own_keys(ptr: *const u8) -> bool {
+    let obj = ptr as *const crate::ObjectHeader;
     let class_id = (*obj).class_id;
     if class_id != 0 && class_chain_may_have_to_json(class_id) {
         return false;
@@ -221,6 +364,38 @@ pub(crate) unsafe fn to_json_definitely_absent(ptr: *const u8) -> bool {
         return false;
     }
     true
+}
+
+/// The plain-data emitter cannot enter the allocating first-time lookup of
+/// Object.prototype. Let the rooted general path populate that cache first.
+/// Once its constructor property is cached, even a dirty verdict is recomputed
+/// with direct reads only; class/prototype overrides still decline normally.
+pub(super) unsafe fn to_json_definitely_absent_without_gc(ptr: *const u8) -> bool {
+    if (*(ptr as *const crate::ObjectHeader)).class_id != 0
+        || (OBJECT_PROTO_TOJSON_STATE.with(|c| c.get()) == PROTO_TOJSON_DIRTY
+            && CACHED_OBJECT_PROTO_BITS.with(|c| c.get()) == 0)
+    {
+        return false;
+    }
+    to_json_definitely_absent(ptr)
+}
+
+/// Establish the stringify-wide part of the plain-data record proof.
+///
+/// A successful data-record emission cannot invoke user code or managed
+/// allocation, so an array walker may reuse this verdict across consecutive
+/// records. It must discard the verdict before entering any fallback path
+/// that can call `toJSON` or a getter. Per-object recorded prototypes remain
+/// checked by the record emitter itself.
+#[inline]
+pub(super) unsafe fn data_record_global_to_json_absent_without_gc() -> bool {
+    if SUPPRESS_NEXT_TO_JSON.with(|c| c.get())
+        || (OBJECT_PROTO_TOJSON_STATE.with(|c| c.get()) == PROTO_TOJSON_DIRTY
+            && CACHED_OBJECT_PROTO_BITS.with(|c| c.get()) == 0)
+    {
+        return false;
+    }
+    !object_proto_may_have_to_json()
 }
 
 // ─── SerializeJSONProperty key (#5909) ───────────────────────────────────────
@@ -289,3 +464,7 @@ pub(crate) unsafe fn current_to_json_key_arg() -> f64 {
     let key = crate::js_string_from_bytes(bytes.as_ptr(), bytes.len() as u32);
     f64::from_bits(STRING_TAG | (key as u64 & POINTER_MASK))
 }
+
+#[cfg(test)]
+#[path = "stringify_tojson_probe_tests.rs"]
+mod tests;

@@ -7,7 +7,7 @@
 use super::*;
 use crate::{
     array::{note_array_slot_layout_only, ArrayHeader},
-    js_array_alloc, js_array_push, js_string_from_bytes, JSValue, StringHeader,
+    js_array_alloc, js_array_push, JSValue, StringHeader,
 };
 
 // ─── Direct JSON parser ────────────────────────────────────────────────────────
@@ -26,6 +26,83 @@ impl<'a> ParsedStr<'a> {
             ParsedStr::Owned(v) => v,
         }
     }
+}
+
+/// Per-object duplicate-key index for wide JSON objects.
+///
+/// Property names are untrusted, so `ahash::RandomState` computes a randomly
+/// keyed, hash-flood-resistant digest over every incoming byte string. The
+/// table stores that result as a `u64`: growth can then rehash the integer in
+/// constant time instead of re-reading every managed string. A matching hash
+/// is never accepted by itself; exact bytes decide identity, and genuine hash
+/// collisions retain their additional indices in `collisions`.
+struct ParsedObjectIndex {
+    hash_state: ahash::RandomState,
+    primary: crate::fast_hash::PtrHashMap<u64, usize>,
+    collisions: Vec<(u64, usize)>,
+}
+
+impl ParsedObjectIndex {
+    unsafe fn from_keys(keys: &[*const StringHeader]) -> Self {
+        let mut index = Self {
+            hash_state: ahash::RandomState::new(),
+            primary: crate::fast_hash::PtrHashMap::with_capacity_and_hasher(
+                keys.len(),
+                crate::fast_hash::PtrHasher,
+            ),
+            collisions: Vec::new(),
+        };
+        for (slot, &key) in keys.iter().enumerate() {
+            let bytes = std::slice::from_raw_parts(
+                crate::string::string_data(key),
+                (*key).byte_len as usize,
+            );
+            let hash = index.hash_bytes(bytes);
+            index.insert_hash(hash, slot);
+        }
+        index
+    }
+
+    #[inline]
+    fn hash_bytes(&self, bytes: &[u8]) -> u64 {
+        self.hash_state.hash_one(bytes)
+    }
+
+    #[inline]
+    unsafe fn find_hashed(
+        &self,
+        hash: u64,
+        bytes: &[u8],
+        keys: &[*const StringHeader],
+    ) -> Option<usize> {
+        let first = *self.primary.get(&hash)?;
+        if json_key_bytes_equal(keys[first], bytes) {
+            return Some(first);
+        }
+        self.collisions
+            .iter()
+            .filter(|(candidate_hash, _)| *candidate_hash == hash)
+            .map(|(_, slot)| *slot)
+            .find(|&slot| json_key_bytes_equal(keys[slot], bytes))
+    }
+
+    #[inline]
+    fn insert_hash(&mut self, hash: u64, value_index: usize) {
+        match self.primary.entry(hash) {
+            std::collections::hash_map::Entry::Occupied(_) => {
+                self.collisions.push((hash, value_index));
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(value_index);
+            }
+        }
+    }
+}
+
+#[inline]
+unsafe fn json_key_bytes_equal(key: *const StringHeader, bytes: &[u8]) -> bool {
+    (*key).byte_len as usize == bytes.len()
+        && std::slice::from_raw_parts(crate::string::string_data(key), bytes.len()) == bytes
 }
 
 #[inline]
@@ -113,23 +190,57 @@ pub(crate) const MAX_ITERATIVE_NESTING_DEPTH: usize = 500_000;
 /// `"[[[[[[…"` string is not mistaken for deep nesting. This runs before any
 /// syntax validation, so it must not assume the input is well-formed — an
 /// unbalanced `]` clamps at zero rather than underflowing.
+#[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
 pub(crate) fn nesting_depth_exceeds(bytes: &[u8], limit: usize) -> bool {
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for &byte in bytes {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                in_string = false;
-            }
-            continue;
+    // If no byte after the root can open a container, the input cannot exceed
+    // depth one. This proof remains valid for quoted, escaped and malformed
+    // text because a false positive opening only sends us to the full scan;
+    // syntax validation remains the parser's job.
+    if bytes.len() >= 256 && matches!(bytes[0], b'[' | b'{') && limit > 0 {
+        let body = &bytes[1..];
+        if !body.contains(&b'{') && !body.contains(&b'[') {
+            return false;
         }
-        match byte {
-            b'"' => in_string = true,
+    }
+    let mut depth = 0usize;
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        match bytes[pos] {
+            b'"' => {
+                pos += 1;
+                #[cfg(target_arch = "aarch64")]
+                let start = pos;
+                // A quoted span can be megabytes long. Skip ordinary bytes in
+                // bulk while retaining the preflight's handling of malformed
+                // input: only quotes/backslashes change string state here.
+                while pos < bytes.len() {
+                    #[cfg(target_arch = "aarch64")]
+                    let offset = depth_string::find_quote_or_backslash(&bytes[pos..]);
+                    #[cfg(not(target_arch = "aarch64"))]
+                    let offset = super::simd::find_quote_or_backslash(&bytes[pos..]);
+                    let Some(offset) = offset else {
+                        return false;
+                    };
+                    pos += offset;
+                    if bytes[pos] == b'"' {
+                        break;
+                    }
+                    // Skip the backslash and its escaped byte, including an
+                    // escaped quote/backslash. A trailing escape ends the scan;
+                    // the real parser remains responsible for syntax errors.
+                    pos = (pos + 2).min(bytes.len());
+                    // Amortize block classification over longer escaped spans.
+                    // Short strings keep the existing quote/escape loop.
+                    #[cfg(target_arch = "aarch64")]
+                    if pos - start >= 128 {
+                        let Some(end) = depth_string::quoted_end(&bytes[pos..]) else {
+                            return false;
+                        };
+                        pos += end;
+                        break;
+                    }
+                }
+            }
             b'[' | b'{' => {
                 depth += 1;
                 if depth > limit {
@@ -139,6 +250,7 @@ pub(crate) fn nesting_depth_exceeds(bytes: &[u8], limit: usize) -> bool {
             b']' | b'}' => depth = depth.saturating_sub(1),
             _ => {}
         }
+        pos += 1;
     }
     false
 }
@@ -160,6 +272,18 @@ pub(crate) struct DirectParser<'a> {
     hot_shape_len: usize,
     hot_shape_keys: [*const StringHeader; 8],
     hot_shape_array: *mut ArrayHeader,
+    hot_shape_id: u32,
+    /// The newest small parse shape, copied once at the parse boundary. A
+    /// top-level record can consume it while reading keys in order, avoiding
+    /// one TLS + RefCell key-cache probe per field. GC is already suppressed
+    /// before `new_batched`, so these cache-owned pointers cannot move while
+    /// the hint is live.
+    warm_record_shape_pending: bool,
+    /// At least one object crossed into the object-local content index.
+    /// Keep the shared key cache stable through recursive parsing, then drop
+    /// it at the outer parse boundary so wide schemas cannot pin arena blocks.
+    saw_wide_object: bool,
+    batch: Option<crate::arena::ConstructionBatch>,
 }
 
 impl<'a> DirectParser<'a> {
@@ -172,7 +296,30 @@ impl<'a> DirectParser<'a> {
             hot_shape_len: 0,
             hot_shape_keys: [std::ptr::null(); 8],
             hot_shape_array: std::ptr::null_mut(),
+            hot_shape_id: 0,
+            warm_record_shape_pending: false,
+            saw_wide_object: false,
+            batch: None,
         }
+    }
+
+    /// Enter only after the parse API roots its input and suppresses collection.
+    pub(crate) unsafe fn new_batched(input: &'a [u8]) -> Self {
+        let mut parser = Self::new(input);
+        parser.batch = crate::arena::ConstructionBatch::new();
+        if (65..=256).contains(&input.len()) && input.first() == Some(&b'{') {
+            PARSE_SHAPE_CACHE.with(|cache| {
+                let cache = cache.borrow();
+                if let Some(entry) = cache.last().filter(|entry| entry.keys.len() <= 8) {
+                    parser.hot_shape_len = entry.keys.len();
+                    parser.hot_shape_keys[..entry.keys.len()].copy_from_slice(&entry.keys);
+                    parser.hot_shape_array = entry.keys_array;
+                    parser.hot_shape_id = entry.shape_id;
+                    parser.warm_record_shape_pending = true;
+                }
+            });
+        }
+        parser
     }
 
     pub(crate) fn with_shape(input: &'a [u8], shape: ObjectShapeHint) -> Self {
@@ -184,6 +331,10 @@ impl<'a> DirectParser<'a> {
             hot_shape_len: 0,
             hot_shape_keys: [std::ptr::null(); 8],
             hot_shape_array: std::ptr::null_mut(),
+            hot_shape_id: 0,
+            warm_record_shape_pending: false,
+            saw_wide_object: false,
+            batch: None,
         }
     }
 
@@ -191,7 +342,7 @@ impl<'a> DirectParser<'a> {
     unsafe fn parse_shape_keys_array_hot(
         &mut self,
         keys: &[*const StringHeader],
-    ) -> *mut ArrayHeader {
+    ) -> (*mut ArrayHeader, u32) {
         if keys.len() <= self.hot_shape_keys.len()
             && keys.len() == self.hot_shape_len
             && !self.hot_shape_array.is_null()
@@ -200,16 +351,17 @@ impl<'a> DirectParser<'a> {
                 .zip(keys.iter())
                 .all(|(a, b)| std::ptr::eq(*a, *b))
         {
-            return self.hot_shape_array;
+            return (self.hot_shape_array, self.hot_shape_id);
         }
 
-        let keys_array = parse_shape_keys_array(keys);
+        let (keys_array, shape_id) = parse_shape_keys_array_with_id(keys);
         if keys.len() <= self.hot_shape_keys.len() {
             self.hot_shape_len = keys.len();
             self.hot_shape_keys[..keys.len()].copy_from_slice(keys);
             self.hot_shape_array = keys_array;
+            self.hot_shape_id = shape_id;
         }
-        keys_array
+        (keys_array, shape_id)
     }
 
     #[inline(always)]
@@ -261,6 +413,10 @@ impl<'a> DirectParser<'a> {
     /// and a second non-whitespace root token.
     pub(crate) fn finish(&mut self) -> bool {
         self.skip_whitespace();
+        if self.saw_wide_object {
+            PARSE_KEY_CACHE.with(|cache| cache.borrow_mut().clear());
+            clear_parse_key_ring();
+        }
         self.valid && self.pos == self.input.len()
     }
 
@@ -330,10 +486,7 @@ impl<'a> DirectParser<'a> {
             // saves the equivalent walk inside `compute_utf16_len`
             // plus the conditional widening for non-ASCII counters.
             let ptr = match s {
-                ParsedStr::Borrowed(b) if b.is_ascii() => {
-                    crate::string::js_string_from_ascii_bytes(b.as_ptr(), b.len() as u32)
-                }
-                ParsedStr::Borrowed(b) => js_string_from_bytes(b.as_ptr(), b.len() as u32),
+                ParsedStr::Borrowed(b) => crate::string::string_from_json_bytes(&mut self.batch, b),
                 // Escaped strings live in a Rust Vec, so the builder can derive
                 // the WTF-8 lone-surrogate flag while allocating the result.
                 ParsedStr::Owned(ref b) => crate::string::js_string_from_builder_bytes(b),
@@ -353,6 +506,7 @@ impl<'a> DirectParser<'a> {
     /// fallback otherwise. On `bench_json_roundtrip` the per-record
     /// strings are 5-16 bytes so most iterations hit the SIMD path
     /// exactly once before the scalar tail handles the boundary.
+    #[inline(never)]
     pub(crate) fn parse_string_bytes(&mut self) -> Option<ParsedStr<'a>> {
         if self.peek() != Some(b'"') {
             self.valid = false;
@@ -385,14 +539,67 @@ impl<'a> DirectParser<'a> {
         None
     }
 
+    /// Speculatively consume the next object key in its common, unescaped
+    /// spelling while comparing it with the warm shape key. The expected
+    /// length tells us exactly where the closing quote must be, so a matching
+    /// key needs one short byte walk instead of a terminator scan followed by
+    /// a second managed-string comparison. Any escape, control byte, or shape
+    /// mismatch restarts at the untouched opening quote through the full JSON
+    /// string decoder.
+    #[inline(always)]
+    unsafe fn parse_string_bytes_expected(
+        &mut self,
+        expected: *const StringHeader,
+    ) -> Option<(ParsedStr<'a>, bool)> {
+        if self.peek() == Some(b'"') && !expected.is_null() {
+            let start = self.pos + 1;
+            let expected_len = (*expected).byte_len as usize;
+            if let Some(end) = start.checked_add(expected_len) {
+                if end < self.input.len() && self.input[end] == b'"' {
+                    let input_bytes = &self.input[start..end];
+                    let expected_bytes = std::slice::from_raw_parts(
+                        crate::string::string_data(expected),
+                        expected_len,
+                    );
+                    let matches = input_bytes
+                        .iter()
+                        .zip(expected_bytes)
+                        .all(|(&actual, &want)| {
+                            actual == want && actual >= 0x20 && actual != b'"' && actual != b'\\'
+                        });
+                    if matches {
+                        self.pos = end + 1;
+                        return Some((ParsedStr::Borrowed(input_bytes), true));
+                    }
+                }
+            }
+        }
+
+        self.parse_string_bytes().map(|key| (key, false))
+    }
+
+    #[inline(never)]
     pub(crate) fn parse_string_bytes_slow(&mut self, start: usize) -> Option<ParsedStr<'a>> {
         let mut result = Vec::from(&self.input[start..self.pos]);
+        // Keep short strings and allocation growth on the scalar path. Chunk
+        // decoding only consumes existing spare capacity; it never grows the
+        // scratch buffer early just to satisfy a worst-case output bound.
+        let mut scalar_end = self.input.len().min(self.pos.saturating_add(64));
         loop {
-            if self.pos >= self.input.len() {
-                self.valid = false;
-                return None;
+            if self.pos >= scalar_end {
+                while self.input.len() - self.pos >= 64 && result.capacity() - result.len() >= 64 {
+                    if self.decode_chunk(&mut result)? {
+                        return Some(ParsedStr::Owned(result));
+                    }
+                }
+                scalar_end = self.input.len().min(self.pos.saturating_add(64));
+                if self.pos >= self.input.len() {
+                    self.valid = false;
+                    return None;
+                }
             }
-            let ch = self.input[self.pos];
+            // scalar_end never exceeds input.len(), including after chunk decoding.
+            let ch = unsafe { *self.input.get_unchecked(self.pos) };
             self.pos += 1;
             match ch {
                 b'"' => return Some(ParsedStr::Owned(result)),
@@ -714,23 +921,34 @@ impl<'a> DirectParser<'a> {
         self.advance();
         self.skip_whitespace();
 
+        // Only the root object may claim the parse-boundary hint. Nested
+        // objects keep using the parser-local homogeneous-shape cache.
+        let warm_shape = if self.warm_record_shape_pending {
+            self.warm_record_shape_pending = false;
+            Some((
+                self.hot_shape_len,
+                self.hot_shape_keys,
+                self.hot_shape_array,
+                self.hot_shape_id,
+            ))
+        } else {
+            None
+        };
+        let mut warm_shape_slot = 0usize;
+        let mut warm_shape_matches = warm_shape.is_some();
+
         let saved_roots = parse_root_save_len();
 
         if self.peek() == Some(b'}') {
             self.advance();
             let keys: [*const StringHeader; 0] = [];
-            let keys_arr = self.parse_shape_keys_array_hot(&keys);
-            let js_obj = crate::object::js_object_alloc_class_inline_keys(0, 0, 0, keys_arr);
-            // #8098: see `parse_object_shaped`.
-            crate::object::mark_object_plain_ordinary(js_obj);
-            // NOTE: no hand-rolled slot fill here. The allocator has written
-            // `undefined` into every slot it allocated since #4717. The fill
-            // this replaces was a leftover from when that was the caller's job,
-            // and it wrote EIGHT slots — `js_object_alloc_class_inline_keys(0,
-            // 0, 0, …)` allocates `max(0, INLINE_SLOT_FLOOR)` = 2 of them (the
-            // floor dropped 4 -> 2 in #7928), so `JSON.parse("{}")` overwrote 48
-            // bytes past the object: the exact "heap buffer overflow into
-            // adjacent arena objects" `js_object_alloc_with_parent` warns about.
+            let (keys_arr, shape_id) = self.parse_shape_keys_array_hot(&keys);
+            let js_obj = crate::object::object_from_json_fields_preinstalled(
+                &mut self.batch,
+                keys_arr,
+                shape_id,
+                &[],
+            );
             parse_root_restore(saved_roots);
             return JSValue::object_ptr(js_obj as *mut u8);
         }
@@ -738,13 +956,36 @@ impl<'a> DirectParser<'a> {
         let mut inline_keys: [*const StringHeader; 8] = [std::ptr::null(); 8];
         let mut inline_values: [JSValue; 8] = [JSValue::undefined(); 8];
         let mut inline_len: usize = 0;
-        let mut heap_fields: Option<(Vec<*const StringHeader>, Vec<JSValue>)> = None;
+        // Keep small-object searches linear, including modest spills past
+        // the eight inline slots. Wide objects index interned key identities
+        // so new keys do not scan every prior key. The vectors retain order;
+        // a duplicate only replaces its value. GC is suppressed for the parse,
+        // exactly as for the raw key pointers already held in these vectors.
+        type HeapFields = (
+            Vec<*const StringHeader>,
+            Vec<JSValue>,
+            Option<ParsedObjectIndex>,
+        );
+        let mut heap_fields: Option<HeapFields> = None;
 
         loop {
             self.skip_whitespace();
-            let key = match self.parse_string_bytes() {
-                Some(k) => k,
-                None => break,
+            let expected_key = warm_shape.as_ref().and_then(|(len, keys, _, _)| {
+                if warm_shape_matches && warm_shape_slot < *len {
+                    Some(keys[warm_shape_slot])
+                } else {
+                    None
+                }
+            });
+            let (key, matched_expected_spelling) = match expected_key {
+                Some(expected) => match self.parse_string_bytes_expected(expected) {
+                    Some(key) => key,
+                    None => break,
+                },
+                None => match self.parse_string_bytes() {
+                    Some(key) => (key, false),
+                    None => break,
+                },
             };
 
             if !self.expect(b':') {
@@ -760,31 +1001,84 @@ impl<'a> DirectParser<'a> {
             // the temporary values vector below.
 
             let key_bytes = key.as_bytes();
-            let key_ptr = cached_parse_key_ptr(key_bytes);
-            if let Some((keys, values)) = heap_fields.as_mut() {
-                if let Some(existing) = keys.iter().position(|&ptr| ptr == key_ptr) {
-                    values[existing] = value;
+            if let Some((keys, values, indices)) = heap_fields.as_mut() {
+                // Linear lookup wins for modest objects. Build the index only
+                // when another field arrives after 128 unique keys, so an
+                // object ending at that size never pays to build an unused map.
+                if indices.is_none() && keys.len() == 128 {
+                    // From here this object's content index owns duplicate
+                    // detection. Defer clearing the shared cache until finish:
+                    // a nested wide object must not change key identity while
+                    // its enclosing object is still recognizing duplicates.
+                    self.saw_wide_object = true;
+                    *indices = Some(ParsedObjectIndex::from_keys(keys));
+                }
+                if let Some(index) = indices {
+                    let hash = index.hash_bytes(key_bytes);
+                    if let Some(existing) = index.find_hashed(hash, key_bytes, keys) {
+                        values[existing] = value;
+                    } else {
+                        // The object-local content index already proves this
+                        // key is new. Avoid duplicating every wide key in the
+                        // global interning table only to clear it at return.
+                        let key_ptr =
+                            crate::string::string_from_json_bytes(&mut self.batch, key_bytes);
+                        index.insert_hash(hash, keys.len());
+                        keys.push(key_ptr);
+                        values.push(value);
+                    }
                 } else {
+                    let key_ptr = cached_parse_key_ptr(key_bytes);
+                    let warm_prefix_uses_old_key_identity =
+                        warm_shape_slot != 0 && !warm_shape_matches;
+                    if let Some(existing) = keys.iter().position(|&ptr| {
+                        ptr == key_ptr
+                            || (warm_prefix_uses_old_key_identity
+                                && json_key_bytes_equal(ptr, key_bytes))
+                    }) {
+                        values[existing] = value;
+                    } else {
+                        keys.push(key_ptr);
+                        values.push(value);
+                    }
+                }
+            } else {
+                let key_ptr = if warm_shape_matches {
+                    let (expected_len, expected_keys, _, _) = warm_shape.as_ref().unwrap();
+                    if warm_shape_slot < *expected_len
+                        && (matched_expected_spelling
+                            || json_key_bytes_equal(expected_keys[warm_shape_slot], key_bytes))
+                    {
+                        let ptr = expected_keys[warm_shape_slot];
+                        warm_shape_slot += 1;
+                        ptr
+                    } else {
+                        warm_shape_matches = false;
+                        cached_parse_key_ptr(key_bytes)
+                    }
+                } else {
+                    cached_parse_key_ptr(key_bytes)
+                };
+                let warm_prefix_uses_old_key_identity = warm_shape_slot != 0 && !warm_shape_matches;
+                if let Some(existing) = inline_keys[..inline_len].iter().position(|&ptr| {
+                    ptr == key_ptr
+                        || (warm_prefix_uses_old_key_identity
+                            && json_key_bytes_equal(ptr, key_bytes))
+                }) {
+                    inline_values[existing] = value;
+                } else if inline_len < inline_keys.len() {
+                    inline_keys[inline_len] = key_ptr;
+                    inline_values[inline_len] = value;
+                    inline_len += 1;
+                } else {
+                    let mut keys = Vec::with_capacity(16);
+                    let mut values = Vec::with_capacity(16);
+                    keys.extend_from_slice(&inline_keys);
+                    values.extend_from_slice(&inline_values);
                     keys.push(key_ptr);
                     values.push(value);
+                    heap_fields = Some((keys, values, None));
                 }
-            } else if let Some(existing) = inline_keys[..inline_len]
-                .iter()
-                .position(|&ptr| ptr == key_ptr)
-            {
-                inline_values[existing] = value;
-            } else if inline_len < inline_keys.len() {
-                inline_keys[inline_len] = key_ptr;
-                inline_values[inline_len] = value;
-                inline_len += 1;
-            } else {
-                let mut keys = Vec::with_capacity(16);
-                let mut values = Vec::with_capacity(16);
-                keys.extend_from_slice(&inline_keys);
-                values.extend_from_slice(&inline_values);
-                keys.push(key_ptr);
-                values.push(value);
-                heap_fields = Some((keys, values));
             }
 
             self.skip_whitespace();
@@ -795,45 +1089,29 @@ impl<'a> DirectParser<'a> {
             }
         }
         self.expect(b'}');
-        let field_count = heap_fields
-            .as_ref()
-            .map_or(inline_len, |(keys, _)| keys.len()) as u32;
-        let keys_arr = if let Some((keys, _)) = heap_fields.as_ref() {
+        let (keys_arr, shape_id) = if let Some((keys, _, _)) = heap_fields.as_ref() {
             self.parse_shape_keys_array_hot(keys)
+        } else if warm_shape_matches
+            && warm_shape
+                .as_ref()
+                .is_some_and(|(len, _, _, _)| *len == inline_len && warm_shape_slot == *len)
+        {
+            let (_, _, keys_array, shape_id) = warm_shape.unwrap();
+            (keys_array, shape_id)
         } else {
             self.parse_shape_keys_array_hot(&inline_keys[..inline_len])
         };
-        let js_obj = crate::object::js_object_alloc_class_inline_keys(0, 0, field_count, keys_arr);
-        // #8098: see `parse_object_shaped`.
-        crate::object::mark_object_plain_ordinary(js_obj);
-        let alloc_field_count =
-            std::cmp::max(field_count as usize, crate::object::INLINE_SLOT_FLOOR);
-        let fields_ptr =
-            (js_obj as *mut u8).add(std::mem::size_of::<crate::ObjectHeader>()) as *mut JSValue;
-        for i in 0..alloc_field_count {
-            std::ptr::write(fields_ptr.add(i), JSValue::undefined());
-        }
-        let write_field = |i: usize, value: JSValue| -> bool {
-            let value_bits = value.bits();
-            unsafe {
-                // GC_STORE_AUDIT(BARRIERED): JSON object field write uses the
-                // layout-deferred slot-store helper (#7630); the layout state is
-                // settled once below. No allocation happens between the writes
-                // and the finalize, so `js_obj` cannot move in between.
-                crate::object::store_object_field_slot_layout_deferred(js_obj, i, value_bits)
-            }
-        };
-        let mut saw_pointer = false;
-        if let Some((_, values)) = heap_fields.as_ref() {
-            for (i, value) in values.iter().copied().enumerate() {
-                saw_pointer |= write_field(i, value);
-            }
-        } else {
-            for (i, value) in inline_values[..inline_len].iter().copied().enumerate() {
-                saw_pointer |= write_field(i, value);
-            }
-        }
-        crate::gc::layout_finish_deferred_boxed_object(js_obj as usize, saw_pointer);
+        let values = heap_fields
+            .as_ref()
+            .map_or(&inline_values[..inline_len], |(_, values, _)| {
+                values.as_slice()
+            });
+        let js_obj = crate::object::object_from_json_fields_preinstalled(
+            &mut self.batch,
+            keys_arr,
+            shape_id,
+            values,
+        );
         parse_root_restore(saved_roots);
         JSValue::object_ptr(js_obj as *mut u8)
     }
@@ -843,37 +1121,83 @@ impl<'a> DirectParser<'a> {
         self.skip_whitespace();
 
         let saved_roots = parse_root_save_len();
+        if self.peek() != Some(b'{') {
+            return self.parse_array_prefix(saved_roots);
+        }
         // Same `[{...}]` pre-size heuristic as the typed path.
-        let mut js_arr = js_array_alloc(if self.peek() == Some(b'{') {
-            // 96 B/object is an empirical average for small JSON objects
-            // (e.g. `{"id":1,"name":"x"}` ≈ 80-120 B with separators).
-            // Clamped to 16..16_384 so tiny payloads stay cheap and
-            // multi-MB documents don't over-commit when the average drifts.
-            ((self.input.len() - self.pos) / 96).clamp(16, 16_384) as u32
-        } else {
-            16
-        });
-        let arr_slot = parse_root_push(JSValue::object_ptr(js_arr as *mut u8));
+        // Preserve the object-leading estimate on large record arrays.
+        let array = super::construction_array::ConstructionArray::new(
+            &mut self.batch,
+            ((self.input.len() - self.pos) / 96).clamp(16, 16_384) as u32,
+        );
+        self.parse_array_tail(array, saved_roots)
+    }
 
+    /// The direct parser's existing suppression window protects these native
+    /// value slots, just as it protects parse_object_untyped's inline fields.
+    /// Child allocations belong to the result graph. Delay the array itself
+    /// until its width is known, avoiding sixteen slots for a two-item array.
+    #[inline(never)]
+    unsafe fn parse_array_prefix(&mut self, saved_roots: usize) -> JSValue {
+        let mut values = [JSValue::undefined(); 8];
+        let mut used = 0;
         if self.peek() == Some(b']') {
             self.advance();
-            parse_root_restore(saved_roots);
-            return JSValue::object_ptr(js_arr as *mut u8);
+            return self.finish_short_array(&values[..used], saved_roots);
         }
+        loop {
+            if used == values.len() {
+                // The comma after element eight was consumed. Continue at
+                // the ninth value without reparsing any prefix or child.
+                let mut array =
+                    super::construction_array::ConstructionArray::new(&mut self.batch, 16);
+                for &value in &values {
+                    array.push(&mut self.batch, value);
+                }
+                return self.parse_array_tail(array, saved_roots);
+            }
+            let value = self.parse_value();
+            if !self.valid {
+                self.expect(b']');
+                return self.finish_short_array(&values[..used], saved_roots);
+            }
+            values[used] = value;
+            used += 1;
+            self.skip_whitespace();
+            if self.peek() == Some(b',') {
+                self.advance();
+            } else {
+                self.expect(b']');
+                return self.finish_short_array(&values[..used], saved_roots);
+            }
+        }
+    }
 
+    unsafe fn finish_short_array(&mut self, values: &[JSValue], saved_roots: usize) -> JSValue {
+        let mut array =
+            super::construction_array::ConstructionArray::new(&mut self.batch, values.len() as u32);
+        for &value in values {
+            array.push(&mut self.batch, value);
+        }
+        let result = array.finish(&self.batch);
+        parse_root_restore(saved_roots);
+        JSValue::object_ptr(result.cast())
+    }
+
+    /// Containers stay private until complete. Collection remains suppressed
+    /// for the whole parse; the native builder carries only final output slots
+    /// and bounded aggregate layout facts, not a second representation.
+    unsafe fn parse_array_tail(
+        &mut self,
+        mut array: super::construction_array::ConstructionArray,
+        saved_roots: usize,
+    ) -> JSValue {
         loop {
             let value = self.parse_value();
             if !self.valid {
                 break;
             }
-            js_arr = parse_root_array_ptr(arr_slot);
-            // GC is suppressed for the whole direct parse, so array growth
-            // cannot collect before `value` is stored.
-            js_arr = self.array_push_parse_fast(js_arr, value);
-            // js_array_push may have returned a new ArrayHeader* after grow;
-            // update the root slot so GC sees the new pointer, not the stale one.
-            parse_root_set(arr_slot, JSValue::object_ptr(js_arr as *mut u8));
-
+            array.push(&mut self.batch, value);
             self.skip_whitespace();
             if self.peek() == Some(b',') {
                 self.advance();
@@ -882,9 +1206,9 @@ impl<'a> DirectParser<'a> {
             }
         }
         self.expect(b']');
-        js_arr = parse_root_array_ptr(arr_slot);
+        let result = array.finish(&self.batch);
         parse_root_restore(saved_roots);
-        JSValue::object_ptr(js_arr as *mut u8)
+        JSValue::object_ptr(result.cast())
     }
 
     pub(crate) unsafe fn parse_number(&mut self) -> JSValue {
@@ -1054,3 +1378,37 @@ impl<'a> DirectParser<'a> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "parser_scan_tests.rs"]
+mod scan_tests;
+
+#[cfg(test)]
+#[path = "parser_short_array_tests.rs"]
+mod short_array_tests;
+
+#[path = "parser_escape_chunk.rs"]
+mod escape_chunk;
+
+#[cfg(test)]
+#[path = "parser_escape_chunk_tests.rs"]
+mod escape_chunk_tests;
+
+#[cfg(target_arch = "aarch64")]
+#[path = "parser_depth_string.rs"]
+mod depth_string;
+
+#[cfg(all(test, target_arch = "aarch64"))]
+#[path = "parser_depth_string_tests.rs"]
+mod depth_string_tests;
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[path = "parser_depth_blocks.rs"]
+mod depth_blocks;
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+pub(crate) use depth_blocks::nesting_depth_exceeds;
+
+#[cfg(all(test, target_arch = "aarch64", target_endian = "little"))]
+#[path = "parser_depth_blocks_tests.rs"]
+mod depth_blocks_tests;
