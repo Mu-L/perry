@@ -26,6 +26,7 @@ mod construction_array;
 mod parse_api;
 mod parse_empty;
 mod parse_inline_object;
+mod parse_reuse;
 mod parse_scalar;
 mod parser;
 // `pub(crate)` so `gc::mod` can register `scan_raw_json_key_root_mut` (#7211):
@@ -41,6 +42,7 @@ mod stringify_copy;
 mod stringify_data_record;
 mod stringify_escaped_output;
 mod stringify_flat;
+pub(crate) use stringify_flat::note_completed_malloc_json_output;
 mod stringify_nested_records;
 mod stringify_primitive_array;
 mod stringify_primitive_object;
@@ -84,6 +86,16 @@ pub(crate) use parse_api::test_json_parse_direct;
 pub(crate) unsafe fn test_json_stringify_record_output(bits: u64) -> Option<JSValue> {
     stringify_record_output::try_object(bits)
 }
+pub(crate) use parse_reuse::{
+    cached_parse_source_is_direct, cached_parse_string, remember_parse_object_template,
+    remember_parse_string, try_reuse_parse_object_template, validate_cached_parse_source,
+    ParseStringReuse,
+};
+#[cfg(test)]
+pub(crate) use parse_reuse::{
+    test_parse_object_template_matches, test_root_scanner_slot_addresses,
+    test_seed_root_scanner_slots,
+};
 pub(crate) use parser::{DirectParser, ObjectShapeHint};
 pub(crate) use raw_json::{ptr_is_raw_json_wrapper, raw_json_text_bytes};
 #[cfg(test)]
@@ -105,6 +117,9 @@ pub(crate) use stringify_tojson_probe::{
 };
 
 // ─── Circular reference detection ────────────────────────────────────────────
+static PARSE_KEY_CACHE_OVERSIZED_THREADS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 thread_local! {
     /// Stack of object pointers currently being stringified (for circular detection).
     pub(crate) static STRINGIFY_STACK: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
@@ -253,6 +268,13 @@ thread_local! {
     pub(crate) static PARSE_ROOTS: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
 }
 
+crate::perry_thread_local! {
+    /// Set exactly when the key cache crosses its boundary limit. Tiny parse
+    /// completions can test this bit without borrowing the hash table.
+    pub(super) static PARSE_KEY_CACHE_OVERSIZED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
+}
+
 pub(crate) struct ParseShapeCacheEntry {
     pub(crate) keys: Vec<*const StringHeader>,
     pub(crate) keys_array: *mut crate::ArrayHeader,
@@ -381,11 +403,25 @@ pub(crate) fn cached_parse_key_ptr(key_bytes: &[u8]) -> *const StringHeader {
     }
 
     let ptr = allocate_parse_key(key_bytes);
-    PARSE_KEY_CACHE.with(|c| {
-        c.borrow_mut().insert(key_bytes.to_vec(), ptr);
-    });
+    cache_parse_key(key_bytes.to_vec(), ptr);
     remember_parse_key_ring(ptr);
     ptr
+}
+
+#[inline]
+pub(crate) fn cache_parse_key(key: Vec<u8>, ptr: *const StringHeader) {
+    PARSE_KEY_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        cache.insert(key, ptr);
+        if cache.len() > 4096 {
+            PARSE_KEY_CACHE_OVERSIZED.with(|oversized| {
+                if !oversized.replace(true) {
+                    PARSE_KEY_CACHE_OVERSIZED_THREADS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+    });
 }
 
 #[inline]
@@ -544,6 +580,35 @@ pub(crate) fn json_string_from_output_bytes(bytes: &[u8]) -> *mut StringHeader {
     }
 }
 
+/// Publish a completed JSON buffer whose bytes live in native Rust storage.
+///
+/// Large transient stringify results are individually sweepable leaves rather
+/// than old-generation arena residents. The source must not point into the GC
+/// heap: servicing accumulated output debt may collect before the destination
+/// allocation, while the caller's `String`/`Vec` remains stable.
+#[inline]
+pub(crate) fn json_string_from_native_output_bytes(bytes: &[u8]) -> *mut StringHeader {
+    let len = bytes.len() as u32;
+    if len < crate::string::JSON_MALLOC_OUTPUT_THRESHOLD {
+        return json_string_from_output_bytes(bytes);
+    }
+
+    let utf16_len = if bytes.is_ascii() {
+        len
+    } else {
+        crate::string::compute_utf16_len(bytes.as_ptr(), len)
+    };
+    stringify_flat::service_json_output_sweep_boundary();
+    let (ptr, data) = crate::string::json_output_storage_alloc(len);
+    unsafe {
+        crate::string::init_string_header(ptr, utf16_len, len, len, 0, 0);
+        // GC_STORE_AUDIT(POINTER_FREE): completed JSON payload bytes.
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, len as usize);
+    }
+    stringify_flat::note_completed_malloc_json_output(len);
+    ptr
+}
+
 /// Receipt for a pushed shape-cache frame. Consumed by `restore_shape_cache`.
 ///
 /// It is not `Copy` and carries a `Drop` that pops the frame, so a JS exception
@@ -664,6 +729,7 @@ pub fn scan_parse_roots_mut(visitor: &mut crate::gc::RuntimeRootVisitor<'_>) {
             }
         }
     });
+    parse_reuse::scan_roots_mut(visitor);
     // #7268: the STRINGIFY-side shape cache keys every template on a raw
     // `ArrayHeader*` and reads the property-name strings back out of it. Its
     // doc comment used to claim no GC could run over the user object graph
@@ -768,9 +834,9 @@ pub(crate) fn test_stringify_shape_cache_keys() -> Vec<usize> {
 #[cfg(test)]
 pub(crate) fn test_clear_parse_roots() {
     PARSE_ROOTS.with(|r| r.borrow_mut().clear());
-    PARSE_KEY_CACHE.with(|c| c.borrow_mut().clear());
-    PARSE_KEY_RING.with(|ring| ring.borrow_mut().clear());
+    parse_scalar::clear_key_cache();
     PARSE_SHAPE_CACHE.with(|cache| cache.borrow_mut().clear());
+    parse_reuse::clear_caches();
     // #7268: the stringify-side cache is a GC root now, so a template left
     // behind by an earlier test on this thread would hand the next test's
     // collector a pointer into an arena that no longer exists.
