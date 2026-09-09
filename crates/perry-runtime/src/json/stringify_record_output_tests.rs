@@ -33,6 +33,108 @@ unsafe fn clear_key_prefix_cache() {
     KEY_PREFIX_CACHE.with(|cache| {
         *cache.get() = [EMPTY_KEY_PREFIX_PLAN; KEY_PREFIX_CACHE_SLOTS];
     });
+    REPEATED_OUTPUT.with(|cache| *cache.get() = EMPTY_REPEATED_OUTPUT);
+}
+
+struct ArrayPrototypeLatchGuard {
+    _guard_tests: std::sync::MutexGuard<'static, ()>,
+    recorded: bool,
+    invalidated: u8,
+}
+
+impl ArrayPrototypeLatchGuard {
+    fn new() -> Self {
+        let _guard_tests = crate::typed_feedback::typed_feedback_test_lock();
+        Self {
+            _guard_tests,
+            recorded: crate::object::prototype_chain::array_static_proto_recorded(),
+            invalidated: crate::array::PERRY_ARRAY_INDEX_FAST_PATH_INVALIDATED
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+}
+
+impl Drop for ArrayPrototypeLatchGuard {
+    fn drop(&mut self) {
+        crate::object::prototype_chain::test_swap_array_static_proto_recorded(self.recorded);
+        crate::array::test_swap_array_index_fast_path_invalidated(self.invalidated);
+    }
+}
+
+#[test]
+fn cached_record_reuses_only_the_same_receiver_semantic_proof() {
+    unsafe {
+        clear_key_prefix_cache();
+        RECEIVER_PROOF_MISSES.with(|count| count.set(0));
+        REPEATED_OUTPUT_HITS.with(|count| count.set(0));
+        let text = r#"{"id":42,"name":"user_42","email":"user_42@example.com","active":false,"score":63,"tags":["tag_2","tag_0"]}"#;
+        let first = parse(text);
+        let second = parse(text);
+        let scope = crate::gc::RuntimeHandleScope::new();
+        let first = scope.root_nanbox_u64(first.bits());
+        let second = scope.root_nanbox_u64(second.bits());
+        let first_bits = first.get_nanbox_f64().to_bits();
+        assert!(
+            super::super::stringify_tojson_probe::to_json_definitely_absent(
+                (first_bits & POINTER_MASK) as *const u8
+            )
+        );
+        let _no_movement = crate::gc::GcSuppressScope::new();
+        let current =
+            |root: &crate::gc::RuntimeHandle| JSValue::from_bits(root.get_nanbox_f64().to_bits());
+
+        // An unrelated parallel test may advance the process-wide semantic
+        // epoch between calls. Keep proving stable output until this receiver
+        // gets an uninterrupted admission window.
+        for _ in 0..32 {
+            assert_eq!(output_bytes(current(&first)), text.as_bytes());
+            if REPEATED_OUTPUT_HITS.with(std::cell::Cell::get) != 0 {
+                break;
+            }
+        }
+        assert!(RECEIVER_PROOF_MISSES.with(std::cell::Cell::get) >= 1);
+        assert_eq!(REPEATED_OUTPUT_HITS.with(std::cell::Cell::get), 1);
+
+        let first_obj =
+            (first.get_nanbox_f64().to_bits() & POINTER_MASK) as *mut crate::ObjectHeader;
+        crate::object::js_object_set_field(first_obj, 0, JSValue::number(43.0));
+        let changed_id = text.replacen("\"id\":42", "\"id\":43", 1);
+        assert_eq!(output_bytes(current(&first)), changed_id.as_bytes());
+        let hits = REPEATED_OUTPUT_HITS.with(std::cell::Cell::get);
+        assert_eq!(hits, 1);
+        for _ in 0..32 {
+            assert_eq!(output_bytes(current(&first)), changed_id.as_bytes());
+            if REPEATED_OUTPUT_HITS.with(std::cell::Cell::get) != hits {
+                break;
+            }
+        }
+        assert_eq!(REPEATED_OUTPUT_HITS.with(std::cell::Cell::get), hits + 1);
+
+        let tags = crate::object::js_object_get_field(first_obj, 5)
+            .as_pointer::<crate::ArrayHeader>() as *mut crate::ArrayHeader;
+        crate::array::js_array_set(tags, 0, JSValue::bool(false));
+        let changed_array = changed_id.replacen("[\"tag_2\",", "[false,", 1);
+        assert_eq!(output_bytes(current(&first)), changed_array.as_bytes());
+        let hits = REPEATED_OUTPUT_HITS.with(std::cell::Cell::get);
+        assert_eq!(hits, 2);
+        for _ in 0..32 {
+            assert_eq!(output_bytes(current(&first)), changed_array.as_bytes());
+            if REPEATED_OUTPUT_HITS.with(std::cell::Cell::get) != hits {
+                break;
+            }
+        }
+        assert_eq!(REPEATED_OUTPUT_HITS.with(std::cell::Cell::get), hits + 1);
+
+        let misses = RECEIVER_PROOF_MISSES.with(std::cell::Cell::get);
+        assert_eq!(output_bytes(current(&second)), text.as_bytes());
+        assert!(RECEIVER_PROOF_MISSES.with(std::cell::Cell::get) > misses);
+        assert_eq!(REPEATED_OUTPUT_HITS.with(std::cell::Cell::get), hits + 1);
+        let misses = RECEIVER_PROOF_MISSES.with(std::cell::Cell::get);
+        crate::object::prop_plan::prop_plan_epoch_bump();
+        assert_eq!(output_bytes(current(&second)), text.as_bytes());
+        assert!(RECEIVER_PROOF_MISSES.with(std::cell::Cell::get) > misses);
+        assert_eq!(REPEATED_OUTPUT_HITS.with(std::cell::Cell::get), hits + 1);
+    }
 }
 
 #[test]
@@ -199,6 +301,19 @@ fn record_final_output_declines_array_expandos_and_undefined() {
         crate::array::js_array_set(arr, 1, JSValue::number(2.0));
         let key = js_string_from_bytes(b"toJSON".as_ptr(), 6);
         crate::array::array_named_property_set(arr, key, 1.0);
+        assert!(try_object(value.bits()).is_none());
+    }
+}
+
+#[test]
+fn record_final_output_rechecks_arrays_after_any_prototype_override() {
+    let _latches = ArrayPrototypeLatchGuard::new();
+    unsafe {
+        let value = parse("{\"id\":1,\"tags\":[1,2]}");
+        let obj = value.as_pointer::<crate::ObjectHeader>();
+        let arr = crate::object::js_object_get_field(obj, 1).as_pointer::<crate::ArrayHeader>();
+        crate::object::prototype_chain::object_set_user_prototype(arr as usize, TAG_NULL);
+        assert!(crate::object::prototype_chain::array_static_proto_recorded());
         assert!(try_object(value.bits()).is_none());
     }
 }
