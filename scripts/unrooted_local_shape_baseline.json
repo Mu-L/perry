@@ -7,8 +7,6 @@
     "crates/perry-ext-events/src/module_iterators.rs": 2,
     "crates/perry-ext-events/src/module_on.rs": 3,
     "crates/perry-ext-events/src/tests.rs": 2,
-    "crates/perry-ext-fetch/src/lib.rs": 14,
-    "crates/perry-ext-fetch/src/tests.rs": 14,
     "crates/perry-ext-http/src/agent.rs": 3,
     "crates/perry-ext-http/src/client_request_surface.rs": 2,
     "crates/perry-ext-http/src/server/handle_dispatch.rs": 2,
@@ -37,10 +35,7 @@
     "crates/perry-stdlib/src/events/once_helpers.rs": 1,
     "crates/perry-stdlib/src/events/warnings.rs": 1,
     "crates/perry-stdlib/src/fetch/mod.rs": 6,
-    "crates/perry-stdlib/src/ioredis.rs": 3,
     "crates/perry-stdlib/src/lodash.rs": 21,
-    "crates/perry-stdlib/src/mongodb.rs": 4,
-    "crates/perry-stdlib/src/nodemailer.rs": 3,
     "crates/perry-stdlib/src/querystring.rs": 2,
     "crates/perry-stdlib/src/readline/mod.rs": 4,
     "crates/perry-stdlib/src/sqlite/backup.rs": 8,
@@ -70,5 +65,5 @@
     "crates/perry-stdlib/src/zlib.rs": 3
   },
   "schema_version": 3,
-  "total": 428
+  "total": 390
 }

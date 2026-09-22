@@ -747,8 +747,11 @@ pub(crate) fn binding_needs_shared_tokio(module: &str) -> bool {
         | "http"
         | "https"
         | "http2"
-        // HTTP clients (reqwest, hyper)
-        | "node-fetch"
+        // `axios` and `node-fetch` were listed here. Neither has a wrapper
+        // crate in this tree any more — P11 dropped node-fetch's row (it
+        // duplicated perry-stdlib's WHATWG fetch symbols and the two disagreed
+        // on handle encoding, which segfaulted), and main's npm-binding strip
+        // dropped axios's — so this predicate is never asked about them.
         // undici — glue over the native fetch stack (network I/O family).
         // The wrapper itself has no tokio dep today, but it rides the
         // shared build so the driver auto-builds its archive alongside

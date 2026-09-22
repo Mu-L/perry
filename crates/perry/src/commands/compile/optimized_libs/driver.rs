@@ -67,6 +67,29 @@ pub(crate) fn build_optimized_libs(
         );
         std::process::exit(1);
     }
+    // turnloop P8 group H: perry-stdlib's bundled ioredis / mongodb copies were
+    // deleted, so with the flip disabled there is nothing left to define
+    // `js_ioredis_*` / `js_mongodb_*` and the link would fail with a wall of
+    // undefined symbols. Say so up front instead.
+    //
+    // pg / mysql2 / fastify are NOT listed: main's npm-binding strip removed
+    // their well-known rows entirely, so those imports compile the real npm
+    // package from source and never reach a wrapper either way.
+    if let Some(module) = iteration_set
+        .iter()
+        .map(|m| m.strip_prefix("node:").unwrap_or(m))
+        .find(|m| matches!(*m, "ioredis" | "redis" | "iovalkey" | "mongodb"))
+        .filter(|_| !use_well_known)
+    {
+        eprintln!(
+            "error: `import '{module}'` requires an external perry-ext-* wrapper, but the \
+             well-known flip is disabled (PERRY_DISABLE_WELL_KNOWN). perry-stdlib's bundled \
+             ioredis / mongodb copies were removed; unset PERRY_DISABLE_WELL_KNOWN so the \
+             import routes to its wrapper crate."
+        );
+        std::process::exit(1);
+    }
+
     // `PERRY_NO_AUTO_OPTIMIZE=1` — opt out of the per-app feature-set
     // specialization and use the prebuilt `target/release/libperry_*.a`
     // built with the default `full` feature set. Used by CI doc-tests
@@ -234,6 +257,23 @@ pub(crate) fn build_optimized_libs(
                 // exists on disk first (so we can actually build it).
                 let crate_dir = workspace_root.join("crates").join(&binding.krate);
                 if !crate_dir.is_dir() {
+                    // turnloop P8 group H removed the bundled db copies, so
+                    // the fall-back below has nothing to fall back to.
+                    if matches!(
+                        module_normalized,
+                        "ioredis" | "redis" | "iovalkey" | "mongodb"
+                    ) {
+                        eprintln!(
+                            "error: `import '{}'` requires the external {} wrapper, but its \
+                             source crate was not found at `{}`. perry-stdlib's bundled copy was \
+                             removed; build or restore {}.",
+                            module,
+                            binding.krate,
+                            crate_dir.display(),
+                            binding.krate
+                        );
+                        std::process::exit(1);
+                    }
                     if matches!(format, OutputFormat::Text) && verbose > 0 {
                         eprintln!(
                             "  well-known: skipping `{}` — crate `{}` source not on disk; \
@@ -314,14 +354,24 @@ pub(crate) fn build_optimized_libs(
                     "bundled-bcrypt"
                         | "bundled-argon2"
                         | "bundled-nodemailer"
-                        | "bundled-ioredis"
-                        | "bundled-mongodb"
                         | "bundled-ws"
                         | "bundled-net"
                         | "http-client"
                         | "bundled-streams"
                 )
             }) {
+                features.insert("async-runtime");
+            }
+            // turnloop P8 group H: the bundled pg / mysql2 / ioredis / mongodb
+            // modules were deleted, so `module_to_features` names no feature
+            // for them and the check above cannot see them. The wrappers still
+            // settle every promise through perry-stdlib's `perry_ffi_*` shim,
+            // which only compiles under `async-runtime` — key it on the module
+            // name, the same way `undici` / `nodemailer` / `fastify` do below.
+            if matches!(
+                module_normalized,
+                "pg" | "mysql2" | "mysql2/promise" | "ioredis" | "redis" | "iovalkey" | "mongodb"
+            ) {
                 features.insert("async-runtime");
             }
             // `undici` (#466): perry-ext-undici is thin glue over the
@@ -335,6 +385,17 @@ pub(crate) fn build_optimized_libs(
             // the wrapper's JsPromise surface needs anyway.)
             if module_normalized == "undici" {
                 features.insert("web-fetch");
+            }
+            // turnloop P6 — the same shape, for SMTP. `import 'nodemailer'`
+            // strips `bundled-nodemailer` and routes to perry-ext-nodemailer,
+            // which reaches perry-stdlib's turnloop SMTP engine through the
+            // `js_perry_smtp_*` C seam. That engine is gated on
+            // `turnloop-smtp-client`, which is NOT implied by
+            // `bundled-nodemailer` precisely so the strip cannot take it — but
+            // the rebuilt feature list is explicit, so it has to be re-asserted
+            // here or the wrapper's externs dangle at link time.
+            if module_normalized == "nodemailer" {
+                features.insert("turnloop-smtp-client");
             }
             // v0.5.579 — when the flip strips `bundled-net`, activate
             // `external-net-pump` to retain the shared runtime and external

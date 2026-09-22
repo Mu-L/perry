@@ -6,6 +6,9 @@
 //! # Features
 //! - `core` - Minimal runtime (always included)
 //! - `http-server` - Native HTTP server (hyper-based)
+//! - `http-client` - Web Fetch and Axios compatibility surface
+//! - `database` - In-stdlib databases (sqlite only; postgres/mysql/redis/mongodb
+//!   are served by the perry-ext-* wrappers)
 //! - `http-client` - Web Fetch compatibility surface
 //! - `database` - All databases (postgres, mysql, sqlite, redis, mongodb)
 //! - `crypto` - Cryptographic functions
@@ -91,6 +94,29 @@ pub use framework::*;
 // The npm `fastify` binding was removed (#466): `import 'fastify'` now
 // compiles the real npm package from source, same as any other package
 // under the wildcard resolution.
+
+// === turnloop P6: the shared client TLS session ===
+// Driven by both outbound engines below (`turnloop_client`, `turnloop_smtp`).
+#[cfg(any(feature = "turnloop-http-client", feature = "turnloop-smtp-client"))]
+pub(crate) mod turnloop_tls_client;
+
+// === turnloop P6: SMTP on turnloop handles ===
+// `turnloop-smtp`'s sans-I/O `Connection` over a turnloop socket. Gated on its
+// own feature rather than `bundled-nodemailer` so the `js_smtp_*` entry points
+// survive the well-known flip that strips the bundled surface — that is how
+// perry-ext-nodemailer reaches this engine.
+#[cfg(feature = "turnloop-smtp-client")]
+pub mod turnloop_smtp;
+
+// === turnloop P6: outbound HTTP/1.1 on turnloop handles ===
+// The transport `fetch` and `axios` take whenever this agent has a loop —
+// directly when this thread owns it, and through turnloop P10's `agent_post`
+// when another thread of the same agent does. The reqwest client stays beside
+// it for what the engine declines: an undrivable proxy, a URL the fetch policy
+// layer rejects, and a genuine absence of an agent loop (a host where
+// `Loop::new` failed). See `turnloop_client`'s module note.
+#[cfg(feature = "turnloop-http-client")]
+pub mod turnloop_client;
 
 // === Web Fetch API (fetch / Headers / Request / Response / Blob) ===
 // #5174: gated on `web-fetch`, not `http-client`, so Web Fetch stays
@@ -192,6 +218,12 @@ pub mod tls;
 pub use tls::*;
 
 // === Databases ===
+// The bundled `pg` / `mysql2` / `ioredis` / `mongodb` modules were deleted in
+// turnloop P8 group H. `import 'pg'` / `'mysql2'` / `'ioredis'` / `'redis'` /
+// `'iovalkey'` / `'mongodb'` are served exclusively by the perry-ext-*
+// wrappers through the well-known flip, which is the only path they have taken
+// since v0.5.565-568; each wrapper defines a strict superset of the symbols the
+// bundled copy did. Only sqlite remains in-stdlib.
 // Both in-tree database wrappers that lived here are gone: the `pg`
 // module + `bundled-pg` feature (#10677) and the `mysql2` module +
 // `bundled-mysql2` feature (#10680), the pre-#466 native
@@ -232,16 +264,6 @@ pub extern "C" fn js_sqlite_is_db_handle(_handle: i64) -> i32 {
 pub extern "C" fn js_sqlite_is_stmt_handle(_handle: i64) -> i32 {
     0
 }
-
-#[cfg(feature = "bundled-ioredis")]
-pub mod ioredis;
-#[cfg(feature = "bundled-ioredis")]
-pub use ioredis::*;
-
-#[cfg(feature = "bundled-mongodb")]
-pub mod mongodb;
-#[cfg(feature = "bundled-mongodb")]
-pub use mongodb::*;
 
 // === Crypto ===
 #[cfg(feature = "crypto")]
