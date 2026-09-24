@@ -1047,6 +1047,8 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
         }
         ast::Stmt::Switch(switch_stmt) => {
             let mut discriminant = lower_expr(ctx, &switch_stmt.discriminant)?;
+            let interfaces =
+                enter_interface_scope(ctx, switch_stmt.cases.iter().flat_map(|case| &case.cons))?;
             let mut cases = Vec::new();
             let switch_scope_mark = ctx.push_block_scope();
             // Case statement-lists share the switch's block scope without
@@ -1082,6 +1084,7 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
             }
 
             crate::lower_decl::exit_class_rename_scope(ctx, saved_class_renames);
+            exit_interface_scope(ctx, interfaces);
             ctx.pop_block_scope(switch_scope_mark);
 
             if !tdz_boxes.is_empty() {
@@ -2227,7 +2230,8 @@ fn lower_body_stmt_impl(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Result<V
         ast::Stmt::Empty(_) => {}
         // `debugger;` is a no-op in AOT compilation.
         ast::Stmt::Debugger(_) => {}
-        // Type-only declarations are fully erased at compile time.
+        // Type-only declarations emit no runtime statements. Interfaces were
+        // registered at scope entry, before any uses (including forward uses).
         ast::Stmt::Decl(ast::Decl::TsInterface(_)) | ast::Stmt::Decl(ast::Decl::TsTypeAlias(_)) => {
         }
         // Body-local enum. Enum accesses never need a runtime object: both the
