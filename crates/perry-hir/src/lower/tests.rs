@@ -1990,3 +1990,5 @@ mod issue_10745_passthrough_heritage;
 mod issue_11139_member_heritage_builtin_name;
 
 mod hoisted_sibling_in_later_closure;
+
+mod issue_11157_class_decl_self_statics;
