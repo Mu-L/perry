@@ -1494,7 +1494,7 @@ unsafe fn replay_class_object_constructor_impl(
     let _active_evaluation =
         super::class_registry::push_active_class_evaluation(capture_owner_handle.get_nanbox_f64());
     inst_handle.with_mut_ptr::<ObjectHeader, _>(|inst| {
-        call_vtable_method(
+        super::class_registry::call_vtable_method_with_private_brand(
             ctor_ptr,
             inst as i64,
             final_args.as_ptr(),
@@ -1504,6 +1504,7 @@ unsafe fn replay_class_object_constructor_impl(
             // Capture-forwarding constructor args are materialized positionally
             // above (including any caps), so no trailing rest re-packing here.
             false,
+            capture_owner_handle.get_nanbox_f64(),
         )
     })
 }
