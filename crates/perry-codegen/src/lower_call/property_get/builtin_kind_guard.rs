@@ -402,7 +402,7 @@ fn guarded_call(
 
     ctx.current_block = generic_idx;
     let (generic_recv, generic_args) = reread(ctx)?;
-    let generic_value = super::super::console_promise::emit_native_method_str_dispatch(
+    let generic_value = super::super::console_promise::emit_native_method_str_dispatch_plain(
         ctx,
         property,
         call_byte_offset,
