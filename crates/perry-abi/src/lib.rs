@@ -18,10 +18,13 @@ pub const STATIC_SHAPE_ID_COUNT: u32 = 1 << 20;
 pub const ARRAY_HEADER_SIZE: usize = 8;
 
 /// `agent_ptrs::PERRY_AGENT_PTRS`: the number of per-agent pointer slots.
-/// Slot 0 is reserved (the megamorphic follow-up's shape-record directory);
-/// slot 1 held the implicit-`this` cell's address until this-as-a-parameter
-/// deleted the cell, and is free; slot 2 is the stack limit.
 pub const AGENT_PTR_SLOTS: usize = 4;
+/// Slot 0: the address of this agent's ordinary shape-directory mirror
+/// (`shapes_store::ORDINARY_DIR`), which a generic read site passes to its
+/// GC-leaf miss front (`js_object_get_field_ic_front`) so the front reads no
+/// thread-local. Slot 1 held the implicit-`this` cell's address until
+/// this-as-a-parameter deleted the cell, and is free; slot 2 is the stack limit.
+pub const AGENT_PTR_SHAPE_DIR: usize = 0;
 /// Slot 2: this agent's stack limit (#10812) — not a pointer to anything, the
 /// lowest frame address a compiled prologue accepts before it throws
 /// `RangeError: Maximum call stack size exceeded`. Null means unchecked.
