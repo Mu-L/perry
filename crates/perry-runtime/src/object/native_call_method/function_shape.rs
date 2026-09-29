@@ -105,7 +105,7 @@ unsafe fn function_shape_decline(
     args_ptr: *const f64,
     args_len: usize,
 ) -> Option<f64> {
-    if crate::closure::shape::is_class_code((*(addr as *const ClosureHeader)).func_ptr) {
+    if crate::closure::shape::is_class_info((*(addr as *const ClosureHeader)).info) {
         return super::primitive_methods::class_value_method_call(object, name, args_ptr, args_len);
     }
     None
@@ -182,11 +182,14 @@ mod tests {
         crate::string::js_string_from_bytes(s.as_ptr(), s.len() as u32)
     }
 
-    /// A prototype object whose `bind` slot holds `func` (the intrinsic thunk
-    /// or anything else), published as this agent's Function.prototype.
-    unsafe fn install_proto(func: *const u8) -> *mut crate::object::ObjectHeader {
+    /// A prototype object whose `bind` slot holds a closure over `info` (the
+    /// intrinsic thunk or anything else), published as this agent's
+    /// Function.prototype.
+    unsafe fn install_proto(
+        info: *const crate::closure::JsFunctionInfo,
+    ) -> *mut crate::object::ObjectHeader {
         let proto = crate::object::js_object_alloc(0, 0);
-        let method = crate::closure::js_closure_alloc(func, 0);
+        let method = crate::closure::js_closure_alloc(info, 0);
         crate::object::js_object_set_field_by_name(
             proto,
             key("bind"),
@@ -207,7 +210,7 @@ mod tests {
         unsafe {
             let saved = crate::closure::shape::FUNCTION_PROTOTYPE_PTR.load(Ordering::Acquire);
             install_proto(crate::object::global_this::function_prototype_bind_thunk_for_test());
-            let target = crate::closure::js_closure_alloc(target_body as *const u8, 0);
+            let target = crate::closure::js_closure_alloc(crate::fn_info!(target_body, 0), 0);
             let target_v = crate::value::js_nanbox_pointer(target as i64);
             let this_arg = [f64::from_bits(crate::value::TAG_UNDEFINED)];
             let before = hits();
@@ -215,10 +218,7 @@ mod tests {
                 .expect("the shape path must answer bind on a base-shaped function");
             assert_eq!(hits(), before + 1, "the path must FIRE, not only agree");
             let bound_ptr = JSValue::from_bits(bound.to_bits()).as_pointer::<ClosureHeader>();
-            assert_eq!(
-                (*bound_ptr).func_ptr,
-                crate::closure::BOUND_FUNCTION_FUNC_PTR
-            );
+            assert_eq!((*bound_ptr).code(), crate::closure::BOUND_FUNCTION_FUNC_PTR);
             assert_eq!(
                 crate::closure::js_closure_call0(bound_ptr, crate::closure::plain_call_receiver()),
                 42.0
@@ -234,8 +234,8 @@ mod tests {
         unsafe {
             let saved = crate::closure::shape::FUNCTION_PROTOTYPE_PTR.load(Ordering::Acquire);
             // The slot holds something else: identity by VALUE says no.
-            install_proto(target_body as *const u8);
-            let target = crate::closure::js_closure_alloc(target_body as *const u8, 0);
+            install_proto(crate::fn_info!(target_body, 0));
+            let target = crate::closure::js_closure_alloc(crate::fn_info!(target_body, 0), 0);
             let target_v = crate::value::js_nanbox_pointer(target as i64);
             let this_arg = [f64::from_bits(crate::value::TAG_UNDEFINED)];
             let before = hits();

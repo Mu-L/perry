@@ -301,7 +301,7 @@ fn pinned_promise_reaction_runs(cross_thread: bool, fulls: usize) -> bool {
         crate::promise::js_promise_new()
     };
     js_shadow_slot_set(0, ptr_bits(p as usize));
-    let cb = crate::closure::js_closure_alloc(record_cb as *const u8, 0);
+    let cb = crate::closure::js_closure_alloc(crate::fn_info!(record_cb, 1), 0);
     let _derived = crate::promise::js_promise_then(slot_ptr(), cb, std::ptr::null());
     let p: *mut crate::promise::Promise = slot_ptr();
     if !cross_thread {
@@ -315,7 +315,7 @@ fn pinned_promise_reaction_runs(cross_thread: bool, fulls: usize) -> bool {
     }
     // A freed reaction cell is handed back to a closure that records -1.
     for _ in 0..4096 {
-        let _ = crate::closure::js_closure_alloc(overwrite_cb as *const u8, 0);
+        let _ = crate::closure::js_closure_alloc(crate::fn_info!(overwrite_cb, 1), 0);
     }
     if !cross_thread {
         unsafe { crate::gc::unpin_object(header_of(p as *mut u8)) };

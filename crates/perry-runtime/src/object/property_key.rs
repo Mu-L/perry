@@ -621,7 +621,7 @@ mod property_key_tests {
             let obj = js_object_alloc(0, 0);
             let obj_value = crate::value::js_nanbox_pointer(obj as i64);
             let sym = crate::symbol::js_symbol_new_empty();
-            let getter = crate::closure::js_closure_alloc(accessor_getter as *const u8, 0);
+            let getter = crate::closure::js_closure_alloc(crate::fn_info!(accessor_getter, 0), 0);
             let getter_value = crate::value::js_nanbox_pointer(getter as i64);
 
             js_object_define_accessor(

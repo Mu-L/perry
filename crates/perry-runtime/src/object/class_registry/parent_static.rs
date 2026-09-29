@@ -868,12 +868,12 @@ pub unsafe extern "C" fn js_register_class_computed_accessor(
                     .entry(class_id)
                     .or_default()
                     .entry(name.clone())
-                    .or_insert((0, 0));
+                    .or_default();
                 if getter_ptr != 0 {
-                    entry.0 = getter_ptr as usize;
+                    entry.get = getter_ptr as usize;
                 }
                 if setter_ptr != 0 {
-                    entry.1 = setter_ptr as usize;
+                    entry.set = setter_ptr as usize;
                 }
             }
             crate::object::class_value::note_intrinsic_registration(class_id, &name);

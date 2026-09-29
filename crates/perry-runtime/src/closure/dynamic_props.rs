@@ -360,7 +360,7 @@ pub(crate) fn closure_get_dynamic_prop_keyed(
     let on_base = unsafe { super::shape::closure_on_base_shape(ptr as *const ClosureHeader) };
     if on_base {
         // fall through to the data lookups below
-    } else if super::shape::is_class_code(unsafe { (*(ptr as *const ClosureHeader)).func_ptr }) {
+    } else if super::shape::is_class_info(unsafe { (*(ptr as *const ClosureHeader)).info }) {
         // A class constructor: its class lookup (statics, the parent chain,
         // `name`/`length`/`prototype`, Function.prototype) — never the plain
         // function fallbacks below.
@@ -413,7 +413,7 @@ pub(crate) fn closure_get_dynamic_prop_keyed(
     // cached, the `closure_props` lookup above intercepts before this runs
     // again.
     if prop == "name" && (on_base || !closure_is_key_deleted(ptr, "name")) {
-        let func_ptr = unsafe { (*(ptr as *const ClosureHeader)).func_ptr };
+        let func_ptr = unsafe { (*(ptr as *const ClosureHeader)).code() };
         if func_ptr == crate::closure::BOUND_FUNCTION_FUNC_PTR {
             return unsafe { crate::closure::bound_function_lazy_name(ptr) };
         }
@@ -889,12 +889,11 @@ pub(crate) fn clone_closure_rebind_this(closure_bits: u64, recv_box: f64) -> u64
         if count == 0 {
             return closure_bits;
         }
-        // Allocate a fresh closure with the same func_ptr + capture_count (preserving the flag).
+        // Allocate a fresh closure of the same body + capture_count (preserving the flag).
         let scope = crate::gc::RuntimeHandleScope::new();
         let closure_handle = scope.root_nanbox_u64(closure_bits);
         let recv_handle = scope.root_nanbox_f64(recv_box);
-        let func_ptr = (*header).func_ptr;
-        let new_closure = js_closure_alloc(func_ptr, raw_count);
+        let new_closure = js_closure_alloc((*header).info, raw_count);
         let source_bits = closure_handle.get_nanbox_u64();
         let source_ptr = (source_bits & 0x0000_FFFF_FFFF_FFFF) as usize;
         if !closure_kind_probe(source_ptr) {

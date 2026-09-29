@@ -3798,6 +3798,10 @@ fn compile_module_impl(
         cross_module: &cross_module,
     })?;
 
+    // One `JsFunctionInfo` per body a function object runs (`crate::fn_info`),
+    // after every function — and so every allocation site — exists.
+    llmod.emit_fn_infos();
+
     // Emit the buffer alias-scope metadata once per module, covering every
     // scope id allocated across compile_function / compile_closure /
     // compile_method / compile_static_method / compile_module_entry. Must
