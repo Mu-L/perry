@@ -25,6 +25,13 @@ pub const AGENT_PTR_SLOTS: usize = 4;
 /// thread-local. Slot 1 held the implicit-`this` cell's address until
 /// this-as-a-parameter deleted the cell, and is free; slot 2 is the stack limit.
 pub const AGENT_PTR_SHAPE_DIR: usize = 0;
+/// Payloads below this are native-registry handles, never heap cells
+/// (`addr_class::HANDLE_BAND_MAX`). A generic read site's fused receiver test
+/// computes `payload - RECEIVER_HANDLE_FLOOR` on its pointer edge, and its
+/// miss front (`js_object_get_field_ic_front`) takes the receiver in exactly
+/// that form: the front adds the floor back inside its load displacements,
+/// and the site passes the value its test already holds.
+pub const RECEIVER_HANDLE_FLOOR: usize = 0x10_0000;
 /// Slot 2: this agent's stack limit (#10812) — not a pointer to anything, the
 /// lowest frame address a compiled prologue accepts before it throws
 /// `RangeError: Maximum call stack size exceeded`. Null means unchecked.
