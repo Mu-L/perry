@@ -51,6 +51,7 @@ pub extern "C" fn js_promise_static_function_value(name_ptr: *const u8, name_len
 
 extern "C" fn url_can_parse_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     input: f64,
     base: f64,
 ) -> f64 {
@@ -66,6 +67,7 @@ extern "C" fn url_can_parse_thunk(
 
 extern "C" fn url_parse_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     input: f64,
     base: f64,
 ) -> f64 {
@@ -91,6 +93,7 @@ extern "C" fn url_parse_thunk(
 // compile-time `Uint8Array.fromBase64(str)` call path produces.
 extern "C" fn uint8array_from_base64_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     input: f64,
     opts: f64,
 ) -> f64 {
@@ -100,6 +103,7 @@ extern "C" fn uint8array_from_base64_thunk(
 
 extern "C" fn uint8array_from_hex_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     input: f64,
 ) -> f64 {
     let buf = crate::buffer::js_u8_from_hex(input.to_bits() as i64);
@@ -108,6 +112,7 @@ extern "C" fn uint8array_from_hex_thunk(
 
 extern "C" fn subtle_crypto_supports_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     rest: f64,
 ) -> f64 {
     let args = global_this_rest_array_values(rest);
@@ -158,8 +163,8 @@ fn rejected_type_error_with_code_promise(message: &str, code: &'static str) -> f
     crate::value::js_nanbox_pointer(promise as i64)
 }
 
-fn subtle_crypto_dispatch_rest(method_name: &str, rest: f64) -> f64 {
-    let this_value = f64::from_bits(IMPLICIT_THIS.with(|c| c.get()));
+fn subtle_crypto_dispatch_rest(this: crate::closure::JsThis, method_name: &str, rest: f64) -> f64 {
+    let this_value = f64::from_bits(this.bits());
     if !is_subtle_crypto_this(this_value) {
         return rejected_type_error_with_code_promise(
             "Value of \"this\" must be of type SubtleCrypto",
@@ -186,30 +191,34 @@ fn subtle_crypto_dispatch_rest(method_name: &str, rest: f64) -> f64 {
 
 pub(crate) extern "C" fn subtle_crypto_encapsulate_bits_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     rest: f64,
 ) -> f64 {
-    subtle_crypto_dispatch_rest("encapsulateBits", rest)
+    subtle_crypto_dispatch_rest(this, "encapsulateBits", rest)
 }
 
 pub(crate) extern "C" fn subtle_crypto_decapsulate_bits_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     rest: f64,
 ) -> f64 {
-    subtle_crypto_dispatch_rest("decapsulateBits", rest)
+    subtle_crypto_dispatch_rest(this, "decapsulateBits", rest)
 }
 
 pub(crate) extern "C" fn subtle_crypto_encapsulate_key_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     rest: f64,
 ) -> f64 {
-    subtle_crypto_dispatch_rest("encapsulateKey", rest)
+    subtle_crypto_dispatch_rest(this, "encapsulateKey", rest)
 }
 
 pub(crate) extern "C" fn subtle_crypto_decapsulate_key_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     rest: f64,
 ) -> f64 {
-    subtle_crypto_dispatch_rest("decapsulateKey", rest)
+    subtle_crypto_dispatch_rest(this, "decapsulateKey", rest)
 }
 
 /// Install a single callable static method on a constructor closure as a
@@ -986,22 +995,24 @@ pub(crate) fn install_noop_proto_methods(proto_obj: *mut ObjectHeader, methods: 
 
 pub(crate) extern "C" fn url_pattern_test_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     input: f64,
     rest: f64,
 ) -> f64 {
     let base = rest_first_arg(rest);
-    let this_value = crate::object::js_implicit_this_get();
+    let this_value = this.as_f64();
     let pattern = crate::value::js_nanbox_get_pointer(this_value) as *mut ObjectHeader;
     crate::url::js_url_pattern_test(pattern, input, base)
 }
 
 pub(crate) extern "C" fn url_pattern_exec_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     input: f64,
     rest: f64,
 ) -> f64 {
     let base = rest_first_arg(rest);
-    let this_value = crate::object::js_implicit_this_get();
+    let this_value = this.as_f64();
     let pattern = crate::value::js_nanbox_get_pointer(this_value) as *mut ObjectHeader;
     crate::url::js_url_pattern_exec(pattern, input, base)
 }
@@ -1024,8 +1035,9 @@ fn rest_first_arg(rest: f64) -> f64 {
 /// 27.2.4.8, 22.2.5.2, 23.2.2.4).
 pub(crate) extern "C" fn builtin_species_getter_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
 ) -> f64 {
-    f64::from_bits(IMPLICIT_THIS.with(|c| c.get()))
+    f64::from_bits(this.bits())
 }
 
 /// Install the standard own `get [Symbol.species]` accessor

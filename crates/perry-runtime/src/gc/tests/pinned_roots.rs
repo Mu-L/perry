@@ -261,12 +261,20 @@ std::thread_local! {
     static SETTLED_WITH: std::cell::Cell<f64> = const { std::cell::Cell::new(f64::NAN) };
 }
 
-extern "C" fn record_cb(_c: *const crate::closure::ClosureHeader, v: f64) -> f64 {
+extern "C" fn record_cb(
+    _c: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+    v: f64,
+) -> f64 {
     SETTLED_WITH.with(|s| s.set(v));
     v
 }
 
-extern "C" fn overwrite_cb(_c: *const crate::closure::ClosureHeader, v: f64) -> f64 {
+extern "C" fn overwrite_cb(
+    _c: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+    v: f64,
+) -> f64 {
     SETTLED_WITH.with(|s| s.set(-1.0));
     v
 }

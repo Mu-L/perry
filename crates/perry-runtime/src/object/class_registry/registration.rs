@@ -210,29 +210,33 @@ pub(crate) fn class_registered_static_accessor_ptrs(
 }
 
 /// Trampoline giving a raw vtable getter func_ptr (`fn(this) -> f64`) the
-/// closure calling convention. The receiver comes from `IMPLICIT_THIS`, set
+/// closure calling convention. The receiver is the `this` argument passed
 /// by the method-call dispatch the closure value travels through.
-extern "C" fn class_accessor_getter_thunk(closure: *const crate::closure::ClosureHeader) -> f64 {
+extern "C" fn class_accessor_getter_thunk(
+    closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
     let raw = crate::closure::js_closure_get_capture_ptr(closure, 0) as usize;
     if raw == 0 {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
-    let this = crate::object::js_implicit_this_get();
-    let f: extern "C" fn(f64) -> f64 = unsafe { std::mem::transmute(raw) };
+    let this = this.as_f64();
+    let f = unsafe { crate::closure::body_call::js_method_body_fn!(raw as *const u8;) };
     f(this)
 }
 
 /// Trampoline for a raw vtable setter func_ptr (`fn(this, value) -> f64`).
 extern "C" fn class_accessor_setter_thunk(
     closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     value: f64,
 ) -> f64 {
     let raw = crate::closure::js_closure_get_capture_ptr(closure, 0) as usize;
     if raw == 0 {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
-    let this = crate::object::js_implicit_this_get();
-    let f: extern "C" fn(f64, f64) -> f64 = unsafe { std::mem::transmute(raw) };
+    let this = this.as_f64();
+    let f = unsafe { crate::closure::body_call::js_method_body_fn!(raw as *const u8; a0) };
     f(this, value)
 }
 

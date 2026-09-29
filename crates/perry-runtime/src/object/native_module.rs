@@ -439,6 +439,7 @@ pub(crate) fn call_worker_threads_getter(
     if ptr.is_null() {
         return fallback();
     }
+    // NOT-A-JS-BODY: a native Rust helper registered by another crate.
     let getter: WorkerThreadsValueGetter = unsafe { std::mem::transmute(ptr) };
     getter()
 }
@@ -511,6 +512,7 @@ pub(crate) fn install_nm_ee_ops() {
 /// `closure::dispatch::value_call`; see `NmEeOps::ee_dynamic_super`).
 unsafe fn nm_ee_dynamic_super(
     func_value: f64,
+    this: crate::closure::JsThis,
     args_ptr: *const f64,
     args_len: usize,
 ) -> Option<f64> {
@@ -520,7 +522,7 @@ unsafe fn nm_ee_dynamic_super(
     if (module == "events" && (method == "EventEmitter" || method == "EventEmitterAsyncResource"))
         || (module == "stream" && method == "Stream")
     {
-        let this_val = super::js_implicit_this_get();
+        let this_val = this.as_f64();
         if crate::value::JSValue::from_bits(this_val.to_bits()).is_pointer() {
             if method == "EventEmitterAsyncResource" {
                 let options = if !args_ptr.is_null() && args_len > 0 {
@@ -1348,7 +1350,7 @@ pub(crate) fn build_symbol_bound_method_closure(
 /// Resolve the effective receiver for a BOUND_METHOD dispatch. When the
 /// captured receiver is a canonical class-method marker (a class prototype-ref,
 /// produced by `class_prototype_method_value_for_name`), substitute the
-/// call-site `this` (IMPLICIT_THIS) provided it is itself a dispatchable class
+/// call-site `this` argument provided it is itself a dispatchable class
 /// receiver (an instance or class ref). Otherwise the captured value is the real
 /// receiver and is returned unchanged. See `dispatch_bound_method`.
 /// Is `value` a bound STATIC-method value — a BOUND_METHOD closure whose
@@ -1379,13 +1381,16 @@ pub(crate) fn is_static_bound_method_value(value: f64) -> bool {
         || class_registry::is_class_object_value(captured)
 }
 
-pub(crate) fn canonical_bound_method_receiver(captured: f64) -> f64 {
+pub(crate) fn canonical_bound_method_receiver(
+    captured: f64,
+    call_this: crate::closure::JsThis,
+) -> f64 {
     if class_prototype_ref_id(captured).is_some() {
         // The captured prototype identifies the method's owner, not its receiver.
         // Class methods are strict: every call-site value, including null,
         // undefined, primitives and arrays, must reach the body unchanged.
         // Dispatch resolves the body from the captured owner independently.
-        super::js_implicit_this_get()
+        call_this.as_f64()
     } else {
         captured
     }
@@ -1418,7 +1423,7 @@ fn class_id_from_method_receiver_known(instance: f64, class_ref: Option<u32>) ->
             // this guard, a free call to a `C.prototype.method` bound-method
             // value made from inside a function-object method body (e.g.
             // test262's `assert.throws(…, function(){ m(...) })`, where
-            // `IMPLICIT_THIS` is the `assert` function) would mis-substitute the
+            // the call-site `this` was the `assert` function) would mis-substitute the
             // function object as the receiver and dispatch `assert.method(...)`
             // instead of `C.prototype.method`, bypassing the generator wrapper's
             // param prologue. See `canonical_bound_method_receiver`.
@@ -1679,19 +1684,4 @@ pub(crate) use cjs_default::{
 };
 
 #[cfg(test)]
-mod buffer_pool_size_tests {
-    // #11471: `Buffer.poolSize` is per realm, so a worker's write (possibly of
-    // a heap value) never reaches another thread.
-    #[test]
-    fn buffer_pool_size_writes_stay_on_their_thread() {
-        let written = std::thread::spawn(|| {
-            super::set_buffer_pool_size(1.0);
-            super::buffer_pool_size()
-        })
-        .join()
-        .unwrap();
-        assert_eq!(written, 1.0);
-        let elsewhere = std::thread::spawn(super::buffer_pool_size).join().unwrap();
-        assert_eq!(elsewhere, 65536.0);
-    }
-}
+mod buffer_pool_size_tests;

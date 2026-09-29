@@ -38,7 +38,10 @@ fn rejected_promise(reason: f64) -> f64 {
     f64::from_bits(crate::value::JSValue::pointer(promise as *const u8).bits())
 }
 
-extern "C" fn mkdtemp_disposable_remove_impl(closure: *const ClosureHeader) -> f64 {
+extern "C" fn mkdtemp_disposable_remove_impl(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let path_value = crate::closure::js_closure_get_capture_f64(closure, 0);
     match remove_temp_dir_result(path_value) {
         Ok(()) => f64::from_bits(crate::value::TAG_UNDEFINED),
@@ -46,7 +49,10 @@ extern "C" fn mkdtemp_disposable_remove_impl(closure: *const ClosureHeader) -> f
     }
 }
 
-extern "C" fn mkdtemp_disposable_async_remove_impl(closure: *const ClosureHeader) -> f64 {
+extern "C" fn mkdtemp_disposable_async_remove_impl(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let path_value = crate::closure::js_closure_get_capture_f64(closure, 0);
     match remove_temp_dir_result(path_value) {
         Ok(()) => resolved_promise(f64::from_bits(crate::value::TAG_UNDEFINED)),
@@ -56,7 +62,7 @@ extern "C" fn mkdtemp_disposable_async_remove_impl(closure: *const ClosureHeader
 
 fn mkdtemp_disposable_method(
     path_value: f64,
-    func: extern "C" fn(*const ClosureHeader) -> f64,
+    func: crate::closure::body_call::js_body_fn_ty!(),
 ) -> f64 {
     crate::closure::js_register_closure_arity(func as *const u8, 0);
     let closure = crate::closure::js_closure_alloc(func as *const u8, 1);
@@ -80,9 +86,9 @@ fn build_mkdtemp_disposable_object(
     let display_path = encoded_string_ptr(&actual_path_bytes, &display_encoding);
     let display_path_value = f64::from_bits(crate::value::JSValue::string_ptr(display_path).bits());
     let remove_func = if async_remove {
-        mkdtemp_disposable_async_remove_impl as extern "C" fn(*const ClosureHeader) -> f64
+        mkdtemp_disposable_async_remove_impl as crate::closure::body_call::js_body_fn_ty!()
     } else {
-        mkdtemp_disposable_remove_impl as extern "C" fn(*const ClosureHeader) -> f64
+        mkdtemp_disposable_remove_impl as crate::closure::body_call::js_body_fn_ty!()
     };
     let remove_method = mkdtemp_disposable_method(actual_path_value, remove_func);
     let symbol_method = mkdtemp_disposable_method(actual_path_value, remove_func);

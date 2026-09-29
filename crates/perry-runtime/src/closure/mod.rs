@@ -6,6 +6,7 @@
 //!   - Followed by captured values (as f64 or i64 pointers)
 
 mod alloc;
+pub(crate) mod body_call;
 mod box_captures;
 mod dispatch;
 mod dynamic_props;
@@ -16,6 +17,8 @@ mod unbox;
 mod v8_stubs;
 mod wide_call;
 
+#[cfg(test)]
+mod receiver_param_tests;
 #[cfg(test)]
 mod tests;
 
@@ -32,6 +35,7 @@ pub use alloc::{
 pub(crate) use alloc::{
     closure_install_boxed_captures, gc_capture_slot_range, singleton_closure_if_cached,
 };
+pub use body_call::{call_value, plain_call_receiver, JsThis};
 pub use shape::closure_kind_probe;
 
 pub(crate) use registry::closure_registry_census;
@@ -63,6 +67,7 @@ pub use registry::{
     BOUND_METHOD_FUNC_PTR, CAPTURES_THIS_FLAG, NO_THIS_REBIND_FLAG,
 };
 
+pub(crate) use dispatch::native_call_value_this;
 pub(crate) use dispatch::{
     bound_function_lazy_name, bound_function_length, bound_method_source_func_ptr,
     coerce_call_this, rebind_explicit_this, rebind_explicit_this_allocates,
@@ -71,11 +76,11 @@ pub(crate) use dispatch::{
 pub use dispatch::{
     clean_closure_ptr, dispatch_bound_function, dispatch_bound_method, get_valid_func_ptr,
     js_closure_call0, js_closure_call1, js_closure_call10, js_closure_call11, js_closure_call12,
-    js_closure_call13, js_closure_call14, js_closure_call15, js_closure_call16,
-    js_closure_call1_receiverless, js_closure_call2, js_closure_call3, js_closure_call4,
-    js_closure_call5, js_closure_call6, js_closure_call7, js_closure_call8, js_closure_call9,
-    js_closure_call_apply_with_spread, js_closure_call_array, js_function_bind,
-    js_native_call_value, throw_not_callable, DirectCall1, DirectCall2, DirectCall3, DirectCall4,
+    js_closure_call13, js_closure_call14, js_closure_call15, js_closure_call16, js_closure_call2,
+    js_closure_call3, js_closure_call4, js_closure_call5, js_closure_call6, js_closure_call7,
+    js_closure_call8, js_closure_call9, js_closure_call_apply_with_spread, js_closure_call_array,
+    js_function_bind, js_native_call_value, throw_not_callable, DirectCall1, DirectCall2,
+    DirectCall3, DirectCall4,
 };
 pub use unbox::{js_closure_unbox_callee_checked, js_closure_unbox_callee_checked_rebind};
 
@@ -102,8 +107,7 @@ pub use dynamic_props::{
     closure_delete_own_dynamic_prop, closure_dynamic_props_snapshot, closure_get_dynamic_prop,
     closure_get_own_dynamic_prop, closure_has_own_dynamic_prop, closure_is_key_deleted,
     closure_mark_key_deleted, closure_set_dynamic_prop, closure_set_static_prototype,
-    closure_static_prototype, is_closure_ptr, js_closure_unbind_this,
-    scan_closure_dynamic_props_roots_mut,
+    closure_static_prototype, is_closure_ptr, scan_closure_dynamic_props_roots_mut,
 };
 
 // v8_stubs re-exports the AOT stubs + non-macOS Rust V8-interop stubs.

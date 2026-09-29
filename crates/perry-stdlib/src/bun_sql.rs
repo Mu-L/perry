@@ -122,6 +122,7 @@ unsafe fn execute_sqlite_query(db_handle: Handle, strings_value: f64, params_val
 
 extern "C" fn bun_sql_query_tag(
     closure: *const ClosureHeader,
+    _this: perry_runtime::closure::JsThis,
     strings_value: f64,
     params_value: f64,
 ) -> f64 {
@@ -146,7 +147,11 @@ unsafe fn finish_transaction(db_handle: Handle, nested: bool, success: bool) {
     });
 }
 
-extern "C" fn bun_sql_transaction_fulfilled(closure: *const ClosureHeader, value: f64) -> f64 {
+extern "C" fn bun_sql_transaction_fulfilled(
+    closure: *const ClosureHeader,
+    _this: perry_runtime::closure::JsThis,
+    value: f64,
+) -> f64 {
     unsafe {
         let handle = captured_handle(closure);
         let nested = js_closure_get_capture_f64(closure, 1) != 0.0;
@@ -155,7 +160,11 @@ extern "C" fn bun_sql_transaction_fulfilled(closure: *const ClosureHeader, value
     }
 }
 
-extern "C" fn bun_sql_transaction_rejected(closure: *const ClosureHeader, reason: f64) -> f64 {
+extern "C" fn bun_sql_transaction_rejected(
+    closure: *const ClosureHeader,
+    _this: perry_runtime::closure::JsThis,
+    reason: f64,
+) -> f64 {
     unsafe {
         let scope = RuntimeHandleScope::new();
         let reason = scope.root_nanbox_f64(reason);
@@ -171,7 +180,11 @@ extern "C" fn bun_sql_transaction_rejected(closure: *const ClosureHeader, reason
     }
 }
 
-extern "C" fn bun_sql_begin(closure: *const ClosureHeader, callback_value: f64) -> f64 {
+extern "C" fn bun_sql_begin(
+    closure: *const ClosureHeader,
+    _this: perry_runtime::closure::JsThis,
+    callback_value: f64,
+) -> f64 {
     unsafe {
         if closure_ptr_from_value(callback_value).is_none() {
             let error = js_call_catching(|| throw_plain_type("SQL.begin expects a callback"))
@@ -202,18 +215,23 @@ extern "C" fn bun_sql_begin(closure: *const ClosureHeader, callback_value: f64) 
 
         let callback_ptr = closure_ptr_from_value(callback.get_nanbox_f64())
             .expect("the rooted transaction callback remains callable");
-        let callback_result =
-            match js_call_catching(|| js_closure_call1(callback_ptr, client.get_nanbox_f64())) {
-                Ok(value) => value,
-                Err(error) => {
-                    let error = scope.root_nanbox_f64(error);
-                    let _ = js_call_catching(|| {
-                        finish_transaction(db_handle, nested, false);
-                        undefined_f64()
-                    });
-                    return rejected_promise(error.get_nanbox_f64());
-                }
-            };
+        let callback_result = match js_call_catching(|| {
+            js_closure_call1(
+                callback_ptr,
+                perry_runtime::closure::plain_call_receiver(),
+                client.get_nanbox_f64(),
+            )
+        }) {
+            Ok(value) => value,
+            Err(error) => {
+                let error = scope.root_nanbox_f64(error);
+                let _ = js_call_catching(|| {
+                    finish_transaction(db_handle, nested, false);
+                    undefined_f64()
+                });
+                return rejected_promise(error.get_nanbox_f64());
+            }
+        };
         let callback_scope = RuntimeHandleScope::new();
         let callback_result = callback_scope.root_nanbox_f64(callback_result);
         let callback_promise = match js_promise_resolved_catching(callback_result.get_nanbox_f64())
@@ -259,11 +277,18 @@ extern "C" fn bun_sql_begin(closure: *const ClosureHeader, callback_value: f64) 
     }
 }
 
-extern "C" fn bun_sql_reserve(closure: *const ClosureHeader, _options: f64) -> f64 {
+extern "C" fn bun_sql_reserve(
+    closure: *const ClosureHeader,
+    _this: perry_runtime::closure::JsThis,
+    _options: f64,
+) -> f64 {
     unsafe { resolved_promise(captured_client(closure)) }
 }
 
-extern "C" fn bun_sql_release(_closure: *const ClosureHeader) -> f64 {
+extern "C" fn bun_sql_release(
+    _closure: *const ClosureHeader,
+    _this: perry_runtime::closure::JsThis,
+) -> f64 {
     undefined_f64()
 }
 
@@ -275,11 +300,22 @@ unsafe fn call_onclose(callback_value: f64, client: f64, error: f64) -> Result<(
     let Some(callback) = closure_ptr_from_value(callback_value.get_nanbox_f64()) else {
         return Ok(());
     };
-    js_call_catching(|| js_closure_call2(callback, client.get_nanbox_f64(), error.get_nanbox_f64()))
-        .map(|_| ())
+    js_call_catching(|| {
+        js_closure_call2(
+            callback,
+            perry_runtime::closure::plain_call_receiver(),
+            client.get_nanbox_f64(),
+            error.get_nanbox_f64(),
+        )
+    })
+    .map(|_| ())
 }
 
-extern "C" fn bun_sql_close(closure: *const ClosureHeader, _options: f64) -> f64 {
+extern "C" fn bun_sql_close(
+    closure: *const ClosureHeader,
+    _this: perry_runtime::closure::JsThis,
+    _options: f64,
+) -> f64 {
     unsafe {
         let scope = RuntimeHandleScope::new();
         let db_handle = captured_handle(closure);
@@ -463,7 +499,11 @@ pub unsafe extern "C" fn js_bun_sql_new(config_value: f64, options_value: f64) -
 
     if let Some(onconnect) = onconnect {
         if let Some(callback) = closure_ptr_from_value(onconnect.get_nanbox_f64()) {
-            js_closure_call1(callback, client.get_nanbox_f64());
+            js_closure_call1(
+                callback,
+                perry_runtime::closure::plain_call_receiver(),
+                client.get_nanbox_f64(),
+            );
         }
     }
     client.get_nanbox_f64()

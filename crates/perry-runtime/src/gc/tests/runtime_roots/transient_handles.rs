@@ -686,7 +686,10 @@ fn test_spill_store_past_length_ignores_tail_garbage_11550() {
 #[test]
 fn test_transient_runtime_handle_closure_captures_gc() {
     let _legacy_pacing = crate::gc::policy::force_legacy_gc_pacing();
-    extern "C" fn captured_func(_closure: *const crate::closure::ClosureHeader) -> f64 {
+    extern "C" fn captured_func(
+        _closure: *const crate::closure::ClosureHeader,
+        _this: crate::closure::JsThis,
+    ) -> f64 {
         0.0
     }
 

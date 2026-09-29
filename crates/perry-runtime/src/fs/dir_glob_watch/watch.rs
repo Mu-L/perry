@@ -231,7 +231,7 @@ fn signal_abort_reason(signal: f64) -> f64 {
 fn add_abort_listener(
     signal: f64,
     id: usize,
-    func: extern "C" fn(*const ClosureHeader) -> f64,
+    func: crate::closure::body_call::js_body_fn_ty!(),
 ) -> f64 {
     let Some(signal_ptr) = crate::url::abort::abort_signal_ptr_from_value(signal) else {
         return undefined_value();
@@ -412,13 +412,12 @@ fn emit_listener0(object_value: f64, callback: f64) {
     if cb.is_null() {
         return;
     }
-    let prev_this = scope.root_nanbox_f64(crate::object::js_implicit_this_set(
-        object_handle.get_nanbox_f64(),
-    ));
     with_watcher_uncaught_trap(|| {
-        crate::closure::js_closure_call0(cb);
+        crate::closure::js_closure_call0(
+            cb,
+            crate::closure::JsThis::from_f64(object_handle.get_nanbox_f64()),
+        );
     });
-    crate::object::js_implicit_this_set(prev_this.get_nanbox_f64());
 }
 
 fn emit_fs_watch_event(
@@ -442,18 +441,19 @@ fn emit_fs_watch_event(
     let refreshed_callbacks =
         crate::gc::RuntimeHandleScope::refreshed_nanbox_f64_slice(&callback_handles);
     let refreshed_args = crate::gc::RuntimeHandleScope::refreshed_nanbox_f64_slice(&arg_handles);
-    // #9445: the displaced receiver is rooted ONCE here, not once per callback.
-    let prev_this = scope.root_nanbox_f64(crate::object::js_implicit_this_get());
     for callback in refreshed_callbacks {
         let cb = extract_closure_ptr(callback);
         if cb.is_null() {
             continue;
         }
-        crate::object::js_implicit_this_set(object_handle.get_nanbox_f64());
         with_watcher_uncaught_trap(|| {
-            crate::closure::js_closure_call2(cb, refreshed_args[0], refreshed_args[1]);
+            crate::closure::js_closure_call2(
+                cb,
+                crate::closure::JsThis::from_f64(object_handle.get_nanbox_f64()),
+                refreshed_args[0],
+                refreshed_args[1],
+            );
         });
-        crate::object::js_implicit_this_set(prev_this.get_nanbox_f64());
     }
 }
 
@@ -479,18 +479,19 @@ fn emit_watch_file_change(
     let refreshed_callbacks =
         crate::gc::RuntimeHandleScope::refreshed_nanbox_f64_slice(&callback_handles);
     let refreshed_args = crate::gc::RuntimeHandleScope::refreshed_nanbox_f64_slice(&arg_handles);
-    // #9445: the displaced receiver is rooted ONCE here, not once per callback.
-    let prev_this = scope.root_nanbox_f64(crate::object::js_implicit_this_get());
     for callback in refreshed_callbacks {
         let cb = extract_closure_ptr(callback);
         if cb.is_null() {
             continue;
         }
-        crate::object::js_implicit_this_set(object_handle.get_nanbox_f64());
         with_watcher_uncaught_trap(|| {
-            crate::closure::js_closure_call2(cb, refreshed_args[0], refreshed_args[1]);
+            crate::closure::js_closure_call2(
+                cb,
+                crate::closure::JsThis::from_f64(object_handle.get_nanbox_f64()),
+                refreshed_args[0],
+                refreshed_args[1],
+            );
         });
-        crate::object::js_implicit_this_set(prev_this.get_nanbox_f64());
     }
 }
 
@@ -900,17 +901,18 @@ fn emit_fs_watch_error(
     let err_handle = scope.root_nanbox_f64(err_value);
     let refreshed_callbacks =
         crate::gc::RuntimeHandleScope::refreshed_nanbox_f64_slice(&callback_handles);
-    let prev_this = scope.root_nanbox_f64(crate::object::js_implicit_this_get());
     for callback in refreshed_callbacks {
         let cb = extract_closure_ptr(callback);
         if cb.is_null() {
             continue;
         }
-        crate::object::js_implicit_this_set(object_handle.get_nanbox_f64());
         with_watcher_uncaught_trap(|| {
-            crate::closure::js_closure_call1(cb, err_handle.get_nanbox_f64());
+            crate::closure::js_closure_call1(
+                cb,
+                crate::closure::JsThis::from_f64(object_handle.get_nanbox_f64()),
+                err_handle.get_nanbox_f64(),
+            );
         });
-        crate::object::js_implicit_this_set(prev_this.get_nanbox_f64());
     }
 }
 
@@ -923,7 +925,10 @@ fn start_promise_watcher(id: usize, state: &mut PromiseWatchState) {
     state.active = true;
 }
 
-extern "C" fn watch_file_poll_impl(closure: *const ClosureHeader) -> f64 {
+extern "C" fn watch_file_poll_impl(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let id = js_closure_get_capture_f64(closure, 0) as usize;
     let delivery = WATCH_FILE_STATES.with(|states| {
         let mut states = states.borrow_mut();
@@ -946,13 +951,19 @@ extern "C" fn watch_file_poll_impl(closure: *const ClosureHeader) -> f64 {
     undefined_value()
 }
 
-extern "C" fn fs_watcher_abort_impl(closure: *const ClosureHeader) -> f64 {
+extern "C" fn fs_watcher_abort_impl(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let id = js_closure_get_capture_f64(closure, 0) as usize;
     close_fs_watcher(id);
     undefined_value()
 }
 
-extern "C" fn promise_watcher_abort_impl(closure: *const ClosureHeader) -> f64 {
+extern "C" fn promise_watcher_abort_impl(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let id = js_closure_get_capture_f64(closure, 0) as usize;
     let signal = PROMISE_WATCHERS.with(|watchers| {
         watchers
@@ -969,14 +980,20 @@ extern "C" fn promise_watcher_abort_impl(closure: *const ClosureHeader) -> f64 {
     undefined_value()
 }
 
-extern "C" fn fs_watcher_close_impl(closure: *const ClosureHeader) -> f64 {
+extern "C" fn fs_watcher_close_impl(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let id = js_closure_get_capture_f64(closure, 0) as usize;
     let self_value = js_closure_get_capture_f64(closure, 1);
     close_fs_watcher(id);
     self_value
 }
 
-extern "C" fn fs_watcher_ref_impl(closure: *const ClosureHeader) -> f64 {
+extern "C" fn fs_watcher_ref_impl(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let id = js_closure_get_capture_f64(closure, 0) as usize;
     let self_value = js_closure_get_capture_f64(closure, 1);
     FS_WATCHERS.with(|watchers| {
@@ -987,7 +1004,10 @@ extern "C" fn fs_watcher_ref_impl(closure: *const ClosureHeader) -> f64 {
     self_value
 }
 
-extern "C" fn fs_watcher_unref_impl(closure: *const ClosureHeader) -> f64 {
+extern "C" fn fs_watcher_unref_impl(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let id = js_closure_get_capture_f64(closure, 0) as usize;
     let self_value = js_closure_get_capture_f64(closure, 1);
     FS_WATCHERS.with(|watchers| {
@@ -1000,6 +1020,7 @@ extern "C" fn fs_watcher_unref_impl(closure: *const ClosureHeader) -> f64 {
 
 extern "C" fn fs_watcher_on_impl(
     closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     event_value: f64,
     listener: f64,
 ) -> f64 {
@@ -1017,6 +1038,7 @@ extern "C" fn fs_watcher_on_impl(
 
 extern "C" fn fs_watcher_once_impl(
     closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     event_value: f64,
     listener: f64,
 ) -> f64 {
@@ -1034,6 +1056,7 @@ extern "C" fn fs_watcher_once_impl(
 
 extern "C" fn fs_watcher_off_impl(
     closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     event_value: f64,
     listener: f64,
 ) -> f64 {
@@ -1049,7 +1072,10 @@ extern "C" fn fs_watcher_off_impl(
     self_value
 }
 
-extern "C" fn stat_watcher_ref_impl(closure: *const ClosureHeader) -> f64 {
+extern "C" fn stat_watcher_ref_impl(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let id = js_closure_get_capture_f64(closure, 0) as usize;
     let self_value = js_closure_get_capture_f64(closure, 1);
     WATCH_FILE_STATES.with(|states| {
@@ -1060,7 +1086,10 @@ extern "C" fn stat_watcher_ref_impl(closure: *const ClosureHeader) -> f64 {
     self_value
 }
 
-extern "C" fn stat_watcher_unref_impl(closure: *const ClosureHeader) -> f64 {
+extern "C" fn stat_watcher_unref_impl(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let id = js_closure_get_capture_f64(closure, 0) as usize;
     let self_value = js_closure_get_capture_f64(closure, 1);
     WATCH_FILE_STATES.with(|states| {
@@ -1073,6 +1102,7 @@ extern "C" fn stat_watcher_unref_impl(closure: *const ClosureHeader) -> f64 {
 
 extern "C" fn stat_watcher_on_impl(
     closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     event_value: f64,
     listener: f64,
 ) -> f64 {
@@ -1090,6 +1120,7 @@ extern "C" fn stat_watcher_on_impl(
 
 extern "C" fn stat_watcher_once_impl(
     closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     event_value: f64,
     listener: f64,
 ) -> f64 {
@@ -1107,6 +1138,7 @@ extern "C" fn stat_watcher_once_impl(
 
 extern "C" fn stat_watcher_off_impl(
     closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     event_value: f64,
     listener: f64,
 ) -> f64 {
@@ -1135,7 +1167,10 @@ enum GlobNextAction {
     Entry(FsGlobMatch, bool),
 }
 
-extern "C" fn glob_iterator_next_impl(closure: *const ClosureHeader) -> f64 {
+extern "C" fn glob_iterator_next_impl(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let id = js_closure_get_capture_f64(closure, 0) as usize;
     let action = GLOB_ITERATORS.with(|iterators| {
         let mut iterators = iterators.borrow_mut();
@@ -1163,7 +1198,10 @@ extern "C" fn glob_iterator_next_impl(closure: *const ClosureHeader) -> f64 {
     }
 }
 
-extern "C" fn glob_iterator_return_impl(closure: *const ClosureHeader) -> f64 {
+extern "C" fn glob_iterator_return_impl(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let id = js_closure_get_capture_f64(closure, 0) as usize;
     GLOB_ITERATORS.with(|iterators| {
         iterators.borrow_mut().remove(&id);
@@ -1171,11 +1209,17 @@ extern "C" fn glob_iterator_return_impl(closure: *const ClosureHeader) -> f64 {
     resolved_iterator_promise(undefined_value(), true)
 }
 
-extern "C" fn glob_iterator_self_impl(closure: *const ClosureHeader) -> f64 {
+extern "C" fn glob_iterator_self_impl(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     js_closure_get_capture_f64(closure, 1)
 }
 
-extern "C" fn bun_glob_sync_iterator_next_impl(closure: *const ClosureHeader) -> f64 {
+extern "C" fn bun_glob_sync_iterator_next_impl(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let id = js_closure_get_capture_f64(closure, 0) as usize;
     let action = GLOB_ITERATORS.with(|iterators| {
         let mut iterators = iterators.borrow_mut();
@@ -1205,7 +1249,10 @@ extern "C" fn bun_glob_sync_iterator_next_impl(closure: *const ClosureHeader) ->
     }
 }
 
-extern "C" fn bun_glob_sync_iterator_return_impl(closure: *const ClosureHeader) -> f64 {
+extern "C" fn bun_glob_sync_iterator_return_impl(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let id = js_closure_get_capture_f64(closure, 0) as usize;
     GLOB_ITERATORS.with(|iterators| {
         iterators.borrow_mut().remove(&id);
@@ -1213,11 +1260,17 @@ extern "C" fn bun_glob_sync_iterator_return_impl(closure: *const ClosureHeader) 
     iterator_result(undefined_value(), true)
 }
 
-extern "C" fn bun_glob_sync_iterator_self_impl(closure: *const ClosureHeader) -> f64 {
+extern "C" fn bun_glob_sync_iterator_self_impl(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     js_closure_get_capture_f64(closure, 1)
 }
 
-extern "C" fn promise_watcher_next_impl(closure: *const ClosureHeader) -> f64 {
+extern "C" fn promise_watcher_next_impl(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let id = js_closure_get_capture_f64(closure, 0) as usize;
     let action = PROMISE_WATCHERS.with(|watchers| {
         let mut watchers = watchers.borrow_mut();
@@ -1255,7 +1308,10 @@ extern "C" fn promise_watcher_next_impl(closure: *const ClosureHeader) -> f64 {
     }
 }
 
-extern "C" fn promise_watcher_return_impl(closure: *const ClosureHeader) -> f64 {
+extern "C" fn promise_watcher_return_impl(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let id = js_closure_get_capture_f64(closure, 0) as usize;
     let pending = close_promise_watcher_return(id);
     for promise in pending {
@@ -1264,7 +1320,10 @@ extern "C" fn promise_watcher_return_impl(closure: *const ClosureHeader) -> f64 
     resolved_iterator_promise(undefined_value(), true)
 }
 
-extern "C" fn promise_watcher_self_impl(closure: *const ClosureHeader) -> f64 {
+extern "C" fn promise_watcher_self_impl(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     js_closure_get_capture_f64(closure, 1)
 }
 

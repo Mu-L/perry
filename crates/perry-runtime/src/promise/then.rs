@@ -436,6 +436,7 @@ pub extern "C" fn js_promise_resolve_with_promise(outer: *mut Promise, inner: *m
 /// Internal callback for forwarding resolve from inner to outer promise
 extern "C" fn promise_forward_resolve(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     value: f64,
 ) -> f64 {
     let outer_ptr = crate::closure::js_closure_get_capture_ptr(closure, 0) as *mut Promise;
@@ -446,6 +447,7 @@ extern "C" fn promise_forward_resolve(
 /// Internal callback for forwarding reject from inner to outer promise
 extern "C" fn promise_forward_reject(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     reason: f64,
 ) -> f64 {
     let outer_ptr = crate::closure::js_closure_get_capture_ptr(closure, 0) as *mut Promise;
@@ -1026,12 +1028,14 @@ fn call_receiver_then(receiver: f64, args: &[f64]) -> f64 {
         let err_val = crate::value::JSValue::pointer(err_ptr as *const u8).bits();
         crate::exception::js_throw(f64::from_bits(err_val));
     }
-    let this_scope = crate::gc::RuntimeHandleScope::new(); // #9445
-    let prev_this = this_scope.root_nanbox_f64(crate::object::js_implicit_this_set(receiver));
-    let result =
-        unsafe { crate::closure::js_native_call_value(then_fn, args.as_ptr(), args.len()) };
-    crate::object::js_implicit_this_set(prev_this.get_nanbox_f64());
-    result
+    unsafe {
+        crate::closure::native_call_value_this(
+            then_fn,
+            crate::closure::JsThis::from_f64(receiver),
+            args.as_ptr(),
+            args.len(),
+        )
+    }
 }
 
 fn throw_promise_finally_non_object() -> ! {
@@ -1204,6 +1208,7 @@ fn promise_species_constructor(receiver: f64) -> f64 {
 // Captures: [on_fulfilled_f64, cap_resolve_f64, cap_reject_f64]
 extern "C" fn then_cap_fulfill_fn(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     value: f64,
 ) -> f64 {
     use crate::closure::{js_closure_get_capture_f64, js_native_call_value};
@@ -1221,7 +1226,11 @@ extern "C" fn then_cap_fulfill_fn(
         (value, false)
     } else {
         match crate::exception::catch_js_throw(|| {
-            crate::closure::js_closure_call1(on_ful_cl, value)
+            crate::closure::js_closure_call1(
+                on_ful_cl,
+                crate::closure::plain_call_receiver(),
+                value,
+            )
         }) {
             Ok(ret) => (ret, false),
             Err(exc) => (exc, true),
@@ -1230,7 +1239,14 @@ extern "C" fn then_cap_fulfill_fn(
 
     let func = if threw { cap_reject } else { cap_resolve };
     let args = [result];
-    let _ = unsafe { js_native_call_value(func, args.as_ptr(), 1) };
+    let _ = unsafe {
+        js_native_call_value(
+            func,
+            crate::closure::plain_call_receiver(),
+            args.as_ptr(),
+            1,
+        )
+    };
     undef
 }
 
@@ -1238,6 +1254,7 @@ extern "C" fn then_cap_fulfill_fn(
 // Captures: [on_rejected_f64, cap_resolve_f64, cap_reject_f64]
 extern "C" fn then_cap_reject_fn(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     reason: f64,
 ) -> f64 {
     use crate::closure::{js_closure_get_capture_f64, js_native_call_value};
@@ -1255,7 +1272,11 @@ extern "C" fn then_cap_reject_fn(
         (reason, true) // passthrough rejection
     } else {
         match crate::exception::catch_js_throw(|| {
-            crate::closure::js_closure_call1(on_rej_cl, reason)
+            crate::closure::js_closure_call1(
+                on_rej_cl,
+                crate::closure::plain_call_receiver(),
+                reason,
+            )
         }) {
             Ok(ret) => (ret, false),
             Err(exc) => (exc, true),
@@ -1264,7 +1285,14 @@ extern "C" fn then_cap_reject_fn(
 
     let func = if threw { cap_reject } else { cap_resolve };
     let args = [result];
-    let _ = unsafe { js_native_call_value(func, args.as_ptr(), 1) };
+    let _ = unsafe {
+        js_native_call_value(
+            func,
+            crate::closure::plain_call_receiver(),
+            args.as_ptr(),
+            1,
+        )
+    };
     undef
 }
 
@@ -1335,6 +1363,7 @@ fn perform_promise_then_with_cap(
 // Captures [value_f64]: ignores its argument and returns the captured value.
 extern "C" fn spec_value_return_fn(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     _arg: f64,
 ) -> f64 {
     crate::closure::js_closure_get_capture_f64(closure, 0)
@@ -1343,6 +1372,7 @@ extern "C" fn spec_value_return_fn(
 // Captures [reason_f64]: ignores its argument and throws the captured reason.
 extern "C" fn spec_reason_thrower_fn(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     _arg: f64,
 ) -> f64 {
     let reason = crate::closure::js_closure_get_capture_f64(closure, 0);
@@ -1352,6 +1382,7 @@ extern "C" fn spec_reason_thrower_fn(
 // thenFinally: captures [C_f64, on_finally_f64], called with fulfilled value.
 extern "C" fn spec_then_finally_fn(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     value: f64,
 ) -> f64 {
     use crate::closure::{
@@ -1370,7 +1401,7 @@ extern "C" fn spec_then_finally_fn(
     let result = if on_finally_cl.is_null() {
         undef
     } else {
-        crate::closure::js_closure_call0(on_finally_cl)
+        crate::closure::js_closure_call0(on_finally_cl, crate::closure::plain_call_receiver())
     };
 
     // Build valueThunk = () => value
@@ -1388,6 +1419,7 @@ extern "C" fn spec_then_finally_fn(
 // catchFinally: captures [C_f64, on_finally_f64], called with rejection reason.
 extern "C" fn spec_catch_finally_fn(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     reason: f64,
 ) -> f64 {
     use crate::closure::{
@@ -1406,7 +1438,7 @@ extern "C" fn spec_catch_finally_fn(
     let result = if on_finally_cl.is_null() {
         undef
     } else {
-        crate::closure::js_closure_call0(on_finally_cl)
+        crate::closure::js_closure_call0(on_finally_cl, crate::closure::plain_call_receiver())
     };
 
     // Build thrower = () => { throw reason; }
@@ -1445,11 +1477,12 @@ fn ensure_spec_finally_arities_registered() {
 
 pub(crate) extern "C" fn promise_prototype_then_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     on_fulfilled: f64,
     on_rejected: f64,
 ) -> f64 {
     ensure_spec_finally_arities_registered();
-    let receiver = crate::object::js_implicit_this_get();
+    let receiver = this.as_f64();
     let promise = if js_value_is_promise(receiver) != 0 {
         crate::value::js_nanbox_get_pointer(receiver) as *mut Promise
     } else if let Some(backing) = super::subclass::subclass_backing_promise(receiver) {
@@ -1501,9 +1534,10 @@ pub(crate) extern "C" fn promise_prototype_then_thunk(
 
 pub(crate) extern "C" fn promise_prototype_catch_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     on_rejected: f64,
 ) -> f64 {
-    let receiver = crate::object::js_implicit_this_get();
+    let receiver = this.as_f64();
     let args = [f64::from_bits(crate::value::TAG_UNDEFINED), on_rejected];
     call_receiver_then(receiver, &args)
 }
@@ -1514,12 +1548,13 @@ pub(crate) extern "C" fn promise_prototype_catch_thunk(
 
 pub(crate) extern "C" fn promise_prototype_finally_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     on_finally: f64,
 ) -> f64 {
     use crate::closure::{js_closure_alloc, js_closure_set_capture_f64};
     ensure_spec_finally_arities_registered();
 
-    let receiver = crate::object::js_implicit_this_get();
+    let receiver = this.as_f64();
 
     // receiver must be a JS Object — pointer-tagged, not a registered symbol, not a handle.
     if !is_promise_species_object(receiver) {
@@ -1556,7 +1591,7 @@ pub(crate) extern "C" fn promise_prototype_finally_thunk(
 /// `then`/`catch`/`finally` value-read, or `None` for any other property.
 /// Returns the shared prototype method so `p.then === Promise.prototype.then`
 /// (spec-required identity) and `.call(receiver)` properly receives the caller's
-/// `this` via IMPLICIT_THIS rather than a captured pointer.
+/// `this` as its receiver parameter rather than a captured pointer.
 pub unsafe fn js_promise_bound_method(_promise: *mut Promise, property: &str) -> Option<f64> {
     if !matches!(property, "then" | "catch" | "finally") {
         return None;
@@ -1590,6 +1625,7 @@ pub unsafe fn js_promise_bound_method(_promise: *mut Promise, property: &str) ->
 /// Called with the upstream fulfilled `value`.
 extern "C" fn finally_fulfill_wrapper(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     value: f64,
 ) -> f64 {
     finally_wrapper_common(closure, value, true)
@@ -1600,6 +1636,7 @@ extern "C" fn finally_fulfill_wrapper(
 /// Called with the upstream rejection `reason`.
 extern "C" fn finally_reject_wrapper(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     reason: f64,
 ) -> f64 {
     finally_wrapper_common(closure, reason, false)
@@ -1653,17 +1690,18 @@ fn finally_wrapper_common(
     // report 1, failing every finally test that asserts a zero-arg invocation.
     // (Armed in a C trampoline frame, #9305; the rejection below runs after
     // the trap is popped, as before.)
-    let ret =
-        match crate::exception::catch_js_throw(|| crate::closure::js_closure_call0(on_finally)) {
-            Ok(ret) => ret,
-            Err(exc) => {
-                // onFinally threw — reject `next` with the thrown value.
-                if !next.is_null() {
-                    js_promise_reject(next, exc);
-                }
-                return undef;
+    let ret = match crate::exception::catch_js_throw(|| {
+        crate::closure::js_closure_call0(on_finally, crate::closure::plain_call_receiver())
+    }) {
+        Ok(ret) => ret,
+        Err(exc) => {
+            // onFinally threw — reject `next` with the thrown value.
+            if !next.is_null() {
+                js_promise_reject(next, exc);
             }
-        };
+            return undef;
+        }
+    };
 
     // If onFinally returned a Promise/thenable, adopt it: wait for it before
     // settling `next`. `js_assimilate_thenable` returns a native Promise for
@@ -1742,6 +1780,7 @@ fn finally_settle_next_with_extra_hop(next: *mut Promise, orig: f64, is_fulfille
 /// Captures [next_promise_ptr (i64), orig (f64), is_fulfilled (TAG_TRUE/FALSE)].
 extern "C" fn finally_cleanup_fulfill(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     _cleanup_value: f64,
 ) -> f64 {
     use crate::closure::{js_closure_get_capture_f64, js_closure_get_capture_ptr};
@@ -1762,6 +1801,7 @@ extern "C" fn finally_cleanup_fulfill(
 /// the upstream outcome). Captures [next_promise_ptr (i64)].
 extern "C" fn finally_cleanup_reject(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     cleanup_reason: f64,
 ) -> f64 {
     use crate::closure::js_closure_get_capture_ptr;
@@ -1776,6 +1816,7 @@ extern "C" fn finally_cleanup_reject(
 /// Captures [next_promise_ptr (i64), value (f64)].
 extern "C" fn finally_passthrough_fulfill(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     _: f64,
 ) -> f64 {
     use crate::closure::{js_closure_get_capture_f64, js_closure_get_capture_ptr};
@@ -1818,6 +1859,7 @@ extern "C" fn finally_passthrough_fulfill(
 /// Captures [next_promise_ptr (i64), reason (f64)].
 extern "C" fn finally_passthrough_reject(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     _: f64,
 ) -> f64 {
     use crate::closure::{js_closure_get_capture_f64, js_closure_get_capture_ptr};

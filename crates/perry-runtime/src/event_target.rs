@@ -167,8 +167,11 @@ fn event_bool_field(event: *mut ObjectHeader, name: &[u8]) -> bool {
     crate::value::js_is_truthy(value) != 0
 }
 
-extern "C" fn event_prevent_default_thunk(_closure: *const crate::closure::ClosureHeader) -> f64 {
-    let this_value = crate::object::js_implicit_this_get();
+extern "C" fn event_prevent_default_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
+    let this_value = this.as_f64();
     let Some(event) = value_as_ptr::<ObjectHeader>(this_value) else {
         return undefined_value();
     };
@@ -178,8 +181,11 @@ extern "C" fn event_prevent_default_thunk(_closure: *const crate::closure::Closu
     undefined_value()
 }
 
-extern "C" fn event_stop_propagation_thunk(_closure: *const crate::closure::ClosureHeader) -> f64 {
-    let this_value = crate::object::js_implicit_this_get();
+extern "C" fn event_stop_propagation_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
+    let this_value = this.as_f64();
     if let Some(event) = value_as_ptr::<ObjectHeader>(this_value) {
         set_event_field(event, b"_stopped", bool_value(true));
     }
@@ -188,8 +194,9 @@ extern "C" fn event_stop_propagation_thunk(_closure: *const crate::closure::Clos
 
 extern "C" fn event_stop_immediate_propagation_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
 ) -> f64 {
-    let this_value = crate::object::js_implicit_this_get();
+    let this_value = this.as_f64();
     if let Some(event) = value_as_ptr::<ObjectHeader>(this_value) {
         set_event_field(event, b"_stopped", bool_value(true));
         set_event_field(event, b"_immediateStopped", bool_value(true));
@@ -200,7 +207,7 @@ extern "C" fn event_stop_immediate_propagation_thunk(
 fn install_event_method(
     event: *mut ObjectHeader,
     name: &str,
-    func: extern "C" fn(*const crate::closure::ClosureHeader) -> f64,
+    func: crate::closure::body_call::js_body_fn_ty!(),
 ) {
     let func_ptr = func as *const u8;
     let closure = crate::closure::js_closure_alloc(func_ptr, 0);
@@ -817,6 +824,7 @@ unsafe fn remove_event_listener_with_capture(
 
 extern "C" fn event_target_abort_remove_listener(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
 ) -> f64 {
     let target = crate::closure::js_closure_get_capture_ptr(closure, 0) as *mut ObjectHeader;
     let event_name_ptr =
@@ -1014,8 +1022,9 @@ pub unsafe extern "C" fn js_event_target_dispatch_event(
 
     let args = [event];
     let this_scope = crate::gc::RuntimeHandleScope::new();
-    // #9445: the displaced receiver is rooted ONCE here, not once per callback.
-    let prev_this = this_scope.root_nanbox_f64(crate::object::js_implicit_this_get());
+    // A listener can collect, so the receiver is rooted ONCE here and re-read
+    // at each call.
+    let target_value_handle = this_scope.root_nanbox_f64(target_value);
     for (callback, capture, once) in callbacks {
         let Some(callable) = closure_value_from_listener(callback) else {
             continue;
@@ -1023,9 +1032,12 @@ pub unsafe extern "C" fn js_event_target_dispatch_event(
         if once {
             remove_event_listener_value_with_capture(target, event_name_ptr, callback, capture);
         }
-        crate::object::js_implicit_this_set(target_value);
-        let _ = crate::closure::js_native_call_value(callable, args.as_ptr(), args.len());
-        crate::object::js_implicit_this_set(prev_this.get_nanbox_f64());
+        let _ = crate::closure::native_call_value_this(
+            callable,
+            crate::closure::JsThis::from_f64(target_value_handle.get_nanbox_f64()),
+            args.as_ptr(),
+            args.len(),
+        );
         if event_bool_field(event_ptr, b"_immediateStopped") {
             break;
         }
@@ -1123,10 +1135,13 @@ pub unsafe extern "C" fn js_event_target_set_max_listeners(
 
 /// The receiver a bound EventTarget method closure captured in slot 0 (stored
 /// as NaN-boxed bits so the GC's closure scan keeps it alive and relocates it).
-unsafe fn bound_event_target(closure: *const crate::closure::ClosureHeader) -> *mut ObjectHeader {
+unsafe fn bound_event_target(
+    closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+) -> *mut ObjectHeader {
     let bits = crate::closure::js_closure_get_capture_ptr(closure, 0) as u64;
     if bits == 0 {
-        let receiver = crate::object::js_implicit_this_get();
+        let receiver = this.as_f64();
         if let Some(target) = value_as_ptr::<ObjectHeader>(receiver) {
             let valid = crate::value::addr_class::try_read_gc_header(target as usize)
                 .is_some_and(|h| h.obj_type == crate::gc::GC_TYPE_OBJECT);
@@ -1155,8 +1170,8 @@ unsafe fn bound_event_target(closure: *const crate::closure::ClosureHeader) -> *
     crate::value::js_nanbox_get_pointer(f64::from_bits(bits)) as *mut ObjectHeader
 }
 
-fn event_proto_receiver() -> *mut ObjectHeader {
-    let receiver = crate::object::js_implicit_this_get();
+fn event_proto_receiver(this: crate::closure::JsThis) -> *mut ObjectHeader {
+    let receiver = this.as_f64();
     if let Some(event) = value_as_ptr::<ObjectHeader>(receiver) {
         let valid = unsafe {
             crate::value::addr_class::try_read_gc_header(event as usize)
@@ -1174,33 +1189,37 @@ fn event_proto_receiver() -> *mut ObjectHeader {
 
 extern "C" fn event_proto_prevent_default_thunk(
     closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
 ) -> f64 {
-    event_proto_receiver();
-    event_prevent_default_thunk(closure)
+    event_proto_receiver(this);
+    event_prevent_default_thunk(closure, this)
 }
 
 extern "C" fn event_proto_stop_propagation_thunk(
     closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
 ) -> f64 {
-    event_proto_receiver();
-    event_stop_propagation_thunk(closure)
+    event_proto_receiver(this);
+    event_stop_propagation_thunk(closure, this)
 }
 
 extern "C" fn event_proto_stop_immediate_propagation_thunk(
     closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
 ) -> f64 {
-    event_proto_receiver();
-    event_stop_immediate_propagation_thunk(closure)
+    event_proto_receiver(this);
+    event_stop_immediate_propagation_thunk(closure, this)
 }
 
 extern "C" fn event_proto_init_event_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     event_type: f64,
     bubbles: f64,
     cancelable: f64,
 ) -> f64 {
     let scope = crate::gc::RuntimeHandleScope::new();
-    let event = scope.root_raw_mut_ptr(event_proto_receiver());
+    let event = scope.root_raw_mut_ptr(event_proto_receiver(this));
     let event_type = scope.root_nanbox_f64(event_type);
     let phase_key = key(b"eventPhase");
     if event
@@ -1235,9 +1254,10 @@ extern "C" fn event_proto_init_event_thunk(
 
 extern "C" fn event_proto_composed_path_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
 ) -> f64 {
     let scope = crate::gc::RuntimeHandleScope::new();
-    let event = scope.root_raw_mut_ptr(event_proto_receiver());
+    let event = scope.root_raw_mut_ptr(event_proto_receiver(this));
     let current_key = key(b"currentTarget");
     let current = event.with_mut_ptr::<ObjectHeader, _>(|event| {
         js_object_get_field_by_name_f64(event, current_key)
@@ -1343,6 +1363,7 @@ pub(crate) fn install_web_event_proto_methods(name: &str, proto_obj: *mut Object
 /// arguments are rooted across it and re-read afterwards.
 unsafe fn bound_listener_call(
     closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     event_type: f64,
     listener: f64,
     options: f64,
@@ -1356,7 +1377,7 @@ unsafe fn bound_listener_call(
         return undefined_value();
     }
     let scope = crate::gc::RuntimeHandleScope::new();
-    let target_handle = scope.root_raw_mut_ptr(bound_event_target(closure));
+    let target_handle = scope.root_raw_mut_ptr(bound_event_target(closure, this));
     let listener_handle = scope.root_nanbox_f64(listener);
     let options_handle = scope.root_nanbox_f64(options);
 
@@ -1376,27 +1397,30 @@ unsafe fn bound_listener_call(
 
 extern "C" fn event_target_add_event_listener_thunk(
     closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     event_type: f64,
     listener: f64,
     options: f64,
 ) -> f64 {
-    unsafe { bound_listener_call(closure, event_type, listener, options, true) }
+    unsafe { bound_listener_call(closure, this, event_type, listener, options, true) }
 }
 
 extern "C" fn event_target_remove_event_listener_thunk(
     closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     event_type: f64,
     listener: f64,
     options: f64,
 ) -> f64 {
-    unsafe { bound_listener_call(closure, event_type, listener, options, false) }
+    unsafe { bound_listener_call(closure, this, event_type, listener, options, false) }
 }
 
 extern "C" fn event_target_dispatch_event_thunk(
     closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     event: f64,
 ) -> f64 {
-    unsafe { js_event_target_dispatch_event(bound_event_target(closure), event) }
+    unsafe { js_event_target_dispatch_event(bound_event_target(closure, this), event) }
 }
 
 /// The EventTarget method names, in the order Node's `EventTarget.prototype`

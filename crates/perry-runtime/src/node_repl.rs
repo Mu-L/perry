@@ -164,16 +164,21 @@ fn call_function(callback: f64, this: f64, args: &[f64]) -> f64 {
     if !is_callable_value(callback) {
         return undefined();
     }
+    let this_scope = crate::gc::RuntimeHandleScope::new();
+    // The rebind clone allocates, so the receiver is re-read from a root.
+    let this_h = this_scope.root_nanbox_f64(this);
     let rebound = f64::from_bits(crate::closure::clone_closure_rebind_this(
         callback.to_bits(),
         this,
     ));
-    let this_scope = crate::gc::RuntimeHandleScope::new(); // #9445
-    let prev = this_scope.root_nanbox_f64(crate::object::js_implicit_this_set(this));
-    let result =
-        unsafe { crate::closure::js_native_call_value(rebound, args.as_ptr(), args.len()) };
-    crate::object::js_implicit_this_set(prev.get_nanbox_f64());
-    result
+    unsafe {
+        crate::closure::native_call_value_this(
+            rebound,
+            crate::closure::JsThis::from_f64(this_h.get_nanbox_f64()),
+            args.as_ptr(),
+            args.len(),
+        )
+    }
 }
 
 fn call_method(receiver: f64, name: &str, args: &[f64]) -> f64 {
@@ -366,25 +371,36 @@ fn fn_value(func: *const u8, name: &str, arity: u32) -> f64 {
     crate::value::js_nanbox_pointer(closure as i64)
 }
 
-extern "C" fn repl_on_thunk(_closure: *const ClosureHeader, event: f64, listener: f64) -> f64 {
-    let server = crate::object::js_implicit_this_get();
+extern "C" fn repl_on_thunk(
+    _closure: *const ClosureHeader,
+    this: crate::closure::JsThis,
+    event: f64,
+    listener: f64,
+) -> f64 {
+    let server = this.as_f64();
     add_listener(server, event, listener, false);
     server
 }
 
-extern "C" fn repl_once_thunk(_closure: *const ClosureHeader, event: f64, listener: f64) -> f64 {
-    let server = crate::object::js_implicit_this_get();
+extern "C" fn repl_once_thunk(
+    _closure: *const ClosureHeader,
+    this: crate::closure::JsThis,
+    event: f64,
+    listener: f64,
+) -> f64 {
+    let server = this.as_f64();
     add_listener(server, event, listener, true);
     server
 }
 
 extern "C" fn repl_emit_thunk(
     _closure: *const ClosureHeader,
+    this: crate::closure::JsThis,
     event: f64,
     arg0: f64,
     arg1: f64,
 ) -> f64 {
-    let server = crate::object::js_implicit_this_get();
+    let server = this.as_f64();
     let Some(event_name) = string_to_rust(event) else {
         return bool_value(false);
     };
@@ -398,23 +414,28 @@ extern "C" fn repl_emit_thunk(
 
 extern "C" fn repl_display_prompt_thunk(
     _closure: *const ClosureHeader,
+    this: crate::closure::JsThis,
     _preserve_cursor: f64,
 ) -> f64 {
-    let server = crate::object::js_implicit_this_get();
+    let server = this.as_f64();
     display_prompt_for(server);
     undefined()
 }
 
-extern "C" fn repl_clear_buffered_command_thunk(_closure: *const ClosureHeader) -> f64 {
+extern "C" fn repl_clear_buffered_command_thunk(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     undefined()
 }
 
 extern "C" fn repl_setup_history_thunk(
     _closure: *const ClosureHeader,
+    this: crate::closure::JsThis,
     _path: f64,
     callback: f64,
 ) -> f64 {
-    let server = crate::object::js_implicit_this_get();
+    let server = this.as_f64();
     if let Some(obj) = object_ptr_from_value(server) {
         set_field(obj, "history", array_value(crate::array::js_array_alloc(0)));
         set_field(obj, "historySize", 30.0);
@@ -425,10 +446,11 @@ extern "C" fn repl_setup_history_thunk(
 
 extern "C" fn repl_define_command_thunk(
     _closure: *const ClosureHeader,
+    this: crate::closure::JsThis,
     keyword: f64,
     command: f64,
 ) -> f64 {
-    let server = crate::object::js_implicit_this_get();
+    let server = this.as_f64();
     let Some(name) = string_to_rust(keyword) else {
         return undefined();
     };
@@ -439,8 +461,12 @@ extern "C" fn repl_define_command_thunk(
     undefined()
 }
 
-extern "C" fn repl_write_thunk(_closure: *const ClosureHeader, chunk: f64) -> f64 {
-    let server = crate::object::js_implicit_this_get();
+extern "C" fn repl_write_thunk(
+    _closure: *const ClosureHeader,
+    this: crate::closure::JsThis,
+    chunk: f64,
+) -> f64 {
+    let server = this.as_f64();
     let input = string_to_rust(chunk).unwrap_or_default();
     for line in input.split_inclusive('\n') {
         let line = line.strip_suffix('\n').unwrap_or(line);

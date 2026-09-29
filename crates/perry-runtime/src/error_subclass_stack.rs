@@ -77,14 +77,22 @@ unsafe fn error_subclass_stack_head(receiver: f64) -> String {
 /// reports `"E: m"`, and the assignment happens after `super()` returns. A
 /// user `Error.prepareStackTrace` still wins, same as `captureStackTrace`'s
 /// getter.
-extern "C" fn error_subclass_stack_getter(closure: *const crate::closure::ClosureHeader) -> f64 {
-    let receiver = crate::object::js_implicit_this_get();
+extern "C" fn error_subclass_stack_getter(
+    closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
+    let receiver = this.as_f64();
     unsafe {
         if let Some(prep) = error_prepare_stack_trace_override() {
             let structured = build_structured_stack(10);
             let prep_ptr =
                 crate::value::js_nanbox_get_pointer(prep) as *const crate::closure::ClosureHeader;
-            return crate::closure::js_closure_call2(prep_ptr, receiver, structured);
+            return crate::closure::js_closure_call2(
+                prep_ptr,
+                crate::closure::plain_call_receiver(),
+                receiver,
+                structured,
+            );
         }
         // #9486: capture slot 0 holds the ENCODED capture (native return
         // addresses, plus the #5247 line when one was recorded), not a
@@ -122,9 +130,10 @@ extern "C" fn error_subclass_stack_getter(closure: *const crate::closure::Closur
 /// enumerability, different reflection — a deliberate simplification.)
 extern "C" fn error_subclass_stack_setter(
     _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     value: f64,
 ) -> f64 {
-    let receiver = crate::object::js_implicit_this_get();
+    let receiver = this.as_f64();
     let ptr = crate::value::js_nanbox_get_pointer(receiver);
     if ptr != 0
         && crate::value::addr_class::is_above_handle_band(ptr as usize)

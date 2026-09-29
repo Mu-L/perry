@@ -167,6 +167,7 @@ fn is_callable(value: f64) -> bool {
 /// TypeError if either slot is already set (executor called twice).
 extern "C" fn capability_executor_fn(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     resolve: f64,
     reject: f64,
 ) -> f64 {
@@ -299,12 +300,8 @@ fn call_with_this(func: f64, this_arg: f64, args: &[f64]) -> Result<f64, f64> {
     } else {
         (args.as_ptr(), args.len())
     };
-    let this_scope = crate::gc::RuntimeHandleScope::new(); // #9445
-    let prev = this_scope.root_nanbox_f64(crate::object::js_implicit_this_set(this_arg));
-    let result =
-        combinator_catch_js(|| unsafe { crate::closure::js_native_call_value(func, ptr, len) });
-    crate::object::js_implicit_this_set(prev.get_nanbox_f64());
-    result
+    let this = crate::closure::JsThis::from_f64(this_arg);
+    combinator_catch_js(|| unsafe { crate::closure::native_call_value_this(func, this, ptr, len) })
 }
 
 /// `Invoke(obj, "then", args)` catching exceptions into `Err`.
@@ -392,6 +389,7 @@ fn dec_remaining(state: *mut crate::array::ArrayHeader) -> bool {
 /// Promise.all Resolve Element Function.
 extern "C" fn all_resolve_element_fn(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     value: f64,
 ) -> f64 {
     let guard = js_closure_get_capture_ptr(closure, 0) as *mut crate::array::ArrayHeader;
@@ -414,6 +412,7 @@ extern "C" fn all_resolve_element_fn(
 /// Promise.allSettled Resolve Element Function → `{status:"fulfilled", value}`.
 extern "C" fn settled_fulfill_element_fn(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     value: f64,
 ) -> f64 {
     settled_element(closure, value, true)
@@ -422,6 +421,7 @@ extern "C" fn settled_fulfill_element_fn(
 /// Promise.allSettled Reject Element Function → `{status:"rejected", reason}`.
 extern "C" fn settled_reject_element_fn(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     reason: f64,
 ) -> f64 {
     settled_element(closure, reason, false)
@@ -471,6 +471,7 @@ fn settled_element(
 /// AggregateError once all reject.
 extern "C" fn any_reject_element_fn(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     reason: f64,
 ) -> f64 {
     let guard = js_closure_get_capture_ptr(closure, 0) as *mut crate::array::ArrayHeader;
@@ -1331,12 +1332,18 @@ mod fast_arm_tests {
 
     extern "C" fn own_then_fn(
         closure: *const crate::closure::ClosureHeader,
+        _this: crate::closure::JsThis,
         on_fulfilled: f64,
         _on_rejected: f64,
     ) -> f64 {
         let v = crate::closure::js_closure_get_capture_f64(closure, 0);
         unsafe {
-            crate::closure::js_native_call_value(on_fulfilled, [v].as_ptr(), 1);
+            crate::closure::js_native_call_value(
+                on_fulfilled,
+                crate::closure::plain_call_receiver(),
+                [v].as_ptr(),
+                1,
+            );
         }
         undef()
     }

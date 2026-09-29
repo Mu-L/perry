@@ -31,6 +31,7 @@ fn seen() -> Vec<u64> {
 
 extern "C" fn record_this_and_six_args(
     _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     a0: f64,
     a1: f64,
     _a2: f64,
@@ -38,17 +39,13 @@ extern "C" fn record_this_and_six_args(
     _a4: f64,
     a5: f64,
 ) -> f64 {
-    record(&[
-        crate::object::js_implicit_this_get().to_bits(),
-        a0.to_bits(),
-        a1.to_bits(),
-        a5.to_bits(),
-    ]);
+    record(&[this.bits(), a0.to_bits(), a1.to_bits(), a5.to_bits()]);
     0.0
 }
 
 extern "C" fn record_two_args(
     _closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     a0: f64,
     a1: f64,
 ) -> f64 {
@@ -59,6 +56,7 @@ extern "C" fn record_two_args(
 #[allow(clippy::too_many_arguments)]
 extern "C" fn record_rest_and_arguments_after_16(
     _closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     _a0: f64,
     _a1: f64,
     _a2: f64,
@@ -300,7 +298,12 @@ fn rest_bundling_roots_the_rest_array_across_the_arguments_array() {
     // under test here, so the closure pointer is a scoped argument to it —
     // `with_mut_ptr` is the blessed shape for that instead of a bare read.
     closure_handle.with_mut_ptr::<crate::closure::ClosureHeader, _>(|ptr| unsafe {
-        crate::closure::js_closure_call_array(ptr as i64, args.as_ptr(), args.len() as i64);
+        crate::closure::js_closure_call_array(
+            ptr as i64,
+            crate::closure::plain_call_receiver(),
+            args.as_ptr(),
+            args.len() as i64,
+        );
     });
 
     assert!(

@@ -34,12 +34,13 @@ pub use validate::{clean_closure_ptr, dispatch_proxy_callee_or_throw, get_valid_
 
 pub use calln::{
     js_closure_call0, js_closure_call1, js_closure_call10, js_closure_call11, js_closure_call12,
-    js_closure_call13, js_closure_call14, js_closure_call15, js_closure_call16,
-    js_closure_call1_receiverless, js_closure_call2, js_closure_call3, js_closure_call4,
-    js_closure_call5, js_closure_call6, js_closure_call7, js_closure_call8, js_closure_call9,
+    js_closure_call13, js_closure_call14, js_closure_call15, js_closure_call16, js_closure_call2,
+    js_closure_call3, js_closure_call4, js_closure_call5, js_closure_call6, js_closure_call7,
+    js_closure_call8, js_closure_call9,
 };
 pub use direct::{DirectCall1, DirectCall2, DirectCall3, DirectCall4};
 
+pub(crate) use value_call::native_call_value_this;
 pub use value_call::{
     js_closure_call_apply_with_spread, js_closure_call_array, js_native_call_value,
 };

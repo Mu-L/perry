@@ -67,37 +67,60 @@ fn test(receiver: &RuntimeHandle<'_>, input: &RuntimeHandle<'_>) -> bool {
     input.with_const_ptr(|input| crate::regex::js_regexp_test(raw, input)) != 0
 }
 
-extern "C" fn return_this(_: *const crate::closure::ClosureHeader, _: f64) -> f64 {
-    crate::object::js_implicit_this_get()
+extern "C" fn return_this(
+    _: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+    _: f64,
+) -> f64 {
+    this.as_f64()
 }
-extern "C" fn return_null(_: *const crate::closure::ClosureHeader, _: f64) -> f64 {
+extern "C" fn return_null(
+    _: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+    _: f64,
+) -> f64 {
     f64::from_bits(TAG_NULL)
 }
-extern "C" fn read_answer(_: *const crate::closure::ClosureHeader, _: f64) -> f64 {
+extern "C" fn read_answer(
+    _: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+    _: f64,
+) -> f64 {
     let scope = RuntimeHandleScope::new();
-    let receiver = scope.root_nanbox_f64(crate::object::js_implicit_this_get());
+    let receiver = scope.root_nanbox_f64(this.as_f64());
     api::finish(dispatch::get(&receiver, b"answer"))
 }
-extern "C" fn collect_and_echo(_: *const crate::closure::ClosureHeader, arg: f64) -> f64 {
+extern "C" fn collect_and_echo(
+    _: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+    arg: f64,
+) -> f64 {
     let scope = RuntimeHandleScope::new();
-    let receiver = scope.root_nanbox_f64(crate::object::js_implicit_this_get());
+    let receiver = scope.root_nanbox_f64(this.as_f64());
     let argument = scope.root_nanbox_f64(arg);
     gc_collect_minor();
     put(&receiver, b"seen", &argument);
     receiver.get_nanbox_f64()
 }
-extern "C" fn collecting_getter(_: *const crate::closure::ClosureHeader) -> f64 {
+extern "C" fn collecting_getter(
+    _: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     gc_collect_minor();
     let fp = collect_and_echo as *const u8;
     crate::closure::js_register_closure_arity(fp, 1);
     js_nanbox_pointer(crate::closure::js_closure_alloc_singleton(fp) as i64)
 }
-extern "C" fn collect_missing_apply(_: *const crate::closure::ClosureHeader) -> f64 {
+extern "C" fn collect_missing_apply(
+    _: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     gc_collect_minor();
     f64::from_bits(TAG_UNDEFINED)
 }
 extern "C" fn echo_apply(
     _: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     _target: f64,
     receiver: f64,
     args: f64,
@@ -115,23 +138,40 @@ extern "C" fn echo_apply(
     put(&receiver, b"seen", &value);
     receiver.get_nanbox_f64()
 }
-extern "C" fn throw_exec(_: *const crate::closure::ClosureHeader, _: f64) -> f64 {
+extern "C" fn throw_exec(
+    _: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+    _: f64,
+) -> f64 {
     gc_collect_minor();
     crate::exception::js_throw(843.0)
 }
-extern "C" fn throw_getter(_: *const crate::closure::ClosureHeader) -> f64 {
+extern "C" fn throw_getter(
+    _: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     gc_collect_minor();
     crate::exception::js_throw(844.0)
 }
-extern "C" fn ordered_string(_: *const crate::closure::ClosureHeader) -> f64 {
+extern "C" fn ordered_string(
+    _: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     ORDER.with(|n| n.set(n.get() * 10 + 1));
     js_nanbox_string(crate::string::js_string_from_bytes(b"x".as_ptr(), 1) as i64)
 }
-extern "C" fn ordered_exec(_: *const crate::closure::ClosureHeader, _: f64) -> f64 {
+extern "C" fn ordered_exec(
+    _: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+    _: f64,
+) -> f64 {
     ORDER.with(|n| n.set(n.get() * 10 + 3));
     js_nanbox_pointer(crate::array::js_array_alloc(0) as i64)
 }
-extern "C" fn ordered_getter(_: *const crate::closure::ClosureHeader) -> f64 {
+extern "C" fn ordered_getter(
+    _: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     ORDER.with(|n| n.set(n.get() * 10 + 2));
     let fp = ordered_exec as *const u8;
     crate::closure::js_register_closure_arity(fp, 1);
@@ -191,19 +231,24 @@ fn perex_dispatch_generic_prototype_test_coerces_before_getting_exec() {
     ));
     assert!(crate::proxy::proxy_wraps_callable(method.get_nanbox_f64()));
     ORDER.with(|n| n.set(0));
-    let previous = scope.root_nanbox_f64(crate::object::js_implicit_this_set(
-        receiver.get_nanbox_f64(),
-    ));
     let args = [argument.get_nanbox_f64()];
     let result = crate::exception::catch_js_throw(|| unsafe {
-        crate::closure::js_native_call_value(method.get_nanbox_f64(), args.as_ptr(), 1)
+        crate::closure::native_call_value_this(
+            method.get_nanbox_f64(),
+            crate::closure::JsThis::from_f64(receiver.get_nanbox_f64()),
+            args.as_ptr(),
+            1,
+        )
     });
-    crate::object::js_implicit_this_set(previous.get_nanbox_f64());
     assert_eq!(result.unwrap().to_bits(), crate::value::TAG_TRUE);
     assert_eq!(ORDER.with(Cell::get), 123);
     ORDER.with(|n| n.set(0));
     assert!(matches!(
-        dispatch::test_value(1.0, argument.get_nanbox_f64()),
+        dispatch::test_value(
+            crate::closure::plain_call_receiver(),
+            1.0,
+            argument.get_nanbox_f64()
+        ),
         Err(EngineError::Type(_))
     ));
     assert_eq!(
@@ -226,10 +271,6 @@ fn perex_dispatch_getter_and_callback_reacquire_original_input_after_gc() {
     let before = handle_address::<StringHeader>(&input);
     let method = function(&scope, collecting_getter as *const u8, 0);
     getter(&receiver, &method);
-    let displaced = object(&scope);
-    let previous = scope.root_nanbox_f64(crate::object::js_implicit_this_set(
-        displaced.get_nanbox_f64(),
-    ));
     let roots = RuntimeHandleScope::active_len_for_tests();
     let result = api::finish(dispatch::execute(
         &receiver,
@@ -249,11 +290,6 @@ fn perex_dispatch_getter_and_callback_reacquire_original_input_after_gc() {
         api::finish(dispatch::get(&receiver, b"seen")).to_bits(),
         handle_string_value(&input).to_bits()
     );
-    assert_eq!(
-        crate::object::js_implicit_this_get().to_bits(),
-        displaced.get_nanbox_f64().to_bits()
-    );
-    crate::object::js_implicit_this_set(previous.get_nanbox_f64());
 }
 
 #[test]
@@ -288,10 +324,6 @@ fn perex_dispatch_actual_throws_restore_this_roots_and_accounting() {
         } else {
             put(&receiver, b"exec", &method);
         }
-        let displaced = object(&scope);
-        let previous = scope.root_nanbox_f64(crate::object::js_implicit_this_set(
-            displaced.get_nanbox_f64(),
-        ));
         let roots = RuntimeHandleScope::active_len_for_tests();
         let live = external_side_live_bytes();
         let result =
@@ -304,11 +336,6 @@ fn perex_dispatch_actual_throws_restore_this_roots_and_accounting() {
         assert_ne!(handle_address::<StringHeader>(&input), before);
         assert_eq!(RuntimeHandleScope::active_len_for_tests(), roots);
         assert_eq!(external_side_live_bytes(), live);
-        assert_eq!(
-            crate::object::js_implicit_this_get().to_bits(),
-            displaced.get_nanbox_f64().to_bits()
-        );
-        crate::object::js_implicit_this_set(previous.get_nanbox_f64());
     }
 }
 

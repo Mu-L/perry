@@ -251,7 +251,10 @@ pub(super) fn enqueue_native_adoption_job(outer: *mut Promise, inner: *mut Promi
 /// a synchronous copy, matching V8's reaction-job. A still-pending inner
 /// falls back to the existing chain wiring: its settlement path already
 /// delivers through the microtask runner.
-extern "C" fn native_promise_adoption_job(closure: *const crate::closure::ClosureHeader) -> f64 {
+extern "C" fn native_promise_adoption_job(
+    closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     use crate::closure::js_closure_get_capture_ptr;
 
     let outer = js_closure_get_capture_ptr(closure, 0) as *mut Promise;
@@ -317,6 +320,7 @@ fn thenable_job_take_guard(guard_arr: *mut crate::array::ArrayHeader) -> bool {
 
 pub(super) extern "C" fn thenable_job_resolve_fn(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     value: f64,
 ) -> f64 {
     use crate::closure::js_closure_get_capture_ptr;
@@ -331,6 +335,7 @@ pub(super) extern "C" fn thenable_job_resolve_fn(
 
 pub(super) extern "C" fn thenable_job_reject_fn(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     reason: f64,
 ) -> f64 {
     use crate::closure::js_closure_get_capture_ptr;
@@ -343,7 +348,10 @@ pub(super) extern "C" fn thenable_job_reject_fn(
     0.0
 }
 
-extern "C" fn promise_resolve_thenable_job(closure: *const crate::closure::ClosureHeader) -> f64 {
+extern "C" fn promise_resolve_thenable_job(
+    closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     use crate::array::{js_array_alloc, js_array_set_f64};
     use crate::closure::{
         js_closure_alloc, js_closure_get_capture_f64, js_closure_get_capture_ptr,
@@ -382,12 +390,14 @@ extern "C" fn promise_resolve_thenable_job(closure: *const crate::closure::Closu
     let reject_value = crate::value::js_nanbox_pointer(reject_closure as i64);
     let args = [resolve_value, reject_value];
 
-    let this_scope = crate::gc::RuntimeHandleScope::new(); // #9445
-    let prev_this = this_scope.root_nanbox_f64(crate::object::js_implicit_this_set(thenable));
     let result = combinator_catch_js(|| unsafe {
-        crate::closure::js_native_call_value(then_action, args.as_ptr(), args.len())
+        crate::closure::native_call_value_this(
+            then_action,
+            crate::closure::JsThis::from_f64(thenable),
+            args.as_ptr(),
+            args.len(),
+        )
     });
-    crate::object::js_implicit_this_set(prev_this.get_nanbox_f64());
     if let Err(reason) = result {
         if thenable_job_take_guard(guard_arr) {
             js_promise_reject(promise, reason);
@@ -479,19 +489,16 @@ pub(super) fn assimilate_via_then_property(value: f64) -> f64 {
         .with_mut_ptr::<u8, _>(|reject| crate::value::js_nanbox_pointer(reject as i64));
     let args = [resolve_f64, reject_f64];
 
-    // Bind `this` to the thenable so a non-arrow `then` body reads the right
-    // receiver, then call `Get(value, "then")` as a value (own data property).
-    let prev = scope.root_nanbox_f64(crate::object::js_implicit_this_set(
-        value_handle.get_nanbox_f64(),
-    )); // #9445
+    // Call `Get(value, "then")` as a value (own data property) with the
+    // thenable as its receiver, so a non-arrow `then` body reads the right `this`.
     unsafe {
-        crate::closure::js_native_call_value(
+        crate::closure::native_call_value_this(
             then_handle.get_nanbox_f64(),
+            crate::closure::JsThis::from_f64(value_handle.get_nanbox_f64()),
             args.as_ptr(),
             args.len(),
         );
     }
-    crate::object::js_implicit_this_set(prev.get_nanbox_f64());
 
     // Re-read the wrapper through its handle: the user `then` just ran and may
     // have relocated it (#9539). Returning `new_promise`'s pre-call address is

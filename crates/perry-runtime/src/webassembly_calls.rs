@@ -4,6 +4,7 @@ use super::*;
 
 extern "C" fn js_wasm_instance_result_then(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     on_fulfilled: f64,
     _on_rejected: f64,
 ) -> f64 {
@@ -13,6 +14,7 @@ extern "C" fn js_wasm_instance_result_then(
     let outcome = crate::exception::catch_js_throw(|| unsafe {
         crate::closure::js_native_call_value(
             on_fulfilled.get_nanbox_f64(),
+            crate::closure::plain_call_receiver(),
             [value.get_nanbox_f64()].as_ptr(),
             1,
         )
@@ -45,6 +47,7 @@ macro_rules! wasm_export_call_shim {
     ($name:ident $(, $arg:ident)*) => {
         pub(super) extern "C" fn $name(
             closure: *const crate::closure::ClosureHeader,
+            _this: crate::closure::JsThis,
             $($arg: f64),*
         ) -> f64 {
             call_captured_wasm_export(closure, &[$($arg),*])

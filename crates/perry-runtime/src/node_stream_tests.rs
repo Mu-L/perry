@@ -35,7 +35,10 @@ fn catches_runtime_throw(f: impl FnOnce()) -> bool {
     crate::exception::catch_js_throw(f).is_err()
 }
 
-extern "C" fn capture_finished_callback(_closure: *const ClosureHeader) -> f64 {
+extern "C" fn capture_finished_callback(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     FINISHED_CALLBACK_COUNT.with(|count| *count.borrow_mut() += 1);
     f64::from_bits(TAG_UNDEFINED)
 }
@@ -113,7 +116,11 @@ fn bare_writable_and_transform_reject_missing_methods() {
     }));
 }
 
-extern "C" fn capture_uncaught_stream_error(_closure: *const ClosureHeader, _error: f64) -> f64 {
+extern "C" fn capture_uncaught_stream_error(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    _error: f64,
+) -> f64 {
     UNCAUGHT_STREAM_ERROR_COUNT.with(|count| *count.borrow_mut() += 1);
     f64::from_bits(TAG_UNDEFINED)
 }
@@ -167,7 +174,11 @@ fn pipe_cleanup_does_not_swallow_destination_error() {
     crate::os::test_clear_process_event_listeners();
 }
 
-extern "C" fn return_pipeline_source(_closure: *const ClosureHeader, source: f64) -> f64 {
+extern "C" fn return_pipeline_source(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    source: f64,
+) -> f64 {
     source
 }
 
@@ -212,6 +223,7 @@ fn string_contents(value: f64) -> String {
 
 pub(super) extern "C" fn write_capture(
     _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     chunk: f64,
     _enc: f64,
     cb: f64,
@@ -220,13 +232,19 @@ pub(super) extern "C" fn write_capture(
     let bytes = js_node_stream_collect_bytes(readable);
     WRITE_CAPTURED.with(|captured| captured.borrow_mut().push(bytes));
     unsafe {
-        let _ = crate::closure::js_native_call_value(cb, std::ptr::null(), 0);
+        let _ = crate::closure::js_native_call_value(
+            cb,
+            crate::closure::plain_call_receiver(),
+            std::ptr::null(),
+            0,
+        );
     }
     f64::from_bits(TAG_UNDEFINED)
 }
 
 pub(super) extern "C" fn write_capture_pending(
     _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     chunk: f64,
     _enc: f64,
     cb: f64,
@@ -240,6 +258,7 @@ pub(super) extern "C" fn write_capture_pending(
 
 extern "C" fn write_capture_encoding(
     _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     chunk: f64,
     enc: f64,
     cb: f64,
@@ -254,25 +273,41 @@ extern "C" fn write_capture_encoding(
             .push(JSValue::from_bits(chunk.to_bits()).is_any_string())
     });
     unsafe {
-        let _ = crate::closure::js_native_call_value(cb, std::ptr::null(), 0);
+        let _ = crate::closure::js_native_call_value(
+            cb,
+            crate::closure::plain_call_receiver(),
+            std::ptr::null(),
+            0,
+        );
     }
     f64::from_bits(TAG_UNDEFINED)
 }
 
 extern "C" fn write_callback_error(
     closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     _chunk: f64,
     _enc: f64,
     cb: f64,
 ) -> f64 {
     let err = crate::closure::js_closure_get_capture_f64(closure, 0);
     unsafe {
-        let _ = crate::closure::js_native_call_value(cb, [err].as_ptr(), 1);
+        let _ = crate::closure::js_native_call_value(
+            cb,
+            crate::closure::plain_call_receiver(),
+            [err].as_ptr(),
+            1,
+        );
     }
     f64::from_bits(TAG_UNDEFINED)
 }
 
-extern "C" fn writev_capture(_closure: *const ClosureHeader, chunks: f64, cb: f64) -> f64 {
+extern "C" fn writev_capture(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    chunks: f64,
+    cb: f64,
+) -> f64 {
     let chunks = raw_ptr_from_value(chunks) as *const crate::array::ArrayHeader;
     let len = crate::array::js_array_length(chunks);
     for i in 0..len {
@@ -294,23 +329,38 @@ extern "C" fn writev_capture(_closure: *const ClosureHeader, chunks: f64, cb: f6
         });
     }
     unsafe {
-        let _ = crate::closure::js_native_call_value(cb, std::ptr::null(), 0);
+        let _ = crate::closure::js_native_call_value(
+            cb,
+            crate::closure::plain_call_receiver(),
+            std::ptr::null(),
+            0,
+        );
     }
     f64::from_bits(TAG_UNDEFINED)
 }
 
-extern "C" fn capture_write_callback(_closure: *const ClosureHeader) -> f64 {
+extern "C" fn capture_write_callback(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     WRITE_CALLBACK_COUNT.with(|count| *count.borrow_mut() += 1);
     f64::from_bits(TAG_UNDEFINED)
 }
 
-pub(super) extern "C" fn noop_listener(_closure: *const ClosureHeader) -> f64 {
+pub(super) extern "C" fn noop_listener(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     f64::from_bits(TAG_UNDEFINED)
 }
 
-pub(super) extern "C" fn capture_data_listener(closure: *const ClosureHeader, chunk: f64) -> f64 {
+pub(super) extern "C" fn capture_data_listener(
+    closure: *const ClosureHeader,
+    receiver: crate::closure::JsThis,
+    chunk: f64,
+) -> f64 {
     let expected = crate::closure::js_closure_get_capture_f64(closure, 0);
-    let actual = crate::object::js_implicit_this_get();
+    let actual = receiver.as_f64();
     READABLE_THIS_MATCHES.with(|matches| {
         matches
             .borrow_mut()
@@ -325,7 +375,11 @@ pub(super) extern "C" fn capture_data_listener(closure: *const ClosureHeader, ch
     f64::from_bits(TAG_UNDEFINED)
 }
 
-extern "C" fn capture_data_text_listener(_closure: *const ClosureHeader, chunk: f64) -> f64 {
+extern "C" fn capture_data_text_listener(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    chunk: f64,
+) -> f64 {
     READABLE_DATA_STRING_FLAGS.with(|flags| {
         flags
             .borrow_mut()
@@ -335,7 +389,10 @@ extern "C" fn capture_data_text_listener(_closure: *const ClosureHeader, chunk: 
     f64::from_bits(TAG_UNDEFINED)
 }
 
-pub(super) extern "C" fn capture_readable_listener(closure: *const ClosureHeader) -> f64 {
+pub(super) extern "C" fn capture_readable_listener(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let stream = crate::closure::js_closure_get_capture_f64(closure, 0);
     let got = js_node_stream_method_read(raw_ptr_from_value(stream) as i64, f64::NAN);
     READABLE_READ_CAPTURED.with(|captured| {
@@ -349,9 +406,12 @@ pub(super) extern "C" fn capture_readable_listener(closure: *const ClosureHeader
     f64::from_bits(TAG_UNDEFINED)
 }
 
-pub(super) extern "C" fn capture_end_listener(closure: *const ClosureHeader) -> f64 {
+pub(super) extern "C" fn capture_end_listener(
+    closure: *const ClosureHeader,
+    receiver: crate::closure::JsThis,
+) -> f64 {
     let expected = crate::closure::js_closure_get_capture_f64(closure, 0);
-    let actual = crate::object::js_implicit_this_get();
+    let actual = receiver.as_f64();
     READABLE_THIS_MATCHES.with(|matches| {
         matches
             .borrow_mut()
@@ -409,13 +469,18 @@ fn readable_set_encoding_read_returns_decoded_string() {
     assert_eq!(string_contents(got), "abcd");
 }
 
-extern "C" fn capture_error_listener(_closure: *const ClosureHeader, _err: f64) -> f64 {
+extern "C" fn capture_error_listener(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    _err: f64,
+) -> f64 {
     ERROR_COUNT.with(|count| *count.borrow_mut() += 1);
     f64::from_bits(TAG_UNDEFINED)
 }
 
 pub(super) extern "C" fn capture_expected_arg_listener(
     closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     arg: f64,
 ) -> f64 {
     let expected = crate::closure::js_closure_get_capture_f64(closure, 0);
@@ -427,27 +492,42 @@ pub(super) extern "C" fn capture_expected_arg_listener(
     f64::from_bits(TAG_UNDEFINED)
 }
 
-pub(super) extern "C" fn capture_pause_listener(_closure: *const ClosureHeader) -> f64 {
+pub(super) extern "C" fn capture_pause_listener(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     STREAM_EVENT_ORDER.with(|events| events.borrow_mut().push(b'P'));
     f64::from_bits(TAG_UNDEFINED)
 }
 
-pub(super) extern "C" fn capture_resume_listener(_closure: *const ClosureHeader) -> f64 {
+pub(super) extern "C" fn capture_resume_listener(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     STREAM_EVENT_ORDER.with(|events| events.borrow_mut().push(b'R'));
     f64::from_bits(TAG_UNDEFINED)
 }
 
-pub(super) extern "C" fn capture_finish_listener(_closure: *const ClosureHeader) -> f64 {
+pub(super) extern "C" fn capture_finish_listener(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     WRITABLE_FINISH_COUNT.with(|count| *count.borrow_mut() += 1);
     f64::from_bits(TAG_UNDEFINED)
 }
 
-pub(super) extern "C" fn capture_close_listener(_closure: *const ClosureHeader) -> f64 {
+pub(super) extern "C" fn capture_close_listener(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     WRITABLE_CLOSE_COUNT.with(|count| *count.borrow_mut() += 1);
     f64::from_bits(TAG_UNDEFINED)
 }
 
-pub(super) extern "C" fn capture_end_callback_state(closure: *const ClosureHeader) -> f64 {
+pub(super) extern "C" fn capture_end_callback_state(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let stream = crate::closure::js_closure_get_capture_f64(closure, 0);
     let handle = raw_ptr_from_value(stream) as i64;
     let finish_count = WRITABLE_FINISH_COUNT.with(|count| *count.borrow());
@@ -459,28 +539,39 @@ pub(super) extern "C" fn capture_end_callback_state(closure: *const ClosureHeade
     f64::from_bits(TAG_UNDEFINED)
 }
 
-pub(super) extern "C" fn capture_drain_listener(_closure: *const ClosureHeader) -> f64 {
+pub(super) extern "C" fn capture_drain_listener(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     WRITABLE_DRAIN_COUNT.with(|count| *count.borrow_mut() += 1);
     f64::from_bits(TAG_UNDEFINED)
 }
 
-extern "C" fn read_records_this(closure: *const ClosureHeader) -> f64 {
+extern "C" fn read_records_this(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let stream = crate::closure::js_closure_get_capture_f64(closure, 0);
     set_hidden_value(stream, hidden_error_key(), string_value("from-read"));
     f64::from_bits(TAG_UNDEFINED)
 }
 
-extern "C" fn read_throws(closure: *const ClosureHeader, _size: f64) -> f64 {
+extern "C" fn read_throws(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    _size: f64,
+) -> f64 {
     crate::exception::js_throw(crate::closure::js_closure_get_capture_f64(closure, 0))
 }
 
 extern "C" fn transform_upper_callback(
     _closure: *const ClosureHeader,
+    receiver: crate::closure::JsThis,
     chunk: f64,
     _enc: f64,
     cb: f64,
 ) -> f64 {
-    let this = crate::object::js_implicit_this_get();
+    let this = receiver.as_f64();
     TRANSFORM_THIS_HAS_STREAM_STATE.with(|matches| {
         matches.borrow_mut().push(
             get_hidden_value(this, hidden_readable_flag_key()).is_some()
@@ -492,59 +583,87 @@ extern "C" fn transform_upper_callback(
     let upper = String::from_utf8(bytes).unwrap().to_uppercase();
     let args = [f64::from_bits(TAG_UNDEFINED), string_value(&upper)];
     unsafe {
-        let _ = crate::closure::js_native_call_value(cb, args.as_ptr(), args.len());
+        let _ = crate::closure::js_native_call_value(
+            cb,
+            crate::closure::plain_call_receiver(),
+            args.as_ptr(),
+            args.len(),
+        );
     }
     f64::from_bits(TAG_UNDEFINED)
 }
 
 extern "C" fn transform_identity_callback(
     _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     chunk: f64,
     _enc: f64,
     cb: f64,
 ) -> f64 {
     let args = [f64::from_bits(TAG_UNDEFINED), chunk];
     unsafe {
-        let _ = crate::closure::js_native_call_value(cb, args.as_ptr(), args.len());
+        let _ = crate::closure::js_native_call_value(
+            cb,
+            crate::closure::plain_call_receiver(),
+            args.as_ptr(),
+            args.len(),
+        );
     }
     f64::from_bits(TAG_UNDEFINED)
 }
 
 extern "C" fn transform_error_callback(
     closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     _chunk: f64,
     _enc: f64,
     cb: f64,
 ) -> f64 {
     let err = crate::closure::js_closure_get_capture_f64(closure, 0);
     unsafe {
-        let _ = crate::closure::js_native_call_value(cb, [err].as_ptr(), 1);
+        let _ = crate::closure::js_native_call_value(
+            cb,
+            crate::closure::plain_call_receiver(),
+            [err].as_ptr(),
+            1,
+        );
     }
     f64::from_bits(TAG_UNDEFINED)
 }
 
 extern "C" fn transform_push_pair_callback(
     _closure: *const ClosureHeader,
+    receiver: crate::closure::JsThis,
     _chunk: f64,
     _enc: f64,
     cb: f64,
 ) -> f64 {
-    let this = crate::object::js_implicit_this_get();
+    let this = receiver.as_f64();
     let push = js_object_get_field_by_name_f64(
         raw_ptr_from_value(this) as *const ObjectHeader,
         hidden_key(b"push"),
     );
     unsafe {
-        let _ = crate::closure::js_native_call_value(push, [string_value("a")].as_ptr(), 1);
-        let _ = crate::closure::js_native_call_value(push, [string_value("b")].as_ptr(), 1);
         let _ =
-            crate::closure::js_native_call_value(cb, [f64::from_bits(TAG_UNDEFINED)].as_ptr(), 1);
+            crate::closure::native_call_value_this(push, receiver, [string_value("a")].as_ptr(), 1);
+        let _ =
+            crate::closure::native_call_value_this(push, receiver, [string_value("b")].as_ptr(), 1);
+        let _ = crate::closure::js_native_call_value(
+            cb,
+            crate::closure::plain_call_receiver(),
+            [f64::from_bits(TAG_UNDEFINED)].as_ptr(),
+            1,
+        );
     }
     f64::from_bits(TAG_UNDEFINED)
 }
 
-extern "C" fn transform_flush_tail_callback(_closure: *const ClosureHeader, cb: f64) -> f64 {
-    let this = crate::object::js_implicit_this_get();
+extern "C" fn transform_flush_tail_callback(
+    _closure: *const ClosureHeader,
+    receiver: crate::closure::JsThis,
+    cb: f64,
+) -> f64 {
+    let this = receiver.as_f64();
     TRANSFORM_THIS_HAS_STREAM_STATE.with(|matches| {
         matches.borrow_mut().push(
             get_hidden_value(this, hidden_readable_flag_key()).is_some()
@@ -554,7 +673,12 @@ extern "C" fn transform_flush_tail_callback(_closure: *const ClosureHeader, cb: 
     TRANSFORM_FLUSH_COUNT.with(|count| *count.borrow_mut() += 1);
     let args = [f64::from_bits(TAG_UNDEFINED), string_value("!")];
     unsafe {
-        let _ = crate::closure::js_native_call_value(cb, args.as_ptr(), args.len());
+        let _ = crate::closure::js_native_call_value(
+            cb,
+            crate::closure::plain_call_receiver(),
+            args.as_ptr(),
+            args.len(),
+        );
     }
     f64::from_bits(TAG_UNDEFINED)
 }
@@ -688,7 +812,12 @@ fn writable_options_write_callback_is_invoked_by_stub_write() {
     );
     let args = [string_value("chunk"), f64::from_bits(TAG_UNDEFINED)];
     unsafe {
-        let _ = crate::closure::js_native_call_value(write, args.as_ptr(), args.len());
+        let _ = crate::closure::js_native_call_value(
+            write,
+            crate::closure::plain_call_receiver(),
+            args.as_ptr(),
+            args.len(),
+        );
     }
 
     WRITE_CAPTURED.with(|captured| {
@@ -775,8 +904,22 @@ fn transform_pipe_chain_applies_callback_output() {
         raw_ptr_from_value(upper) as *const ObjectHeader,
         hidden_key(b"pipe"),
     );
-    let _ = unsafe { crate::closure::js_native_call_value(src_pipe, [upper].as_ptr(), 1) };
-    let _ = unsafe { crate::closure::js_native_call_value(upper_pipe, [sink].as_ptr(), 1) };
+    let _ = unsafe {
+        crate::closure::js_native_call_value(
+            src_pipe,
+            crate::closure::plain_call_receiver(),
+            [upper].as_ptr(),
+            1,
+        )
+    };
+    let _ = unsafe {
+        crate::closure::js_native_call_value(
+            upper_pipe,
+            crate::closure::plain_call_receiver(),
+            [sink].as_ptr(),
+            1,
+        )
+    };
     let _ = crate::promise::js_promise_run_microtasks();
 
     READABLE_DATA_CAPTURED.with(|captured| {
@@ -1170,22 +1313,21 @@ fn stream_json_stringify_uses_node_state_shape() {
 }
 
 #[test]
-fn stream_methods_use_implicit_this_without_closure_capture() {
+fn stream_methods_use_their_receiver_without_closure_capture() {
     let stream = js_node_stream_passthrough_new(f64::from_bits(TAG_UNDEFINED));
-    let prev_this = crate::object::js_implicit_this_set(stream);
     let _ = ns_end3(
         std::ptr::null(),
+        crate::closure::JsThis::from_f64(stream),
         f64::from_bits(TAG_UNDEFINED),
         f64::from_bits(TAG_UNDEFINED),
         f64::from_bits(TAG_UNDEFINED),
     );
-    crate::object::js_implicit_this_set(prev_this);
 
     assert!(js_node_stream_is_stub_ended_after_read(stream));
 }
 
 #[test]
-fn stream_method_closure_capture_wins_over_stale_implicit_this() {
+fn stream_method_closure_capture_wins_over_a_foreign_receiver() {
     let stream = js_node_stream_passthrough_new(f64::from_bits(TAG_UNDEFINED));
     let other = box_pointer(crate::object::js_object_alloc(0, 0) as *const u8);
     let end = js_object_get_field_by_name_f64(
@@ -1193,11 +1335,14 @@ fn stream_method_closure_capture_wins_over_stale_implicit_this() {
         hidden_key(b"end"),
     );
 
-    let prev_this = crate::object::js_implicit_this_set(other);
     unsafe {
-        let _ = crate::closure::js_native_call_value(end, std::ptr::null(), 0);
+        let _ = crate::closure::native_call_value_this(
+            end,
+            crate::closure::JsThis::from_f64(other),
+            std::ptr::null(),
+            0,
+        );
     }
-    crate::object::js_implicit_this_set(prev_this);
 
     assert!(js_node_stream_is_stub_ended_after_read(stream));
     assert!(!stream_hidden_ended(other));
@@ -1222,7 +1367,14 @@ fn stream_methods_dispatch_through_dynamic_method_call() {
 #[test]
 fn callable_stream_constructor_autoinstantiates_passthrough() {
     let ctor = crate::object::bound_native_callable_export_value("stream", "PassThrough");
-    let stream = unsafe { crate::closure::js_native_call_value(ctor, std::ptr::null(), 0) };
+    let stream = unsafe {
+        crate::closure::js_native_call_value(
+            ctor,
+            crate::closure::plain_call_receiver(),
+            std::ptr::null(),
+            0,
+        )
+    };
 
     assert!(raw_ptr_from_value(stream) >= 0x10000);
     assert!(get_hidden_value(stream, hidden_readable_flag_key()).is_some());
@@ -1243,7 +1395,13 @@ fn readable_pipe_stub_returns_destination_and_rejects_missing_destination() {
     let dest = js_node_stream_writable_new(f64::from_bits(TAG_UNDEFINED));
 
     assert_eq!(
-        ns_pipe2(std::ptr::null(), dest, f64::from_bits(TAG_UNDEFINED)).to_bits(),
+        ns_pipe2(
+            std::ptr::null(),
+            crate::closure::JsThis::UNDEFINED,
+            dest,
+            f64::from_bits(TAG_UNDEFINED)
+        )
+        .to_bits(),
         dest.to_bits()
     );
     assert!(pipe_destination_is_missing(f64::from_bits(TAG_UNDEFINED)));
@@ -1260,7 +1418,14 @@ fn readable_wrap_method_is_present_and_chainable() {
 
     let wrapped = js_node_stream_readable_new(f64::from_bits(TAG_UNDEFINED));
     let args = [wrapped];
-    let result = unsafe { crate::closure::js_native_call_value(wrap, args.as_ptr(), args.len()) };
+    let result = unsafe {
+        crate::closure::js_native_call_value(
+            wrap,
+            crate::closure::plain_call_receiver(),
+            args.as_ptr(),
+            args.len(),
+        )
+    };
     assert_eq!(result.to_bits(), stream.to_bits());
 }
 
@@ -1274,7 +1439,14 @@ fn writable_cork_and_uncork_update_counter_and_return_undefined() {
 
     assert_eq!(writable_corked_count(stream), 0.0);
 
-    let ret = unsafe { crate::closure::js_native_call_value(cork, std::ptr::null(), 0) };
+    let ret = unsafe {
+        crate::closure::js_native_call_value(
+            cork,
+            crate::closure::plain_call_receiver(),
+            std::ptr::null(),
+            0,
+        )
+    };
     assert_eq!(ret.to_bits(), TAG_UNDEFINED);
     assert_eq!(writable_corked_count(stream), 1.0);
     assert_eq!(
@@ -1282,15 +1454,36 @@ fn writable_cork_and_uncork_update_counter_and_return_undefined() {
         1.0
     );
 
-    let ret = unsafe { crate::closure::js_native_call_value(cork, std::ptr::null(), 0) };
+    let ret = unsafe {
+        crate::closure::js_native_call_value(
+            cork,
+            crate::closure::plain_call_receiver(),
+            std::ptr::null(),
+            0,
+        )
+    };
     assert_eq!(ret.to_bits(), TAG_UNDEFINED);
     assert_eq!(writable_corked_count(stream), 2.0);
 
-    let ret = unsafe { crate::closure::js_native_call_value(uncork, std::ptr::null(), 0) };
+    let ret = unsafe {
+        crate::closure::js_native_call_value(
+            uncork,
+            crate::closure::plain_call_receiver(),
+            std::ptr::null(),
+            0,
+        )
+    };
     assert_eq!(ret.to_bits(), TAG_UNDEFINED);
     assert_eq!(writable_corked_count(stream), 1.0);
 
-    let ret = unsafe { crate::closure::js_native_call_value(uncork, std::ptr::null(), 0) };
+    let ret = unsafe {
+        crate::closure::js_native_call_value(
+            uncork,
+            crate::closure::plain_call_receiver(),
+            std::ptr::null(),
+            0,
+        )
+    };
     assert_eq!(ret.to_bits(), TAG_UNDEFINED);
     assert_eq!(writable_corked_count(stream), 0.0);
 
@@ -1301,7 +1494,14 @@ fn writable_cork_and_uncork_update_counter_and_return_undefined() {
     assert_eq!(ret.to_bits(), TAG_UNDEFINED);
     assert_eq!(js_node_stream_method_writable_corked(handle), 0.0);
 
-    let ret = unsafe { crate::closure::js_native_call_value(uncork, std::ptr::null(), 0) };
+    let ret = unsafe {
+        crate::closure::js_native_call_value(
+            uncork,
+            crate::closure::plain_call_receiver(),
+            std::ptr::null(),
+            0,
+        )
+    };
     assert_eq!(ret.to_bits(), TAG_UNDEFINED);
     assert_eq!(writable_corked_count(stream), 0.0);
 }

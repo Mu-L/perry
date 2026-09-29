@@ -7,7 +7,11 @@ use crate::gc::{RuntimeHandle, RuntimeHandleScope};
 use crate::object::{js_object_alloc, js_object_set_field_by_name};
 use crate::value::{js_nanbox_pointer, JSValue};
 
-extern "C" fn ignore(_closure: *const ClosureHeader, _value: f64) -> f64 {
+extern "C" fn ignore(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    _value: f64,
+) -> f64 {
     undefined()
 }
 
@@ -96,16 +100,20 @@ fn register(plugin: f64) -> f64 {
         b"config",
         js_nanbox_pointer(js_object_alloc(0, 0) as i64),
     );
-    let previous = scope.root_nanbox_f64(crate::object::js_implicit_this_set(if is_function {
-        undefined()
-    } else {
-        plugin.get_nanbox_f64()
-    }));
     let result = crate::exception::catch_js_throw(|| unsafe {
         let args = [build.get_nanbox_f64()];
-        crate::closure::js_native_call_value(setup.get_nanbox_f64(), args.as_ptr(), 1)
+        let receiver = if is_function {
+            undefined()
+        } else {
+            plugin.get_nanbox_f64()
+        };
+        crate::closure::native_call_value_this(
+            setup.get_nanbox_f64(),
+            crate::closure::JsThis::from_f64(receiver),
+            args.as_ptr(),
+            1,
+        )
     });
-    crate::object::js_implicit_this_set(previous.get_nanbox_f64());
     let result = match result {
         Ok(value) => value,
         Err(error) => crate::exception::js_throw(error),
@@ -127,17 +135,25 @@ mod tests {
     static SETUP_CALLS: AtomicU32 = AtomicU32::new(0);
     static LOADER_CALLS: AtomicU32 = AtomicU32::new(0);
 
-    fn closure(func: extern "C" fn(*const ClosureHeader, f64) -> f64) -> f64 {
+    fn closure(func: crate::closure::body_call::js_body_fn_ty!(a)) -> f64 {
         js_register_closure_arity(func as *const u8, 1);
         js_nanbox_pointer(js_closure_alloc(func as *const u8, 0) as i64)
     }
 
-    extern "C" fn loader(_closure: *const ClosureHeader, _args: f64) -> f64 {
+    extern "C" fn loader(
+        _closure: *const ClosureHeader,
+        _this: crate::closure::JsThis,
+        _args: f64,
+    ) -> f64 {
         LOADER_CALLS.fetch_add(1, Ordering::SeqCst);
         undefined()
     }
 
-    extern "C" fn setup(_closure: *const ClosureHeader, build: f64) -> f64 {
+    extern "C" fn setup(
+        _closure: *const ClosureHeader,
+        _this: crate::closure::JsThis,
+        build: f64,
+    ) -> f64 {
         SETUP_CALLS.fetch_add(1, Ordering::SeqCst);
         let scope = RuntimeHandleScope::new();
         let build = scope.root_nanbox_f64(build);
@@ -153,7 +169,14 @@ mod tests {
         ] {
             let hook = object_field(build.get_nanbox_f64(), name).expect("builder hook");
             let args = [undefined(), callback.get_nanbox_f64()];
-            let result = unsafe { crate::closure::js_native_call_value(hook, args.as_ptr(), 2) };
+            let result = unsafe {
+                crate::closure::js_native_call_value(
+                    hook,
+                    crate::closure::plain_call_receiver(),
+                    args.as_ptr(),
+                    2,
+                )
+            };
             assert_eq!(result.to_bits(), undefined().to_bits());
         }
         assert!(object_field(build.get_nanbox_f64(), b"config").is_some());
@@ -193,7 +216,11 @@ mod tests {
         assert_eq!(LOADER_CALLS.load(Ordering::SeqCst), 0);
     }
 
-    extern "C" fn async_setup(_closure: *const ClosureHeader, _build: f64) -> f64 {
+    extern "C" fn async_setup(
+        _closure: *const ClosureHeader,
+        _this: crate::closure::JsThis,
+        _build: f64,
+    ) -> f64 {
         js_nanbox_pointer(crate::promise::js_promise_resolved(42.0) as i64)
     }
 
@@ -219,7 +246,14 @@ mod tests {
         let raw = JSValue::from_bits(value.get_nanbox_f64().to_bits()).as_pointer::<u8>();
         let clear = crate::closure::closure_get_dynamic_prop(raw as usize, "clearAll");
         assert!(!crate::fs::extract_closure_ptr(clear).is_null());
-        let result = unsafe { crate::closure::js_native_call_value(clear, std::ptr::null(), 0) };
+        let result = unsafe {
+            crate::closure::js_native_call_value(
+                clear,
+                crate::closure::plain_call_receiver(),
+                std::ptr::null(),
+                0,
+            )
+        };
         assert_eq!(result.to_bits(), undefined().to_bits());
     }
 }

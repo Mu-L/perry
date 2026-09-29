@@ -740,9 +740,12 @@ pub(crate) unsafe fn js_wasi_init_subclass(this_box: f64, options: f64) {
 }
 
 #[no_mangle]
-pub extern "C" fn js_wasi_get_import_object(_closure: *const ClosureHeader) -> f64 {
+pub extern "C" fn js_wasi_get_import_object(
+    _closure: *const ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
     let scope = crate::gc::RuntimeHandleScope::new();
-    let this = scope.root_nanbox_f64(crate::object::js_implicit_this_get());
+    let this = scope.root_nanbox_f64(this.as_f64());
     if heap_object_ptr(this.get_nanbox_f64()).is_none() || !is_wasi_instance(this.get_nanbox_f64())
     {
         let wrapper = scope.root_raw_mut_ptr(crate::object::js_object_alloc(0, 0));
@@ -777,10 +780,14 @@ pub extern "C" fn js_wasi_get_import_object(_closure: *const ClosureHeader) -> f
 }
 
 #[no_mangle]
-pub extern "C" fn js_wasi_start(_closure: *const ClosureHeader, instance: f64) -> f64 {
+pub extern "C" fn js_wasi_start(
+    _closure: *const ClosureHeader,
+    this: crate::closure::JsThis,
+    instance: f64,
+) -> f64 {
     let scope = crate::gc::RuntimeHandleScope::new();
     let instance = scope.root_nanbox_f64(instance);
-    let wasi = scope.root_nanbox_f64(wasi_receiver_or_throw());
+    let wasi = scope.root_nanbox_f64(wasi_receiver_or_throw(this));
     ensure_wasi_not_started(wasi.get_nanbox_f64());
     let import = scope.root_nanbox_f64(wasi_import_or_throw(wasi.get_nanbox_f64()));
     let memory = scope.root_nanbox_f64(instance_export(instance.get_nanbox_f64(), b"memory"));
@@ -800,7 +807,14 @@ pub extern "C" fn js_wasi_start(_closure: *const ClosureHeader, instance: f64) -
         invalid_undefined_property("instance.exports._initialize", initialize)
     }
     WASI_EXIT_CODE.with(|slot| slot.set(None));
-    unsafe { crate::closure::js_native_call_value(start.get_nanbox_f64(), std::ptr::null(), 0) };
+    unsafe {
+        crate::closure::js_native_call_value(
+            start.get_nanbox_f64(),
+            crate::closure::plain_call_receiver(),
+            std::ptr::null(),
+            0,
+        )
+    };
     if let Some(code) = WASI_EXIT_CODE.with(|slot| slot.take()) {
         return code as f64;
     }
@@ -817,10 +831,14 @@ pub extern "C" fn js_wasi_start(_closure: *const ClosureHeader, instance: f64) -
 }
 
 #[no_mangle]
-pub extern "C" fn js_wasi_initialize(_closure: *const ClosureHeader, instance: f64) -> f64 {
+pub extern "C" fn js_wasi_initialize(
+    _closure: *const ClosureHeader,
+    this: crate::closure::JsThis,
+    instance: f64,
+) -> f64 {
     let scope = crate::gc::RuntimeHandleScope::new();
     let instance = scope.root_nanbox_f64(instance);
-    let wasi = scope.root_nanbox_f64(wasi_receiver_or_throw());
+    let wasi = scope.root_nanbox_f64(wasi_receiver_or_throw(this));
     ensure_wasi_not_started(wasi.get_nanbox_f64());
     let import = scope.root_nanbox_f64(wasi_import_or_throw(wasi.get_nanbox_f64()));
     let memory = scope.root_nanbox_f64(instance_export(instance.get_nanbox_f64(), b"memory"));
@@ -843,7 +861,12 @@ pub extern "C" fn js_wasi_initialize(_closure: *const ClosureHeader, instance: f
     }
     if !is_undefined(initialize.get_nanbox_f64()) {
         unsafe {
-            crate::closure::js_native_call_value(initialize.get_nanbox_f64(), std::ptr::null(), 0)
+            crate::closure::js_native_call_value(
+                initialize.get_nanbox_f64(),
+                crate::closure::plain_call_receiver(),
+                std::ptr::null(),
+                0,
+            )
         };
     }
     undefined()
@@ -852,6 +875,7 @@ pub extern "C" fn js_wasi_initialize(_closure: *const ClosureHeader, instance: f
 #[no_mangle]
 pub extern "C" fn js_wasi_finalize_bindings(
     _closure: *const ClosureHeader,
+    this: crate::closure::JsThis,
     instance: f64,
     rest: f64,
 ) -> f64 {
@@ -862,7 +886,10 @@ pub extern "C" fn js_wasi_finalize_bindings(
     // accepting the optional second argument.
     let options = rest_argument(rest, 0);
     let override_memory = scope.root_nanbox_f64(finalize_memory_option(options));
-    let wasi = scope.root_nanbox_f64(wasi_receiver_or_throw_with_code("ERR_INVALID_ARG_TYPE"));
+    let wasi = scope.root_nanbox_f64(wasi_receiver_or_throw_with_code(
+        "ERR_INVALID_ARG_TYPE",
+        this,
+    ));
     ensure_wasi_not_started(wasi.get_nanbox_f64());
     let import = scope.root_nanbox_f64(wasi_import_or_throw(wasi.get_nanbox_f64()));
     let exported_memory =
@@ -879,12 +906,12 @@ pub extern "C" fn js_wasi_finalize_bindings(
     undefined()
 }
 
-fn wasi_receiver_or_throw() -> f64 {
-    wasi_receiver_or_throw_with_code("")
+fn wasi_receiver_or_throw(this: crate::closure::JsThis) -> f64 {
+    wasi_receiver_or_throw_with_code("", this)
 }
 
-fn wasi_receiver_or_throw_with_code(code: &'static str) -> f64 {
-    let this = crate::object::js_implicit_this_get();
+fn wasi_receiver_or_throw_with_code(code: &'static str, this: crate::closure::JsThis) -> f64 {
+    let this = this.as_f64();
     if heap_object_ptr(this).is_none() {
         type_error_with_code("Value of \"this\" must be of type WASI", code);
     }
@@ -1002,8 +1029,8 @@ fn finalize_memory_option(options: f64) -> f64 {
     object_field(options, b"memory")
 }
 
-fn import_from_closure(closure: *const ClosureHeader) -> f64 {
-    let this = crate::object::js_implicit_this_get();
+fn import_from_closure(this: crate::closure::JsThis, closure: *const ClosureHeader) -> f64 {
+    let this = this.as_f64();
     if let Some(obj) = heap_object_ptr(this) {
         if is_wasi_import_object(obj) {
             return this;
@@ -1140,13 +1167,14 @@ fn import_function_name(closure: *const ClosureHeader) -> &'static str {
 #[no_mangle]
 pub extern "C" fn js_wasi_import_stub(
     closure: *const ClosureHeader,
+    this: crate::closure::JsThis,
     arg0: f64,
     arg1: f64,
     arg2: f64,
     arg3: f64,
 ) -> f64 {
     let scope = crate::gc::RuntimeHandleScope::new();
-    let import = scope.root_nanbox_f64(import_from_closure(closure));
+    let import = scope.root_nanbox_f64(import_from_closure(this, closure));
     match import_function_name(closure).trim_start_matches("bound ") {
         "args_sizes_get" => {
             if !is_undefined(arg2) || argument(arg0).is_none() || argument(arg1).is_none() {

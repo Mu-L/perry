@@ -202,7 +202,10 @@ fn bool_value(value: bool) -> f64 {
     })
 }
 
-extern "C" fn arguments_throw_type_error(_closure: *const crate::closure::ClosureHeader) -> f64 {
+extern "C" fn arguments_throw_type_error(
+    _closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     super::throw_object_type_error(
         b"'caller', 'callee', and 'arguments' properties may not be accessed",
     );
@@ -694,7 +697,7 @@ pub(crate) unsafe fn arguments_object_get_field(
     });
 
     if name == "callee" && state.restricted_callee() {
-        arguments_throw_type_error(std::ptr::null());
+        arguments_throw_type_error(std::ptr::null(), crate::closure::JsThis::UNDEFINED);
     }
     if let Some(box_ptr) = mapped_box {
         let value = crate::r#box::js_box_get(box_ptr);
@@ -706,7 +709,11 @@ pub(crate) unsafe fn arguments_object_get_field(
                 let closure =
                     (acc.get & crate::value::POINTER_MASK) as *const crate::closure::ClosureHeader;
                 if !closure.is_null() {
-                    let value = crate::closure::js_closure_call0(closure);
+                    // An accessor on the arguments object runs with it as `this`.
+                    let this = crate::closure::JsThis::from_f64(crate::value::js_nanbox_pointer(
+                        obj as i64,
+                    ));
+                    let value = crate::closure::js_closure_call0(closure, this);
                     return Some(JSValue::from_bits(value.to_bits()));
                 }
             }
@@ -737,7 +744,7 @@ pub(crate) unsafe fn arguments_object_set_field(
     });
 
     if name == "callee" && state.restricted_callee() {
-        arguments_throw_type_error(std::ptr::null());
+        arguments_throw_type_error(std::ptr::null(), crate::closure::JsThis::UNDEFINED);
     }
     if !super::own_key_present(obj, key) {
         return false;
@@ -747,7 +754,9 @@ pub(crate) unsafe fn arguments_object_set_field(
             let closure =
                 (acc.set & crate::value::POINTER_MASK) as *const crate::closure::ClosureHeader;
             if !closure.is_null() {
-                crate::closure::js_closure_call1(closure, value);
+                let this =
+                    crate::closure::JsThis::from_f64(crate::value::js_nanbox_pointer(obj as i64));
+                crate::closure::js_closure_call1(closure, this, value);
             }
         }
         return true;

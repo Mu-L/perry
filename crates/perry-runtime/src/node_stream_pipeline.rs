@@ -15,7 +15,10 @@ pub(super) struct PipelineOptions {
     pub(super) signal: Option<f64>,
 }
 
-pub(super) extern "C" fn pipeline_success_callback(closure: *const ClosureHeader) -> f64 {
+pub(super) extern "C" fn pipeline_success_callback(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     if closure.is_null() {
         return f64::from_bits(TAG_UNDEFINED);
     }
@@ -30,7 +33,11 @@ pub(super) extern "C" fn pipeline_success_callback(closure: *const ClosureHeader
     f64::from_bits(TAG_UNDEFINED)
 }
 
-pub(super) extern "C" fn pipeline_error_callback(closure: *const ClosureHeader, err: f64) -> f64 {
+pub(super) extern "C" fn pipeline_error_callback(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    err: f64,
+) -> f64 {
     if closure.is_null() {
         return f64::from_bits(TAG_UNDEFINED);
     }
@@ -47,7 +54,10 @@ pub(super) extern "C" fn pipeline_error_callback(closure: *const ClosureHeader, 
     f64::from_bits(TAG_UNDEFINED)
 }
 
-pub(super) extern "C" fn pipeline_close_callback(closure: *const ClosureHeader) -> f64 {
+pub(super) extern "C" fn pipeline_close_callback(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     if closure.is_null() {
         return f64::from_bits(TAG_UNDEFINED);
     }
@@ -480,7 +490,12 @@ pub(super) fn call_pipeline_function_stage(
     }
     let args = [source.get_nanbox_f64()];
     let result = catch_pipeline_throw(|| unsafe {
-        crate::closure::js_native_call_value(stage.get_nanbox_f64(), args.as_ptr(), args.len())
+        crate::closure::js_native_call_value(
+            stage.get_nanbox_f64(),
+            crate::closure::plain_call_receiver(),
+            args.as_ptr(),
+            args.len(),
+        )
     })?;
     settle_pipeline_value_with_origin(result)
 }
@@ -527,7 +542,11 @@ pub(super) fn fail_collected_pipeline(stages: &[f64], callback: f64, err: f64) {
     }
 }
 
-extern "C" fn collected_pipeline_error_noop(_closure: *const ClosureHeader, _err: f64) -> f64 {
+extern "C" fn collected_pipeline_error_noop(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    _err: f64,
+) -> f64 {
     f64::from_bits(TAG_UNDEFINED)
 }
 
@@ -890,6 +909,7 @@ fn fail_composed_duplex(composite: f64, source: f64, stages: f64, err: f64) {
 
 pub(super) extern "C" fn compose_stage_error_callback(
     closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     err: f64,
 ) -> f64 {
     if closure.is_null() {
@@ -904,6 +924,7 @@ pub(super) extern "C" fn compose_stage_error_callback(
 
 pub(super) extern "C" fn compose_source_data_callback(
     closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     chunk: f64,
 ) -> f64 {
     if closure.is_null() {
@@ -922,7 +943,10 @@ pub(super) extern "C" fn compose_source_data_callback(
     f64::from_bits(TAG_UNDEFINED)
 }
 
-pub(super) extern "C" fn compose_source_end_callback(closure: *const ClosureHeader) -> f64 {
+pub(super) extern "C" fn compose_source_end_callback(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     if closure.is_null() {
         return f64::from_bits(TAG_UNDEFINED);
     }
@@ -940,6 +964,7 @@ pub(super) extern "C" fn compose_source_end_callback(closure: *const ClosureHead
 
 pub(super) extern "C" fn compose_source_error_callback(
     closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     err: f64,
 ) -> f64 {
     if closure.is_null() {
@@ -954,6 +979,7 @@ pub(super) extern "C" fn compose_source_error_callback(
 
 pub(super) extern "C" fn compose_duplex_write_callback(
     closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     chunk: f64,
     _encoding: f64,
     cb: f64,
@@ -979,6 +1005,7 @@ pub(super) extern "C" fn compose_duplex_write_callback(
 
 pub(super) extern "C" fn compose_duplex_final_callback(
     closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     cb: f64,
 ) -> f64 {
     if closure.is_null() {
@@ -1215,7 +1242,6 @@ fn new_composed_duplex(stages: &[f64], source: Option<f64>, writable: bool) -> f
                 hidden_key(b"__perryStreamComposePriming"),
                 f64::from_bits(TAG_TRUE),
             );
-            let previous_this = scope.root_nanbox_f64(crate::object::js_implicit_this_get());
             let primed = catch_pipeline_throw(|| {
                 prime_composed_duplex_from_source(
                     composite.get_nanbox_f64(),
@@ -1224,7 +1250,6 @@ fn new_composed_duplex(stages: &[f64], source: Option<f64>, writable: bool) -> f
                 );
                 f64::from_bits(TAG_UNDEFINED)
             });
-            crate::object::js_implicit_this_set(previous_this.get_nanbox_f64());
             if let Err(err) = primed {
                 let err = scope.root_nanbox_f64(err);
                 fail_composed_duplex(

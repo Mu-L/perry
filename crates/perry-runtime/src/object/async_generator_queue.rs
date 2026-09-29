@@ -120,7 +120,7 @@ pub(crate) fn wrap_async_generator_instance(obj: *mut ObjectHeader) {
         (
             b"next".as_slice(),
             &next_h,
-            async_generator_next_wrapper as extern "C" fn(*const ClosureHeader, f64) -> f64,
+            async_generator_next_wrapper as crate::closure::body_call::js_body_fn_ty!(a),
         ),
         (b"return".as_slice(), &ret_h, async_generator_return_wrapper),
         (b"throw".as_slice(), &throw_h, async_generator_throw_wrapper),
@@ -289,15 +289,27 @@ fn original_from_wrapper(closure: *const ClosureHeader) -> *const ClosureHeader 
     js_closure_get_capture_ptr(closure, 1) as *const ClosureHeader
 }
 
-extern "C" fn async_generator_next_wrapper(closure: *const ClosureHeader, arg: f64) -> f64 {
+extern "C" fn async_generator_next_wrapper(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    arg: f64,
+) -> f64 {
     async_generator_request(closure, arg, RequestKind::NextOrThrow)
 }
 
-extern "C" fn async_generator_return_wrapper(closure: *const ClosureHeader, arg: f64) -> f64 {
+extern "C" fn async_generator_return_wrapper(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    arg: f64,
+) -> f64 {
     async_generator_request(closure, arg, RequestKind::Return)
 }
 
-extern "C" fn async_generator_throw_wrapper(closure: *const ClosureHeader, arg: f64) -> f64 {
+extern "C" fn async_generator_throw_wrapper(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    arg: f64,
+) -> f64 {
     async_generator_request(closure, arg, RequestKind::NextOrThrow)
 }
 
@@ -429,6 +441,7 @@ fn make_return_step_wrapper(
 
 extern "C" fn async_generator_return_step_fulfill(
     closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     value: f64,
 ) -> f64 {
     if let Some(state_id) = state_id_from_wrapper(closure) {
@@ -445,6 +458,7 @@ extern "C" fn async_generator_return_step_fulfill(
 
 extern "C" fn async_generator_return_step_reject(
     closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     reason: f64,
 ) -> f64 {
     if let Some(state_id) = state_id_from_wrapper(closure) {
@@ -456,14 +470,21 @@ extern "C" fn async_generator_return_step_reject(
     reason
 }
 
-extern "C" fn async_generator_drain_wrapper(closure: *const ClosureHeader) -> f64 {
+extern "C" fn async_generator_drain_wrapper(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     if let Some(state_id) = state_id_from_wrapper(closure) {
         process_one_queued_request(state_id);
     }
     f64::from_bits(TAG_UNDEFINED)
 }
 
-extern "C" fn async_generator_settle_fulfill(closure: *const ClosureHeader, value: f64) -> f64 {
+extern "C" fn async_generator_settle_fulfill(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    value: f64,
+) -> f64 {
     if let Some(state_id) = state_id_from_wrapper(closure) {
         let out = js_closure_get_capture_ptr(closure, 1) as *mut Promise;
         finish_after_pending_result(state_id, out, true, value);
@@ -471,7 +492,11 @@ extern "C" fn async_generator_settle_fulfill(closure: *const ClosureHeader, valu
     value
 }
 
-extern "C" fn async_generator_settle_reject(closure: *const ClosureHeader, reason: f64) -> f64 {
+extern "C" fn async_generator_settle_reject(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    reason: f64,
+) -> f64 {
     if let Some(state_id) = state_id_from_wrapper(closure) {
         let out = js_closure_get_capture_ptr(closure, 1) as *mut Promise;
         finish_after_pending_result(state_id, out, false, reason);
@@ -485,7 +510,7 @@ fn call_original(original: *const ClosureHeader, arg: f64) -> f64 {
             TAG_UNDEFINED,
         )));
     }
-    js_closure_call1(original, arg)
+    js_closure_call1(original, crate::closure::plain_call_receiver(), arg)
 }
 
 fn after_initial_result(state_id: usize, result: f64) {

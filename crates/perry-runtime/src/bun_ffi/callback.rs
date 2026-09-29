@@ -311,7 +311,10 @@ fn validate_callback_types(ret: u8, args: &[u8]) {
     }
 }
 
-extern "C" fn callback_close_thunk(closure: *const ClosureHeader) -> f64 {
+extern "C" fn callback_close_thunk(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let index = crate::closure::js_closure_get_capture_bits(closure, 0) as usize;
     if let Some(record) = CALLBACKS.lock().unwrap().get_mut(index) {
         close_record(record);
@@ -569,6 +572,7 @@ unsafe fn invoke_record(
     match crate::exception::js_call_catching(|| {
         crate::closure::js_native_call_value(
             callback.get_nanbox_f64(),
+            crate::closure::plain_call_receiver(),
             arguments.as_ptr(),
             arguments.len(),
         )

@@ -214,7 +214,8 @@ fn test_json_reviver_treats_closure_property_as_leaf_after_copied_minor_gc() {
     assert_eq!(stored & TAG_MASK, POINTER_TAG);
     assert_eq!(
         crate::closure::js_closure_call0(
-            (stored & POINTER_MASK) as *const crate::closure::ClosureHeader
+            (stored & POINTER_MASK) as *const crate::closure::ClosureHeader,
+            crate::closure::plain_call_receiver()
         ),
         0.0
     );
@@ -1262,7 +1263,10 @@ impl Drop for RuntimeCallbackRootGuard {
 fn assert_moved_callable_closure(bits: u64, original: usize) {
     let rewritten = assert_moved_closure_ptr(bits, original);
     assert_eq!(
-        crate::closure::js_closure_call0(rewritten as *const crate::closure::ClosureHeader),
+        crate::closure::js_closure_call0(
+            rewritten as *const crate::closure::ClosureHeader,
+            crate::closure::plain_call_receiver()
+        ),
         0.0
     );
 }
@@ -1655,6 +1659,7 @@ thread_local! {
 
 extern "C" fn test_sort_comparator_force_minor_gc(
     _closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     a: f64,
     b: f64,
 ) -> f64 {
@@ -1747,7 +1752,10 @@ fn test_array_sort_comparator_rooted_buffers_survive_copied_minor_gc() {
     }
 }
 
-extern "C" fn test_tojson_force_minor_gc(_closure: *const crate::closure::ClosureHeader) -> f64 {
+extern "C" fn test_tojson_force_minor_gc(
+    _closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let _ = crate::gc::gc_collect_minor();
     test_string_value(b"tojson-out")
 }
@@ -1864,6 +1872,7 @@ fn test_json_stringify_array_rederives_elements_after_tojson_minor_gc() {
 
 extern "C" fn test_replacer_force_minor_gc(
     _closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     matched: f64,
     _offset: f64,
     _whole: f64,
@@ -1912,6 +1921,7 @@ fn test_string_replace_all_fn_rederives_subject_after_callback_minor_gc() {
 
 extern "C" fn test_bigint_comparator_force_minor_gc(
     _closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     a: f64,
     b: f64,
 ) -> f64 {

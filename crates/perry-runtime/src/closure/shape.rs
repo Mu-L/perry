@@ -470,10 +470,10 @@ mod tests {
         closure_set_dynamic_prop, closure_set_static_prototype, js_closure_alloc,
     };
 
-    extern "C" fn plain_body(_c: *const ClosureHeader) -> f64 {
+    extern "C" fn plain_body(_c: *const ClosureHeader, _this: crate::closure::JsThis) -> f64 {
         1.0
     }
-    extern "C" fn async_body(_c: *const ClosureHeader) -> f64 {
+    extern "C" fn async_body(_c: *const ClosureHeader, _this: crate::closure::JsThis) -> f64 {
         2.0
     }
 
@@ -481,7 +481,7 @@ mod tests {
         shapes::shape_object_kind_by_id(unsafe { (*c).shape_id })
     }
 
-    fn fresh(body: extern "C" fn(*const ClosureHeader) -> f64) -> *mut ClosureHeader {
+    fn fresh(body: crate::closure::body_call::js_body_fn_ty!()) -> *mut ClosureHeader {
         js_closure_alloc(body as *const u8, 0)
     }
 
@@ -619,7 +619,13 @@ mod tests {
         assert!(crate::closure::is_closure_ptr(fresh(plain_body) as usize));
     }
 
-    extern "C" fn three_arg_body(_c: *const ClosureHeader, a: f64, b: f64, c: f64) -> f64 {
+    extern "C" fn three_arg_body(
+        _c: *const ClosureHeader,
+        _this: crate::closure::JsThis,
+        a: f64,
+        b: f64,
+        c: f64,
+    ) -> f64 {
         a + b + c
     }
 
@@ -653,7 +659,12 @@ mod tests {
             "target, this, partial args, name snapshot, bound length"
         );
         // The bound call still sees target + partial args + call args.
-        let r = crate::closure::js_closure_call2(b as *const ClosureHeader, 2.0, 3.0);
+        let r = crate::closure::js_closure_call2(
+            b as *const ClosureHeader,
+            crate::closure::plain_call_receiver(),
+            2.0,
+            3.0,
+        );
         assert_eq!(r, 6.0);
     }
 

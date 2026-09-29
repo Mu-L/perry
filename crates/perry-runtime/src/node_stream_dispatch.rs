@@ -12,19 +12,19 @@ use crate::value::JSValue;
 pub(crate) type StubFn = unsafe extern "C" fn();
 
 #[allow(clippy::missing_transmute_annotations)]
-pub(crate) fn cast0(f: extern "C" fn(*const ClosureHeader) -> f64) -> StubFn {
+pub(crate) fn cast0(f: crate::closure::body_call::js_body_fn_ty!()) -> StubFn {
     unsafe { std::mem::transmute(f) }
 }
 #[allow(clippy::missing_transmute_annotations)]
-pub(crate) fn cast1(f: extern "C" fn(*const ClosureHeader, f64) -> f64) -> StubFn {
+pub(crate) fn cast1(f: crate::closure::body_call::js_body_fn_ty!(a)) -> StubFn {
     unsafe { std::mem::transmute(f) }
 }
 #[allow(clippy::missing_transmute_annotations)]
-pub(crate) fn cast2(f: extern "C" fn(*const ClosureHeader, f64, f64) -> f64) -> StubFn {
+pub(crate) fn cast2(f: crate::closure::body_call::js_body_fn_ty!(a, a)) -> StubFn {
     unsafe { std::mem::transmute(f) }
 }
 #[allow(clippy::missing_transmute_annotations)]
-pub(super) fn cast3(f: extern "C" fn(*const ClosureHeader, f64, f64, f64) -> f64) -> StubFn {
+pub(super) fn cast3(f: crate::closure::body_call::js_body_fn_ty!(a, a, a)) -> StubFn {
     unsafe { std::mem::transmute(f) }
 }
 
@@ -309,8 +309,9 @@ fn event_emitter_async_resource_backing(receiver: f64) -> Option<EventEmitterAsy
 
 fn require_event_emitter_async_resource_receiver(
     closure: *const ClosureHeader,
+    this: crate::closure::JsThis,
 ) -> EventEmitterAsyncResourceBacking {
-    if let Some(backing) = event_emitter_async_resource_backing(this_value(closure)) {
+    if let Some(backing) = event_emitter_async_resource_backing(this_value(closure, this)) {
         return backing;
     }
     crate::node_submodules::diagnostics::throw_type_error_no_code(
@@ -320,10 +321,11 @@ fn require_event_emitter_async_resource_receiver(
 
 extern "C" fn ns_ee_async_resource_emit_rest(
     closure: *const ClosureHeader,
+    this: crate::closure::JsThis,
     event: f64,
     rest: f64,
 ) -> f64 {
-    let backing = require_event_emitter_async_resource_receiver(closure);
+    let backing = require_event_emitter_async_resource_receiver(closure, this);
     let runtime_async_id = match backing {
         EventEmitterAsyncResourceBacking::RuntimeResource(resource) => {
             crate::async_hooks::js_async_resource_async_id(resource) as u64
@@ -333,15 +335,18 @@ extern "C" fn ns_ee_async_resource_emit_rest(
     if runtime_async_id != 0 {
         crate::async_hooks::js_async_hooks_provider_enter(runtime_async_id);
     }
-    let result = ns_emit_rest(closure, event, rest);
+    let result = ns_emit_rest(closure, this, event, rest);
     if runtime_async_id != 0 {
         crate::async_hooks::js_async_hooks_provider_leave(runtime_async_id);
     }
     result
 }
 
-extern "C" fn ns_ee_async_resource_destroy(closure: *const ClosureHeader) -> f64 {
-    match require_event_emitter_async_resource_receiver(closure) {
+extern "C" fn ns_ee_async_resource_destroy(
+    closure: *const ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
+    match require_event_emitter_async_resource_receiver(closure, this) {
         EventEmitterAsyncResourceBacking::ExternalEmitter(handle) => {
             crate::object::event_emitter_async_resource_dispatch()
                 .map(|dispatch| unsafe { dispatch(handle, 3) })
@@ -353,9 +358,12 @@ extern "C" fn ns_ee_async_resource_destroy(closure: *const ClosureHeader) -> f64
     }
 }
 
-extern "C" fn ns_ee_async_resource_getter(closure: *const ClosureHeader) -> f64 {
+extern "C" fn ns_ee_async_resource_getter(
+    closure: *const ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
     let operation = crate::closure::js_closure_get_capture_ptr(closure, 1) as u32;
-    match require_event_emitter_async_resource_receiver(closure) {
+    match require_event_emitter_async_resource_receiver(closure, this) {
         EventEmitterAsyncResourceBacking::ExternalEmitter(handle) => {
             crate::object::event_emitter_async_resource_dispatch()
                 .map(|dispatch| unsafe { dispatch(handle, operation) })

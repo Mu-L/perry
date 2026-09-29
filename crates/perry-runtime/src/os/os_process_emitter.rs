@@ -148,6 +148,7 @@ fn listener_lookup_ptr(listener_bits: i64) -> *const crate::closure::ClosureHead
 
 extern "C" fn process_once_raw_wrapper(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     rest_args: f64,
 ) -> f64 {
     if closure.is_null() {
@@ -165,13 +166,23 @@ extern "C" fn process_once_raw_wrapper(
     let rest_jv = crate::value::JSValue::from_bits(rest_args.to_bits());
     if !rest_jv.is_pointer() {
         return unsafe {
-            crate::closure::js_closure_call_array(target_ptr as i64, std::ptr::null(), 0)
+            crate::closure::js_closure_call_array(
+                target_ptr as i64,
+                crate::closure::plain_call_receiver(),
+                std::ptr::null(),
+                0,
+            )
         };
     }
     let arr = rest_jv.as_pointer::<ArrayHeader>();
     if arr.is_null() {
         return unsafe {
-            crate::closure::js_closure_call_array(target_ptr as i64, std::ptr::null(), 0)
+            crate::closure::js_closure_call_array(
+                target_ptr as i64,
+                crate::closure::plain_call_receiver(),
+                std::ptr::null(),
+                0,
+            )
         };
     }
     let len = crate::array::js_array_length(arr) as usize;
@@ -180,7 +191,12 @@ extern "C" fn process_once_raw_wrapper(
         args.push(crate::array::js_array_get_f64(arr, i as u32));
     }
     unsafe {
-        crate::closure::js_closure_call_array(target_ptr as i64, args.as_ptr(), args.len() as i64)
+        crate::closure::js_closure_call_array(
+            target_ptr as i64,
+            crate::closure::plain_call_receiver(),
+            args.as_ptr(),
+            args.len() as i64,
+        )
     }
 }
 
@@ -378,6 +394,7 @@ pub(crate) fn emit_process_event(event: &str, args: &[f64]) -> bool {
         unsafe {
             crate::closure::js_closure_call_array(
                 listener.callback as i64,
+                crate::closure::plain_call_receiver(),
                 args.as_ptr(),
                 args.len() as i64,
             );

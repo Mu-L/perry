@@ -21,6 +21,7 @@ use super::*;
 /// RELOCATED rather than freed.
 extern "C" fn test_thenable_then_force_minor_gc(
     _closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     resolve: f64,
     _reject: f64,
 ) -> f64 {
@@ -31,6 +32,7 @@ extern "C" fn test_thenable_then_force_minor_gc(
     unsafe {
         crate::closure::js_native_call_value(
             resolve_handle.get_nanbox_f64(),
+            crate::closure::plain_call_receiver(),
             args.as_ptr(),
             args.len(),
         );

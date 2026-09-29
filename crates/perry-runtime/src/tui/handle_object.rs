@@ -209,8 +209,7 @@ pub(crate) fn tui_widget_id_from_bits(bits: u64) -> i64 {
 }
 
 /// `(kind, id)` for a NaN-boxed JS value. The prototype thunks resolve their
-/// receiver through this, since `js_implicit_this_get` hands back a boxed
-/// value.
+/// receiver (their `this` parameter, a boxed value) through this.
 fn tui_handle_parts_value(value: f64) -> Option<(TuiKind, i64)> {
     let bits = value.to_bits();
     if (bits & crate::value::TAG_MASK) != crate::value::POINTER_TAG {
@@ -227,8 +226,8 @@ fn tui_handle_parts_value(value: f64) -> Option<(TuiKind, i64)> {
 /// timer methods, and the one that cannot turn a working program into a
 /// throwing one. It is never read as an id of this kind: that is what the
 /// class-id brand prevents.
-fn receiver_id(kind: TuiKind) -> Option<i64> {
-    let this = crate::object::js_implicit_this_get();
+fn receiver_id(this: crate::closure::JsThis, kind: TuiKind) -> Option<i64> {
+    let this = this.as_f64();
     match tui_handle_parts_value(this) {
         Some((k, id)) if k == kind => Some(id),
         _ => None,
@@ -237,43 +236,63 @@ fn receiver_id(kind: TuiKind) -> Option<i64> {
 
 const UNDEFINED: u64 = crate::value::TAG_UNDEFINED;
 
-extern "C" fn state_proto_get_thunk(_c: *const crate::closure::ClosureHeader) -> f64 {
-    match receiver_id(TuiKind::State) {
+extern "C" fn state_proto_get_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
+    match receiver_id(this, TuiKind::State) {
         Some(id) => super::state::state_get_by_id(id),
         None => f64::from_bits(UNDEFINED),
     }
 }
 
-extern "C" fn state_proto_set_thunk(_c: *const crate::closure::ClosureHeader, value: f64) -> f64 {
-    if let Some(id) = receiver_id(TuiKind::State) {
+extern "C" fn state_proto_set_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+    value: f64,
+) -> f64 {
+    if let Some(id) = receiver_id(this, TuiKind::State) {
         super::state::state_set_by_id(id, value);
     }
     f64::from_bits(UNDEFINED)
 }
 
-extern "C" fn ref_proto_get_thunk(_c: *const crate::closure::ClosureHeader) -> f64 {
-    match receiver_id(TuiKind::RefBox) {
+extern "C" fn ref_proto_get_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
+    match receiver_id(this, TuiKind::RefBox) {
         Some(id) => super::hooks::ref_get_by_id(id),
         None => f64::from_bits(UNDEFINED),
     }
 }
 
-extern "C" fn ref_proto_set_thunk(_c: *const crate::closure::ClosureHeader, value: f64) -> f64 {
-    if let Some(id) = receiver_id(TuiKind::RefBox) {
+extern "C" fn ref_proto_set_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+    value: f64,
+) -> f64 {
+    if let Some(id) = receiver_id(this, TuiKind::RefBox) {
         super::hooks::ref_set_by_id(id, value);
     }
     f64::from_bits(UNDEFINED)
 }
 
-extern "C" fn app_proto_exit_thunk(_c: *const crate::closure::ClosureHeader) -> f64 {
-    if receiver_id(TuiKind::App).is_some() {
+extern "C" fn app_proto_exit_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
+    if receiver_id(this, TuiKind::App).is_some() {
         super::input::EXIT_FLAG.store(true, Ordering::Release);
     }
     f64::from_bits(UNDEFINED)
 }
 
-extern "C" fn app_proto_wait_until_exit_thunk(_c: *const crate::closure::ClosureHeader) -> f64 {
-    if receiver_id(TuiKind::App).is_some() {
+extern "C" fn app_proto_wait_until_exit_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
+    if receiver_id(this, TuiKind::App).is_some() {
         super::hooks::wait_until_exit_blocking();
     }
     f64::from_bits(UNDEFINED)
@@ -281,45 +300,62 @@ extern "C" fn app_proto_wait_until_exit_thunk(_c: *const crate::closure::Closure
 
 extern "C" fn stdout_proto_write_thunk(
     _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     value: f64,
 ) -> f64 {
-    if receiver_id(TuiKind::Stdout).is_some() {
+    if receiver_id(this, TuiKind::Stdout).is_some() {
         let s = crate::value::js_jsvalue_to_string_coerce(value);
         super::hooks::stdout_write_string_ptr(s);
     }
     f64::from_bits(UNDEFINED)
 }
 
-extern "C" fn stdout_proto_columns_thunk(_c: *const crate::closure::ClosureHeader) -> f64 {
-    match receiver_id(TuiKind::Stdout) {
+extern "C" fn stdout_proto_columns_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
+    match receiver_id(this, TuiKind::Stdout) {
         Some(_) => super::hooks::js_perry_tui_stdout_columns(0),
         None => f64::from_bits(UNDEFINED),
     }
 }
 
-extern "C" fn stdout_proto_rows_thunk(_c: *const crate::closure::ClosureHeader) -> f64 {
-    match receiver_id(TuiKind::Stdout) {
+extern "C" fn stdout_proto_rows_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
+    match receiver_id(this, TuiKind::Stdout) {
         Some(_) => super::hooks::js_perry_tui_stdout_rows(0),
         None => f64::from_bits(UNDEFINED),
     }
 }
 
-extern "C" fn focus_proto_next_thunk(_c: *const crate::closure::ClosureHeader) -> f64 {
-    if receiver_id(TuiKind::FocusManager).is_some() {
+extern "C" fn focus_proto_next_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
+    if receiver_id(this, TuiKind::FocusManager).is_some() {
         super::hooks::js_perry_tui_focus_next();
     }
     f64::from_bits(UNDEFINED)
 }
 
-extern "C" fn focus_proto_previous_thunk(_c: *const crate::closure::ClosureHeader) -> f64 {
-    if receiver_id(TuiKind::FocusManager).is_some() {
+extern "C" fn focus_proto_previous_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
+    if receiver_id(this, TuiKind::FocusManager).is_some() {
         super::hooks::js_perry_tui_focus_previous();
     }
     f64::from_bits(UNDEFINED)
 }
 
-extern "C" fn focus_proto_focus_thunk(_c: *const crate::closure::ClosureHeader, id: f64) -> f64 {
-    if receiver_id(TuiKind::FocusManager).is_some() {
+extern "C" fn focus_proto_focus_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+    id: f64,
+) -> f64 {
+    if receiver_id(this, TuiKind::FocusManager).is_some() {
         super::hooks::js_perry_tui_focus(id);
     }
     f64::from_bits(UNDEFINED)

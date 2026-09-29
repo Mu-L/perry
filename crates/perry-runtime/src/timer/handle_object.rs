@@ -142,30 +142,39 @@ fn throw_timer_type_error(message: &[u8]) -> ! {
 /// So a foreign receiver is answered, not refused — the opposite of the text
 /// family, whose WebIDL accessors throw. Each thunk below returns node's answer
 /// for `None` and never touches timer state in that case.
-fn timer_receiver() -> (f64, Option<i64>) {
-    let this = crate::object::js_implicit_this_get();
+fn timer_receiver(this: crate::closure::JsThis) -> (f64, Option<i64>) {
+    let this = this.as_f64();
     let id = timer_handle_id(this);
     (this, id)
 }
 
-extern "C" fn timer_proto_ref_thunk(_c: *const crate::closure::ClosureHeader) -> f64 {
-    let (this, id) = timer_receiver();
+extern "C" fn timer_proto_ref_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
+    let (this, id) = timer_receiver(_this);
     if let Some(id) = id {
         js_timer_ref(id);
     }
     this
 }
 
-extern "C" fn timer_proto_unref_thunk(_c: *const crate::closure::ClosureHeader) -> f64 {
-    let (this, id) = timer_receiver();
+extern "C" fn timer_proto_unref_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
+    let (this, id) = timer_receiver(_this);
     if let Some(id) = id {
         js_timer_unref(id);
     }
     this
 }
 
-extern "C" fn timer_proto_has_ref_thunk(_c: *const crate::closure::ClosureHeader) -> f64 {
-    let (_, id) = timer_receiver();
+extern "C" fn timer_proto_has_ref_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
+    let (_, id) = timer_receiver(this);
     match id {
         Some(id) if js_timer_has_ref(id) != 0 => {
             f64::from_bits(crate::value::JSValue::bool(true).bits())
@@ -176,8 +185,11 @@ extern "C" fn timer_proto_has_ref_thunk(_c: *const crate::closure::ClosureHeader
     }
 }
 
-extern "C" fn timer_proto_refresh_thunk(_c: *const crate::closure::ClosureHeader) -> f64 {
-    let (this, id) = timer_receiver();
+extern "C" fn timer_proto_refresh_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
+    let (this, id) = timer_receiver(_this);
     if let Some(id) = id {
         js_timer_refresh(id);
     }
@@ -293,8 +305,11 @@ fn clear_every_kind(id: i64) {
     clearImmediate(id);
 }
 
-extern "C" fn timer_proto_close_thunk(_c: *const crate::closure::ClosureHeader) -> f64 {
-    let (this, id) = timer_receiver();
+extern "C" fn timer_proto_close_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
+    let (this, id) = timer_receiver(_this);
     if let Some(id) = id {
         clear_every_kind(id);
     }
@@ -302,8 +317,11 @@ extern "C" fn timer_proto_close_thunk(_c: *const crate::closure::ClosureHeader) 
 }
 
 /// `t[Symbol.dispose]()` — `using t = setTimeout(...)` clears the timer (#1213).
-extern "C" fn timer_proto_dispose_thunk(_c: *const crate::closure::ClosureHeader) -> f64 {
-    let (_, id) = timer_receiver();
+extern "C" fn timer_proto_dispose_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
+    let (_, id) = timer_receiver(this);
     if let Some(id) = id {
         clear_every_kind(id);
     }
@@ -315,9 +333,10 @@ extern "C" fn timer_proto_dispose_thunk(_c: *const crate::closure::ClosureHeader
 /// conversion, so `+setImmediate(...)` must stay `NaN` (#10542).
 extern "C" fn timer_proto_to_primitive_thunk(
     _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     _hint: f64,
 ) -> f64 {
-    let (_, id) = timer_receiver();
+    let (_, id) = timer_receiver(this);
     match id {
         Some(id) => id as f64,
         None => f64::from_bits(crate::value::TAG_UNDEFINED),
@@ -328,7 +347,11 @@ extern "C" fn timer_proto_to_primitive_thunk(
 /// is not usable directly. This stands in for it so `t.constructor.name` is
 /// answered by an ordinary prototype property instead of the fabricated
 /// `{ name }` object the handle path had to synthesize per read.
-extern "C" fn timer_ctor_thunk(_c: *const crate::closure::ClosureHeader, _a: f64) -> f64 {
+extern "C" fn timer_ctor_thunk(
+    _c: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+    _a: f64,
+) -> f64 {
     throw_timer_type_error(b"Timeout is not a constructor")
 }
 

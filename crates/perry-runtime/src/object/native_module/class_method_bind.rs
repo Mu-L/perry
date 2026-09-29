@@ -78,7 +78,7 @@ pub extern "C" fn js_class_method_bind(
     // `class_prototype_method_value_for_name` instead of minting a fresh
     // per-receiver closure here. The canonical captures the OWNER class's
     // prototype-ref (capture 0); `dispatch_bound_method` recognises that marker
-    // and supplies the call-site `this` (IMPLICIT_THIS) so invocations still see
+    // and supplies the call-site `this` argument so invocations still see
     // the right receiver — e.g. the `this.m = this.m.bind(this)` idiom rebinds
     // correctly, and a bare `const f = c.m; f()` runs with the spec `this`.
     //

@@ -24,7 +24,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::closure::{
-    js_closure_alloc, js_closure_call0, js_closure_call1, js_closure_call2, js_closure_call_array,
+    js_closure_alloc, js_closure_call0, js_closure_call1, js_closure_call2,
     js_closure_get_capture_ptr, js_closure_set_capture_ptr, js_register_closure_arity,
     ClosureHeader,
 };
@@ -48,9 +48,9 @@ struct ExportSpec {
 }
 
 enum ExportThunk {
-    Fn1(extern "C" fn(*const ClosureHeader, f64) -> f64),
-    Fn2(extern "C" fn(*const ClosureHeader, f64, f64) -> f64),
-    Fn3(extern "C" fn(*const ClosureHeader, f64, f64, f64) -> f64),
+    Fn1(crate::closure::body_call::js_body_fn_ty!(a)),
+    Fn2(crate::closure::body_call::js_body_fn_ty!(a, a)),
+    Fn3(crate::closure::body_call::js_body_fn_ty!(a, a, a)),
 }
 
 impl ExportThunk {
@@ -96,6 +96,7 @@ macro_rules! thunk {
         #[allow(non_snake_case)] // thunk name mirrors JS API surface
         pub(crate) extern "C" fn $name(
             _closure: *const crate::closure::ClosureHeader,
+            _this: crate::closure::JsThis,
             _arg: f64,
         ) -> f64 {
             let msg: &'static str = $msg;
@@ -197,6 +198,7 @@ thunk!(
 
 extern "C" fn thunk_vm_create_context(
     _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     sandbox: f64,
     options: f64,
 ) -> f64 {

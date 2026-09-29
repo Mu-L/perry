@@ -336,7 +336,12 @@ fn generator_receiver_type_error_value(method: &[u8]) -> f64 {
 /// `is_async` selects the spec's incompatible-receiver behaviour: sync
 /// generators throw a `TypeError` synchronously, async generators return a
 /// rejected promise (their methods always return promises). (#3664)
-fn generator_proto_method(method: &[u8], arg: f64, is_async: bool) -> f64 {
+fn generator_proto_method(
+    this: crate::closure::JsThis,
+    method: &[u8],
+    arg: f64,
+    is_async: bool,
+) -> f64 {
     let bad_receiver = |method: &[u8]| -> f64 {
         let errv = generator_receiver_type_error_value(method);
         if is_async {
@@ -346,7 +351,7 @@ fn generator_proto_method(method: &[u8], arg: f64, is_async: bool) -> f64 {
             crate::exception::js_throw(errv)
         }
     };
-    let this = crate::object::js_implicit_this_get();
+    let this = this.as_f64();
     let jv = JSValue::from_bits(this.to_bits());
     if !jv.is_pointer() {
         return bad_receiver(method);
@@ -390,46 +395,56 @@ fn generator_proto_method(method: &[u8], arg: f64, is_async: bool) -> f64 {
         return bad_receiver(method);
     }
     match own_method(method) {
-        Some(own_closure) => crate::closure::js_closure_call1(own_closure, arg),
+        Some(own_closure) => crate::closure::js_closure_call1(
+            own_closure,
+            crate::closure::plain_call_receiver(),
+            arg,
+        ),
         None => bad_receiver(method),
     }
 }
 
 extern "C" fn generator_proto_next_thunk(
     _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     arg: f64,
 ) -> f64 {
-    generator_proto_method(b"next", arg, false)
+    generator_proto_method(this, b"next", arg, false)
 }
 extern "C" fn generator_proto_return_thunk(
     _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     arg: f64,
 ) -> f64 {
-    generator_proto_method(b"return", arg, false)
+    generator_proto_method(this, b"return", arg, false)
 }
 extern "C" fn generator_proto_throw_thunk(
     _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     arg: f64,
 ) -> f64 {
-    generator_proto_method(b"throw", arg, false)
+    generator_proto_method(this, b"throw", arg, false)
 }
 extern "C" fn async_generator_proto_next_thunk(
     _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     arg: f64,
 ) -> f64 {
-    generator_proto_method(b"next", arg, true)
+    generator_proto_method(this, b"next", arg, true)
 }
 extern "C" fn async_generator_proto_return_thunk(
     _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     arg: f64,
 ) -> f64 {
-    generator_proto_method(b"return", arg, true)
+    generator_proto_method(this, b"return", arg, true)
 }
 extern "C" fn async_generator_proto_throw_thunk(
     _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     arg: f64,
 ) -> f64 {
-    generator_proto_method(b"throw", arg, true)
+    generator_proto_method(this, b"throw", arg, true)
 }
 
 /// `%AsyncGenerator.prototype%[Symbol.asyncIterator]()` returns `this` (spec
@@ -438,9 +453,10 @@ extern "C" fn async_generator_proto_throw_thunk(
 /// iterator and either throws or silently produces nothing.
 extern "C" fn async_generator_proto_async_iterator_thunk(
     _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     _arg: f64,
 ) -> f64 {
-    crate::object::js_implicit_this_get()
+    this.as_f64()
 }
 
 /// `%Generator.prototype%[Symbol.iterator]()` returns `this` (spec inherits this
@@ -448,9 +464,10 @@ extern "C" fn async_generator_proto_async_iterator_thunk(
 /// note in `build_generator_tower` for why the sync prototype now carries this.
 extern "C" fn generator_proto_iterator_thunk(
     _c: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     _arg: f64,
 ) -> f64 {
-    crate::object::js_implicit_this_get()
+    this.as_f64()
 }
 
 /// Install a well-known-symbol-keyed method (returning `this`) on a
@@ -828,8 +845,8 @@ fn build_generator_tower(
     // Without the async one, `for await (x of gen())` over an async-generator
     // *method instance* can't resolve the async iterator and hangs/yields nothing
     // (the instance carries no own iterator symbol). The async-iterator-
-    // acquisition path (`js_get_async_iterator`) sets the implicit-this before
-    // invoking this thunk, so it returns the generator instance.
+    // acquisition path (`js_get_async_iterator`) passes the receiver as `this`
+    // when invoking this thunk, so it returns the generator instance.
     //
     // The SYNC `%Generator.prototype%` carries `[Symbol.iterator]` for the same
     // reason (#6696): a *computed* read `gen[Symbol.iterator]` walks the
@@ -839,8 +856,8 @@ fn build_generator_tower(
     // `value[Symbol.iterator]()` on the delegate generator. `for (x of gen())`
     // is unaffected: it drives the generator's own `.next()` directly (the
     // builtin-iterator recognizers), and where the sync iterator-acquisition
-    // path (`js_get_iterator`) does read `[Symbol.iterator]`, it binds
-    // implicit-this before invoking the method, so the thunk returns the
+    // path (`js_get_iterator`) does read `[Symbol.iterator]`, it passes the
+    // receiver as `this` when invoking the method, so the thunk returns the
     // generator instance.
     let (symbol_name, display_name, thunk) = if is_async {
         (

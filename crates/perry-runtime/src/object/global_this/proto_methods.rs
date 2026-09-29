@@ -4,8 +4,8 @@ use super::*;
 // `array_proto_*_thunk` without routing through the trunk re-exports.
 use super::array_error::*;
 
-fn web_method_receiver(name: &str) -> *mut ObjectHeader {
-    let receiver = crate::object::js_implicit_this_get();
+fn web_method_receiver(this: crate::closure::JsThis, name: &str) -> *mut ObjectHeader {
+    let receiver = this.as_f64();
     if crate::object::web_builtin_to_string_tag(receiver) == Some(name) {
         return crate::value::js_nanbox_get_pointer(receiver) as *mut ObjectHeader;
     }
@@ -15,22 +15,30 @@ fn web_method_receiver(name: &str) -> *mut ObjectHeader {
     crate::exception::js_throw(crate::value::js_nanbox_pointer(error as i64))
 }
 
-extern "C" fn url_prototype_href_thunk(_closure: *const crate::closure::ClosureHeader) -> f64 {
-    crate::url::js_url_get_href(web_method_receiver("URL"))
+extern "C" fn url_prototype_href_thunk(
+    _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
+    crate::url::js_url_get_href(web_method_receiver(this, "URL"))
 }
 
 extern "C" fn abort_controller_prototype_abort_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     reason: f64,
 ) -> f64 {
-    crate::url::js_abort_controller_abort_reason(web_method_receiver("AbortController"), reason);
+    crate::url::js_abort_controller_abort_reason(
+        web_method_receiver(this, "AbortController"),
+        reason,
+    );
     f64::from_bits(crate::value::TAG_UNDEFINED)
 }
 
 extern "C" fn abort_signal_prototype_throw_if_aborted_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
 ) -> f64 {
-    crate::url::js_abort_signal_throw_if_aborted(web_method_receiver("AbortSignal"))
+    crate::url::js_abort_signal_throw_if_aborted(web_method_receiver(this, "AbortSignal"))
 }
 
 fn web_method_enumerable(proto_obj: *mut ObjectHeader, name: &str) {
@@ -227,27 +235,29 @@ fn install_object_prototype_dunder_proto(proto_obj: *mut ObjectHeader) {
 
 extern "C" fn object_prototype_dunder_proto_getter_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
 ) -> f64 {
     // Spec (Annex B §B.3.1 `get __proto__`): `ToObject(this).[[GetPrototypeOf]]()`.
     // `js_object_get_prototype_of` already implements exactly this shape —
     // wrapper-prototype resolution for primitives, Proxy/Temporal/handle
     // receivers, and a throw on `null`/`undefined` (the `ToObject` failure
     // case) — so the getter is a direct delegation, not a reimplementation.
-    let receiver = crate::object::js_implicit_this_get();
+    let receiver = this.as_f64();
     crate::object::js_object_get_prototype_of(receiver)
 }
 
 extern "C" fn object_prototype_dunder_proto_setter_thunk(
     _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     value: f64,
 ) -> f64 {
-    let receiver = crate::object::js_implicit_this_get();
+    let receiver = this.as_f64();
     crate::proxy::legacy_dunder_proto_set(receiver, value);
     f64::from_bits(crate::value::TAG_UNDEFINED)
 }
 
 /// Install a native accessor (getter only) on a builtin prototype. The getter
-/// is an ordinary `ClosureHeader` that reads its receiver from `IMPLICIT_THIS`
+/// is an ordinary `ClosureHeader` that takes its receiver as `this`
 /// and brand-checks it, so `Object.getOwnPropertyDescriptor(P, k).get.call({})`
 /// throws like node's.
 ///
@@ -385,7 +395,7 @@ pub(crate) fn populate_builtin_prototype_methods(builtin_name: &str, proto_obj: 
             );
             // Generic mutators get REAL thunks (vs the noop above) so a borrowed
             // reference works: `obj.pop = Array.prototype.pop; obj.pop()` and
-            // `Array.prototype.splice.call(obj, …)`. Each reads IMPLICIT_THIS and
+            // `Array.prototype.splice.call(obj, …)`. Each reads its `this` and
             // runs the array algorithm on a real array or array-like object.
             // #7760: `values` was a NOOP in the list above, and
             // `Array.prototype[Symbol.iterator]` was not an own property at all
@@ -466,7 +476,7 @@ pub(crate) fn populate_builtin_prototype_methods(builtin_name: &str, proto_obj: 
             );
             // Iteration / search methods: real generic-engine thunks (rest
             // shape — spec `.length` recorded separately below).
-            type RestThunk = extern "C" fn(*const crate::closure::ClosureHeader, f64) -> f64;
+            type RestThunk = crate::closure::body_call::js_body_fn_ty!(a);
             let arraylike_thunks: [(&str, RestThunk, u32); 14] = [
                 ("forEach", array_proto_forEach_thunk, 1),
                 ("map", array_proto_map_thunk, 1),

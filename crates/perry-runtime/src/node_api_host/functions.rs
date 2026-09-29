@@ -37,6 +37,7 @@ fn current_callback_record(index: usize) -> Option<NativeCallbackRecord> {
 
 extern "C" fn napi_callback_thunk(
     closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     arguments: f64,
 ) -> f64 {
     let env = current_env();
@@ -66,7 +67,7 @@ extern "C" fn napi_callback_thunk(
             }
         }
     }
-    let this_bits = crate::object::js_implicit_this_get().to_bits();
+    let this_bits = this.as_f64().to_bits();
     let this_value = add_handle(env, this_bits).unwrap_or(std::ptr::null_mut());
     let new_target_bits = crate::object::js_new_target_get().to_bits();
     let new_target = if JSValue::from_bits(new_target_bits).is_undefined() {
@@ -291,18 +292,14 @@ pub unsafe extern "C" fn napi_call_function(
         };
         arguments.push(f64::from_bits(bits));
     }
-    let this_scope = crate::gc::RuntimeHandleScope::new(); // #9445
-    let previous_this = this_scope.root_nanbox_f64(crate::object::js_implicit_this_set(
-        f64::from_bits(receiver_bits),
-    ));
     let call_result = catch_value_call(env, || {
         crate::closure::js_native_call_value(
             f64::from_bits(function_bits),
+            crate::closure::JsThis(receiver_bits),
             arguments.as_ptr(),
             arguments.len(),
         )
     });
-    crate::object::js_implicit_this_set(previous_this.get_nanbox_f64());
     match call_result {
         Ok(value) => {
             if !result.is_null() {

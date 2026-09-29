@@ -28,12 +28,13 @@ const ASYNC_RESOURCE_METHODS: &[(&str, u32)] = &[
 /// `run`, `exit`, and `runInAsyncScope`.
 extern "C" fn async_hooks_prototype_method_thunk(
     closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     rest: f64,
 ) -> f64 {
     unsafe {
         let name_ptr = crate::closure::js_closure_get_capture_ptr(closure, 0) as *const i8;
         let name_len = crate::closure::js_closure_get_capture_ptr(closure, 1) as usize;
-        let receiver = crate::object::js_implicit_this_get();
+        let receiver = this.as_f64();
         let name = std::slice::from_raw_parts(name_ptr as *const u8, name_len);
 
         // Node's enterWith/disable implementations do not brand-check an
@@ -190,7 +191,7 @@ fn attach_prototype(constructor_value: f64, methods: &[(&str, u32)]) -> f64 {
 
 /// Materialize an unbound `AsyncResource.prototype` method for native-handle
 /// property reads whose static type was erased. Invocation observes the
-/// call-site receiver through `IMPLICIT_THIS`, just like the real prototype.
+/// call-site receiver as its `this` argument, just like the real prototype.
 pub(crate) fn async_resource_prototype_method_value(name: &'static str, length: u32) -> f64 {
     let thunk = async_hooks_prototype_method_thunk as *const u8;
     crate::closure::js_register_closure_rest(thunk, 0);

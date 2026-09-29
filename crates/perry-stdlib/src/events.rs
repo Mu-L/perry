@@ -473,6 +473,7 @@ impl EventEmitterHandle {
             let closure_ptr = handle.get_heap_word_u64() as *const ClosureHeader;
             js_closure_call2(
                 closure_ptr,
+                perry_runtime::closure::plain_call_receiver(),
                 event_arg_h.get_nanbox_f64(),
                 listener_arg_h.get_nanbox_f64(),
             );
@@ -691,7 +692,11 @@ unsafe fn create_once_raw_wrapper(handle: Handle, event_name: &str, callback: i6
     wrapper as i64
 }
 
-extern "C" fn event_emitter_once_wrapper(closure: *const ClosureHeader, rest: f64) -> f64 {
+extern "C" fn event_emitter_once_wrapper(
+    closure: *const ClosureHeader,
+    _this: perry_runtime::closure::JsThis,
+    rest: f64,
+) -> f64 {
     use perry_runtime::closure::js_closure_get_capture_ptr;
 
     unsafe {
@@ -849,9 +854,13 @@ unsafe fn dispatch_error_monitor(emitter: &mut EventEmitterHandle, arg: Option<f
     for handle in &callback_handles {
         let closure_ptr = handle.get_heap_word_u64() as *const ClosureHeader;
         if let Some(arg_handle) = &arg_handle {
-            js_closure_call1(closure_ptr, arg_handle.get_nanbox_f64());
+            js_closure_call1(
+                closure_ptr,
+                perry_runtime::closure::plain_call_receiver(),
+                arg_handle.get_nanbox_f64(),
+            );
         } else {
-            js_closure_call0(closure_ptr);
+            js_closure_call0(closure_ptr, perry_runtime::closure::plain_call_receiver());
         }
     }
 }
@@ -1039,19 +1048,22 @@ unsafe fn call_emitter_listener(
             arr_handle.get_raw_mut_ptr::<ArrayHeader>() as i64,
         );
     }
-    // #10490: root the displaced `this` across the listener (user code).
-    let this_scope = perry_runtime::gc::RuntimeHandleScope::new();
-    let previous_this =
-        this_scope.root_nanbox_f64(perry_runtime::object::js_implicit_this_set(receiver));
-    let result =
-        perry_runtime::closure::js_native_call_value(callback_value, args.as_ptr(), args.len());
-    perry_runtime::object::js_implicit_this_set(previous_this.get_nanbox_f64());
-    result
+    // A listener runs with the emitter as `this`.
+    perry_runtime::closure::js_native_call_value(
+        callback_value,
+        perry_runtime::closure::JsThis::from_f64(receiver),
+        args.as_ptr(),
+        args.len(),
+    )
 }
 
 const TAG_UNDEFINED_F64_BITS: u64 = 0x7FFC_0000_0000_0001;
 
-extern "C" fn events_capture_rejection_handler(closure: *const ClosureHeader, reason: f64) -> f64 {
+extern "C" fn events_capture_rejection_handler(
+    closure: *const ClosureHeader,
+    _this: perry_runtime::closure::JsThis,
+    reason: f64,
+) -> f64 {
     use perry_runtime::closure::js_closure_get_capture_ptr;
 
     let handle = js_closure_get_capture_ptr(closure, 0) as Handle;

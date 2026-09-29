@@ -202,8 +202,8 @@ fn trace_id_symbol() -> f64 {
     })
 }
 
-fn this_trace_id() -> i64 {
-    let this_value = crate::object::js_implicit_this_get();
+fn this_trace_id(this: crate::closure::JsThis) -> i64 {
+    let this_value = this.as_f64();
     let Some(_) = object_ptr_from_value(this_value) else {
         throw_invalid_this();
     };
@@ -303,7 +303,11 @@ fn set_trace_enabled(id: i64, enabled: bool) {
     }
 }
 
-extern "C" fn trace_tracing_constructor(_closure: *const ClosureHeader, categories: f64) -> f64 {
+extern "C" fn trace_tracing_constructor(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    categories: f64,
+) -> f64 {
     if crate::object::js_new_target_get().to_bits() == crate::value::TAG_UNDEFINED {
         throw_type_error_no_code(b"Class constructor Tracing cannot be invoked without 'new'");
     }
@@ -313,26 +317,38 @@ extern "C" fn trace_tracing_constructor(_closure: *const ClosureHeader, categori
     create_trace(categories_handle.get_nanbox_f64(), category_names)
 }
 
-extern "C" fn trace_tracing_enable(_closure: *const ClosureHeader) -> f64 {
-    set_trace_enabled(this_trace_id(), true);
+extern "C" fn trace_tracing_enable(
+    _closure: *const ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
+    set_trace_enabled(this_trace_id(this), true);
     undefined()
 }
 
-extern "C" fn trace_tracing_disable(_closure: *const ClosureHeader) -> f64 {
-    set_trace_enabled(this_trace_id(), false);
+extern "C" fn trace_tracing_disable(
+    _closure: *const ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
+    set_trace_enabled(this_trace_id(this), false);
     undefined()
 }
 
-extern "C" fn trace_categories_getter(_closure: *const ClosureHeader) -> f64 {
-    let id = this_trace_id();
+extern "C" fn trace_categories_getter(
+    _closure: *const ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
+    let id = this_trace_id(this);
     let categories = trace_state_value(id, |state| state.categories);
     let scope = crate::gc::RuntimeHandleScope::new();
     let categories = scope.root_nanbox_f64(categories);
     string_value(&categories_from_array(categories.get_nanbox_f64()).join(","))
 }
 
-extern "C" fn trace_enabled_getter(_closure: *const ClosureHeader) -> f64 {
-    let id = this_trace_id();
+extern "C" fn trace_enabled_getter(
+    _closure: *const ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
+    let id = this_trace_id(this);
     trace_state_value(id, |state| bool_value(state.enabled))
 }
 
@@ -445,6 +461,7 @@ fn create_trace(categories: f64, source_categories: Vec<String>) -> f64 {
 #[allow(non_snake_case)] // thunk name mirrors JS API surface
 pub(crate) extern "C" fn thunk_trace_events_createTracing(
     _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     options: f64,
 ) -> f64 {
     init_trace_events_runtime();
@@ -456,6 +473,7 @@ pub(crate) extern "C" fn thunk_trace_events_createTracing(
 #[allow(non_snake_case)] // thunk name mirrors JS API surface
 pub(crate) extern "C" fn thunk_trace_events_getEnabledCategories(
     _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     _arg: f64,
 ) -> f64 {
     init_trace_events_runtime();
@@ -632,17 +650,14 @@ fn emit_enabled_trace_warning() {
     let process = scope.root_nanbox_f64(process);
     let callback = scope.root_nanbox_f64(callback);
     let warning = scope.root_nanbox_f64(warning);
-    let previous = scope.root_nanbox_f64(crate::object::js_implicit_this_set(
-        process.get_nanbox_f64(),
-    ));
     unsafe {
-        crate::closure::js_native_call_value(
+        crate::closure::native_call_value_this(
             callback.get_nanbox_f64(),
+            crate::closure::JsThis::from_f64(process.get_nanbox_f64()),
             [warning.get_nanbox_f64()].as_ptr(),
             1,
         );
     }
-    crate::object::js_implicit_this_set(previous.get_nanbox_f64());
 }
 
 #[cfg(test)]

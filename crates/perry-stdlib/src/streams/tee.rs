@@ -235,9 +235,12 @@ pub(super) unsafe fn tee_source_enqueue(
         g.get(&id).map(|s| s.strategy_size_cb).unwrap_or(0)
     };
     let size = if size_cb != 0 {
-        let size = super::readable_strategy_size_to_number(
-            perry_runtime::closure::js_closure_call1(size_cb as *const ClosureHeader, chunk),
-        );
+        let size =
+            super::readable_strategy_size_to_number(perry_runtime::closure::js_closure_call1(
+                size_cb as *const ClosureHeader,
+                perry_runtime::closure::plain_call_receiver(),
+                chunk,
+            ));
         if size.is_nan() || size < 0.0 || size.is_infinite() {
             super::throw_invalid_readable_strategy_size(id, size);
         }
@@ -324,7 +327,10 @@ pub(super) unsafe fn tee_schedule_pull_demand(source: usize) {
 /// later. `TEE_PULLING` stays held across the hop (single-threaded microtask
 /// dispatch — the remove+insert below has no interleaving window), so
 /// coalescing against enqueue/close reroutes keeps working.
-extern "C" fn tee_demand_hop(closure: *const ClosureHeader) -> f64 {
+extern "C" fn tee_demand_hop(
+    closure: *const ClosureHeader,
+    _this: perry_runtime::closure::JsThis,
+) -> f64 {
     unsafe {
         let source = perry_runtime::closure::js_closure_get_capture_ptr(closure, 0) as usize;
         TEE_PULLING.lock().unwrap().remove(&source);
@@ -335,7 +341,10 @@ extern "C" fn tee_demand_hop(closure: *const ClosureHeader) -> f64 {
 
 /// The extra tick a byte-stream tee's CHAINED pull pays before the next
 /// cycle (see the chain decision in `tee_pull_microtask`).
-extern "C" fn tee_byte_chain_hop(closure: *const ClosureHeader) -> f64 {
+extern "C" fn tee_byte_chain_hop(
+    closure: *const ClosureHeader,
+    _this: perry_runtime::closure::JsThis,
+) -> f64 {
     unsafe {
         let source = perry_runtime::closure::js_closure_get_capture_ptr(closure, 0) as usize;
         tee_schedule_pull(source);
@@ -343,7 +352,10 @@ extern "C" fn tee_byte_chain_hop(closure: *const ClosureHeader) -> f64 {
     f64::from_bits(0x7FFC_0000_0000_0001) // TAG_UNDEFINED
 }
 
-extern "C" fn tee_close_tick(closure: *const ClosureHeader) -> f64 {
+extern "C" fn tee_close_tick(
+    closure: *const ClosureHeader,
+    _this: perry_runtime::closure::JsThis,
+) -> f64 {
     unsafe {
         let source = perry_runtime::closure::js_closure_get_capture_ptr(closure, 0) as usize;
         tee_close_branches(source);
@@ -351,7 +363,10 @@ extern "C" fn tee_close_tick(closure: *const ClosureHeader) -> f64 {
     f64::from_bits(0x7FFC_0000_0000_0001) // TAG_UNDEFINED
 }
 
-extern "C" fn tee_pull_microtask(closure: *const ClosureHeader) -> f64 {
+extern "C" fn tee_pull_microtask(
+    closure: *const ClosureHeader,
+    _this: perry_runtime::closure::JsThis,
+) -> f64 {
     let undef = f64::from_bits(0x7FFC_0000_0000_0001); // TAG_UNDEFINED
     unsafe {
         let source = perry_runtime::closure::js_closure_get_capture_ptr(closure, 0) as usize;

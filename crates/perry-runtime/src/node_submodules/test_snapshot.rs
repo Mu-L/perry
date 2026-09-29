@@ -29,6 +29,7 @@ fn snapshot_payload(value: f64) -> String {
 
 pub(super) extern "C" fn snapshot_set_default_serializers(
     _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     serializers: f64,
 ) -> f64 {
     if !is_array_value(serializers) {
@@ -44,6 +45,7 @@ pub(super) extern "C" fn snapshot_set_default_serializers(
 
 pub(super) extern "C" fn snapshot_set_resolve_snapshot_path(
     _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     resolver: f64,
 ) -> f64 {
     if !is_callable_value(resolver) {
@@ -61,6 +63,7 @@ fn validate_snapshot_assertion_options(options: f64) {
 
 pub(super) extern "C" fn assert_snapshot(
     _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     value: f64,
     options: f64,
 ) -> f64 {
@@ -74,7 +77,11 @@ pub(super) extern "C" fn assert_snapshot(
         );
     }
     let resolver_ptr = raw_ptr_from_value(resolver) as *const ClosureHeader;
-    let path_value = js_closure_call1(resolver_ptr, string_value(""));
+    let path_value = js_closure_call1(
+        resolver_ptr,
+        crate::closure::plain_call_receiver(),
+        string_value(""),
+    );
     let Some(path) = value_to_string(path_value) else {
         throw_invalid_arg_type("snapshot path", "string", path_value);
     };
@@ -117,6 +124,7 @@ pub(super) extern "C" fn assert_snapshot(
 
 pub(super) extern "C" fn assert_file_snapshot(
     _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     value: f64,
     path_value: f64,
     options: f64,

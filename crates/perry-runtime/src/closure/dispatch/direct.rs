@@ -82,21 +82,19 @@ pub(crate) fn resolve_direct_func_ptr(
     Some(func_ptr)
 }
 
-/// Resolve one receiverless arrow callback at a method boundary. Ordinary
-/// functions stay on `js_closure_callN`, which is responsible for binding a
-/// bare call's dynamic `this` to `undefined`; bound/rest/padded calls likewise
-/// retain their full dispatcher semantics.
+/// Resolve one callback for PLAIN calls (`f(x)`) at a method boundary: the
+/// body the caller may call directly, passing `undefined` as its receiver —
+/// exactly what `js_closure_callN` passes. An arrow ignores the receiver; an
+/// ordinary function binds it (a sloppy body coerces it in its own
+/// prologue). Bound/rest/padded calls retain their full dispatcher semantics.
 #[no_mangle]
-pub extern "C" fn js_closure_resolve_arrow_direct_call(
+pub extern "C" fn js_closure_resolve_plain_direct_call(
     closure: *const ClosureHeader,
     arity: u32,
 ) -> *const u8 {
     let Some(func_ptr) = resolve_direct_func_ptr(closure, arity) else {
         return std::ptr::null();
     };
-    if !resolve_strategy(func_ptr).is_arrow() {
-        return std::ptr::null();
-    }
     let Some(trusted) = super::super::registry::lookup_closure_trusted_direct(func_ptr) else {
         return func_ptr;
     };
@@ -153,30 +151,45 @@ pub extern "C" fn js_closure_resolve_versioned_loop_direct_call(
 macro_rules! define_direct_call_site {
     (
         $(#[$meta:meta])*
-        $site:ident, $arity:literal, $slow:ident, $($arg:ident),+
+        $site:ident, $arity:literal, $entry:ident, $slow:ident, $($arg:ident),+
     ) => {
+        /// The fallback, a JS body: the full dispatcher with the receiver it
+        /// is handed.
+        extern "C" fn $slow(
+            closure: *const ClosureHeader,
+            this: crate::closure::JsThis,
+            $($arg: f64),+
+        ) -> f64 {
+            $entry(closure, this, $($arg),+)
+        }
+
         $(#[$meta])*
         #[derive(Clone, Copy)]
-        pub struct $site(extern "C" fn(*const ClosureHeader, $(define_direct_call_site!(@f64 $arg)),+) -> f64);
+        pub struct $site(crate::closure::body_call::js_body_fn_ty!($($arg),+));
 
         impl $site {
             /// Resolve `closure` once, before the loop.
             #[inline]
             pub fn resolve(closure: *const ClosureHeader) -> Self {
                 $site(resolve_direct_func_ptr(closure, $arity).map_or($slow, |func_ptr| unsafe {
-                    std::mem::transmute::<
-                        *const u8,
-                        extern "C" fn(*const ClosureHeader, $(define_direct_call_site!(@f64 $arg)),+) -> f64,
-                    >(func_ptr)
+                    crate::closure::body_call::js_body_fn!(func_ptr; $($arg),+)
                 }))
             }
 
             /// Invoke with the CURRENT closure address (see the module docs on
-            /// rooting). Falls back to the full dispatcher when the closure
-            /// did not resolve.
+            /// rooting) and receiver `this` (`plain_call_receiver()` for a
+            /// plain call, a builtin's `thisArg` otherwise). Falls back to
+            /// the full dispatcher when the closure did not resolve.
             #[inline]
-            pub fn call(&self, closure: *const ClosureHeader, $($arg: f64),+) -> f64 {
-                (self.0)(closure, $($arg),+)
+            pub fn call(
+                &self,
+                closure: *const ClosureHeader,
+                this: crate::closure::JsThis,
+                $($arg: f64),+
+            ) -> f64 {
+                // SAFETY: `self.0` is the resolved body of `closure` at this
+                // arity, or the dispatcher fallback.
+                unsafe { (self.0)(closure, this, $($arg),+) }
             }
 
             /// Whether the direct target was resolved. Test-only: a "fast
@@ -186,12 +199,11 @@ macro_rules! define_direct_call_site {
             pub(crate) fn is_direct(&self) -> bool {
                 !std::ptr::fn_addr_eq(
                     self.0,
-                    $slow as extern "C" fn(*const ClosureHeader, $(define_direct_call_site!(@f64 $arg)),+) -> f64,
+                    $slow as crate::closure::body_call::js_body_fn_ty!($($arg),+),
                 )
             }
         }
     };
-    (@f64 $arg:ident) => { f64 };
 }
 
 define_direct_call_site!(
@@ -199,6 +211,7 @@ define_direct_call_site!(
     DirectCall1,
     1,
     js_closure_call1,
+    direct_call1_fallback,
     arg0
 );
 
@@ -208,6 +221,7 @@ define_direct_call_site!(
     DirectCall2,
     2,
     js_closure_call2,
+    direct_call2_fallback,
     arg0,
     arg1
 );
@@ -219,6 +233,7 @@ define_direct_call_site!(
     DirectCall3,
     3,
     js_closure_call3,
+    direct_call3_fallback,
     arg0,
     arg1,
     arg2
@@ -230,6 +245,7 @@ define_direct_call_site!(
     DirectCall4,
     4,
     js_closure_call4,
+    direct_call4_fallback,
     arg0,
     arg1,
     arg2,
@@ -242,35 +258,75 @@ mod tests {
 
     // A capture-less body behind a real `ClosureHeader`, the same way
     // `array/tests.rs` and `array/typed_array_receiver_tests.rs` build theirs.
-    extern "C" fn add3(_c: *const ClosureHeader, a: f64, b: f64, c: f64) -> f64 {
+    extern "C" fn add3(
+        _c: *const ClosureHeader,
+        _this: crate::closure::JsThis,
+        a: f64,
+        b: f64,
+        c: f64,
+    ) -> f64 {
         a * 100.0 + b * 10.0 + c
     }
 
-    extern "C" fn sum2(_c: *const ClosureHeader, a: f64, b: f64) -> f64 {
+    extern "C" fn sum2(
+        _c: *const ClosureHeader,
+        _this: crate::closure::JsThis,
+        a: f64,
+        b: f64,
+    ) -> f64 {
         a + b
     }
 
-    extern "C" fn ordinary3(_c: *const ClosureHeader, a: f64, b: f64, c: f64) -> f64 {
+    extern "C" fn ordinary3(
+        _c: *const ClosureHeader,
+        _this: crate::closure::JsThis,
+        a: f64,
+        b: f64,
+        c: f64,
+    ) -> f64 {
         a + b + c
     }
 
-    extern "C" fn rest_body(_c: *const ClosureHeader, _a: f64, _rest: f64) -> f64 {
+    extern "C" fn rest_body(
+        _c: *const ClosureHeader,
+        _this: crate::closure::JsThis,
+        _a: f64,
+        _rest: f64,
+    ) -> f64 {
         0.0
     }
 
-    extern "C" fn trusted_add3(_c: *const ClosureHeader, a: f64, b: f64, c: f64) -> f64 {
+    extern "C" fn trusted_add3(
+        _c: *const ClosureHeader,
+        _this: crate::closure::JsThis,
+        a: f64,
+        b: f64,
+        c: f64,
+    ) -> f64 {
         a * 100.0 + b * 10.0 + c
     }
 
-    extern "C" fn boxed1(_c: *const ClosureHeader, value: f64) -> f64 {
+    extern "C" fn boxed1(
+        _c: *const ClosureHeader,
+        _this: crate::closure::JsThis,
+        value: f64,
+    ) -> f64 {
         value
     }
 
-    extern "C" fn trusted_boxed1(_c: *const ClosureHeader, value: f64) -> f64 {
+    extern "C" fn trusted_boxed1(
+        _c: *const ClosureHeader,
+        _this: crate::closure::JsThis,
+        value: f64,
+    ) -> f64 {
         value
     }
 
-    extern "C" fn versioned_source(_c: *const ClosureHeader, value: f64) -> f64 {
+    extern "C" fn versioned_source(
+        _c: *const ClosureHeader,
+        _this: crate::closure::JsThis,
+        value: f64,
+    ) -> f64 {
         value
     }
 
@@ -283,12 +339,12 @@ mod tests {
     }
 
     #[test]
-    fn exported_resolver_admits_only_directly_callable_arrows() {
+    fn exported_resolver_admits_directly_callable_bodies() {
         let arrow = closure_for(add3 as *const u8);
         crate::closure::js_register_closure_arity(add3 as *const u8, 3);
         crate::closure::js_register_closure_arrow_function(add3 as *const u8);
         assert_eq!(
-            js_closure_resolve_arrow_direct_call(arrow, 3),
+            js_closure_resolve_plain_direct_call(arrow, 3),
             add3 as *const u8
         );
         crate::closure::js_register_closure_trusted_direct(
@@ -298,10 +354,10 @@ mod tests {
             0,
         );
         assert_eq!(
-            js_closure_resolve_arrow_direct_call(arrow, 3),
+            js_closure_resolve_plain_direct_call(arrow, 3),
             trusted_add3 as *const u8
         );
-        assert!(js_closure_resolve_arrow_direct_call(arrow, 2).is_null());
+        assert!(js_closure_resolve_plain_direct_call(arrow, 2).is_null());
 
         let ordinary = closure_for(ordinary3 as *const u8);
         crate::closure::js_register_closure_arity(ordinary3 as *const u8, 3);
@@ -311,16 +367,23 @@ mod tests {
             0,
             0,
         );
-        assert!(js_closure_resolve_arrow_direct_call(ordinary, 3).is_null());
+        // An ordinary function is as directly callable as an arrow: the
+        // caller passes the plain-call `undefined` receiver itself. Trusted
+        // clones attach to arrow bodies only, so it resolves to its public
+        // body.
+        assert_eq!(
+            js_closure_resolve_plain_direct_call(ordinary, 3),
+            ordinary3 as *const u8
+        );
 
         let rest = closure_for(rest_body as *const u8);
         crate::closure::js_register_closure_rest(rest_body as *const u8, 1);
         crate::closure::js_register_closure_arrow_function(rest_body as *const u8);
-        assert!(js_closure_resolve_arrow_direct_call(rest, 3).is_null());
+        assert!(js_closure_resolve_plain_direct_call(rest, 3).is_null());
 
         for sentinel in [BOUND_METHOD_FUNC_PTR, BOUND_FUNCTION_FUNC_PTR] {
             let bound = closure_for(sentinel);
-            assert!(js_closure_resolve_arrow_direct_call(bound, 3).is_null());
+            assert!(js_closure_resolve_plain_direct_call(bound, 3).is_null());
         }
     }
 
@@ -337,7 +400,7 @@ mod tests {
 
         let wrong_count = closure_for(boxed1 as *const u8);
         assert_eq!(
-            js_closure_resolve_arrow_direct_call(wrong_count, 1),
+            js_closure_resolve_plain_direct_call(wrong_count, 1),
             boxed1 as *const u8,
             "a wrong capture count must retain the checked public body"
         );
@@ -345,7 +408,7 @@ mod tests {
         let non_box = crate::closure::js_closure_alloc(boxed1 as *const u8, 1);
         crate::closure::js_closure_set_capture_bits(non_box, 0, crate::value::TAG_UNDEFINED);
         assert_eq!(
-            js_closure_resolve_arrow_direct_call(non_box, 1),
+            js_closure_resolve_plain_direct_call(non_box, 1),
             boxed1 as *const u8,
             "a non-box payload must retain the checked public body"
         );
@@ -354,7 +417,7 @@ mod tests {
         let cell = crate::r#box::js_box_alloc_bits(crate::value::TAG_UNDEFINED as i64);
         crate::closure::js_closure_set_box_capture_ptr(valid, 0, cell as i64);
         assert_eq!(
-            js_closure_resolve_arrow_direct_call(valid, 1),
+            js_closure_resolve_plain_direct_call(valid, 1),
             trusted_boxed1 as *const u8,
             "the exact compiler-installed layout must select the private body"
         );
@@ -401,10 +464,13 @@ mod tests {
             "an unregistered, capture-less, non-bound callback must resolve to \
              a direct target -- otherwise this whole module is inert"
         );
-        assert_eq!(site.call(c, 1.0, 2.0, 3.0), 123.0);
         assert_eq!(
-            site.call(c, 1.0, 2.0, 3.0),
-            js_closure_call3(c, 1.0, 2.0, 3.0)
+            site.call(c, crate::closure::plain_call_receiver(), 1.0, 2.0, 3.0),
+            123.0
+        );
+        assert_eq!(
+            site.call(c, crate::closure::plain_call_receiver(), 1.0, 2.0, 3.0),
+            js_closure_call3(c, crate::closure::plain_call_receiver(), 1.0, 2.0, 3.0)
         );
     }
 

@@ -427,6 +427,7 @@ fn registered_readable_stream_reader(stream: f64) -> Option<f64> {
         return None;
     }
     let reader = unsafe {
+        // NOT-A-JS-BODY: a native Rust helper registered by another crate.
         let func: StreamGetReaderFn = std::mem::transmute(f);
         func(stream)
     };
@@ -477,7 +478,7 @@ fn call_collector_method(
     if let Some(promise) = promise_ptr_from_value(result) {
         crate::promise::js_promise_then(promise, step, reject);
     } else {
-        consumer_collect_step(step, result);
+        consumer_collect_step(step, crate::closure::plain_call_receiver(), result);
     }
 }
 
@@ -507,10 +508,14 @@ fn call_symbol_async_iterator(stream: f64) -> Option<f64> {
     if !is_callable_value(method) {
         return None;
     }
-    let this_scope = crate::gc::RuntimeHandleScope::new(); // #9445
-    let prev_this = this_scope.root_nanbox_f64(crate::object::js_implicit_this_set(stream));
-    let iterator = unsafe { crate::closure::js_native_call_value(method, std::ptr::null(), 0) };
-    crate::object::js_implicit_this_set(prev_this.get_nanbox_f64());
+    let iterator = unsafe {
+        crate::closure::native_call_value_this(
+            method,
+            crate::closure::JsThis::from_f64(stream),
+            std::ptr::null(),
+            0,
+        )
+    };
     if iterator.to_bits() == crate::value::TAG_UNDEFINED {
         None
     } else {
@@ -582,13 +587,21 @@ pub(crate) fn consume_bytes(stream: f64) -> f64 {
     consume_stream(ConsumerKind::Bytes, stream)
 }
 
-extern "C" fn consumer_collect_rejected(closure: *const ClosureHeader, reason: f64) -> f64 {
+extern "C" fn consumer_collect_rejected(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    reason: f64,
+) -> f64 {
     let promise = js_closure_get_capture_ptr(closure, 0) as *mut crate::Promise;
     crate::promise::js_promise_reject(promise, reason);
     0.0
 }
 
-extern "C" fn consumer_collect_step(closure: *const ClosureHeader, iter_result: f64) -> f64 {
+extern "C" fn consumer_collect_step(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    iter_result: f64,
+) -> f64 {
     let promise = js_closure_get_capture_ptr(closure, 0) as *mut crate::Promise;
     let mut result_arr = js_closure_get_capture_ptr(closure, 1) as *mut crate::array::ArrayHeader;
     let receiver = js_closure_get_capture_f64(closure, 2);
@@ -619,16 +632,25 @@ extern "C" fn consumer_collect_step(closure: *const ClosureHeader, iter_result: 
     0.0
 }
 
-pub(crate) extern "C" fn thunk_consumers_text(_closure: *const ClosureHeader, stream: f64) -> f64 {
+pub(crate) extern "C" fn thunk_consumers_text(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    stream: f64,
+) -> f64 {
     consume_stream(ConsumerKind::Text, stream)
 }
 
-pub(crate) extern "C" fn thunk_consumers_json(_closure: *const ClosureHeader, stream: f64) -> f64 {
+pub(crate) extern "C" fn thunk_consumers_json(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    stream: f64,
+) -> f64 {
     consume_stream(ConsumerKind::Json, stream)
 }
 
 pub(crate) extern "C" fn thunk_consumers_buffer(
     _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     stream: f64,
 ) -> f64 {
     consume_stream(ConsumerKind::Buffer, stream)
@@ -637,15 +659,24 @@ pub(crate) extern "C" fn thunk_consumers_buffer(
 #[allow(non_snake_case)] // thunk name mirrors JS API surface
 pub(crate) extern "C" fn thunk_consumers_arrayBuffer(
     _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
     stream: f64,
 ) -> f64 {
     consume_stream(ConsumerKind::ArrayBuffer, stream)
 }
 
-pub(crate) extern "C" fn thunk_consumers_bytes(_closure: *const ClosureHeader, stream: f64) -> f64 {
+pub(crate) extern "C" fn thunk_consumers_bytes(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    stream: f64,
+) -> f64 {
     consume_stream(ConsumerKind::Bytes, stream)
 }
 
-pub(crate) extern "C" fn thunk_consumers_blob(_closure: *const ClosureHeader, stream: f64) -> f64 {
+pub(crate) extern "C" fn thunk_consumers_blob(
+    _closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+    stream: f64,
+) -> f64 {
     consume_stream(ConsumerKind::Blob, stream)
 }

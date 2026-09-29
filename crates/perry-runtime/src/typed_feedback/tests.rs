@@ -23,7 +23,11 @@ extern "C" fn test_direct_method(_this: f64, value: f64) -> f64 {
     value
 }
 
-extern "C" fn test_direct_closure(_closure: *const crate::closure::ClosureHeader, arg: f64) -> f64 {
+extern "C" fn test_direct_closure(
+    _closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
+    arg: f64,
+) -> f64 {
     TEST_DIRECT_CLOSURE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     arg
 }
@@ -2997,7 +3001,14 @@ fn function_source_array_literal_keeps_the_array_index_fast_path_armed() {
     .map(|s| s.to_string())
     .collect();
     let f = crate::dyn_eval::dyn_function_from_strings(&source);
-    let result = unsafe { crate::closure::js_native_call_value(f, [].as_ptr(), 0) };
+    let result = unsafe {
+        crate::closure::js_native_call_value(
+            f,
+            crate::closure::plain_call_receiver(),
+            [].as_ptr(),
+            0,
+        )
+    };
     let result = crate::value::JSValue::from_bits(result.to_bits());
     assert_eq!(
         if result.is_int32() {

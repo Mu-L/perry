@@ -322,13 +322,25 @@ fn expected_is_callable(value: f64) -> bool {
 fn call_validator_capturing(validator: f64, arg: f64) -> Result<f64, f64> {
     crate::exception::catch_js_throw(|| {
         let args = [arg];
-        unsafe { crate::closure::js_native_call_value(validator, args.as_ptr(), 1) }
+        unsafe {
+            crate::closure::js_native_call_value(
+                validator,
+                crate::closure::plain_call_receiver(),
+                args.as_ptr(),
+                1,
+            )
+        }
     })
 }
 
 fn call_block_capturing_throw(block: f64) -> Result<f64, f64> {
     crate::exception::catch_js_throw(|| unsafe {
-        crate::closure::js_native_call_value(block, std::ptr::null(), 0)
+        crate::closure::js_native_call_value(
+            block,
+            crate::closure::plain_call_receiver(),
+            std::ptr::null(),
+            0,
+        )
     })
 }
 
@@ -508,6 +520,7 @@ fn promise_from_assert_async_input(input: f64) -> AssertAsyncInput {
 
 extern "C" fn assert_rejects_fulfilled(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     _value: f64,
 ) -> f64 {
     let result =
@@ -527,6 +540,7 @@ extern "C" fn assert_rejects_fulfilled(
 
 extern "C" fn assert_rejects_rejected(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     reason: f64,
 ) -> f64 {
     let result =
@@ -550,6 +564,7 @@ extern "C" fn assert_rejects_rejected(
 
 extern "C" fn assert_does_not_reject_fulfilled(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     _value: f64,
 ) -> f64 {
     let result =
@@ -560,6 +575,7 @@ extern "C" fn assert_does_not_reject_fulfilled(
 
 extern "C" fn assert_does_not_reject_rejected(
     closure: *const crate::closure::ClosureHeader,
+    _this: crate::closure::JsThis,
     reason: f64,
 ) -> f64 {
     let result =

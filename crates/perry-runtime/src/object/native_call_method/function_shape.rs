@@ -152,14 +152,14 @@ unsafe fn dictionary_function_proto_method_call(
     }
     // A user callable inherited from the recorded prototype: an ordinary
     // method call with the function as `this`.
-    let prev_this_h = scope.root_nanbox_u64(
-        super::IMPLICIT_THIS.with(|c| c.replace(receiver_h.get_nanbox_f64().to_bits())),
-    );
     let callee =
         crate::closure::rebind_explicit_this(value_h.get_nanbox_f64(), receiver_h.get_nanbox_f64());
-    let result = crate::closure::js_native_call_value(callee, args_ptr, args_len);
-    super::IMPLICIT_THIS.with(|c| c.set(prev_this_h.get_nanbox_u64()));
-    Some(result)
+    Some(crate::closure::native_call_value_this(
+        callee,
+        crate::closure::JsThis::from_f64(receiver_h.get_nanbox_f64()),
+        args_ptr,
+        args_len,
+    ))
 }
 
 #[cfg(test)]
@@ -174,7 +174,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
-    extern "C" fn target_body(_c: *const ClosureHeader) -> f64 {
+    extern "C" fn target_body(_c: *const ClosureHeader, _this: crate::closure::JsThis) -> f64 {
         42.0
     }
 
@@ -219,7 +219,10 @@ mod tests {
                 (*bound_ptr).func_ptr,
                 crate::closure::BOUND_FUNCTION_FUNC_PTR
             );
-            assert_eq!(crate::closure::js_closure_call0(bound_ptr), 42.0);
+            assert_eq!(
+                crate::closure::js_closure_call0(bound_ptr, crate::closure::plain_call_receiver()),
+                42.0
+            );
             crate::closure::shape::FUNCTION_PROTOTYPE_PTR.store(saved, Ordering::Release);
         }
     }

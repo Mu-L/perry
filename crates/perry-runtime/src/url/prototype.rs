@@ -9,8 +9,8 @@ use super::parse::*;
 use super::url_class::*;
 use super::*;
 
-fn require_url_receiver(name: &str) -> *mut ObjectHeader {
-    let this = crate::object::js_implicit_this_get();
+fn require_url_receiver(name: &str, this: crate::closure::JsThis) -> *mut ObjectHeader {
+    let this = this.as_f64();
     if let Some(obj) = object_from_f64(this) {
         if is_url_object_shape(obj) {
             return obj;
@@ -24,8 +24,11 @@ fn require_url_receiver(name: &str) -> *mut ObjectHeader {
 
 macro_rules! url_getter {
     ($fn_name:ident, $name:literal, $slot:expr) => {
-        extern "C" fn $fn_name(_closure: *const crate::closure::ClosureHeader) -> f64 {
-            let obj = require_url_receiver($name);
+        extern "C" fn $fn_name(
+            _closure: *const crate::closure::ClosureHeader,
+            this: crate::closure::JsThis,
+        ) -> f64 {
+            let obj = require_url_receiver($name, this);
             crate::object::js_object_get_field_f64(obj, $slot)
         }
     };
@@ -33,8 +36,12 @@ macro_rules! url_getter {
 
 macro_rules! url_setter {
     ($fn_name:ident, $name:literal, $setter:path) => {
-        extern "C" fn $fn_name(_closure: *const crate::closure::ClosureHeader, value: f64) -> f64 {
-            let obj = require_url_receiver($name);
+        extern "C" fn $fn_name(
+            _closure: *const crate::closure::ClosureHeader,
+            this: crate::closure::JsThis,
+            value: f64,
+        ) -> f64 {
+            let obj = require_url_receiver($name, this);
             $setter(obj, value);
             f64::from_bits(crate::value::TAG_UNDEFINED)
         }

@@ -102,7 +102,10 @@ pub(crate) unsafe fn class_closure_id_unchecked(closure: *const ClosureHeader) -
 /// class function object (and how one is recognized); [[Construct]] never
 /// reaches it — `new` decodes the class id and runs the class's constructor.
 #[no_mangle]
-pub unsafe extern "C" fn js_class_constructor_called(closure: *const ClosureHeader) -> f64 {
+pub unsafe extern "C" fn js_class_constructor_called(
+    closure: *const ClosureHeader,
+    _this: crate::closure::JsThis,
+) -> f64 {
     let name = unsafe { class_closure_id_unchecked(closure) }
         .and_then(super::class_registry::class_name_for_id)
         .unwrap_or_default();
@@ -694,7 +697,7 @@ pub(crate) unsafe fn class_static_accessor_call_get(
     if acc.raw_get != 0 {
         crate::object::static_this_arm_if_unarmed(this);
         crate::object::static_private_owner_push(receiver);
-        let f: extern "C" fn() -> f64 = std::mem::transmute(acc.raw_get);
+        let f = crate::closure::body_call::js_bare_body_fn!(acc.raw_get as *const u8;);
         let result = f();
         crate::object::static_private_owner_pop();
         crate::object::static_this_disarm();
@@ -718,7 +721,7 @@ pub(crate) unsafe fn class_static_accessor_call_set(
     if acc.raw_set != 0 {
         crate::object::static_this_arm_if_unarmed(receiver);
         crate::object::static_private_owner_push(receiver);
-        let f: extern "C" fn(f64) -> f64 = std::mem::transmute(acc.raw_set);
+        let f = crate::closure::body_call::js_bare_body_fn!(acc.raw_set as *const u8; value);
         let _ = f(value);
         crate::object::static_private_owner_pop();
         crate::object::static_this_disarm();

@@ -961,8 +961,12 @@ unsafe extern "C" fn call_wasm_import(
             _ => f64::from_bits(TAG_UNDEFINED),
         })
         .collect();
-    let result =
-        crate::closure::js_native_call_value(callback.get_nanbox_f64(), args.as_ptr(), args.len());
+    let result = crate::closure::js_native_call_value(
+        callback.get_nanbox_f64(),
+        crate::closure::plain_call_receiver(),
+        args.as_ptr(),
+        args.len(),
+    );
 
     let result_kinds = if result_count == 0 {
         &[]
@@ -1076,8 +1080,8 @@ fn make_export_function(
     })
 }
 
-fn global_handle_from_receiver() -> Option<*mut c_void> {
-    let receiver = JSValue::from_bits(crate::object::js_implicit_this_get().to_bits());
+fn global_handle_from_receiver(this: crate::closure::JsThis) -> Option<*mut c_void> {
+    let receiver = JSValue::from_bits(this.as_f64().to_bits());
     if !receiver.is_pointer() {
         return None;
     }
@@ -1088,8 +1092,11 @@ fn global_handle_from_receiver() -> Option<*mut c_void> {
     .map(|handle| handle as *mut c_void)
 }
 
-extern "C" fn js_wasm_global_get(_closure: *const crate::closure::ClosureHeader) -> f64 {
-    let Some(handle) = global_handle_from_receiver() else {
+extern "C" fn js_wasm_global_get(
+    _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
+) -> f64 {
+    let Some(handle) = global_handle_from_receiver(this) else {
         return nanbox_undefined();
     };
     let mut kind = WASM_VAL_KIND_NONE;
@@ -1102,9 +1109,10 @@ extern "C" fn js_wasm_global_get(_closure: *const crate::closure::ClosureHeader)
 
 extern "C" fn js_wasm_global_set(
     _closure: *const crate::closure::ClosureHeader,
+    this: crate::closure::JsThis,
     value: f64,
 ) -> f64 {
-    let Some(handle) = global_handle_from_receiver() else {
+    let Some(handle) = global_handle_from_receiver(this) else {
         return nanbox_undefined();
     };
     let mut kind = WASM_VAL_KIND_NONE;
@@ -1567,7 +1575,7 @@ pub extern "C" fn js_webassembly_instantiate(bytes_jsval: f64, imports_jsval: f6
 
 /// `WebAssembly.callExport(handle, name, ...args)` — invoke an exported
 /// function by name with numeric arguments. Currently supports up to 4
-/// numeric args, mirroring the closure-call ABI in `closure.rs`. All
+/// numeric args, mirroring the `js_closure_call{N}` entries. All
 /// arguments and the return value are passed as f64; the runtime infers
 /// the wasm signature from the export type and widens/narrows as needed.
 ///
