@@ -118,12 +118,14 @@ pub(super) fn clear_typed_layout_intact_for_user(user_ptr: usize) {
     }
 }
 
+pub(in crate::gc) mod shape_layout_table;
 mod slot_mask;
 #[cfg(test)]
 mod test_accessors;
 mod transfer;
 mod typed_shape;
 
+pub(in crate::gc) use shape_layout_table::{ShapeLayoutTable, ShapeMaskMemo};
 pub(in crate::gc) use slot_mask::LayoutSlotMask;
 #[cfg(test)]
 pub(crate) use test_accessors::{
@@ -185,8 +187,9 @@ thread_local! {
 // array cannot stale this index. Nothing to prune on object death (entries are
 // per-shape, shared).
 thread_local! {
-    pub(in crate::gc) static SHAPE_LAYOUTS: RefCell<crate::fast_hash::PtrHashMap<u32, Option<TypedLayoutDescriptor>>> =
-        RefCell::new(crate::fast_hash::new_ptr_hash_map());
+    pub(in crate::gc) static SHAPE_LAYOUTS: RefCell<
+        ShapeMaskMemo<crate::fast_hash::PtrHashMap<u32, Option<TypedLayoutDescriptor>>>,
+    > = RefCell::new(ShapeMaskMemo::new());
 }
 
 fn shape_layout_keyed_enabled() -> bool {
@@ -337,7 +340,17 @@ unsafe fn shape_shared_pointer_mask_from(
     if (*header)._reserved & GC_OBJ_TYPED_LAYOUT_INTACT == 0 {
         return None;
     }
-    with_shape_shared_descriptor_from(user_ptr, shape, |d| d.pointer_mask.clone())
+    // `with_shape_shared_descriptor_from(.., |d| d.pointer_mask.clone())`,
+    // through the table's exact one-entry memo (`shape_layout_table.rs`).
+    let shape_id =
+        crate::object::shapes::object_shape_stamp(user_ptr as *const crate::object::ObjectHeader);
+    if shape_id == 0 {
+        return None;
+    }
+    let field_count = shape.map_or(0, |shape| shape.live_inline_slot_count() as usize);
+    hot_shape_layouts()
+        .borrow()
+        .shared_pointer_mask(shape_id, field_count)
 }
 
 /// Install `descriptor` as the canonical layout for `shape_id` and set the
@@ -1610,6 +1623,7 @@ impl HeapChildSlotIterator {
     /// caller already resolved (#8122). The payload-mask selection reuses it
     /// instead of probing the shape table, and it is retained on the iterator
     /// for the slot visitor.
+    #[inline(always)]
     pub(super) fn new_object(
         header: *mut GcHeader,
         prefix_slot: Option<*mut u64>,
@@ -1766,6 +1780,7 @@ pub(super) unsafe fn heap_payload_slot_selection(
 /// [`heap_payload_slot_selection`] for an ObjectFields receiver whose shape
 /// record the caller already resolved (#8122): the shared-shape
 /// pointer-mask lookup reuses it instead of probing the shape table twice.
+#[inline(always)]
 pub(super) unsafe fn heap_payload_slot_selection_from(
     header: *mut GcHeader,
     payload: HeapSlotRange,
@@ -1776,7 +1791,7 @@ pub(super) unsafe fn heap_payload_slot_selection_from(
     })
 }
 
-#[inline]
+#[inline(always)]
 unsafe fn heap_payload_slot_selection_impl(
     header: *mut GcHeader,
     payload: HeapSlotRange,
@@ -1838,6 +1853,9 @@ unsafe fn heap_payload_slot_selection_impl(
 
 /// #10362: every arm returns the iterator it builds, never through an `Option`
 /// combinator whose temporary is copied out — a per-object memmove per GC walk.
+/// Inlined (#11549): the descriptor walk has two instantiations now, and out of
+/// line the iterator came back by memory on every traced object.
+#[inline(always)]
 pub(super) unsafe fn gc_child_slots(header: *mut GcHeader) -> HeapChildSlotIterator {
     if header.is_null() || (*header).gc_flags & GC_FLAG_FORWARDED != 0 {
         return HeapChildSlotIterator::empty();
@@ -1965,6 +1983,13 @@ pub(super) enum GcMutableSlotDescriptor {
 
 impl GcMutableSlotDescriptor {
     pub(super) unsafe fn visit_slots(self, visit: &mut dyn FnMut(GcMutableSlot)) {
+        self.visit_slots_inline(visit)
+    }
+
+    /// [`Self::visit_slots`] monomorphized for one visitor, so the copying
+    /// minor's per-slot closure inlines instead of taking a dyn call per slot.
+    #[inline(always)]
+    pub(super) unsafe fn visit_slots_inline<F: FnMut(GcMutableSlot) + ?Sized>(self, visit: &mut F) {
         match self {
             GcMutableSlotDescriptor::Slot(slot) => visit(slot),
             GcMutableSlotDescriptor::Range { range, layout_kind } => {
